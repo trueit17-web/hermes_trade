@@ -175,7 +175,11 @@ class BacktestResult:
         self.running_capital: float = 0.0
 
     def compute_metrics(self):
-        """Вычислить все метрики на основе trades."""
+        """Вычислить все метрики на основе trades и equity curve."""
+        # Даундрафт считается по equity curve и не зависит от списка сделок
+        # (может быть заполнена даже без единой закрытой сделки)
+        self._compute_max_drawdown()
+
         if not self.trades:
             return
 
@@ -205,9 +209,6 @@ class BacktestResult:
         loss_rate_decimal = self.losing_trades / self.total_trades if self.total_trades > 0 else 0
         self.expectancy = (win_rate_decimal * self.average_win) - (loss_rate_decimal * self.average_loss)
 
-        # Максимальный даундрафт
-        self._compute_max_drawdown()
-
         # Sharpe ratio (упрощённый — на основе retired trades)
         if self.total_trades > 1:
             returns = [t.pnl_pct for t in self.trades]
@@ -229,6 +230,7 @@ class BacktestResult:
             return
 
         peak = self.equity_curve[0][1]
+        peak_time = self.equity_curve[0][0]
         max_dd = 0.0
         max_dd_start = self.equity_curve[0][0]
         max_dd_end = self.equity_curve[0][0]
@@ -237,14 +239,16 @@ class BacktestResult:
         for time, equity in self.equity_curve:
             if equity > peak:
                 peak = equity
+                peak_time = time
 
-            dd = (peak - equity) / peak * 100
+            dd = (peak - equity) / peak * 100 if peak > 0 else 0.0
             if dd > max_dd:
                 max_dd = dd
-                max_dd_start = max_dd_peak
+                max_dd_start = peak_time
                 max_dd_end = time
+                max_dd_peak = peak
 
-        self.max_drawdown = max_dd
+        self.max_drawdown = round(max_dd, 2)
         self.max_drawdown_start = max_dd_start
         self.max_drawdown_end = max_dd_end
         self.max_drawdown_peak = max_dd_peak
@@ -309,6 +313,12 @@ class BacktestEngine:
 
         if data.empty:
             raise ValueError("No data in selected date range")
+
+        min_rows = 50  # минимум свечей для расчёта индикаторов (см. _extract_features)
+        if len(data) < min_rows:
+            raise ValueError(
+                f"No data: недостаточно свечей для бэктеста ({len(data)} < {min_rows})"
+            )
 
         logger.info(
             f"Запуск бэктеста: {symbol} {timeframe} | "

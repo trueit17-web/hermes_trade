@@ -50,44 +50,45 @@ class SignalQualityScorer:
     ) -> float:
         """
         Оценить качество сигнала (0.0 - 1.0).
-        Чем выше — тем качественнее.
+        Чем выше — тем качественнее. Аддитивная модель: каждый фактор
+        вносит свой вклад независимо, что даёт предсказуемый диапазон
+        (мультипликативная модель с базой 0.5 не может превысить ~0.64
+        даже для идеального сигнала).
         """
-        score = 0.5  # базовый балл
+        score = 0.0
 
-        # 1. Историческая точность канала
+        # 1. Историческая точность канала — до 35%
         stats = self.channel_stats.get(channel_id, {})
         channel_win_rate = stats.get("win_rate", 0.5)
-        score *= (0.5 + channel_win_rate * 0.5)  # вклад 50%
+        score += channel_win_rate * 0.35
 
-        # 2. Уверенность сигнала (если есть)
+        # 2. Уверенность сигнала (если есть) — до 35%
         confidence = signal.get("confidence", 0.5)
-        score *= (0.3 + confidence * 0.7)  # вклад 30%
+        score += confidence * 0.35
 
-        # 3. Совпадение с рыночным контекстом
+        # 3. Совпадение с рыночным контекстом — до 10%
         if market_context:
             trend = market_context.get("trend", "neutral")
             signal_side = signal.get("side", "")
 
             if trend == "bull" and signal_side == "long":
-                score *= 1.1
+                score += 0.1
             elif trend == "bear" and signal_side == "short":
-                score *= 1.1
-            elif trend == "neutral":
-                score *= 1.0
-            else:
-                score *= 0.9  # против тренда — снижаем
+                score += 0.1
+            elif trend != "neutral":
+                score -= 0.1  # против тренда — штраф
 
-        # 4. Наличие SL/TP (риск-менеджмент)
+        # 4. Наличие SL/TP (риск-менеджмент) — до 10%
         has_sl = signal.get("sl") is not None
         has_tp = signal.get("tp") is not None
         if has_sl and has_tp:
-            score *= 1.1
+            score += 0.1
         elif has_sl:
-            score *= 1.0
+            score += 0.03
         else:
-            score *= 0.7  # нет SL — рискованно
+            score -= 0.15  # нет SL — рискованно
 
-        # 5. Справедливый RR (risk/reward)
+        # 5. Справедливый RR (risk/reward) — до 10%
         entry = signal.get("entry", 0)
         sl = signal.get("sl", 0)
         tp = signal.get("tp", 0)
@@ -97,13 +98,11 @@ class SignalQualityScorer:
             if risk > 0:
                 rr_ratio = reward / risk
                 if rr_ratio >= 2.0:
-                    score *= 1.05
+                    score += 0.1
                 elif rr_ratio >= 1.5:
-                    score *= 1.0
+                    score += 0.05
                 elif rr_ratio >= 1.0:
-                    score *= 0.95
-                else:
-                    score *= 0.8
+                    score += 0.02
 
         # Ограничиваем 0-1
         score = max(0.0, min(1.0, score))

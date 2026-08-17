@@ -1,6 +1,7 @@
 """Тесты для крипто-трейдер бота."""
 import asyncio
 import unittest
+from datetime import datetime
 from unittest.mock import MagicMock, AsyncMock, PropertyMock, patch
 
 import numpy as np
@@ -33,11 +34,9 @@ class TestConfig(unittest.TestCase):
 
     def setUp(self):
         self.original_trading_mode = settings.trading_mode
-        self.original_mode = settings.is_paper
 
     def tearDown(self):
         settings.trading_mode = self.original_trading_mode
-        settings.is_paper = self.original_mode
 
     def test_paper_mode_detection(self):
         """Paper режим корректно определяется."""
@@ -53,7 +52,7 @@ class TestConfig(unittest.TestCase):
 
     def test_default_capital(self):
         """Стартовый капитал по умолчанию."""
-        self.assertEqual(settings.startup_capitol_usdt, 10000.0)
+        self.assertEqual(settings.startup_capital_usdt, 10000.0)
 
     def test_risk_defaults(self):
         """Риск-параметры по умолчанию."""
@@ -377,6 +376,16 @@ class TestEnsembleVoterStrategy(unittest.TestCase):
         self.assertEqual(aggregated.side, "long")
 
 
+def _make_ohlcv(n: int) -> pd.DataFrame:
+    """Синтетические OHLCV-свечи для тестов индикаторов."""
+    close = np.random.uniform(100, 110, n)
+    high = close + np.random.uniform(0.5, 1.5, n)
+    low = close - np.random.uniform(0.5, 1.5, n)
+    open_ = close + np.random.uniform(-0.5, 0.5, n)
+    volume = np.random.uniform(1000, 5000, n)
+    return pd.DataFrame({"open": open_, "high": high, "low": low, "close": close, "volume": volume})
+
+
 class TestFeatureEngine(unittest.TestCase):
     """Тесты для FeatureEngine."""
 
@@ -386,19 +395,19 @@ class TestFeatureEngine(unittest.TestCase):
 
     def test_compute_rsi(self):
         """Вычисление RSI."""
-        df = pd.DataFrame({"close": np.random.uniform(100, 110, 50)})
+        df = _make_ohlcv(50)
         result = self.engine.compute_all_indicators(df)
         self.assertIn("rsi_14", result.columns)
 
     def test_compute_macd(self):
         """Вычисление MACD."""
-        df = pd.DataFrame({"close": np.random.uniform(100, 110, 50)})
+        df = _make_ohlcv(50)
         result = self.engine.compute_all_indicators(df)
         self.assertIn("macd", result.columns)
 
     def test_extract_ml_features(self):
         """Извлечение признаков для ML."""
-        df = pd.DataFrame({"close": np.random.uniform(100, 110, 100)})
+        df = _make_ohlcv(100)
         result = self.engine.compute_all_indicators(df)
         features = self.engine.extract_features_for_ml(result, include_target=True)
         self.assertFalse(features.empty)
@@ -428,7 +437,7 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
     async def test_paper_mode_initialization(self):
         """Инициализация в paper режиме."""
         settings.trading_mode = "paper"
-        settings.startup_capitol_usdt = 10000.0
+        settings.startup_capital_usdt = 10000.0
         await self.engine.initialize("binance")
         self.assertTrue(self.engine.is_paper)
         self.assertEqual(self.engine.get_paper_balance(), 10000.0)
@@ -440,7 +449,7 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
     async def test_paper_create_order(self):
         """Создание paper ордера."""
         settings.trading_mode = "paper"
-        settings.startup_capitol_usdt = 10000.0
+        settings.startup_capital_usdt = 10000.0
         await self.engine.initialize("binance")
         order = await self.engine.create_order(
             symbol="BTC/USDT", side="buy", amount=0.01, price=50000.0,

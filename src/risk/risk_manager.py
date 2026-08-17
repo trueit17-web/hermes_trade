@@ -57,6 +57,13 @@ class RiskState:
         self.paused = False
         self.kill_switch_active = False
 
+        # Пороговые значения (по умолчанию из настроек, синхронизируются
+        # с RiskProfile через RiskManager при изменении конфигурации)
+        self.max_open_positions = settings.risk_max_open_positions
+        self.daily_loss_limit_usd = settings.risk_daily_loss_limit_usd
+        self.max_drawdown_pct = settings.risk_max_drawdown_pct
+        self.cooldown_seconds = settings.risk_cooldown_seconds
+
     def update_balance(self, balance: float):
         """Обновить текущий баланс."""
         self.current_balance = balance
@@ -77,21 +84,23 @@ class RiskState:
         if self.daily_loss_limit_reached:
             now = datetime.utcnow()
             if self.daily_loss_reset_time is None:
-                self.daily_loss_reset_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
-                if now >= self.daily_loss_reset_time:
-                    self.daily_pnl = 0.0
-                    self.daily_loss_limit_reached = False
-                    logger.info("🔄 Daily PnL сброшен (начало нового дня)")
+                # Сброс произойдёт на следующую полночь, а не в момент срабатывания лимита
+                next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                self.daily_loss_reset_time = next_midnight
             elif now >= self.daily_loss_reset_time:
                 self.daily_pnl = 0.0
                 self.daily_loss_limit_reached = False
-                logger.info(f"🔄 Daily PnL сброшен в {self.daily_loss_reset_time}")
+                logger.info(f"🔄 Daily PnL сброшен (новый день, {now.date()})")
+                self.daily_loss_reset_time = None
 
     def add_open_position(self, symbol: str, size_pct: float):
         """Добавить открытую позицию."""
         self.open_positions[symbol] = size_pct
         self.open_positions_count = len(self.open_positions)
-        logger.debug(f"Позиция добавлена: {symbol} ({size_pct:.1f}%), всего: {self.open_positions_count}/{self.max_open_positions}")
+        logger.debug(
+            f"Позиция добавлена: {symbol} ({size_pct:.1f}%), "
+            f"всего: {self.open_positions_count}/{self.max_open_positions}"
+        )
 
     def remove_open_position(self, symbol: str):
         """Удалить открытую позицию."""
@@ -169,11 +178,20 @@ class RiskManager:
     def __init__(self, profile: Optional[RiskProfile] = None):
         self.profile = profile or RiskProfile()
         self.state = RiskState()
+        self._sync_state_from_profile()
         self.last_pnl_update: Optional[datetime] = None
+
+    def _sync_state_from_profile(self):
+        """Синхронизировать пороговые значения state с текущим профилем риска."""
+        self.state.max_open_positions = self.profile.max_open_positions
+        self.state.daily_loss_limit_usd = self.profile.daily_loss_limit_usd
+        self.state.max_drawdown_pct = self.profile.max_drawdown_pct
+        self.state.cooldown_seconds = self.profile.cooldown_seconds
 
     def configure(self, params: dict):
         """Обновить конфигурацию риска."""
         self.profile.update(params)
+        self._sync_state_from_profile()
 
     def get_state(self) -> dict:
         """Получить текущее состояние риска."""

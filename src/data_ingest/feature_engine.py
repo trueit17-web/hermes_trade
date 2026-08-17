@@ -107,7 +107,9 @@ class FeatureEngine:
         result["close_position"] = (result["close"] - result["low"]) / (result["high"] - result["low"] + 1e-10)
 
         # === Trend strength ===
-        result["adx_14"] = ta.adx(result["high"], result["low"], result["close"], length=14)
+        adx = ta.adx(result["high"], result["low"], result["close"], length=14)
+        if adx is not None:
+            result["adx_14"] = adx.iloc[:, 0]
 
         # Money Flow Index (MFI)
         mfi = ta.mfi(result["high"], result["low"], result["close"], result["volume"], length=14)

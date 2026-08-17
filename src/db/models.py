@@ -47,6 +47,7 @@ class Symbol(Base):
     orders: Mapped[list["Order"]] = relationship(back_populates="symbol")
     trades: Mapped[list["Trade"]] = relationship(back_populates="symbol")
     candles: Mapped[list["Candle"]] = relationship(back_populates="symbol")
+    signals: Mapped[list["Signal"]] = relationship(back_populates="symbol")
 
     __table_args__ = (
         UniqueConstraint("exchange_id", "symbol", name="uq_exchange_symbol"),

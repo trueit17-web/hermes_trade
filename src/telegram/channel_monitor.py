@@ -218,6 +218,16 @@ def parse_with_regex(text: str) -> Optional[dict]:
     tp = extract_price(text, side, "tp", "target", "take_profit", "take profit", "profit")
 
     if entry is None:
+        # Формат без ключевого слова: "BTCUSDT LONG 1.85 SL 1.70 TP 2.10" —
+        # цена входа идёт сразу после направления
+        match = re.search(r"\b(?:long|short|buy|sell)\b\s*[:\-–—]?\s*([\d.]+)", text, re.IGNORECASE)
+        if match:
+            try:
+                entry = float(match.group(1))
+            except ValueError:
+                entry = None
+
+    if entry is None:
         return None
 
     return {

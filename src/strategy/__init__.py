@@ -297,7 +297,6 @@ class BollingerBandsStrategy(BaseStrategy):
             name="Bollinger Bands",
             params=params or {},
         )
-        self.mode = self.params.get("mode", "mean_reversion")  # mean_reversion или breakout
 
     def get_config_schema(self) -> dict:
         return {
@@ -329,10 +328,11 @@ class BollingerBandsStrategy(BaseStrategy):
         sl_pct = self.params.get("sl_pct", 0.02)
         tp_pct = self.params.get("tp_pct", 0.04)
         size_pct = self.params.get("position_size_pct", 5.0)
+        mode = self.params.get("mode", "mean_reversion")
 
         signal = None
 
-        if self.mode == "mean_reversion":
+        if mode == "mean_reversion":
             # Цена у показателя нижней полосы + объём выше нормы
             if close <= bb_lower * 1.005 and volume_ratio > 1.2:
                 confidence = max(0.5, 1.0 - bb_pct / 0.5)
@@ -370,7 +370,7 @@ class BollingerBandsStrategy(BaseStrategy):
                     rationale=f"Цена у верхней BB (bb_pct={bb_pct:.2f}) + объём в 1.2x",
                 )
 
-        elif self.mode == "breakout":
+        elif mode == "breakout":
             # Пробой верхней полосы с высоким объёмом
             if close > bb_upper and volume_ratio > 1.5:
                 signal = StrategySignal(

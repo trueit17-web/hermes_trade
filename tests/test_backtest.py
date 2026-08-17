@@ -72,7 +72,7 @@ class TestBacktestPosition(unittest.TestCase):
 
         pos.update(48999.0, datetime.now())
         self.assertTrue(pos.closed)
-        self.assertEqual(pos.pnl, -100.1)  # примерно
+        self.assertAlmostEqual(pos.pnl, -100.1, places=6)  # примерно
 
     def test_not_closed_before_sl_tp(self):
         """Позиция не закрывается до достижения SL/TP."""
@@ -247,7 +247,7 @@ class TestBacktestResult(unittest.TestCase):
             self.result.trades.append(trade)
 
         self.result.compute_metrics()
-        self.assertEqual(self.result.profit_factor, 3.0)  # (3*50) / (2*50) = 150/100 = 1.5
+        self.assertEqual(self.result.profit_factor, 1.5)  # (3*50) / (2*50) = 150/100 = 1.5
 
     def test_max_drawdown(self):
         """Максимальный даундрафт."""
@@ -477,7 +477,7 @@ class TestDecisionLogger(unittest.TestCase):
             context={"daily_pnl": -500.0},
         )
         self.assertEqual(len(self.logger._steps), 1)
-        self.assertEqual(self.logger._steps[0]["decision"], "rejected")
+        self.assertEqual(self.logger._steps[0]["details"]["decision"], "rejected")
 
     def test_log_execution(self):
         """Лог исполнения."""
