@@ -2,7 +2,6 @@
 import asyncio
 import logging
 import uuid
-from datetime import datetime
 from typing import Any, Optional
 
 import ccxt.async_support as ccxt
@@ -21,6 +20,7 @@ from src.event_bus import (
 )
 from src.utils.logging import logger, log_trade
 from src.utils.crypto import decrypt_api_key, decrypt_secret
+from src.utils.timeutils import utcnow_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -294,7 +294,7 @@ class ExecutionEngine:
             holding_seconds=0,
             outcome="pending",
             is_opening=True,
-            timestamp=datetime.utcnow().timestamp(),
+            timestamp=utcnow_timestamp(),
         )
         await event_bus.publish(trade_event)
 
@@ -359,7 +359,7 @@ class ExecutionEngine:
                 holding_seconds=0,
                 outcome="pending",
                 is_opening=True,
-                timestamp=datetime.utcnow().timestamp(),
+                timestamp=utcnow_timestamp(),
             )
             await event_bus.publish(trade_event)
 

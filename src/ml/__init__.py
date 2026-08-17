@@ -17,6 +17,7 @@ from src.config import settings
 from src.db.session import get_session
 from src.db.models import MLModel, MLFeature, Strategy
 from src.utils.logging import logger
+from src.utils.timeutils import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -215,7 +216,7 @@ class ModelTrainer:
                 "model": model,
                 "feature_cols": available_cols,
                 "version": version,
-                "trained_at": datetime.utcnow().isoformat(),
+                "trained_at": utcnow().isoformat(),
             }, f)
 
         logger.info(
@@ -245,7 +246,7 @@ class ModelTrainer:
                         "val_samples": len(X_val),
                     },
                     is_active=True,
-                    released_at=datetime.utcnow(),
+                    released_at=utcnow(),
                 )
                 session.add(model_record)
                 await session.commit()
@@ -262,7 +263,7 @@ class ModelTrainer:
                 "f1": round(f1, 4),
             },
             "feature_cols": available_cols,
-            "trained_at": datetime.utcnow().isoformat(),
+            "trained_at": utcnow().isoformat(),
         }
 
     async def train_volatility_predictor(
@@ -318,7 +319,7 @@ class ModelTrainer:
                 "model": model,
                 "feature_cols": available_cols,
                 "version": version,
-                "trained_at": datetime.utcnow().isoformat(),
+                "trained_at": utcnow().isoformat(),
             }, f)
 
         logger.info(f"✅ Volatility predictor обучен: v{version} | MSE={mse:.6f} MAE={mae:.6f}")
@@ -327,7 +328,7 @@ class ModelTrainer:
             "version": version,
             "model_path": str(model_path),
             "metrics": {"mse": round(mse, 6), "mae": round(mae, 6)},
-            "trained_at": datetime.utcnow().isoformat(),
+            "trained_at": utcnow().isoformat(),
         }
 
     async def _get_next_version(self, model_type: str) -> int:

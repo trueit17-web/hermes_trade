@@ -9,6 +9,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.db.base import Base
+from src.utils.timeutils import utcnow
 
 
 class Exchange(Base):
@@ -20,9 +21,9 @@ class Exchange(Base):
     api_key_enc: Mapped[Optional[str]] = mapped_column(String(512))
     api_secret_enc: Mapped[Optional[str]] = mapped_column(String(512))
     is_paper: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime, default=utcnow, onupdate=utcnow
     )
 
     symbols: Mapped[list["Symbol"]] = relationship(back_populates="exchange")
@@ -41,7 +42,7 @@ class Symbol(Base):
     quote_asset: Mapped[str] = mapped_column(String(20))
     tick_size: Mapped[Optional[float]] = mapped_column(Float)
     step_size: Mapped[Optional[float]] = mapped_column(Float)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     exchange: Mapped["Exchange"] = relationship(back_populates="symbols")
     orders: Mapped[list["Order"]] = relationship(back_populates="symbol")
@@ -67,9 +68,9 @@ class Strategy(Base):
     params: Mapped[dict] = mapped_column(JSON, default={})
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     weight: Mapped[float] = mapped_column(Float, default=1.0)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime, default=utcnow, onupdate=utcnow
     )
 
     orders: Mapped[list["Order"]] = relationship(back_populates="strategy")
@@ -92,7 +93,7 @@ class Signal(Base):
     position_size_pct: Mapped[float] = mapped_column(Float)
     timeframe: Mapped[str] = mapped_column(String(10))
     rationale: Mapped[str] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     strategy: Mapped["Strategy"] = relationship(back_populates="signals")
     symbol: Mapped["Symbol"] = relationship(back_populates="signals")
@@ -123,9 +124,9 @@ class Order(Base):
     order_id_exchange: Mapped[Optional[str]] = mapped_column(String(100))
     client_order_id: Mapped[Optional[str]] = mapped_column(String(100))
     notes: Mapped[Optional[str]] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime, default=utcnow, onupdate=utcnow
     )
     closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
@@ -162,7 +163,7 @@ class Trade(Base):
         String(20)
     )  # win, loss, break-even
     is_open: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     symbol: Mapped["Symbol"] = relationship(back_populates="trades")
@@ -217,9 +218,9 @@ class TelegramChannel(Base):
     quality_threshold: Mapped[float] = mapped_column(Float, default=0.5)
     auto_execute: Mapped[bool] = mapped_column(Boolean, default=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime, default=utcnow, onupdate=utcnow
     )
 
     signals: Mapped[list["TelegramSignal"]] = relationship(back_populates="channel")
@@ -243,7 +244,7 @@ class TelegramSignal(Base):
         String(30), default="pending"
     )  # executed, rejected, pending
     executed_trade_id: Mapped[Optional[int]] = mapped_column(ForeignKey("trades.id"))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     channel: Mapped["TelegramChannel"] = relationship(back_populates="signals")
     executed_trade: Mapped[Optional["Trade"]] = relationship()
@@ -265,7 +266,7 @@ class MLModel(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
     is_shadow: Mapped[bool] = mapped_column(Boolean, default=False)
     released_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     __table_args__ = (Index("ix_ml_model_active", "model_type", "is_active"),)
 
@@ -284,7 +285,7 @@ class MLFeature(Base):
     )  # -1, 0, +1
     label_volatility: Mapped[Optional[float]] = mapped_column(Float)
     source: Mapped[str] = mapped_column(String(20))  # live, backtest
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     __table_args__ = (
         UniqueConstraint("symbol", "timeframe", "timestamp", name="uq_feature_unique"),
@@ -304,7 +305,7 @@ class BotConfig(Base):
     )  # default, ui, api, ml
     updated_by: Mapped[Optional[str]] = mapped_column(String(50))
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime, default=utcnow, onupdate=utcnow
     )
 
 
@@ -317,7 +318,7 @@ class BotEvent(Base):
     source: Mapped[str] = mapped_column(String(50), nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     details: Mapped[Optional[dict]] = mapped_column(JSON)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     __table_args__ = (
         Index("ix_events_created", "created_at"),
@@ -330,7 +331,7 @@ class PerformanceSnapshot(Base):
     __tablename__ = "performance_snapshots"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    snapshot_time: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    snapshot_time: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     total_balance: Mapped[float] = mapped_column(DECIMAL)
     open_pnl: Mapped[float] = mapped_column(DECIMAL, default=0)
     realized_pnl: Mapped[float] = mapped_column(DECIMAL, default=0)
@@ -355,7 +356,7 @@ class TradeDecisionLog(Base):
     )  # market_data, strategy_signal, ml_score, risk_check, execution
     description: Mapped[str] = mapped_column(Text, nullable=False)
     details: Mapped[Optional[dict]] = mapped_column(JSON)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     __table_args__ = (
         Index("ix_decision_log_trade", "trade_id"),

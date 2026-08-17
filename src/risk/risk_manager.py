@@ -11,6 +11,7 @@ from src.event_bus import (
     TradeEvent,
 )
 from src.utils.logging import logger
+from src.utils.timeutils import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ class RiskState:
     def check_daily_loss_limit_reset(self):
         """Проверить, можно ли сбросить daily loss лимит (начало нового дня)."""
         if self.daily_loss_limit_reached:
-            now = datetime.utcnow()
+            now = utcnow()
             if self.daily_loss_reset_time is None:
                 # Сброс произойдёт на следующую полночь, а не в момент срабатывания лимита
                 next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -115,7 +116,7 @@ class RiskState:
         if self.last_trade_time is None:
             return False
 
-        elapsed = (datetime.utcnow() - self.last_trade_time).total_seconds()
+        elapsed = (utcnow() - self.last_trade_time).total_seconds()
         if elapsed < self.cooldown_seconds:
             self.cooldown_active = True
             remaining = self.cooldown_seconds - elapsed
@@ -127,7 +128,7 @@ class RiskState:
 
     def record_trade_time(self):
         """Записать время последней сделки."""
-        self.last_trade_time = datetime.utcnow()
+        self.last_trade_time = utcnow()
         self.cooldown_active = True
 
     def check_max_positions(self) -> bool:

@@ -2,7 +2,6 @@
 import asyncio
 import logging
 import re
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -11,6 +10,7 @@ from telethon.tl.types import Channel, Message
 
 from src.config import settings
 from src.utils.logging import logger
+from src.utils.timeutils import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +101,7 @@ async def monitor_channels(channels: list[dict]):
                 "channel_id": channel["channel_id"],
                 "channel_title": channel.get("channel_title", ""),
                 "raw_message": raw_text,
-                "message_date": datetime.utcnow(),
+                "message_date": utcnow(),
                 "parsed_pair": parsed.get("pair"),
                 "parsed_side": parsed.get("side"),
                 "parsed_entry": parsed.get("entry"),

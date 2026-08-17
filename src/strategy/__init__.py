@@ -2,7 +2,6 @@
 import asyncio
 import logging
 from abc import ABC, abstractmethod
-from datetime import datetime
 from typing import Any, Optional
 
 import pandas as pd
@@ -16,6 +15,7 @@ from src.event_bus import (
     TradeEvent,
 )
 from src.utils.logging import logger
+from src.utils.timeutils import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ class StrategySignal:
         self.position_size_pct = position_size_pct
         self.timeframe = timeframe
         self.rationale = rationale
-        self.timestamp = datetime.utcnow()
+        self.timestamp = utcnow()
 
 
 # === Интерфейс стратегии ===

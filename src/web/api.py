@@ -1,7 +1,6 @@
 """FastAPI веб-интерфейс — API для управления ботом."""
 import asyncio
 import logging
-from datetime import datetime
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -16,6 +15,7 @@ from src.execution.executor import execution_engine
 from src.ml import model_registry, model_trainer
 from src.strategy import strategy_registry
 from src.utils.logging import logger
+from src.utils.timeutils import utcnow
 from src.db.session import get_session
 from src.db.models import (
     Strategy as StrategyModel,
@@ -160,7 +160,7 @@ async def root():
     return {
         "status": "running",
         "mode": settings.trading_mode,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": utcnow().isoformat(),
     }
 
 
@@ -171,7 +171,7 @@ async def health():
         "status": "ok",
         "trading_mode": settings.trading_mode,
         "bot_running": True,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": utcnow().isoformat(),
     }
 
 
@@ -199,7 +199,7 @@ async def get_status():
         "ml_active_model": await model_registry.get_active_model("direction_classifier"),
         "telegram_channels": telegram_channels,
         "event_bus_history_size": len(event_bus.get_history()),
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": utcnow().isoformat(),
     }
 
 

@@ -1,11 +1,11 @@
 """Decision Tree Logger — записывает полную цепочку решений для каждой сделки."""
 import logging
-from datetime import datetime
 from typing import Any, Optional
 
 from src.db.session import get_session
 from src.db.models import TradeDecisionLog, Trade
 from src.utils.logging import logger
+from src.utils.timeutils import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ class DecisionLogger:
             "step_type": step_type,
             "description": description,
             "details": details or {},
-            "timestamp": datetime.utcnow(),
+            "timestamp": utcnow(),
         }
         self._steps.append(step)
         logger.debug(f"DecisionLog [{step_order}] {step_type}: {description}")

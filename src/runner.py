@@ -164,13 +164,14 @@ def run_backtest():
 
     if args.output:
         import json
-        from datetime import datetime
+
+        from src.utils.timeutils import utcnow
 
         report = {
             "symbol": args.symbol,
             "timeframe": args.timeframe,
             "capital": args.capital,
-            "generated_at": datetime.utcnow().isoformat(),
+            "generated_at": utcnow().isoformat(),
             "best_strategy": best_name,
             "results": [
                 {
