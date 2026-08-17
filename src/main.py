@@ -2,9 +2,9 @@
 import asyncio
 import logging
 import sys
-from datetime import datetime
 from typing import Optional
 
+import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -22,6 +22,8 @@ from src.ml import model_trainer, model_registry, ml_inference
 from src.telegram.channel_monitor import init_telegram, close_telegram, subscribe_telegram_signal
 from src.telegram.notifier import send_notification
 from src.utils.crypto import generate_encryption_key
+from src.utils.timeutils import utcnow
+from src.web.api import app as web_app
 
 
 class TradingBot:
@@ -256,7 +258,7 @@ class TradingBot:
             return
 
         # Daily PnL reset
-        today = datetime.utcnow().date()
+        today = utcnow().date()
         if self.daily_pnl_reset_date != today:
             self.daily_pnl = 0.0
             self.daily_pnl_reset_date = today
@@ -438,7 +440,7 @@ class TradingBot:
                     "side": signal.side, "entry_price": entry_price,
                     "amount": amount, "strategy_id": signal.strategy_id,
                     "rationale": signal.rationale, "sl": signal.stop_loss,
-                    "tp": signal.take_profit, "opened_at": datetime.utcnow(),
+                    "tp": signal.take_profit, "opened_at": utcnow(),
                 }
                 risk_manager.on_position_added(symbol, size_pct)
                 self.daily_pnl = getattr(risk_manager.state, "daily_pnl", 0.0)
@@ -461,8 +463,22 @@ class TradingBot:
 async def main():
     """Точка входа."""
     bot = TradingBot()
+
+    # Веб-панель (FastAPI) запускается в этом же процессе, а не отдельным
+    # сервисом — она читает состояние напрямую из in-memory синглтонов
+    # (execution_engine, risk_manager, strategy_registry, ...), которые
+    # существуют только внутри процесса самого бота.
+    web_config = uvicorn.Config(
+        web_app,
+        host=settings.web_host,
+        port=settings.web_port,
+        log_level=settings.log_level.lower(),
+    )
+    web_server = uvicorn.Server(web_config)
+    web_server.install_signal_handlers = lambda: None  # управление сигналами — у asyncio.run()
+
     try:
-        await bot.run()
+        await asyncio.gather(bot.run(), web_server.serve())
     except KeyboardInterrupt:
         logger.info("📥 SIGINT — shutdown")
         await bot._cleanup()
