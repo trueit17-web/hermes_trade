@@ -1,8 +1,7 @@
-"""Основной модуль — инициализация и запуск бота."""
+"""CryptoBot Pro — автономный самообучающийся крипто-трейдер бот."""
 import asyncio
 import logging
 import sys
-from datetime import datetime
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -15,381 +14,444 @@ from src.event_bus import event_bus
 from src.data_ingest.market_data import MarketDataIngest
 from src.data_ingest.coinglass_client import get_coinglass_client
 from src.data_ingest.feature_engine import get_feature_engine
+from src.data_ingest.websocket_feed import get_ws_feed
 from src.strategy import strategy_registry
 from src.risk.risk_manager import risk_manager
 from src.execution.executor import execution_engine
-from src.ml import model_trainer, feature_store, model_registry, ml_inference
+from src.execution.decision_logger import decision_logger
+from src.ml import model_trainer, model_registry, ml_inference
 from src.telegram.channel_monitor import init_telegram, close_telegram, subscribe_telegram_signal
-from src.web.api import app
-from src.web.websocket import setup_websocket_broadcast
 from src.utils.crypto import generate_encryption_key
 
-logger = logging.getLogger(__name__)
 
+class TradingBot:
+    """Основной класс торгового бота."""
 
-async def initialize_bot():
-    """Инициализация всех компонентов бота."""
-    logger.info("🚀 Инициализация CryptoBot Pro...")
+    def __init__(self):
+        self.running = False
+        self.ingest = None
+        self.ws_feed = None
+        self.cg_client = None
+        self.feature_engine = None
+        self.ml_inference = None
+        self.ml_trainer = None
+        self.scheduler = None
+        self.candles_buffer = {}
+        self.last_prices = {}
+        self.open_positions = {}
+        self.closed_trades = []
+        self.daily_pnl = 0.0
+        self.daily_pnl_reset_date = None
 
-    # 1. Логирование
-    setup_logging()
+    async def initialize(self):
+        """Инициализация всех компонентов."""
+        setup_logging()
+        logger.info("🚀 Инициализация CryptoBot Pro...")
 
-    # 2. База данных
-    await init_db()
-    logger.info("✅ База данных инициализирована")
+        # База данных
+        await init_db()
+        logger.info("✅ База данных инициализирована")
 
-    # 3. Инженер признаков
-    feature_engine = get_feature_engine()
-    logger.info("✅ Feature Engine готов")
+        # Feature engine
+        self.feature_engine = get_feature_engine()
 
-    # 4. CoinGlass клиент
-    cg_client = get_coinglass_client()
-    logger.info("✅ CoinGlass клиент готов")
+        # CoinGlass клиент
+        self.cg_client = get_coinglass_client()
 
-    # 5. Execution Engine
-    await execution_engine.initialize("binance")
-    logger.info(f"✅ Execution Engine: {'paper' if settings.is_paper else 'real'} режим")
-
-    # 6. Telegram клиент (опционально)
-    if settings.telegram_api_id and settings.telegram_api_hash:
-        await init_telegram()
-
-    # 7. WebSocket broadcast
-    setup_websocket_broadcast()
-
-    logger.info("✅ Инициализация завершена")
-
-
-async def start_market_data_feed():
-    """Запуск потока рыночных данных."""
-    logger.info("📡 Запуск потока рыночных данных...")
-
-    ingest = MarketDataIngest("binance")
-    await ingest.initialize()
-
-    # Загрузить исторические свечи
-    symbols = settings.default_symbols
-    for symbol in symbols:
-        df = await ingest.fetch_ohlcv(symbol, "1h", limit=200)
-        if df is not None:
-            ingest.update_buffer(symbol, df)
-            logger.info(f"📊 Загружено 200 свечей для {symbol}")
-
-    # Запустить периодическое обновление
-    feed_task = asyncio.create_task(
-        ingest.start_periodic_update(symbols, "1h", interval_seconds=60)
-    )
-
-    return ingest, feed_task
-
-
-async def start_strategies(ingest: MarketDataIngest):
-    """Запуск стратегий на обработку данных."""
-    logger.info("🧠 Запуск стратегий...")
-
-    strategy_task_running = True
-
-    async def strategy_loop():
-        nonlocal strategy_task_running
-        while strategy_task_running:
-            try:
-                # Обрабатываем каждую пару
-                for symbol in settings.default_symbols:
-                    df = ingest.get_candles_for_symbol(symbol, limit=50)
-                    if df is None or df.empty:
-                        continue
-
-                    latest = df.iloc[-1]
-
-                    # Получаем фичи
-                    features = {
-                        "symbol": symbol,
-                        "timeframe": "1h",
-                        "close": latest.get("close"),
-                        "rsi_14": latest.get("rsi_14"),
-                        "rsi_7": latest.get("rsi_7"),
-                        "rsi_21": latest.get("rsi_21"),
-                        "macd": latest.get("macd"),
-                        "macd_signal": latest.get("macd_signal"),
-                        "macd_hist": latest.get("macd_hist"),
-                        "bb_upper": latest.get("bb_upper"),
-                        "bb_lower": latest.get("bb_lower"),
-                        "bb_mid": latest.get("bb_mid"),
-                        "bb_pct": latest.get("bb_pct"),
-                        "bb_width": latest.get("bb_width"),
-                        "ema_20": latest.get("ema_20"),
-                        "ema_50": latest.get("ema_50"),
-                        "ema_200": latest.get("ema_200"),
-                        "ema_20_slope": latest.get("ema_20_slope"),
-                        "ema_50_slope": latest.get("ema_50_slope"),
-                        "price_above_ema20": latest.get("price_above_ema20"),
-                        "price_above_ema50": latest.get("price_above_ema50"),
-                        "atr_14": latest.get("atr_14"),
-                        "natr_14": latest.get("natr_14"),
-                        "realized_vol_20": latest.get("realized_vol_20"),
-                        "realized_vol_60": latest.get("realized_vol_60"),
-                        "volume_ratio": latest.get("volume_ratio"),
-                        "obv": latest.get("obv"),
-                        "return_1": latest.get("return_1"),
-                        "return_3": latest.get("return_3"),
-                        "return_5": latest.get("return_5"),
-                        "return_10": latest.get("return_10"),
-                        "return_20": latest.get("return_20"),
-                        "log_return": latest.get("log_return"),
-                        "momentum_10": latest.get("momentum_10"),
-                        "momentum_20": latest.get("momentum_20"),
-                        "dist_from_ema20": latest.get("dist_from_ema20"),
-                        "dist_from_ema50": latest.get("dist_from_ema50"),
-                        "high_low_range": latest.get("high_low_range"),
-                        "range_ratio": latest.get("range_ratio"),
-                        "close_position": latest.get("close_position"),
-                        "stoch_k": latest.get("stoch_k"),
-                        "stoch_d": latest.get("stoch_d"),
-                        "wr_14": latest.get("wr_14"),
-                        "mfi_14": latest.get("mfi_14"),
-                        "hour": latest.get("hour", 0),
-                        "day_of_week": latest.get("day_of_week", 0),
-                        "is_weekend": latest.get("is_weekend", 0),
-                        "roc_5": latest.get("roc_5"),
-                        "roc_10": latest.get("roc_10"),
-                        "roc_20": latest.get("roc_20"),
-                        "ema_9_lag_1": latest.get("ema_9_lag_1"),
-                        "ema_21_lag_1": latest.get("ema_21_lag_1"),
-                        "close_lag_1": latest.get("close_lag_1"),
-                        "close_lag_2": latest.get("close_lag_2"),
-                        "volume_lag_1": latest.get("volume_lag_1"),
-                    }
-
-                    # Проверка: все ли признаки валидны
-                    if not all(v is not None and not (isinstance(v, float) and v != v)
-                               for v in [features.get("close"), features.get("rsi_14")]):
-                        continue
-
-                    # Запускаем ML inference для получения вероятностей
-                    ml_result = ml_inference.predict_direction(features)
-                    if ml_result:
-                        features["ml_proba_up"] = ml_result.get("proba_up")
-                        features["ml_proba_down"] = ml_result.get("proba_down")
-                        features["ml_proba_neutral"] = ml_result.get("proba_neutral")
-                        features["ml_features_used"] = str(ml_result.get("feature_importance", ""))[:200]
-
-                    # Получаем сигналы от каждой активной стратегии
-                    signals = []
-                    for strategy in strategy_registry.get_active():
-                        signal = strategy.generate_signal(features)
-                        if signal:
-                            signals.append(signal)
-
-                    # Агрегация через Ensemble Voter
-                    ensemble = strategy_registry.get("ensemble_voter")
-                    if ensemble and signals:
-                        # Установка весов по умолчанию
-                        for s in signals:
-                            ensemble.set_strategy_weight(s.strategy_id, s.weight)
-
-                        aggregated = ensemble.aggregate_signals(signals)
-                        if aggregated:
-                            # Проверка риска
-                            can_trade, reason = risk_manager.check_signal(aggregated)
-                            if can_trade:
-                                # Расчёт размера позиции
-                                balance = execution_engine.get_paper_balance() if settings.is_paper else 10000
-                                size = risk_manager.adjust_position_size(aggregated, balance)
-                                logger.info(
-                                    f"📈 СИГНАЛ: {aggregated.side.upper()} {aggregated.symbol} | "
-                                    f"size={size:.2f} USDT | conf={aggregated.confidence:.2f} | "
-                                    f"SL={aggregated.stop_loss:.2f} TP={aggregated.take_profit:.2f}"
-                                )
-
-                                # Создание ордера
-                                order = await execution_engine.create_order(
-                                    symbol=aggregated.symbol,
-                                    side=aggregated.side,
-                                    amount=size / aggregated.entry_price if aggregated.entry_price > 0 else 0,
-                                    price=aggregated.entry_price,
-                                    order_type="market",
-                                    stop_loss=aggregated.stop_loss,
-                                    take_profit=aggregated.take_profit,
-                                    strategy_id=1,  # TODO: real strategy_id
-                                    signal_data={
-                                        "strategy_id": aggregated.strategy_id,
-                                        "confidence": aggregated.confidence,
-                                        "rationale": aggregated.rationale,
-                                    },
-                                )
-                                if order:
-                                    logger.info(f"✅ Ордер создан: {order.client_order_id}")
-
-                    # Логирование
-                    logger.debug(
-                        f"[{symbol}] close={features.get('close'):.2f} rsi={features.get('rsi_14'):.1f} "
-                        f"ema20_slope={features.get('ema_20_slope'):.4f} vol_ratio={features.get('volume_ratio'):.1f}"
-                    )
-
-            except Exception as e:
-                logger.error(f"Ошибка в strategy loop: {e}")
-
-            await asyncio.sleep(60)  # Каждую минуту
-
-    strategy_task = asyncio.create_task(strategy_loop())
-    return strategy_task
-
-
-async def start_coinglass_updater():
-    """Периодическое обновление данных из CoinGlass."""
-    logger.info("📈 Запуск обновления CoinGlass данных...")
-
-    async def update():
+        # WebSocket feed (если доступно)
         try:
-            # Получаем данные для BTC (как основного актива)
-            btc_data = await cg_client.get_coins_markets(symbol="BTC")
-            if btc_data:
-                logger.debug(f"CoinGlass: BTC markets обновлены")
-
-            # Funding rate для BTC
-            funding = await cg_client.get_funding_rate_history(symbol="BTC/USDT", limit=50)
-            if funding:
-                logger.debug(f"CoinGlass: BTC funding rate обновлён")
-
-            # OI для BTC
-            oi = await cg_client.get_open_interest_history(symbol="BTC/USDT", limit=50)
-            if oi:
-                logger.debug(f"CoinGlass: BTC OI обновлён")
-
-            # Fear & Greed
-            fear = await cg_client.get_fear_greed_history(limit=10)
-            if fear:
-                logger.debug(f"CoinGlass: Fear & Greed обновлён")
-
+            self.ws_feed = get_ws_feed("binance")
+            await self.ws_feed.initialize()
+            logger.info("✅ WebSocket feed инициализирован")
         except Exception as e:
-            logger.debug(f" CoinGlass обновление: {e}")
+            logger.warning(f"⚠️ WebSocket feed недоступен: {e}")
+            self.ws_feed = None
 
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(
-        update,
-        IntervalTrigger(hours=settings.coinglass_update_interval_hours),
-        id="coinglass_updater",
-        name="CoinGlass data updater",
-    )
-    scheduler.start()
-    logger.info(f"✅ CoinGlass updater запущен (каждые {settings.coinglass_update_interval_hours} часов)")
+        # Market data ingest (fallback)
+        self.ingest = MarketDataIngest("binance")
+        await self.ingest.initialize()
 
-    return scheduler
+        # Загрузка исторических данных
+        for symbol in settings.default_symbols:
+            df = await self.ingest.fetch_ohlcv(symbol, "1h", limit=200)
+            if df is not None:
+                self.ingest.update_buffer(symbol, df)
+                self.candles_buffer[symbol] = df
+                logger.info(f"📊 Загружено 200 свечей для {symbol}")
 
+        # ML inference
+        self.ml_inference = ml_inference
+        active_model = model_registry.get_active_model("direction_classifier")
+        if active_model and active_model.get("model_path"):
+            self.ml_inference.load_model("direction_classifier", active_model["model_path"])
+            logger.info(f"✅ ML модель загружена: {active_model['model_type']} v{active_model['version']}")
+        else:
+            logger.warning("⚠️ ML модель не найдена — используются только rule-based стратегии")
 
-async def start_ml_retrainer():
-    """Периодическое переобучение ML моделей."""
-    logger.info("🧠 Запуск планировщика ML переобучения...")
+        # Execution engine
+        await execution_engine.initialize("binance")
+        logger.info(f"✅ Execution Engine: {'paper' if settings.is_paper else 'real'} режим")
 
-    async def retrain():
+        # Telegram (опционально)
+        if settings.telegram_api_id and settings.telegram_api_hash:
+            await init_telegram()
+            subscribe_telegram_signal(self._on_telegram_signal)
+            logger.info("✅ Telegram клиент инициализирован")
+
+        # Планировщик
+        self.scheduler = AsyncIOScheduler()
+        self.scheduler.add_job(
+            self._update_coinglass,
+            IntervalTrigger(hours=settings.coinglass_update_interval_hours),
+            id="coinglass_updater",
+        )
+        self.scheduler.add_job(
+            self._retrain_ml,
+            IntervalTrigger(hours=settings.ml_retraining_interval_hours),
+            id="ml_retrainer",
+        )
+        self.scheduler.start()
+        logger.info(f"✅ Планировщик запущен")
+
+        self.running = True
+        logger.info("✅ Инициализация завершена")
+
+    async def _update_coinglass(self):
+        """Обновление данных из CoinGlass."""
         try:
-            # Проверяем, есть ли достаточно данных
-            trades_count = await _get_trades_count()
+            btc_market = await self.cg_client.get_coins_markets(symbol="BTC")
+            funding = await self.cg_client.get_funding_rate_history(symbol="BTC/USDT", limit=50)
+            oi = await self.cg_client.get_open_interest_history(symbol="BTC/USDT", limit=50)
+            fear = await self.cg_client.get_fear_greed_history(limit=10)
+            logger.debug("CoinGlass данные обновлены")
+        except Exception as e:
+            logger.debug(f"CoinGlass: {e}")
+
+    async def _retrain_ml(self):
+        """Переобучение ML моделей."""
+        try:
+            from src.db.models import Trade
+            from src.db.session import get_session
+
+            async with get_session() as session:
+                trades_count = await session.query(Trade).count()
+
             if trades_count < 50:
-                logger.debug(f"Слишком мало сделок для обучения: {trades_count}")
+                logger.debug(f"ML retraining пропущен: {trades_count} сделок")
                 return
 
+            logger.info(f"ML retraining: {trades_count} сделок")
             result = model_trainer.train_direction_classifier()
             if result:
-                logger.info(f"ML модель переобучена: v{result['version']}")
+                logger.info(f"✅ Direction classifier: v{result['version']}")
                 model_registry.activate_model("direction_classifier", result["version"])
-
+                if self.ml_inference:
+                    self.ml_inference.load_model("direction_classifier", result["model_path"])
         except Exception as e:
-            logger.error(f"Ошибка ML переобучения: {e}")
+            logger.error(f"ML retraining: {e}")
 
-    async def _get_trades_count() -> int:
-        async with get_session() as session:
-            from src.db.models import Trade
-            result = await session.query(Trade).count()
-            return result
+    async def _on_telegram_signal(self, signal_event: dict):
+        """Обработка Telegram сигнала."""
+        channel_id = signal_event.get("channel_id", "")
+        pair = signal_event.get("parsed_pair", "")
+        side = signal_event.get("parsed_side", "")
+        entry = signal_event.get("parsed_entry", 0)
+        sl = signal_event.get("parsed_sl")
+        tp = signal_event.get("parsed_tp")
 
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(
-        retrain,
-        IntervalTrigger(hours=settings.ml_retraining_interval_hours),
-        id="ml_retrainer",
-        name="ML model retrainer",
-    )
-    scheduler.start()
-    logger.info(f"✅ ML retrainer запущен (каждые {settings.ml_retraining_interval_hours} часов)")
+        if not pair or not side or entry <= 0:
+            return
 
-    return scheduler
+        from src.telegram.quality_scorer import signal_quality_scorer
+        quality = signal_quality_scorer.score_signal(signal_event, channel_id)
+        logger.info(f"📲 Telegram сигнал: {pair} {side.upper()} | quality={quality:.2f}")
 
+        if quality < settings.telegram_signals_quality_threshold:
+            logger.info(f"🚫 Сигнал отклонён (quality={quality:.2f})")
+            return
 
-async def start_telegram_signal_processor():
-    """Обработка Telegram сигналов."""
-    logger.info("📱 Запуск Telegram signal processor...")
-
-    async def signal_handler(signal_event: dict):
-        logger.info(f"📲 Получен Telegram сигнал: {signal_event.get('parsed_pair')} {signal_event.get('parsed_side')}")
-
-        # Оценка качества
-        quality = signal_quality_scorer.score_signal(
-            signal_event,
-            signal_event.get("channel_id", ""),
-        )
-        logger.info(f"Quality score: {quality}")
-
-        # Проверка порога
-        if quality >= settings.telegram_signals_quality_threshold:
-            if settings.telegram_signals_auto_execute:
-                logger.info(f"🤖 Автоматическое исполнение сигнала: {signal_event.get('parsed_pair')}")
-                # TODO: исполнение сигнала
-            else:
-                logger.info(f"⏳ Сигнал ожидает подтверждения: {signal_event.get('parsed_pair')}")
+        if settings.telegram_signals_auto_execute:
+            logger.info(f"🤖 Автоматическое исполнение")
+            await self._execute_telegram_signal(signal_event)
         else:
-            logger.info(f"🚫 Сигнал отклонён (quality={quality:.2f} < threshold={settings.telegram_signals_quality_threshold})")
+            logger.info(f"⏳ Сигнал ожидает подтверждения")
 
-    subscribe_telegram_signal(signal_handler)
+    async def _execute_telegram_signal(self, signal_event: dict):
+        """Исполнение Telegram сигнала."""
+        pair = signal_event.get("parsed_pair", "")
+        side = signal_event.get("parsed_side", "long")
+        entry = signal_event.get("parsed_entry", 0)
+        sl = signal_event.get("parsed_sl")
+        tp = signal_event.get("parsed_tp")
 
+        symbol = pair
+        order_side = "buy" if side == "long" else "sell"
 
-async def run_bot():
-    """Основной цикл работы бота."""
-    await initialize_bot()
+        balance = execution_engine.get_paper_balance() if settings.is_paper else 10000
+        size_pct = 5.0
+        position_value = balance * (size_pct / 100)
+        amount = position_value / entry
 
-    # Запуск компонентов
-    ingest, feed_task = await start_market_data_feed()
-    strategy_task = await start_strategies(ingest)
-    coinglass_scheduler = await start_coinglass_updater()
-    ml_scheduler = await start_ml_retrainer()
+        logger.info(f"📝 Ордер: {order_side.upper()} {amount:.6f} {symbol} @ {entry:.2f}")
+        order = await execution_engine.create_order(
+            symbol=symbol,
+            side=order_side,
+            amount=amount,
+            price=entry,
+            order_type="market",
+            stop_loss=sl,
+            take_profit=tp,
+        )
+        if order:
+            logger.info(f"✅ Ордер исполнен: {order.client_order_id}")
 
-    # Telegram
-    await start_telegram_signal_processor()
+    async def run(self):
+        """Основной цикл торговли."""
+        if not self.running:
+            await self.initialize()
 
-    logger.info("✅ Бот полностью запущен")
+        logger.info("🔄 Запуск основного цикла...")
 
-    # Основной цикл — просто ждём, пока все задачи работают
-    try:
-        while True:
-            await asyncio.sleep(60)
-            # Периодический чек состояния
-            logger.debug(
-                f"🌐 Статус: mode={settings.trading_mode}, "
-                f"balance={execution_engine.get_paper_balance():.2f}, "
-                f"positions={len(execution_engine.get_paper_positions())}, "
-                f"risk_paused={risk_manager.state.paused}"
+        # WebSocket в отдельной задаче
+        ws_task = None
+        if self.ws_feed:
+            ws_task = asyncio.create_task(self.ws_feed.start())
+            logger.info("📡 WebSocket stream запущен")
+
+        while self.running:
+            try:
+                await self._trading_iteration()
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Основной цикл: {e}")
+                await asyncio.sleep(60)
+
+        if ws_task:
+            ws_task.cancel()
+        await self._cleanup()
+
+    async def _trading_iteration(self):
+        """Одна итерация торговли."""
+        if risk_manager.state.kill_switch_active or risk_manager.state.paused:
+            return
+
+        # Daily PnL reset
+        today = datetime.utcnow().date()
+        if self.daily_pnl_reset_date != today:
+            self.daily_pnl = 0.0
+            self.daily_pnl_reset_date = today
+
+        for symbol in settings.default_symbols:
+            await self._process_symbol(symbol)
+
+    async def _process_symbol(self, symbol: str):
+        """Обработка одной пары."""
+        df = self.candles_buffer.get(symbol)
+        if df is None or df.empty or len(df) < 50:
+            df = await self.ingest.fetch_ohlcv(symbol, "1h", limit=50)
+            if df is not None:
+                self.ingest.update_buffer(symbol, df)
+                self.candles_buffer[symbol] = df
+
+        if df is None or df.empty or len(df) < 50:
+            return
+
+        latest = df.iloc[-1]
+        close = float(latest["close"])
+        self.last_prices[symbol] = close
+
+        # Фичи
+        features = self.feature_engine.compute_all_indicators(df)
+        latest_features = features.iloc[-1]
+
+        # Сбор данных для стратегий
+        strategy_data = {
+            "symbol": symbol,
+            "timeframe": "1h",
+            "close": close,
+            "rsi_14": latest_features.get("rsi_14"),
+            "rsi_7": latest_features.get("rsi_7"),
+            "rsi_21": latest_features.get("rsi_21"),
+            "macd": latest_features.get("macd"),
+            "macd_signal": latest_features.get("macd_signal"),
+            "macd_hist": latest_features.get("macd_hist"),
+            "bb_upper": latest_features.get("bb_upper"),
+            "bb_lower": latest_features.get("bb_lower"),
+            "bb_mid": latest_features.get("bb_mid"),
+            "bb_pct": latest_features.get("bb_pct"),
+            "bb_width": latest_features.get("bb_width"),
+            "ema_20": latest_features.get("ema_20"),
+            "ema_50": latest_features.get("ema_50"),
+            "ema_20_slope": latest_features.get("ema_20_slope"),
+            "ema_50_slope": latest_features.get("ema_50_slope"),
+            "price_above_ema20": latest_features.get("price_above_ema20"),
+            "price_above_ema50": latest_features.get("price_above_ema50"),
+            "atr_14": latest_features.get("atr_14"),
+            "natr_14": latest_features.get("natr_14"),
+            "realized_vol_20": latest_features.get("realized_vol_20"),
+            "volume_ratio": latest_features.get("volume_ratio"),
+            "obv": latest_features.get("obv"),
+            "return_1": latest_features.get("return_1"),
+            "return_3": latest_features.get("return_3"),
+            "return_5": latest_features.get("return_5"),
+            "log_return": latest_features.get("log_return"),
+            "momentum_10": latest_features.get("momentum_10"),
+            "dist_from_ema20": latest_features.get("dist_from_ema20"),
+            "dist_from_ema50": latest_features.get("dist_from_ema50"),
+            "high_low_range": latest_features.get("high_low_range"),
+            "stoch_k": latest_features.get("stoch_k"),
+            "stoch_d": latest_features.get("stoch_d"),
+            "wr_14": latest_features.get("wr_14"),
+            "mfi_14": latest_features.get("mfi_14"),
+            "hour": latest_features.get("hour", 0),
+            "day_of_week": latest_features.get("day_of_week", 0),
+        }
+
+        # ML inference
+        if self.ml_inference:
+            ml_result = self.ml_inference.predict_direction(strategy_data)
+            if ml_result:
+                strategy_data["ml_proba_up"] = ml_result.get("proba_up")
+                strategy_data["ml_proba_down"] = ml_result.get("proba_down")
+                strategy_data["ml_proba_neutral"] = ml_result.get("proba_neutral")
+
+        # Decision logger: market data
+        decision_logger.log_market_data(
+            symbol=symbol, timeframe="1h", price=close,
+            features={k: round(v, 4) if isinstance(v, float) else v
+                     for k, v in list(strategy_data.items())[:15]},
+        )
+
+        # Сигналы от стратегий
+        signals = []
+        for strategy in strategy_registry.get_active():
+            signal = strategy.generate_signal(strategy_data)
+            if signal:
+                signals.append(signal)
+                decision_logger.log_strategy_signal(
+                    strategy_id=strategy.strategy_id,
+                    strategy_name=strategy.name,
+                    signal_side=signal.side,
+                    confidence=signal.confidence,
+                    entry_price=signal.entry_price or close,
+                    stop_loss=signal.stop_loss,
+                    take_profit=signal.take_profit,
+                    rationale=signal.rationale,
+                )
+
+        # ML score log
+        if "ml_proba_up" in strategy_data:
+            decision_logger.log_ml_score(
+                model_type="direction_classifier",
+                model_version=model_registry.get_active_model("direction_classifier", {}).get("version", 1),
+                proba_up=strategy_data["ml_proba_up"],
+                proba_down=strategy_data["ml_proba_down"],
+                proba_neutral=strategy_data["ml_proba_neutral"],
             )
-    except asyncio.CancelledError:
-        logger.info("Бот остановлен")
-    finally:
-        # Очистка
-        feed_task.cancel()
-        strategy_task.cancel()
-        coinglass_scheduler.shutdown()
-        ml_scheduler.shutdown()
+
+        # Ensemble
+        ensemble = strategy_registry.get("ensemble_voter")
+        if ensemble and signals:
+            for s in signals:
+                ensemble.set_strategy_weight(s.strategy_id, s.weight)
+            aggregated = ensemble.aggregate_signals(signals)
+            if aggregated:
+                signals = [aggregated]
+
+        if not signals:
+            return
+
+        # Риск + исполнение
+        for signal in signals:
+            can_execute, reason = risk_manager.check_signal(signal)
+            decision_logger.log_risk_check(
+                decision="allowed" if can_execute else "rejected",
+                reason=reason,
+                context={"symbol": symbol, "side": signal.side, "daily_pnl": self.daily_pnl},
+            )
+
+            if not can_execute:
+                logger.info(f"🚫 Сигнал отклонён (risk): {symbol} {signal.side} — {reason}")
+                continue
+
+            balance = execution_engine.get_paper_balance() if settings.is_paper else 10000
+            size_pct = signal.position_size_pct
+            position_value = balance * (size_pct / 100)
+            entry_price = signal.entry_price if signal.entry_price > 0 else close
+            amount = position_value / entry_price if entry_price > 0 else 0
+
+            if amount <= 0:
+                continue
+
+            order_side = "buy" if signal.side == "long" else "sell"
+            logger.info(
+                f"📝 Ордер: {order_side.upper()} {amount:.6f} {symbol} @ {entry_price:.2f} | "
+                f"Conf: {signal.confidence:.2f} | SL: {signal.stop_loss} TP: {signal.take_profit}"
+            )
+
+            decision_logger.log_execution(
+                order_id="pending", order_type="market", amount=amount,
+                price=entry_price, status="pending", fee=0,
+            )
+
+            order = await execution_engine.create_order(
+                symbol=symbol,
+                side=order_side,
+                amount=amount,
+                price=entry_price,
+                order_type="market",
+                stop_loss=signal.stop_loss,
+                take_profit=signal.take_profit,
+                strategy_id=1,
+                signal_data={"strategy_id": signal.strategy_id, "confidence": signal.confidence},
+            )
+
+            if order:
+                decision_logger.log_execution(
+                    order_id=order.client_order_id, order_type="market",
+                    amount=amount, price=entry_price, status="filled", fee=order.fee,
+                )
+                self.open_positions[symbol] = {
+                    "side": signal.side, "entry_price": entry_price,
+                    "amount": amount, "strategy_id": signal.strategy_id,
+                    "rationale": signal.rationale, "sl": signal.stop_loss,
+                    "tp": signal.take_profit, "opened_at": datetime.utcnow(),
+                }
+                risk_manager.on_position_added(symbol, size_pct)
+                self.daily_pnl = getattr(risk_manager.state, "daily_pnl", 0.0)
+                logger.info(f"✅ Ордер: {order.client_order_id}")
+
+    async def _cleanup(self):
+        """Очистка."""
+        logger.info("🧹 Очистка...")
+
+        if self.ws_feed:
+            await self.ws_feed.close()
+        if self.ingest:
+            await self.ingest.close()
+        if self.cg_client:
+            await self.cg_client.close()
+        if self.scheduler:
+            self.scheduler.shutdown()
         await close_telegram()
-        await execution_engine.close()
+        logger.info("✅ Очистка завершена")
 
 
 async def main():
     """Точка входа."""
+    bot = TradingBot()
     try:
-        await run_bot()
+        await bot.run()
     except KeyboardInterrupt:
-        logger.info("Получен SIGINT — graceful shutdown")
+        logger.info("📥 SIGINT — shutdown")
+        await bot._cleanup()
         sys.exit(0)
     except Exception as e:
         logger.critical(f"Критическая ошибка: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
