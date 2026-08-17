@@ -20,3 +20,6 @@ from src.telegram.signal_parser import (
 from src.telegram.quality_scorer import (
     signal_quality_scorer,
 )
+from src.telegram.notifier import (
+    send_notification,
+)

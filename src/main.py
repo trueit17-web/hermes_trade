@@ -20,6 +20,7 @@ from src.execution.executor import execution_engine
 from src.execution.decision_logger import decision_logger
 from src.ml import model_trainer, model_registry, ml_inference
 from src.telegram.channel_monitor import init_telegram, close_telegram, subscribe_telegram_signal
+from src.telegram.notifier import send_notification
 from src.utils.crypto import generate_encryption_key
 
 
@@ -40,6 +41,7 @@ class TradingBot:
         self.closed_trades = []
         self.daily_pnl = 0.0
         self.daily_pnl_reset_date = None
+        self._kill_switch_notified = False
 
     async def initialize(self):
         """Инициализация всех компонентов."""
@@ -109,8 +111,24 @@ class TradingBot:
         self.scheduler.start()
         logger.info(f"✅ Планировщик запущен")
 
+        # Telegram-уведомления (алерты о сделках/ошибках, без приёма команд)
+        event_bus.subscribe("trade_event", self._on_trade_event)
+
         self.running = True
         logger.info("✅ Инициализация завершена")
+        await send_notification(
+            f"🚀 CryptoBot Pro запущен | режим: {settings.trading_mode} | "
+            f"символы: {', '.join(settings.default_symbols)}"
+        )
+
+    async def _on_trade_event(self, event):
+        """Отправить Telegram-уведомление об открытой сделке."""
+        side = "LONG 📈" if event.direction == "long" else "SHORT 📉"
+        await send_notification(
+            f"{side} {event.symbol}\n"
+            f"Цена входа: {event.entry_price:.4f}\n"
+            f"Объём: {event.amount:.6f}"
+        )
 
     async def _update_coinglass(self):
         """Обновление данных из CoinGlass."""
@@ -220,13 +238,21 @@ class TradingBot:
                 break
             except Exception as e:
                 logger.error(f"Основной цикл: {e}")
+                await send_notification(f"🔴 Ошибка основного цикла: {e}")
                 await asyncio.sleep(60)
 
         await self._cleanup()
 
     async def _trading_iteration(self):
         """Одна итерация торговли."""
-        if risk_manager.state.kill_switch_active or risk_manager.state.paused:
+        if risk_manager.state.kill_switch_active:
+            if not self._kill_switch_notified:
+                self._kill_switch_notified = True
+                await send_notification("🔴 KILL SWITCH активирован — вся торговля остановлена")
+            return
+        self._kill_switch_notified = False
+
+        if risk_manager.state.paused:
             return
 
         # Daily PnL reset
