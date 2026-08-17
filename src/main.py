@@ -374,7 +374,9 @@ class TradingBot:
         ensemble = strategy_registry.get("ensemble_voter")
         if ensemble and signals:
             for s in signals:
-                ensemble.set_strategy_weight(s.strategy_id, s.weight)
+                source_strategy = strategy_registry.get(s.strategy_id)
+                if source_strategy:
+                    ensemble.set_strategy_weight(s.strategy_id, source_strategy.weight)
             aggregated = ensemble.aggregate_signals(signals)
             if aggregated:
                 signals = [aggregated]
