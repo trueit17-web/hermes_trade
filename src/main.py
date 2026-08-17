@@ -2,8 +2,10 @@
 import asyncio
 import logging
 import sys
-from typing import Optional
+from datetime import datetime
+from typing import Any, Optional
 
+import pandas as pd
 import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -18,7 +20,7 @@ from src.strategy import strategy_registry
 from src.risk.risk_manager import risk_manager
 from src.execution.executor import execution_engine
 from src.execution.decision_logger import decision_logger
-from src.ml import model_trainer, model_registry, ml_inference
+from src.ml import model_trainer, model_registry, ml_inference, feature_store
 from src.telegram.channel_monitor import init_telegram, close_telegram, subscribe_telegram_signal
 from src.telegram.notifier import send_notification
 from src.utils.crypto import generate_encryption_key
@@ -44,6 +46,7 @@ class TradingBot:
         self.daily_pnl = 0.0
         self.daily_pnl_reset_date = None
         self._kill_switch_notified = False
+        self._last_ml_feature_ts: dict[str, Any] = {}
 
     async def initialize(self):
         """Инициализация всех компонентов."""
@@ -289,6 +292,8 @@ class TradingBot:
         features = self.feature_engine.compute_all_indicators(df)
         latest_features = features.iloc[-1]
 
+        await self._record_ml_training_sample(symbol, df)
+
         # Сбор данных для стратегий
         strategy_data = {
             "symbol": symbol,
@@ -449,6 +454,48 @@ class TradingBot:
                 risk_manager.on_position_added(symbol, size_pct)
                 self.daily_pnl = getattr(risk_manager.state, "daily_pnl", 0.0)
                 logger.info(f"✅ Ордер: {order.client_order_id}")
+
+    async def _record_ml_training_sample(self, symbol: str, df: pd.DataFrame):
+        """
+        Сохранить в ml_features размеченный обучающий пример (признаки +
+        целевая переменная), как только его исход становится известен из
+        буфера свечей. extract_features_for_ml() смотрит на horizon свечей
+        вперёд, поэтому размеченной может быть только строка не из самого
+        конца буфера — это "прошлая" свеча, чьё будущее уже наступило.
+        """
+        try:
+            labeled = self.feature_engine.extract_features_for_ml(df, include_target=True)
+            if labeled.empty:
+                return
+
+            latest_ts = labeled.index[-1]
+            if self._last_ml_feature_ts.get(symbol) == latest_ts:
+                return  # уже сохраняли этот пример (буфер обновляется раз в час)
+
+            latest_row = labeled.iloc[-1]
+            feature_values = {
+                k: float(v) for k, v in latest_row.items()
+                if k not in ("target_direction", "target_volatility") and not pd.isna(v)
+            }
+            volatility_label = latest_row.get("target_volatility")
+
+            timestamp = latest_ts.to_pydatetime() if hasattr(latest_ts, "to_pydatetime") else latest_ts
+            if not isinstance(timestamp, datetime):
+                timestamp = utcnow()
+
+            await feature_store.add_features(
+                symbol=symbol,
+                timeframe="1h",
+                timestamp=timestamp,
+                features=feature_values,
+                labels={
+                    "direction": float(latest_row["target_direction"]),
+                    "volatility": float(volatility_label) if not pd.isna(volatility_label) else None,
+                },
+            )
+            self._last_ml_feature_ts[symbol] = latest_ts
+        except Exception as e:
+            logger.debug(f"Не удалось сохранить ML-обучающий пример для {symbol}: {e}")
 
     async def _check_position_exit(self, symbol: str, current_price: float) -> bool:
         """
