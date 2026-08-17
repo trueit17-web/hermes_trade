@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CryptoBot Pro — Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1420;
+    --panel: #161d2e;
+    --panel-border: #232c42;
+    --text: #e6e9f0;
+    --text-dim: #8a93a8;
+    --green: #3ddc97;
+    --red: #ff5d6c;
+    --yellow: #f5c451;
+    --blue: #5b8cff;
+    --accent: #7c5cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--panel-border);
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  header h1 {
+    font-size: 18px;
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; }
+  .badge {
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  .badge-mode-paper { background: rgba(91,140,255,.15); color: var(--blue); }
+  .badge-mode-real { background: rgba(255,93,108,.15); color: var(--red); }
+  .badge-running { background: rgba(61,220,151,.15); color: var(--green); }
+  .badge-paused { background: rgba(245,196,81,.15); color: var(--yellow); }
+  .badge-killed { background: rgba(255,93,108,.2); color: var(--red); }
+
+  main { padding: 20px 24px 60px; max-width: 1300px; margin: 0 auto; }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 14px;
+    margin-bottom: 20px;
+  }
+  .stat-card {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .stat-card .label { color: var(--text-dim); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .stat-card .value { font-size: 22px; font-weight: 700; margin-top: 4px; }
+  .value.pos { color: var(--green); }
+  .value.neg { color: var(--red); }
+
+  .controls {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 24px;
+  }
+  button {
+    font: inherit;
+    cursor: pointer;
+    border: 1px solid var(--panel-border);
+    background: var(--panel);
+    color: var(--text);
+    padding: 9px 16px;
+    border-radius: 8px;
+    font-weight: 600;
+    transition: filter .1s;
+  }
+  button:hover { filter: brightness(1.2); }
+  button:disabled { opacity: .5; cursor: default; }
+  .btn-primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  .btn-warn { background: var(--yellow); border-color: var(--yellow); color: #1a1a1a; }
+  .btn-danger { background: var(--red); border-color: var(--red); color: #fff; }
+  .btn-ghost { background: transparent; }
+
+  section {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    margin-bottom: 20px;
+    overflow: hidden;
+  }
+  section > h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--text-dim);
+    margin: 0;
+    padding: 14px 16px 10px;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 16px; font-size: 13px; white-space: nowrap; }
+  thead th { color: var(--text-dim); font-weight: 600; border-bottom: 1px solid var(--panel-border); }
+  tbody tr { border-bottom: 1px solid var(--panel-border); }
+  tbody tr:last-child { border-bottom: none; }
+  tbody tr:hover { background: rgba(255,255,255,.02); }
+  .empty-row td { color: var(--text-dim); text-align: center; padding: 24px; }
+
+  .side-long { color: var(--green); font-weight: 600; }
+  .side-short { color: var(--red); font-weight: 600; }
+  .pnl-pos { color: var(--green); }
+  .pnl-neg { color: var(--red); }
+
+  .toggle {
+    position: relative;
+    display: inline-block;
+    width: 38px;
+    height: 20px;
+  }
+  .toggle input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute; cursor: pointer; inset: 0;
+    background-color: #333c52;
+    transition: .15s;
+    border-radius: 999px;
+  }
+  .slider:before {
+    position: absolute; content: "";
+    height: 14px; width: 14px; left: 3px; bottom: 3px;
+    background-color: white;
+    transition: .15s;
+    border-radius: 50%;
+  }
+  input:checked + .slider { background-color: var(--green); }
+  input:checked + .slider:before { transform: translateX(18px); }
+
+  .table-wrap { overflow-x: auto; }
+  .muted { color: var(--text-dim); }
+  #lastUpdated { color: var(--text-dim); font-size: 12px; }
+  .toast {
+    position: fixed; bottom: 20px; right: 20px;
+    background: var(--panel); border: 1px solid var(--panel-border);
+    padding: 12px 18px; border-radius: 8px;
+    font-size: 13px; opacity: 0; transform: translateY(8px);
+    transition: .2s; pointer-events: none;
+  }
+  .toast.show { opacity: 1; transform: translateY(0); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>⚙️ CryptoBot Pro
+    <span class="badges" id="headerBadges"></span>
+  </h1>
+  <div id="lastUpdated">—</div>
+</header>
+
+<main>
+
+  <div class="stats" id="statCards"></div>
+
+  <div class="controls">
+    <button id="btnPauseResume" class="btn-warn">…</button>
+    <button id="btnKillSwitch" class="btn-danger">🔴 Kill Switch</button>
+    <button id="btnClearKill" class="btn-ghost">Сбросить Kill Switch</button>
+    <button id="btnRefresh" class="btn-primary">↻ Обновить</button>
+  </div>
+
+  <section>
+    <h2>Открытые позиции</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Символ</th><th>Сторона</th><th>Кол-во</th><th>Цена входа</th></tr></thead>
+        <tbody id="positionsBody"><tr class="empty-row"><td colspan="4">Загрузка…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Стратегии</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Название</th><th>ID</th><th>Вес</th><th>Активна</th></tr></thead>
+        <tbody id="strategiesBody"><tr class="empty-row"><td colspan="4">Загрузка…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Последние сделки</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Символ</th><th>Сторона</th><th>Вход</th><th>Выход</th><th>PnL</th><th>Итог</th><th>Закрыта</th></tr></thead>
+        <tbody id="tradesBody"><tr class="empty-row"><td colspan="7">Загрузка…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>ML модели</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Тип</th><th>Версия</th><th>Активна</th><th>Метрики</th></tr></thead>
+        <tbody id="mlBody"><tr class="empty-row"><td colspan="4">Загрузка…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Telegram-каналы</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Канал</th><th>ID</th><th>Активен</th></tr></thead>
+        <tbody id="telegramBody"><tr class="empty-row"><td colspan="3">Загрузка…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const REFRESH_MS = 5000;
+let lastStatus = null;
+
+function fmt(n, digits = 2) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  return Number(n).toLocaleString("ru-RU", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+
+function showToast(msg, isError = false) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.style.borderColor = isError ? "var(--red)" : "var(--panel-border)";
+  t.classList.add("show");
+  setTimeout(() => t.classList.remove("show"), 3000);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
+    ...opts,
+  });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { detail = (await res.json()).detail || detail; } catch (e) {}
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+function renderHeader(status) {
+  const badges = document.getElementById("headerBadges");
+  const modeClass = status.is_paper ? "badge-mode-paper" : "badge-mode-real";
+  const modeText = status.is_paper ? "PAPER" : "REAL";
+
+  let stateClass = "badge-running", stateText = "Работает";
+  if (status.risk_state.kill_switch) { stateClass = "badge-killed"; stateText = "KILL SWITCH"; }
+  else if (status.risk_state.paused) { stateClass = "badge-paused"; stateText = "Пауза"; }
+
+  badges.innerHTML = `
+    <span class="badge ${modeClass}">${modeText}</span>
+    <span class="badge ${stateClass}">${stateText}</span>
+  `;
+
+  const btnPauseResume = document.getElementById("btnPauseResume");
+  if (status.risk_state.paused) {
+    btnPauseResume.textContent = "▶ Возобновить";
+    btnPauseResume.dataset.action = "resume";
+  } else {
+    btnPauseResume.textContent = "⏸ Пауза";
+    btnPauseResume.dataset.action = "pause";
+  }
+
+  document.getElementById("btnClearKill").disabled = !status.risk_state.kill_switch;
+  document.getElementById("btnKillSwitch").disabled = status.risk_state.kill_switch;
+}
+
+function renderStats(status, trades) {
+  const rs = status.risk_state;
+  const wins = trades.filter(t => t.outcome === "win").length;
+  const closedTrades = trades.filter(t => !t.is_open);
+  const winRate = closedTrades.length ? (wins / closedTrades.length * 100) : null;
+
+  const cards = [
+    { label: "Баланс (paper)", value: status.is_paper ? `$${fmt(status.paper_balance)}` : "—" },
+    { label: "Дневной PnL", value: `${fmt(rs.daily_pnl)} USDT`, cls: rs.daily_pnl >= 0 ? "pos" : "neg" },
+    { label: "Открытые позиции", value: `${rs.open_positions_count} / ${rs.max_open_positions}` },
+    { label: "Win rate (посл. сделки)", value: winRate === null ? "—" : `${fmt(winRate, 1)}%` },
+    { label: "Просадка", value: `${fmt(rs.total_drawdown_pct, 1)}%` },
+  ];
+
+  document.getElementById("statCards").innerHTML = cards.map(c => `
+    <div class="stat-card">
+      <div class="label">${c.label}</div>
+      <div class="value ${c.cls || ""}">${c.value}</div>
+    </div>
+  `).join("");
+}
+
+function renderPositions(status) {
+  const body = document.getElementById("positionsBody");
+  const positions = status.paper_positions || {};
+  const rows = Object.entries(positions);
+  if (!rows.length) {
+    body.innerHTML = `<tr class="empty-row"><td colspan="4">Нет открытых позиций</td></tr>`;
+    return;
+  }
+  body.innerHTML = rows.map(([symbol, pos]) => `
+    <tr>
+      <td>${symbol}</td>
+      <td class="side-${pos.side === 'long' ? 'long' : 'short'}">${(pos.side || '').toUpperCase()}</td>
+      <td>${fmt(pos.amount, 6)}</td>
+      <td>${fmt(pos.entry_price)}</td>
+    </tr>
+  `).join("");
+}
+
+async function renderStrategies() {
+  const body = document.getElementById("strategiesBody");
+  try {
+    const data = await api("/strategies");
+    const strategies = data.strategies || [];
+    if (!strategies.length) {
+      body.innerHTML = `<tr class="empty-row"><td colspan="4">Нет стратегий</td></tr>`;
+      return;
+    }
+    body.innerHTML = strategies.map(s => `
+      <tr>
+        <td>${s.name}</td>
+        <td class="muted">${s.id}</td>
+        <td>${fmt(s.weight, 2)}</td>
+        <td>
+          <label class="toggle">
+            <input type="checkbox" ${s.active ? "checked" : ""} data-strategy-id="${s.id}">
+            <span class="slider"></span>
+          </label>
+        </td>
+      </tr>
+    `).join("");
+
+    body.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+      cb.addEventListener("change", async (e) => {
+        const id = e.target.dataset.strategyId;
+        const active = e.target.checked;
+        try {
+          await api(`/strategies/${id}/toggle`, { method: "POST", body: JSON.stringify({ active }) });
+          showToast(`Стратегия ${id} ${active ? "включена" : "выключена"}`);
+        } catch (err) {
+          e.target.checked = !active;
+          showToast(`Ошибка: ${err.message}`, true);
+        }
+      });
+    });
+  } catch (err) {
+    body.innerHTML = `<tr class="empty-row"><td colspan="4">Ошибка загрузки: ${err.message}</td></tr>`;
+  }
+}
+
+async function renderTrades() {
+  const body = document.getElementById("tradesBody");
+  try {
+    const data = await api("/trades?limit=20");
+    const trades = data.trades || [];
+    if (!trades.length) {
+      body.innerHTML = `<tr class="empty-row"><td colspan="7">Сделок пока нет</td></tr>`;
+      return;
+    }
+    body.innerHTML = trades.map(t => `
+      <tr>
+        <td>${t.symbol || ("#" + t.symbol_id)}</td>
+        <td class="side-${t.direction === 'long' ? 'long' : 'short'}">${(t.direction || '').toUpperCase()}</td>
+        <td>${fmt(t.entry_price)}</td>
+        <td>${t.exit_price !== null ? fmt(t.exit_price) : "—"}</td>
+        <td class="${t.pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${t.pnl >= 0 ? "+" : ""}${fmt(t.pnl)} (${fmt(t.pnl_pct, 2)}%)</td>
+        <td>${t.outcome || (t.is_open ? "открыта" : "—")}</td>
+        <td class="muted">${t.closed_at ? new Date(t.closed_at + "Z").toLocaleString("ru-RU") : "—"}</td>
+      </tr>
+    `).join("");
+    return trades;
+  } catch (err) {
+    body.innerHTML = `<tr class="empty-row"><td colspan="7">Ошибка загрузки: ${err.message}</td></tr>`;
+    return [];
+  }
+}
+
+async function renderMlModels() {
+  const body = document.getElementById("mlBody");
+  try {
+    const data = await api("/ml/models");
+    const models = data.models || [];
+    if (!models.length) {
+      body.innerHTML = `<tr class="empty-row"><td colspan="4">Моделей пока нет — недостаточно данных для обучения</td></tr>`;
+      return;
+    }
+    body.innerHTML = models.map(m => `
+      <tr>
+        <td>${m.model_type}</td>
+        <td>v${m.version}</td>
+        <td>${m.is_active ? "✅" : "—"}</td>
+        <td class="muted">${m.metrics ? Object.entries(m.metrics).map(([k, v]) => `${k}=${v}`).join(", ") : "—"}</td>
+      </tr>
+    `).join("");
+  } catch (err) {
+    body.innerHTML = `<tr class="empty-row"><td colspan="4">Ошибка загрузки: ${err.message}</td></tr>`;
+  }
+}
+
+function renderTelegram(status) {
+  const body = document.getElementById("telegramBody");
+  const channels = status.telegram_channels || [];
+  if (!channels.length) {
+    body.innerHTML = `<tr class="empty-row"><td colspan="3">Каналы не настроены</td></tr>`;
+    return;
+  }
+  body.innerHTML = channels.map(c => `
+    <tr>
+      <td>${c.channel_title || c.channel_id}</td>
+      <td class="muted">${c.channel_id}</td>
+      <td>✅</td>
+    </tr>
+  `).join("");
+}
+
+async function refreshAll() {
+  try {
+    const status = await api("/status");
+    lastStatus = status;
+    renderHeader(status);
+    renderPositions(status);
+    renderTelegram(status);
+    const trades = await renderTrades();
+    renderStats(status, trades || []);
+    await renderStrategies();
+    await renderMlModels();
+    document.getElementById("lastUpdated").textContent =
+      "Обновлено: " + new Date().toLocaleTimeString("ru-RU");
+  } catch (err) {
+    showToast(`Ошибка обновления: ${err.message}`, true);
+  }
+}
+
+document.getElementById("btnPauseResume").addEventListener("click", async (e) => {
+  const action = e.target.dataset.action;
+  try {
+    await api(`/risk/${action}`, { method: "POST" });
+    showToast(action === "pause" ? "Торговля приостановлена" : "Торговля возобновлена");
+    await refreshAll();
+  } catch (err) {
+    showToast(`Ошибка: ${err.message}`, true);
+  }
+});
+
+document.getElementById("btnKillSwitch").addEventListener("click", async () => {
+  if (!confirm("Активировать KILL SWITCH? Вся торговля будет немедленно остановлена.")) return;
+  try {
+    await api("/risk/kill-switch", { method: "POST" });
+    showToast("🔴 Kill switch активирован");
+    await refreshAll();
+  } catch (err) {
+    showToast(`Ошибка: ${err.message}`, true);
+  }
+});
+
+document.getElementById("btnClearKill").addEventListener("click", async () => {
+  if (!confirm("Сбросить kill switch и разрешить торговлю?")) return;
+  try {
+    await api("/risk/clear-kill-switch", { method: "POST" });
+    showToast("Kill switch сброшен");
+    await refreshAll();
+  } catch (err) {
+    showToast(`Ошибка: ${err.message}`, true);
+  }
+});
+
+document.getElementById("btnRefresh").addEventListener("click", refreshAll);
+
+refreshAll();
+setInterval(refreshAll, REFRESH_MS);
+</script>
+
+</body>
+</html>

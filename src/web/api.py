@@ -1,12 +1,15 @@
 """FastAPI веб-интерфейс — API для управления ботом."""
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from src.config import settings
 from src.event_bus import event_bus
@@ -162,6 +165,15 @@ async def root():
         "mode": settings.trading_mode,
         "timestamp": utcnow().isoformat(),
     }
+
+
+DASHBOARD_HTML_PATH = Path(__file__).parent / "static" / "dashboard.html"
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    """Веб-дашборд управления ботом (статус, позиции, сделки, стратегии, риск-контролы)."""
+    return HTMLResponse(DASHBOARD_HTML_PATH.read_text(encoding="utf-8"))
 
 
 @app.get("/health")
@@ -323,7 +335,11 @@ async def list_trades(limit: int = 100, offset: int = 0):
     async with get_session() as session:
         trades = (
             await session.execute(
-                select(Trade).order_by(Trade.created_at.desc()).offset(offset).limit(limit)
+                select(Trade)
+                .options(selectinload(Trade.symbol))
+                .order_by(Trade.created_at.desc())
+                .offset(offset)
+                .limit(limit)
             )
         ).scalars().all()
         return {
@@ -331,6 +347,7 @@ async def list_trades(limit: int = 100, offset: int = 0):
                 {
                     "id": t.id,
                     "symbol_id": t.symbol_id,
+                    "symbol": t.symbol.symbol if t.symbol else None,
                     "direction": t.direction,
                     "entry_price": float(t.entry_price),
                     "exit_price": float(t.exit_price) if t.exit_price else None,
@@ -382,13 +399,19 @@ async def list_orders(limit: int = 100):
     """Список ордеров."""
     async with get_session() as session:
         orders = (
-            await session.execute(select(Order).order_by(Order.created_at.desc()).limit(limit))
+            await session.execute(
+                select(Order)
+                .options(selectinload(Order.symbol))
+                .order_by(Order.created_at.desc())
+                .limit(limit)
+            )
         ).scalars().all()
         return {
             "orders": [
                 {
                     "id": o.id,
                     "symbol_id": o.symbol_id,
+                    "symbol": o.symbol.symbol if o.symbol else None,
                     "side": o.side,
                     "order_type": o.order_type,
                     "amount": float(o.amount),
