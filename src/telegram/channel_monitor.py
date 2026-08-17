@@ -3,6 +3,7 @@ import asyncio
 import logging
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 from telethon import TelegramClient, events
@@ -12,6 +13,13 @@ from src.config import settings
 from src.utils.logging import logger
 
 logger = logging.getLogger(__name__)
+
+# Файл сессии Telethon должен жить в примонтированном volume (data/),
+# иначе при пересоздании контейнера он теряется и авторизацию нужно
+# проходить заново при каждом запуске.
+SESSION_DIR = Path(__file__).parent.parent.parent / "data"
+SESSION_DIR.mkdir(parents=True, exist_ok=True)
+SESSION_PATH = str(SESSION_DIR / "crypto_bot_sessions")
 
 # Глобальный экземпляр клиента
 _telegram_client: Optional[TelegramClient] = None
@@ -30,7 +38,7 @@ async def init_telegram():
         logger.warning("Telegram API credentials not configured — monitoring disabled")
         return None
 
-    _telegram_client = TelegramClient("crypto_bot_sessions", api_id, api_hash)
+    _telegram_client = TelegramClient(SESSION_PATH, api_id, api_hash)
 
     try:
         await _telegram_client.start()
