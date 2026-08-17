@@ -22,6 +22,8 @@ services:
       - ML_RETRAINING_INTERVAL_HOURS=${ML_RETRAINING_INTERVAL_HOURS:-6}
       - WEB_HOST=0.0.0.0
       - WEB_PORT=8000
+    ports:
+      - "8000:8000"
     volumes:
       - ./data:/app/data
     depends_on:
