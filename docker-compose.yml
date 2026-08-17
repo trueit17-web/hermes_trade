@@ -8,7 +8,7 @@ services:
       - TRADING_MODE=${TRADING_MODE:-paper}
       - STARTUP_CAPITAL_USDT=${STARTUP_CAPITAL_USDT:-10000}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - DATABASE_URL=postgresql://bot:${DB_PASSWORD:-password}@db:5432/cryptobot
+      - DATABASE_URL=postgresql+asyncpg://bot:${DB_PASSWORD:-password}@db:5432/cryptobot
       - REDIS_URL=redis://redis:6379
       - COINGLASS_API_KEY=${COINGLASS_API_KEY:-}
       - TELEGRAM_API_ID=${TELEGRAM_API_ID:-}

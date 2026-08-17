@@ -120,7 +120,7 @@ cd cryptobot
 cp .env.example .env
 # Настройте .env для production:
 # - TRADING_MODE=real (или paper)
-# - DATABASE_URL=postgresql://bot:password@db:5432/cryptobot
+# - DATABASE_URL=postgresql+asyncpg://bot:password@db:5432/cryptobot
 # - ENCRYPTION_KEY=<ключ из шага 5>
 # - BINANCE_API_KEY, BINANCE_API_SECRET (для real)
 ```
