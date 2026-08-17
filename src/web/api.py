@@ -7,9 +7,10 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
 from src.config import settings
-from src.event_bus import event_bus, event_bus_history
+from src.event_bus import event_bus
 from src.risk.risk_manager import risk_manager
 from src.execution.executor import execution_engine
 from src.ml import model_registry, model_trainer
@@ -177,18 +178,27 @@ async def health():
 @app.get("/status")
 async def get_status():
     """Получить текущий статус бота."""
+    async with get_session() as session:
+        channels = (
+            await session.execute(select(TelegramChannel).where(TelegramChannel.active == True))
+        ).scalars().all()
+        telegram_channels = [
+            {"id": c.id, "channel_id": c.channel_id, "channel_title": c.channel_title}
+            for c in channels
+        ]
+
     return {
         "trading_mode": settings.trading_mode,
         "is_paper": settings.is_paper,
-        "startup_capital": settings.startup_capitol_usdt,
+        "startup_capital": settings.startup_capital_usdt,
         "risk_state": risk_manager.get_state(),
         "paper_balance": execution_engine.get_paper_balance() if settings.is_paper else None,
         "paper_positions": execution_engine.get_paper_positions() if settings.is_paper else None,
         "active_strategies": strategy_registry.list_strategies(),
         "ml_models": model_registry.list_models(),
         "ml_active_model": model_registry.get_active_model("direction_classifier"),
-        "telegram_channels": [],  # TODO: получить из БД
-        "event_bus_history_size": len(event_bus_history),
+        "telegram_channels": telegram_channels,
+        "event_bus_history_size": len(event_bus.get_history()),
         "timestamp": datetime.utcnow().isoformat(),
     }
 
@@ -219,7 +229,9 @@ async def configure_risk(config: RiskConfigUpdate):
     # Сохранить в БД
     async with get_session() as session:
         for key, value in params.items():
-            config_record = await session.query(BotConfig).filter(BotConfig.config_key == key).first()
+            config_record = (
+                await session.execute(select(BotConfig).where(BotConfig.config_key == key))
+            ).scalar_one_or_none()
             if config_record:
                 config_record.config_value = {"value": value}
             else:
@@ -281,9 +293,11 @@ async def toggle_strategy(strategy_id: str, request: StrategyToggleRequest):
 
     # Сохранить в БД
     async with get_session() as session:
-        db_strategy = await session.query(StrategyModel).filter(
-            StrategyModel.id == int(strategy_id) if strategy_id.isdigit() else None
-        ).first()
+        db_strategy = None
+        if strategy_id.isdigit():
+            db_strategy = (
+                await session.execute(select(StrategyModel).where(StrategyModel.id == int(strategy_id)))
+            ).scalar_one_or_none()
         if db_strategy:
             db_strategy.active = request.active
             await session.commit()
@@ -307,7 +321,11 @@ async def update_strategy(strategy_id: str, request: StrategyUpdateRequest):
 async def list_trades(limit: int = 100, offset: int = 0):
     """Список сделок."""
     async with get_session() as session:
-        trades = await session.query(Trade).order_by(Trade.created_at.desc()).offset(offset).limit(limit).all()
+        trades = (
+            await session.execute(
+                select(Trade).order_by(Trade.created_at.desc()).offset(offset).limit(limit)
+            )
+        ).scalars().all()
         return {
             "trades": [
                 {
@@ -336,9 +354,13 @@ async def get_trade_decision_log(trade_id: int):
     """Получить decision log для сделки (почему сделка была открыта/закрыта)."""
     async with get_session() as session:
         from src.db.models import TradeDecisionLog
-        logs = await session.query(TradeDecisionLog).filter(
-            TradeDecisionLog.trade_id == trade_id
-        ).order_by(TradeDecisionLog.step_order.asc()).all()
+        logs = (
+            await session.execute(
+                select(TradeDecisionLog)
+                .where(TradeDecisionLog.trade_id == trade_id)
+                .order_by(TradeDecisionLog.step_order.asc())
+            )
+        ).scalars().all()
 
         return {
             "trade_id": trade_id,
@@ -359,7 +381,9 @@ async def get_trade_decision_log(trade_id: int):
 async def list_orders(limit: int = 100):
     """Список ордеров."""
     async with get_session() as session:
-        orders = await session.query(Order).order_by(Order.created_at.desc()).limit(limit).all()
+        orders = (
+            await session.execute(select(Order).order_by(Order.created_at.desc()).limit(limit))
+        ).scalars().all()
         return {
             "orders": [
                 {
@@ -427,7 +451,7 @@ async def trigger_retrain():
 async def get_config():
     """Получить конфигурацию бота."""
     async with get_session() as session:
-        configs = await session.query(BotConfig).all()
+        configs = (await session.execute(select(BotConfig))).scalars().all()
         return {
             "config": [
                 {
@@ -446,7 +470,9 @@ async def get_config():
 async def update_config(key: str, value: Any):
     """Обновить конфигурацию."""
     async with get_session() as session:
-        config = await session.query(BotConfig).filter(BotConfig.config_key == key).first()
+        config = (
+            await session.execute(select(BotConfig).where(BotConfig.config_key == key))
+        ).scalar_one_or_none()
         if config:
             config.config_value = {"value": value}
             config.source = "api"
@@ -486,7 +512,7 @@ async def set_trading_mode(mode: str):
 async def list_telegram_channels():
     """Список Telegram каналов."""
     async with get_session() as session:
-        channels = await session.query(TelegramChannel).all()
+        channels = (await session.execute(select(TelegramChannel))).scalars().all()
         return {
             "channels": [
                 {
@@ -509,9 +535,11 @@ async def list_telegram_channels():
 async def create_telegram_channel(channel: TelegramChannelCreate):
     """Добавить Telegram канал."""
     async with get_session() as session:
-        existing = await session.query(TelegramChannel).filter(
-            TelegramChannel.channel_id == channel.channel_id
-        ).first()
+        existing = (
+            await session.execute(
+                select(TelegramChannel).where(TelegramChannel.channel_id == channel.channel_id)
+            )
+        ).scalar_one_or_none()
         if existing:
             raise HTTPException(status_code=400, detail=f"Канал {channel.channel_id} уже добавлен")
 
@@ -541,9 +569,9 @@ async def create_telegram_channel(channel: TelegramChannelCreate):
 async def delete_telegram_channel(channel_id: int):
     """Удалить Telegram канал."""
     async with get_session() as session:
-        channel = await session.query(TelegramChannel).filter(
-            TelegramChannel.id == channel_id
-        ).first()
+        channel = (
+            await session.execute(select(TelegramChannel).where(TelegramChannel.id == channel_id))
+        ).scalar_one_or_none()
         if not channel:
             raise HTTPException(status_code=404, detail="Канал не найден")
         await session.delete(channel)
@@ -556,9 +584,11 @@ async def delete_telegram_channel(channel_id: int):
 async def list_telegram_signals(limit: int = 100):
     """Список Telegram сигналов."""
     async with get_session() as session:
-        signals = await session.query(TelegramSignal).order_by(
-            TelegramSignal.created_at.desc()
-        ).limit(limit).all()
+        signals = (
+            await session.execute(
+                select(TelegramSignal).order_by(TelegramSignal.created_at.desc()).limit(limit)
+            )
+        ).scalars().all()
         return {
             "signals": [
                 {
@@ -584,9 +614,11 @@ async def list_telegram_signals(limit: int = 100):
 async def get_performance():
     """Производительность бота (последние снимки)."""
     async with get_session() as session:
-        snapshots = await session.query(PerformanceSnapshot).order_by(
-            PerformanceSnapshot.snapshot_time.desc()
-        ).limit(100).all()
+        snapshots = (
+            await session.execute(
+                select(PerformanceSnapshot).order_by(PerformanceSnapshot.snapshot_time.desc()).limit(100)
+            )
+        ).scalars().all()
         return {
             "snapshots": [
                 {
@@ -612,10 +644,12 @@ async def get_decision_logs(limit: int = 100, trade_id: Optional[int] = None):
     """Decision logs для анализа."""
     async with get_session() as session:
         from src.db.models import TradeDecisionLog
-        query = session.query(TradeDecisionLog)
+        query = select(TradeDecisionLog)
         if trade_id:
-            query = query.filter(TradeDecisionLog.trade_id == trade_id)
-        logs = await query.order_by(TradeDecisionLog.created_at.desc()).limit(limit).all()
+            query = query.where(TradeDecisionLog.trade_id == trade_id)
+        logs = (
+            await session.execute(query.order_by(TradeDecisionLog.created_at.desc()).limit(limit))
+        ).scalars().all()
         return {
             "logs": [
                 {

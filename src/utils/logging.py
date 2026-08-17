@@ -22,7 +22,7 @@ trading_theme = Theme({
     "trade": "green bold",
     "signal": "blue bold",
     "ml": "magenta bold",
-    "risk": "orange bold",
+    "risk": "dark_orange bold",
     "telegram": "purple bold",
     "coinglass": "blue italic",
 })

@@ -3,10 +3,9 @@ from datetime import datetime
 from typing import Any, Optional
 
 from sqlalchemy import (
-    BigInteger, Boolean, Column, DateTime, Float, Integer, JSON, String, Text,
+    BigInteger, Boolean, Column, DateTime, DECIMAL, Float, Integer, JSON, String, Text,
     ForeignKey, Index, UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import DECIMAL, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.db.base import Base

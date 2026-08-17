@@ -8,14 +8,14 @@
 - Передавать сигналы в основной цикл бота через event_bus
 """
 from src.telegram.channel_monitor import (
-    ChannelMonitor,
     init_telegram,
     close_telegram,
     subscribe_telegram_signal,
+    unsubscribe_telegram_signal,
+    parse_telegram_signal,
 )
 from src.telegram.signal_parser import (
-    parse_signal_text,
-    parse_broadcast_message,
+    telegram_signal_parser,
 )
 from src.telegram.quality_scorer import (
     signal_quality_scorer,

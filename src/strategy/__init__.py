@@ -624,8 +624,8 @@ class MLDirectionClassifierStrategy(BaseStrategy):
             name="ML Direction Classifier",
             params=params or {},
         )
-        self.model_version = params.get("model_version", 1)
-        self.confidence_threshold = params.get("confidence_threshold", 0.65)
+        self.model_version = self.params.get("model_version", 1)
+        self.confidence_threshold = self.params.get("confidence_threshold", 0.65)
 
     def get_config_schema(self) -> dict:
         return {
@@ -745,8 +745,8 @@ class EnsembleVoterStrategy(BaseStrategy):
             params=params or {},
         )
         self.strategy_weights: dict[str, float] = {}
-        self.min_confidence = params.get("min_confidence", 0.6)
-        self.min_strategies_count = params.get("min_strategies_count", 2)
+        self.min_confidence = self.params.get("min_confidence", 0.6)
+        self.min_strategies_count = self.params.get("min_strategies_count", 2)
 
     def get_config_schema(self) -> dict:
         return {

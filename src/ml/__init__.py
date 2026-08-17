@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.model_selection import train_test_split
+from sqlalchemy import select, update
 
 from src.config import settings
 from src.db.session import get_session
@@ -63,9 +64,28 @@ class FeatureStore:
             logger.debug(f"Не удалось сохранить фичи в БД: {e}")
 
     def get_latest_features(self, symbol: str, timeframe: str = "1h") -> Optional[dict]:
-        """Получить последние фичи для символа."""
-        # TODO: получать из БД или из онлайн кэша
-        return self._online_features.get(f"{symbol}:{timeframe}:latest")
+        """Получить последние фичи для символа (из онлайн-кэша или БД)."""
+        cached = self._online_features.get(f"{symbol}:{timeframe}:latest")
+        if cached is not None:
+            return cached
+
+        async def _get():
+            async with get_session() as session:
+                from src.db.models import MLFeature as MF
+                result = await session.execute(
+                    select(MF)
+                    .where(MF.symbol == symbol, MF.timeframe == timeframe)
+                    .order_by(MF.timestamp.desc())
+                    .limit(1)
+                )
+                feature = result.scalar_one_or_none()
+                return dict(feature.features) if feature else None
+
+        try:
+            return asyncio.get_event_loop().run_until_complete(_get())
+        except Exception as e:
+            logger.error(f"Ошибка получения последних фичей для {symbol}: {e}")
+            return None
 
     def get_features_for_training(
         self,
@@ -76,10 +96,11 @@ class FeatureStore:
         async def _get():
             async with get_session() as session:
                 from src.db.models import MLFeature as MF
-                query = session.query(MF).order_by(MF.timestamp.desc())
+                query = select(MF).order_by(MF.timestamp.desc())
                 if symbol:
-                    query = query.filter(MF.symbol == symbol)
-                features = (await query.limit(limit).all())[::-1]
+                    query = query.where(MF.symbol == symbol)
+                result = await session.execute(query.limit(limit))
+                features = result.scalars().all()[::-1]
                 data = []
                 for f in features:
                     row = dict(f.features)
@@ -328,9 +349,10 @@ class ModelTrainer:
         async def _get():
             async with get_session() as session:
                 from src.db.models import MLModel as M
-                last = await session.query(M).filter(
-                    M.model_type == model_type
-                ).order_by(M.version.desc()).first()
+                result = await session.execute(
+                    select(M).where(M.model_type == model_type).order_by(M.version.desc()).limit(1)
+                )
+                last = result.scalar_one_or_none()
                 return (last.version if last else 0) + 1
 
         try:
@@ -358,10 +380,13 @@ class ModelRegistry:
         async def _load():
             async with get_session() as session:
                 from src.db.models import MLModel as M
-                model = await session.query(M).filter(
-                    M.model_type == model_type,
-                    M.is_active == True,
-                ).order_by(M.version.desc()).first()
+                result = await session.execute(
+                    select(M)
+                    .where(M.model_type == model_type, M.is_active == True)
+                    .order_by(M.version.desc())
+                    .limit(1)
+                )
+                model = result.scalar_one_or_none()
                 if model:
                     return {
                         "id": model.id,
@@ -387,10 +412,10 @@ class ModelRegistry:
         async def _get():
             async with get_session() as session:
                 from src.db.models import MLModel as M
-                model = await session.query(M).filter(
-                    M.model_type == model_type,
-                    M.version == version,
-                ).first()
+                result = await session.execute(
+                    select(M).where(M.model_type == model_type, M.version == version)
+                )
+                model = result.scalar_one_or_none()
                 if model:
                     return {
                         "id": model.id,
@@ -414,10 +439,11 @@ class ModelRegistry:
         async def _list():
             async with get_session() as session:
                 from src.db.models import MLModel as M
-                query = session.query(M)
+                query = select(M)
                 if model_type:
-                    query = query.filter(M.model_type == model_type)
-                models = await query.order_by(M.created_at.desc()).all()
+                    query = query.where(M.model_type == model_type)
+                result = await session.execute(query.order_by(M.created_at.desc()))
+                models = result.scalars().all()
                 return [
                     {
                         "id": m.id,
@@ -443,16 +469,17 @@ class ModelRegistry:
             async with get_session() as session:
                 from src.db.models import MLModel as M
                 # Deactivate all
-                await session.query(M).filter(
-                    M.model_type == model_type
-                ).update({"is_active": False})
+                await session.execute(
+                    update(M).where(M.model_type == model_type).values(is_active=False)
+                )
                 # Activate specific
-                result = await session.query(M).filter(
-                    M.model_type == model_type,
-                    M.version == version,
-                ).update({"is_active": True})
+                result = await session.execute(
+                    update(M)
+                    .where(M.model_type == model_type, M.version == version)
+                    .values(is_active=True)
+                )
                 await session.commit()
-                return result > 0
+                return result.rowcount > 0
 
         try:
             success = asyncio.get_event_loop().run_until_complete(_activate())

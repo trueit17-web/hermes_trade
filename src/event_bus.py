@@ -64,7 +64,7 @@ class TelegramSignalEvent(Event):
     raw_message: str = ""
     parsed_pair: str = ""
     parsed_side: str = ""
-    parsed_entry: float | 0 = 0.0
+    parsed_entry: float = 0.0
     parsed_sl: float | None = None
     parsed_tp: float | None = None
     quality_score: float = 0.0

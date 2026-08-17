@@ -163,8 +163,35 @@ def run_backtest():
     print(f"   Средний проигрыш: ${best_result.average_loss:+.2f}")
 
     if args.output:
+        import json
+        from datetime import datetime
+
+        report = {
+            "symbol": args.symbol,
+            "timeframe": args.timeframe,
+            "capital": args.capital,
+            "generated_at": datetime.utcnow().isoformat(),
+            "best_strategy": best_name,
+            "results": [
+                {
+                    "strategy": name,
+                    "total_trades": r.total_trades,
+                    "total_pnl": r.total_pnl,
+                    "total_pnl_pct": r.total_pnl_pct,
+                    "win_rate": r.win_rate,
+                    "profit_factor": r.profit_factor,
+                    "sharpe_ratio": r.sharpe_ratio,
+                    "max_drawdown": r.max_drawdown,
+                    "expectancy": r.expectancy,
+                    "average_win": r.average_win,
+                    "average_loss": r.average_loss,
+                }
+                for name, r in zip(args.strategies, results)
+            ],
+        }
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
         print(f"\n📄 Отчёт сохранён в {args.output}")
-        # TODO: сохранить отчёт
 
 
 def run_health_check():

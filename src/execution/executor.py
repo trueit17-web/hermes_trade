@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 import ccxt.async_support as ccxt
+from sqlalchemy import select
 
 from src.config import settings
 from src.db.session import get_session
@@ -31,7 +32,7 @@ class ExecutionEngine:
         self.exchange: Optional[ccxt.Exchange] = None
         self.exchange_id: Optional[str] = None
         self.is_paper: bool = settings.is_paper
-        self.paper_balance: float = settings.startup_capitol_usdt
+        self.paper_balance: float = settings.startup_capital_usdt
         self.paper_positions: dict[str, dict] = {}
         self.order_counter = 0
 
@@ -41,7 +42,7 @@ class ExecutionEngine:
 
         if self.is_paper:
             logger.info("📄 Execution Engine: Paper Trading режим")
-            self.paper_balance = settings.startup_capitol_usdt
+            self.paper_balance = settings.startup_capital_usdt
             return
 
         # Real mode: подключаемся к бирже
@@ -52,7 +53,7 @@ class ExecutionEngine:
             if not api_key or not api_secret:
                 logger.warning("⚠️ API ключи не указаны, переключаемся в paper режим")
                 self.is_paper = True
-                self.paper_balance = settings.startup_capitol_usdt
+                self.paper_balance = settings.startup_capital_usdt
                 return
 
             if exchange_id == "binance":
@@ -102,6 +103,36 @@ class ExecutionEngine:
         if self.exchange:
             await self.exchange.close()
             logger.info("🔌 Execution Engine: соединение закрыто")
+
+    async def _resolve_symbol_id(self, session, symbol: str) -> tuple[int, int]:
+        """Получить (или создать) id биржи и торговой пары в БД."""
+        exchange_name = self.exchange_id or "paper"
+
+        exchange = (
+            await session.execute(select(Exchange).where(Exchange.name == exchange_name))
+        ).scalar_one_or_none()
+        if exchange is None:
+            exchange = Exchange(name=exchange_name, is_paper=self.is_paper)
+            session.add(exchange)
+            await session.flush()
+
+        symbol_row = (
+            await session.execute(
+                select(Symbol).where(Symbol.exchange_id == exchange.id, Symbol.symbol == symbol)
+            )
+        ).scalar_one_or_none()
+        if symbol_row is None:
+            base_asset, _, quote_asset = symbol.partition("/")
+            symbol_row = Symbol(
+                exchange_id=exchange.id,
+                symbol=symbol,
+                base_asset=base_asset or symbol,
+                quote_asset=quote_asset,
+            )
+            session.add(symbol_row)
+            await session.flush()
+
+        return exchange.id, symbol_row.id
 
     async def create_order(
         self,
@@ -208,8 +239,7 @@ class ExecutionEngine:
                     pos["amount"] -= amount
                     if pos["amount"] <= 0:
                         del self.paper_positions[symbol]
-                    else:
-                        pos["entry_price"] = pos["entry_price"]  # TODO: учесть средневзвешенную
+                    # частичное закрытие не меняет среднюю цену входа оставшейся позиции
                 else:
                     logger.warning(f"Paper: недостаточно позиции {symbol} для закрытия")
                     return None
@@ -218,8 +248,10 @@ class ExecutionEngine:
 
         # Создание Order объекта в БД
         async with get_session() as session:
+            exchange_id, symbol_id = await self._resolve_symbol_id(session, symbol)
             order = Order(
-                symbol_id=1,  # TODO: получить real symbol_id
+                exchange_id=exchange_id,
+                symbol_id=symbol_id,
                 side=side,
                 order_type=order_data["type"],
                 amount=amount,
@@ -293,9 +325,10 @@ class ExecutionEngine:
             logger.info(f"✅ Ордер исполнен на бирже: {order['id']} | {side.upper()} {amount:.4f} {symbol}")
 
             async with get_session() as session:
+                exchange_id, symbol_id = await self._resolve_symbol_id(session, symbol)
                 order_obj = Order(
-                    exchange_id=1,  # TODO: real exchange_id
-                    symbol_id=1,  # TODO: real symbol_id
+                    exchange_id=exchange_id,
+                    symbol_id=symbol_id,
                     side=side,
                     order_type=order_data["type"],
                     amount=amount,

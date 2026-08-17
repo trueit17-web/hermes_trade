@@ -6,7 +6,7 @@
 
 ### 0. Предварительные требования
 
-- Python 3.11+
+- Python 3.12+
 - Git
 - (опционально) Docker + Docker Compose
 - (для real режима) API ключи Binance или Bybit

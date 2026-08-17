@@ -130,11 +130,15 @@ class TradingBot:
     async def _retrain_ml(self):
         """Переобучение ML моделей."""
         try:
+            from sqlalchemy import func, select
+
             from src.db.models import Trade
             from src.db.session import get_session
 
             async with get_session() as session:
-                trades_count = await session.query(Trade).count()
+                trades_count = (
+                    await session.execute(select(func.count()).select_from(Trade))
+                ).scalar_one()
 
             if trades_count < 50:
                 logger.debug(f"ML retraining пропущен: {trades_count} сделок")
