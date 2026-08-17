@@ -15,7 +15,6 @@ from src.event_bus import event_bus
 from src.data_ingest.market_data import MarketDataIngest
 from src.data_ingest.coinglass_client import get_coinglass_client
 from src.data_ingest.feature_engine import get_feature_engine
-from src.data_ingest.websocket_feed import get_ws_feed
 from src.strategy import strategy_registry
 from src.risk.risk_manager import risk_manager
 from src.execution.executor import execution_engine
@@ -31,7 +30,6 @@ class TradingBot:
     def __init__(self):
         self.running = False
         self.ingest = None
-        self.ws_feed = None
         self.cg_client = None
         self.feature_engine = None
         self.ml_inference = None
@@ -59,16 +57,7 @@ class TradingBot:
         # CoinGlass клиент
         self.cg_client = get_coinglass_client()
 
-        # WebSocket feed (если доступно)
-        try:
-            self.ws_feed = get_ws_feed("binance")
-            await self.ws_feed.initialize()
-            logger.info("✅ WebSocket feed инициализирован")
-        except Exception as e:
-            logger.warning(f"⚠️ WebSocket feed недоступен: {e}")
-            self.ws_feed = None
-
-        # Market data ingest (fallback)
+        # Market data ingest
         self.ingest = MarketDataIngest("binance")
         await self.ingest.initialize()
 
@@ -223,12 +212,6 @@ class TradingBot:
 
         logger.info("🔄 Запуск основного цикла...")
 
-        # WebSocket в отдельной задаче
-        ws_task = None
-        if self.ws_feed:
-            ws_task = asyncio.create_task(self.ws_feed.start())
-            logger.info("📡 WebSocket stream запущен")
-
         while self.running:
             try:
                 await self._trading_iteration()
@@ -239,8 +222,6 @@ class TradingBot:
                 logger.error(f"Основной цикл: {e}")
                 await asyncio.sleep(60)
 
-        if ws_task:
-            ws_task.cancel()
         await self._cleanup()
 
     async def _trading_iteration(self):
@@ -439,8 +420,6 @@ class TradingBot:
         """Очистка."""
         logger.info("🧹 Очистка...")
 
-        if self.ws_feed:
-            await self.ws_feed.close()
         if self.ingest:
             await self.ingest.close()
         if self.cg_client:
