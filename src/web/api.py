@@ -535,7 +535,11 @@ async def set_trading_mode(mode: str):
 async def list_telegram_channels():
     """Список Telegram каналов."""
     async with get_session() as session:
-        channels = (await session.execute(select(TelegramChannel))).scalars().all()
+        channels = (
+            await session.execute(
+                select(TelegramChannel).options(selectinload(TelegramChannel.signals))
+            )
+        ).scalars().all()
         return {
             "channels": [
                 {

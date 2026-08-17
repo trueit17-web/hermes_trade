@@ -98,6 +98,39 @@
   .btn-danger { background: var(--red); border-color: var(--red); color: #fff; }
   .btn-ghost { background: transparent; }
 
+  .add-channel-form {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    padding: 0 16px 14px;
+  }
+  .add-channel-form input[type="text"],
+  .add-channel-form input[type="number"] {
+    font: inherit;
+    background: var(--bg);
+    border: 1px solid var(--panel-border);
+    color: var(--text);
+    padding: 8px 10px;
+    border-radius: 8px;
+  }
+  .add-channel-form input[type="text"] { min-width: 180px; }
+  .add-channel-form input[type="number"] { width: 90px; }
+  .checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+  .btn-icon-danger {
+    background: transparent;
+    border: none;
+    color: var(--red);
+    font-size: 16px;
+    padding: 2px 8px;
+  }
+
   section {
     background: var(--panel);
     border: 1px solid var(--panel-border);
@@ -223,11 +256,21 @@
   </section>
 
   <section>
-    <h2>Telegram-каналы</h2>
+    <h2>Telegram-каналы (источники сигналов)</h2>
+    <form id="addChannelForm" class="add-channel-form">
+      <input type="text" id="channelIdInput" placeholder="@channel или -100123456789" required>
+      <input type="text" id="channelTitleInput" placeholder="Название (опционально)">
+      <input type="number" id="channelThresholdInput" placeholder="Порог качества" min="0" max="1" step="0.05" value="0.5">
+      <label class="checkbox-label">
+        <input type="checkbox" id="channelAutoExecuteInput">
+        Автоисполнение
+      </label>
+      <button type="submit" class="btn-primary">+ Добавить канал</button>
+    </form>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Канал</th><th>ID</th><th>Активен</th></tr></thead>
-        <tbody id="telegramBody"><tr class="empty-row"><td colspan="3">Загрузка…</td></tr></tbody>
+        <thead><tr><th>Канал</th><th>ID</th><th>Порог</th><th>Автоисполнение</th><th>Сигналов</th><th>Активен</th><th></th></tr></thead>
+        <tbody id="telegramBody"><tr class="empty-row"><td colspan="7">Загрузка…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -423,21 +466,72 @@ async function renderMlModels() {
   }
 }
 
-function renderTelegram(status) {
+async function renderTelegram() {
   const body = document.getElementById("telegramBody");
-  const channels = status.telegram_channels || [];
-  if (!channels.length) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="3">Каналы не настроены</td></tr>`;
-    return;
+  try {
+    const data = await api("/telegram/channels");
+    const channels = data.channels || [];
+    if (!channels.length) {
+      body.innerHTML = `<tr class="empty-row"><td colspan="7">Каналы не настроены</td></tr>`;
+      return;
+    }
+    body.innerHTML = channels.map(c => `
+      <tr>
+        <td>${c.channel_title || "—"}</td>
+        <td class="muted">${c.channel_id}</td>
+        <td>${fmt(c.quality_threshold, 2)}</td>
+        <td>${c.auto_execute ? "✅" : "—"}</td>
+        <td>${c.signals_count}</td>
+        <td>${c.active ? "✅" : "—"}</td>
+        <td><button class="btn-icon-danger" data-delete-channel="${c.id}" title="Удалить">✕</button></td>
+      </tr>
+    `).join("");
+
+    body.querySelectorAll("[data-delete-channel]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const id = btn.dataset.deleteChannel;
+        if (!confirm("Удалить канал из мониторинга?")) return;
+        try {
+          await api(`/telegram/channels/${id}`, { method: "DELETE" });
+          showToast("Канал удалён");
+          await renderTelegram();
+        } catch (err) {
+          showToast(`Ошибка: ${err.message}`, true);
+        }
+      });
+    });
+  } catch (err) {
+    body.innerHTML = `<tr class="empty-row"><td colspan="7">Ошибка загрузки: ${err.message}</td></tr>`;
   }
-  body.innerHTML = channels.map(c => `
-    <tr>
-      <td>${c.channel_title || c.channel_id}</td>
-      <td class="muted">${c.channel_id}</td>
-      <td>✅</td>
-    </tr>
-  `).join("");
 }
+
+document.getElementById("addChannelForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const channelId = document.getElementById("channelIdInput").value.trim();
+  const channelTitle = document.getElementById("channelTitleInput").value.trim();
+  const qualityThreshold = parseFloat(document.getElementById("channelThresholdInput").value) || 0.5;
+  const autoExecute = document.getElementById("channelAutoExecuteInput").checked;
+
+  if (!channelId) return;
+
+  try {
+    await api("/telegram/channels", {
+      method: "POST",
+      body: JSON.stringify({
+        channel_id: channelId,
+        channel_title: channelTitle || null,
+        quality_threshold: qualityThreshold,
+        auto_execute: autoExecute,
+      }),
+    });
+    showToast(`Канал ${channelId} добавлен`);
+    document.getElementById("addChannelForm").reset();
+    document.getElementById("channelThresholdInput").value = "0.5";
+    await renderTelegram();
+  } catch (err) {
+    showToast(`Ошибка: ${err.message}`, true);
+  }
+});
 
 async function refreshAll() {
   try {
@@ -445,11 +539,11 @@ async function refreshAll() {
     lastStatus = status;
     renderHeader(status);
     renderPositions(status);
-    renderTelegram(status);
     const trades = await renderTrades();
     renderStats(status, trades || []);
     await renderStrategies();
     await renderMlModels();
+    await renderTelegram();
     document.getElementById("lastUpdated").textContent =
       "Обновлено: " + new Date().toLocaleTimeString("ru-RU");
   } catch (err) {
