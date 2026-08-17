@@ -10,7 +10,7 @@ from sqlalchemy import select
 from src.config import settings
 from src.db.session import get_session
 from src.db.models import (
-    Order, Trade, Strategy, Symbol, Exchange, TradeDecisionLog,
+    Order, Trade, Strategy, Symbol, Exchange,
 )
 from src.risk.risk_manager import risk_manager
 from src.event_bus import (
@@ -285,16 +285,6 @@ class ExecutionEngine:
             session.add(order)
             await session.flush()
             order_id = order.id
-
-            # Логирование decision tree
-            log_entry = TradeDecisionLog(
-                trade_id=0,
-                step_order=1,
-                step_type="execution",
-                description=f"Paper ордер исполнен: {side.upper()} {amount:.4f} {symbol} @ {price:.2f}",
-                details={"order_data": order_data},
-            )
-            session.add(log_entry)
             await session.commit()
 
         # Создание TradeEvent
