@@ -282,6 +282,9 @@ class TradingBot:
         close = float(latest["close"])
         self.last_prices[symbol] = close
 
+        if settings.is_paper and await self._check_position_exit(symbol, close):
+            return  # позиция закрыта в этой итерации — новый сигнал сгенерируем в следующем цикле
+
         # Фичи
         features = self.feature_engine.compute_all_indicators(df)
         latest_features = features.iloc[-1]
@@ -427,7 +430,7 @@ class TradingBot:
                 order_type="market",
                 stop_loss=signal.stop_loss,
                 take_profit=signal.take_profit,
-                strategy_id=1,
+                strategy_id=signal.strategy_id,
                 signal_data={"strategy_id": signal.strategy_id, "confidence": signal.confidence},
             )
 
@@ -441,10 +444,76 @@ class TradingBot:
                     "amount": amount, "strategy_id": signal.strategy_id,
                     "rationale": signal.rationale, "sl": signal.stop_loss,
                     "tp": signal.take_profit, "opened_at": utcnow(),
+                    "order_id": order.id, "entry_fee": order.fee,
                 }
                 risk_manager.on_position_added(symbol, size_pct)
                 self.daily_pnl = getattr(risk_manager.state, "daily_pnl", 0.0)
                 logger.info(f"✅ Ордер: {order.client_order_id}")
+
+    async def _check_position_exit(self, symbol: str, current_price: float) -> bool:
+        """
+        Проверить открытую позицию на достижение SL/TP и закрыть при необходимости.
+        Возвращает True, если позиция была закрыта в этом вызове.
+        """
+        position = self.open_positions.get(symbol)
+        if not position:
+            return False
+
+        side = position["side"]
+        sl = position.get("sl")
+        tp = position.get("tp")
+
+        reason = None
+        if side == "long":
+            if sl and current_price <= sl:
+                reason = "stop_loss"
+            elif tp and current_price >= tp:
+                reason = "take_profit"
+        else:  # short
+            if sl and current_price >= sl:
+                reason = "stop_loss"
+            elif tp and current_price <= tp:
+                reason = "take_profit"
+
+        if reason is None:
+            return False
+
+        opened_at = position.get("opened_at")
+        holding_seconds = int((utcnow() - opened_at).total_seconds()) if opened_at else 0
+
+        result = await execution_engine.close_paper_position(
+            symbol=symbol,
+            side=side,
+            entry_price=position["entry_price"],
+            amount=position["amount"],
+            exit_price=current_price,
+            reason=reason,
+            entry_fee=position.get("entry_fee", 0.0),
+            holding_seconds=holding_seconds,
+            strategy_id=position.get("strategy_id"),
+            order_open_id=position.get("order_id"),
+        )
+
+        if result is None:
+            return False
+
+        del self.open_positions[symbol]
+        risk_manager.on_position_closed(symbol)
+        risk_manager.on_trade_closed(result["pnl"])
+        self.daily_pnl = getattr(risk_manager.state, "daily_pnl", 0.0)
+
+        emoji = "✅" if result["pnl"] > 0 else "❌"
+        reason_ru = "Stop Loss" if reason == "stop_loss" else "Take Profit"
+        logger.info(
+            f"{emoji} Позиция закрыта: {symbol} {side.upper()} | {reason_ru} @ {current_price:.4f} | "
+            f"PnL: {result['pnl']:+.2f} ({result['pnl_pct']:+.2f}%)"
+        )
+        await send_notification(
+            f"{emoji} Закрыта {side.upper()} {symbol}\n"
+            f"Причина: {reason_ru}\n"
+            f"PnL: {result['pnl']:+.2f} USDT ({result['pnl_pct']:+.2f}%)"
+        )
+        return True
 
     async def _cleanup(self):
         """Очистка."""

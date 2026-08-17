@@ -20,7 +20,7 @@ from src.event_bus import (
 )
 from src.utils.logging import logger, log_trade
 from src.utils.crypto import decrypt_api_key, decrypt_secret
-from src.utils.timeutils import utcnow_timestamp
+from src.utils.timeutils import utcnow, utcnow_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +133,21 @@ class ExecutionEngine:
             await session.flush()
 
         return exchange.id, symbol_row.id
+
+    async def _resolve_strategy_id(self, session, strategy_name: Optional[str]) -> Optional[int]:
+        """Получить (или создать) id стратегии в БД по её строковому идентификатору."""
+        if not strategy_name:
+            return None
+
+        strategy_row = (
+            await session.execute(select(Strategy).where(Strategy.name == strategy_name))
+        ).scalar_one_or_none()
+        if strategy_row is None:
+            strategy_row = Strategy(name=strategy_name, strategy_type="rule")
+            session.add(strategy_row)
+            await session.flush()
+
+        return strategy_row.id
 
     async def create_order(
         self,
@@ -249,9 +264,11 @@ class ExecutionEngine:
         # Создание Order объекта в БД
         async with get_session() as session:
             exchange_id, symbol_id = await self._resolve_symbol_id(session, symbol)
+            strategy_db_id = await self._resolve_strategy_id(session, order_data.get("strategy_id"))
             order = Order(
                 exchange_id=exchange_id,
                 symbol_id=symbol_id,
+                strategy_id=strategy_db_id,
                 side=side,
                 order_type=order_data["type"],
                 amount=amount,
@@ -300,6 +317,110 @@ class ExecutionEngine:
 
         return order
 
+    async def close_paper_position(
+        self,
+        symbol: str,
+        side: str,  # long, short
+        entry_price: float,
+        amount: float,
+        exit_price: float,
+        reason: str,
+        entry_fee: float = 0.0,
+        holding_seconds: int = 0,
+        strategy_id: Optional[str] = None,
+        order_open_id: Optional[int] = None,
+    ) -> Optional[dict]:
+        """
+        Закрыть paper-позицию: посчитать PnL, обновить баланс, записать закрывающий
+        Order + Trade в БД, опубликовать закрывающий TradeEvent.
+        Возвращает {"pnl", "pnl_pct", "outcome"} или None при ошибке.
+        """
+        fee_pct = settings.paper_fee_pct / 100
+        exit_fee = amount * exit_price * fee_pct
+
+        if side == "long":
+            pnl = (exit_price - entry_price) * amount - entry_fee - exit_fee
+            # LONG при открытии списывает принципал с баланса — при закрытии
+            # возвращаем выручку от продажи (а не только pnl)
+            self.paper_balance += amount * exit_price - exit_fee
+        else:
+            pnl = (entry_price - exit_price) * amount - entry_fee - exit_fee
+            # SHORT в paper-режиме сейчас не резервирует маржу при открытии
+            # (создание короткой позиции без встречной длинной не отслеживается
+            # в self.paper_positions) — учитываем только реализованный PnL
+            self.paper_balance += pnl
+
+        pnl_pct = (pnl / (entry_price * amount) * 100) if entry_price and amount else 0.0
+        outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "break-even")
+
+        self.paper_positions.pop(symbol, None)
+
+        async with get_session() as session:
+            exchange_id, symbol_id = await self._resolve_symbol_id(session, symbol)
+            strategy_db_id = await self._resolve_strategy_id(session, strategy_id)
+
+            close_order = Order(
+                exchange_id=exchange_id,
+                symbol_id=symbol_id,
+                strategy_id=strategy_db_id,
+                side="sell" if side == "long" else "buy",
+                order_type="market",
+                amount=amount,
+                price=exit_price,
+                status="filled",
+                filled_amount=amount,
+                filled_price=exit_price,
+                fee=exit_fee,
+                client_order_id=str(uuid.uuid4())[:12],
+                notes=f"Paper close ({reason})",
+            )
+            session.add(close_order)
+            await session.flush()
+
+            trade = Trade(
+                symbol_id=symbol_id,
+                strategy_id=strategy_db_id,
+                order_open_id=order_open_id,
+                order_close_id=close_order.id,
+                direction=side,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                amount=amount,
+                pnl=pnl,
+                pnl_pct=pnl_pct,
+                holding_seconds=holding_seconds,
+                outcome=outcome,
+                is_open=False,
+                closed_at=utcnow(),
+            )
+            session.add(trade)
+            await session.commit()
+            trade_id = trade.id
+
+        logger.info(
+            f"📄 Paper позиция закрыта: {symbol} {side.upper()} | {reason} | "
+            f"PnL: {pnl:+.2f} ({pnl_pct:+.2f}%)"
+        )
+
+        trade_event = TradeEvent(
+            type="trade_event",
+            trade_id=trade_id,
+            symbol=symbol,
+            direction=side,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            amount=amount,
+            pnl=pnl,
+            pnl_pct=pnl_pct,
+            holding_seconds=holding_seconds,
+            outcome=outcome,
+            is_opening=False,
+            timestamp=utcnow_timestamp(),
+        )
+        await event_bus.publish(trade_event)
+
+        return {"pnl": pnl, "pnl_pct": pnl_pct, "outcome": outcome}
+
     async def _execute_real_order(self, order_data: dict) -> Optional[Order]:
         """Реальный ордер через биржу."""
         symbol = order_data["symbol"]
@@ -326,9 +447,11 @@ class ExecutionEngine:
 
             async with get_session() as session:
                 exchange_id, symbol_id = await self._resolve_symbol_id(session, symbol)
+                strategy_db_id = await self._resolve_strategy_id(session, order_data.get("strategy_id"))
                 order_obj = Order(
                     exchange_id=exchange_id,
                     symbol_id=symbol_id,
+                    strategy_id=strategy_db_id,
                     side=side,
                     order_type=order_data["type"],
                     amount=amount,

@@ -459,6 +459,58 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order.side, "buy")
         self.assertEqual(order.status, "filled")
 
+    async def test_close_paper_position_profit(self):
+        """Закрытие long-позиции в плюс: PnL положительный, баланс растёт, Trade сохранён."""
+        settings.trading_mode = "paper"
+        settings.startup_capital_usdt = 10000.0
+        await self.engine.initialize("binance")
+
+        order = await self.engine.create_order(
+            symbol="BTC/USDT", side="buy", amount=0.1, price=50000.0,
+            order_type="market", stop_loss=49000.0, take_profit=52000.0,
+            strategy_id="rsi_mr",
+        )
+        self.assertIsNotNone(order)
+        balance_after_open = self.engine.get_paper_balance()
+        self.assertLess(balance_after_open, 10000.0)
+
+        result = await self.engine.close_paper_position(
+            symbol="BTC/USDT", side="long", entry_price=50000.0, amount=0.1,
+            exit_price=52000.0, reason="take_profit", entry_fee=order.fee,
+            holding_seconds=3600, strategy_id="rsi_mr", order_open_id=order.id,
+        )
+        self.assertIsNotNone(result)
+        self.assertGreater(result["pnl"], 0)
+        self.assertEqual(result["outcome"], "win")
+        self.assertGreater(self.engine.get_paper_balance(), balance_after_open)
+
+        from src.db.session import get_session
+        from src.db.models import Trade
+        from sqlalchemy import select
+
+        async with get_session() as session:
+            trade = (
+                await session.execute(select(Trade).where(Trade.order_open_id == order.id))
+            ).scalar_one()
+        self.assertFalse(trade.is_open)
+        self.assertEqual(trade.order_open_id, order.id)
+        self.assertIsNotNone(trade.order_close_id)
+        self.assertNotEqual(trade.order_close_id, order.id)
+
+    async def test_close_paper_position_loss(self):
+        """Закрытие short-позиции в минус: PnL отрицательный."""
+        settings.trading_mode = "paper"
+        await self.engine.initialize("binance")
+
+        result = await self.engine.close_paper_position(
+            symbol="ETH/USDT", side="short", entry_price=3000.0, amount=1.0,
+            exit_price=3100.0, reason="stop_loss", entry_fee=1.0,
+            holding_seconds=600, strategy_id="ema_cross",
+        )
+        self.assertIsNotNone(result)
+        self.assertLess(result["pnl"], 0)
+        self.assertEqual(result["outcome"], "loss")
+
 
 class TestTelegramSignalParser(unittest.TestCase):
     """Тесты для парсера Telegram сигналов."""
