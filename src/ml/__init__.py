@@ -1,0 +1,585 @@
+"""ML компоненты: Feature Store, Trainer, Model Registry, Inference."""
+import asyncio
+import logging
+import os
+import pickle
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.model_selection import train_test_split
+
+from src.config import settings
+from src.db.session import get_session
+from src.db.models import MLModel, MLFeature, Strategy
+from src.utils.logging import logger
+
+logger = logging.getLogger(__name__)
+
+MODELS_DIR = Path(__file__).parent.parent.parent / "data" / "models"
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class FeatureStore:
+    """Хранилище фичей для ML."""
+
+    def __init__(self):
+        self._online_features: dict[str, dict] = {}
+
+    def add_features(
+        self,
+        symbol: str,
+        timeframe: str,
+        timestamp: datetime,
+        features: dict[str, float],
+        labels: Optional[dict] = None,
+    ):
+        """Добавить фичи в онлайн-хранилище и сохранить в БД."""
+        key = f"{symbol}:{timeframe}:{timestamp.isoformat()}"
+        self._online_features[key] = features
+
+        # Сохранение в БД
+        async def _save():
+            async with get_session() as session:
+                feature = MLFeature(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    timestamp=timestamp,
+                    features=features,
+                    label_direction=labels.get("direction") if labels else None,
+                    label_volatility=labels.get("volatility") if labels else None,
+                    source="live",
+                )
+                session.add(feature)
+                await session.commit()
+
+        try:
+            asyncio.get_event_loop().run_until_complete(_save())
+        except Exception as e:
+            logger.debug(f"Не удалось сохранить фичи в БД: {e}")
+
+    def get_latest_features(self, symbol: str, timeframe: str = "1h") -> Optional[dict]:
+        """Получить последние фичи для символа."""
+        # TODO: получать из БД или из онлайн кэша
+        return self._online_features.get(f"{symbol}:{timeframe}:latest")
+
+    def get_features_for_training(
+        self,
+        symbol: Optional[str] = None,
+        limit: int = 10000,
+    ) -> Optional[pd.DataFrame]:
+        """Получить фичи для обучения из БД."""
+        async def _get():
+            async with get_session() as session:
+                from src.db.models import MLFeature as MF
+                query = session.query(MF).order_by(MF.timestamp.desc())
+                if symbol:
+                    query = query.filter(MF.symbol == symbol)
+                features = (await query.limit(limit).all())[::-1]
+                data = []
+                for f in features:
+                    row = dict(f.features)
+                    row["symbol"] = f.symbol
+                    row["timeframe"] = f.timeframe
+                    row["timestamp"] = f.timestamp
+                    row["label_direction"] = f.label_direction
+                    row["label_volatility"] = f.label_volatility
+                    data.append(row)
+                return pd.DataFrame(data) if data else None
+
+        try:
+            return asyncio.get_event_loop().run_until_complete(_get())
+        except Exception as e:
+            logger.error(f"Ошибка получения фичей для обучения: {e}")
+            return None
+
+    def clear_online_cache(self):
+        """Очистить онлайн кэш."""
+        self._online_features.clear()
+
+
+class ModelTrainer:
+    """Тренер ML моделей (LightGBM)."""
+
+    def __init__(self):
+        self.feature_store = FeatureStore()
+        self.last_training_time: Optional[datetime] = None
+
+    def train_direction_classifier(
+        self,
+        symbol: Optional[str] = None,
+        training_data: Optional[pd.DataFrame] = None,
+    ) -> Optional[dict]:
+        """
+        Обучить модель классификации направления.
+        Возвращает dict с результатами обучения и метриками.
+        """
+        logger.info(f"Начато обучение direction classifier" + (f" для {symbol}" if symbol else ""))
+
+        if training_data is None:
+            training_data = self.feature_store.get_features_for_training(symbol)
+
+        if training_data is None or training_data.empty:
+            logger.warning("Нет данных для обучения direction classifier")
+            return None
+
+        # Подготовка данных
+        feature_cols = [
+            "rsi_14", "rsi_7", "rsi_21",
+            "macd", "macd_signal", "macd_hist",
+            "bb_pct", "bb_width",
+            "ema_20_slope", "ema_50_slope",
+            "price_above_ema20", "price_above_ema50",
+            "atr_14", "natr_14",
+            "realized_vol_20", "realized_vol_60",
+            "volume_ratio", "obv",
+            "return_1", "return_3", "return_5", "return_10",
+            "log_return", "momentum_10", "momentum_20",
+            "dist_from_ema20", "dist_from_ema50",
+            "high_low_range", "range_ratio",
+            "stoch_k", "stoch_d", "wr_14", "mfi_14",
+            "hour", "day_of_week", "is_weekend",
+            "roc_5", "roc_10", "roc_20",
+        ]
+        available_cols = [c for c in feature_cols if c in training_data.columns]
+
+        if not available_cols:
+            logger.warning("Нет доступных признаков для обучения")
+            return None
+
+        X = training_data[available_cols].dropna()
+        y = training_data.loc[X.index, "label_direction"]
+
+        if len(X) < 100:
+            logger.warning(f"Слишком мало данных для обучения: {len(X)}")
+            return None
+
+        # Разделение на train/validation
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y if len(y.unique()) > 1 else None
+        )
+
+        # Тренировка LightGBM
+        model = lgb.LGBMClassifier(
+            n_estimators=200,
+            max_depth=5,
+            learning_rate=0.05,
+            num_leaves=31,
+            feature_fraction=0.8,
+            bagging_fraction=0.8,
+            bagging_freq=5,
+            min_child_samples=20,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
+            random_state=42,
+            verbose=-1,
+        )
+
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=50),
+                lgb.log_evaluation(period=50),
+            ],
+        )
+
+        # Метрики
+        y_pred = model.predict(X_val)
+        y_proba = model.predict_proba(X_val)
+
+        accuracy = accuracy_score(y_val, y_pred)
+        precision = precision_score(y_val, y_pred, average="weighted", zero_division=0)
+        recall = recall_score(y_val, y_pred, average="weighted", zero_division=0)
+        f1 = f1_score(y_val, y_pred, average="weighted", zero_division=0)
+
+        # Сохранение модели
+        version = self._get_next_version("direction_classifier")
+        model_path = MODELS_DIR / f"direction_classifier_v{version}.pkl"
+        with open(model_path, "wb") as f:
+            pickle.dump({
+                "model": model,
+                "feature_cols": available_cols,
+                "version": version,
+                "trained_at": datetime.utcnow().isoformat(),
+            }, f)
+
+        logger.info(
+            f"✅ Direction classifier обучен: v{version} | "
+            f"accuracy={accuracy:.3f} precision={precision:.3f} recall={recall:.3f} f1={f1:.3f}"
+        )
+
+        # Регистрация в БД
+        async def _register():
+            async with get_session() as session:
+                model_record = MLModel(
+                    model_type="direction_classifier",
+                    version=version,
+                    model_path=str(model_path),
+                    params={
+                        "n_estimators": 200,
+                        "max_depth": 5,
+                        "learning_rate": 0.05,
+                        "feature_cols": available_cols,
+                    },
+                    metrics={
+                        "accuracy": round(accuracy, 4),
+                        "precision": round(precision, 4),
+                        "recall": round(recall, 4),
+                        "f1": round(f1, 4),
+                        "train_samples": len(X_train),
+                        "val_samples": len(X_val),
+                    },
+                    is_active=True,
+                    released_at=datetime.utcnow(),
+                )
+                session.add(model_record)
+                await session.commit()
+
+        try:
+            asyncio.get_event_loop().run_until_complete(_register())
+        except Exception as e:
+            logger.warning(f"Не удалось зарегистрировать модель в БД: {e}")
+
+        return {
+            "version": version,
+            "model_path": str(model_path),
+            "metrics": {
+                "accuracy": round(accuracy, 4),
+                "precision": round(precision, 4),
+                "recall": round(recall, 4),
+                "f1": round(f1, 4),
+            },
+            "feature_cols": available_cols,
+            "trained_at": datetime.utcnow().isoformat(),
+        }
+
+    def train_volatility_predictor(
+        self,
+        symbol: Optional[str] = None,
+        training_data: Optional[pd.DataFrame] = None,
+    ) -> Optional[dict]:
+        """Обучить модель предсказания волатильности."""
+        logger.info(f"Начато обучение volatility predictor" + (f" для {symbol}" if symbol else ""))
+
+        if training_data is None:
+            training_data = self.feature_store.get_features_for_training(symbol)
+
+        if training_data is None or training_data.empty or "label_volatility" not in training_data.columns:
+            logger.warning("Нет данных для обучения volatility predictor")
+            return None
+
+        feature_cols = [
+            "rsi_14", "natr_14", "realized_vol_20", "realized_vol_60",
+            "volume_ratio", "atr_14", "return_1", "return_3",
+        ]
+        available_cols = [c for c in feature_cols if c in training_data.columns]
+
+        if not available_cols:
+            return None
+
+        X = training_data[available_cols].dropna()
+        y = training_data.loc[X.index, "label_volatility"]
+
+        if len(X) < 100:
+            return None
+
+        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        model = lgb.LGBMRegressor(
+            n_estimators=100,
+            max_depth=4,
+            learning_rate=0.05,
+            random_state=42,
+            verbose=-1,
+        )
+
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)])
+
+        y_pred = model.predict(X_val)
+        mse = np.mean((y_val - y_pred) ** 2)
+        mae = np.mean(np.abs(y_val - y_pred))
+
+        version = self._get_next_version("volatility_predictor")
+        model_path = MODELS_DIR / f"volatility_predictor_v{version}.pkl"
+        with open(model_path, "wb") as f:
+            pickle.dump({
+                "model": model,
+                "feature_cols": available_cols,
+                "version": version,
+                "trained_at": datetime.utcnow().isoformat(),
+            }, f)
+
+        logger.info(f"✅ Volatility predictor обучен: v{version} | MSE={mse:.6f} MAE={mae:.6f}")
+
+        return {
+            "version": version,
+            "model_path": str(model_path),
+            "metrics": {"mse": round(mse, 6), "mae": round(mae, 6)},
+            "trained_at": datetime.utcnow().isoformat(),
+        }
+
+    def _get_next_version(self, model_type: str) -> int:
+        """Получить следующую версию модели."""
+        async def _get():
+            async with get_session() as session:
+                from src.db.models import MLModel as M
+                last = await session.query(M).filter(
+                    M.model_type == model_type
+                ).order_by(M.version.desc()).first()
+                return (last.version if last else 0) + 1
+
+        try:
+            return asyncio.get_event_loop().run_until_complete(_get())
+        except Exception:
+            return 1
+
+    def get_training_schedule(self) -> dict:
+        """Получить конфигурацию расписания обучения."""
+        return {
+            "interval_hours": settings.ml_retraining_interval_hours,
+            "max_trades": settings.ml_max_trades_for_retrain,
+            "last_training": self.last_training_time.isoformat() if self.last_training_time else None,
+        }
+
+
+class ModelRegistry:
+    """Реестр ML моделей."""
+
+    def __init__(self):
+        self._active_models: dict[str, dict] = {}
+
+    def load_active_model(self, model_type: str) -> Optional[dict]:
+        """Загрузить активную модель из БД."""
+        async def _load():
+            async with get_session() as session:
+                from src.db.models import MLModel as M
+                model = await session.query(M).filter(
+                    M.model_type == model_type,
+                    M.is_active == True,
+                ).order_by(M.version.desc()).first()
+                if model:
+                    return {
+                        "id": model.id,
+                        "version": model.version,
+                        "model_path": model.model_path,
+                        "params": model.params,
+                        "metrics": model.metrics,
+                        "released_at": model.released_at.isoformat() if model.released_at else None,
+                    }
+            return None
+
+        try:
+            result = asyncio.get_event_loop().run_until_complete(_load())
+            if result:
+                self._active_models[model_type] = result
+            return result
+        except Exception as e:
+            logger.error(f"Ошибка загрузки активной модели {model_type}: {e}")
+            return None
+
+    def get_model_version(self, model_type: str, version: int) -> Optional[dict]:
+        """Получить конкретную версию модели."""
+        async def _get():
+            async with get_session() as session:
+                from src.db.models import MLModel as M
+                model = await session.query(M).filter(
+                    M.model_type == model_type,
+                    M.version == version,
+                ).first()
+                if model:
+                    return {
+                        "id": model.id,
+                        "version": model.version,
+                        "model_path": model.model_path,
+                        "params": model.params,
+                        "metrics": model.metrics,
+                        "released_at": model.released_at.isoformat() if model.released_at else None,
+                        "is_active": model.is_active,
+                    }
+            return None
+
+        try:
+            return asyncio.get_event_loop().run_until_complete(_get())
+        except Exception as e:
+            logger.error(f"Ошибка получения версии модели {model_type} v{version}: {e}")
+            return None
+
+    def list_models(self, model_type: Optional[str] = None) -> list[dict]:
+        """Список моделей."""
+        async def _list():
+            async with get_session() as session:
+                from src.db.models import MLModel as M
+                query = session.query(M)
+                if model_type:
+                    query = query.filter(M.model_type == model_type)
+                models = await query.order_by(M.created_at.desc()).all()
+                return [
+                    {
+                        "id": m.id,
+                        "model_type": m.model_type,
+                        "version": m.version,
+                        "is_active": m.is_active,
+                        "is_shadow": m.is_shadow,
+                        "metrics": m.metrics,
+                        "created_at": m.created_at.isoformat() if m.created_at else None,
+                    }
+                    for m in models
+                ]
+
+        try:
+            return asyncio.get_event_loop().run_until_complete(_list())
+        except Exception as e:
+            logger.error(f"Ошибка получения списка моделей: {e}")
+            return []
+
+    def activate_model(self, model_type: str, version: int) -> bool:
+        """Активировать модель определённой версии."""
+        async def _activate():
+            async with get_session() as session:
+                from src.db.models import MLModel as M
+                # Deactivate all
+                await session.query(M).filter(
+                    M.model_type == model_type
+                ).update({"is_active": False})
+                # Activate specific
+                result = await session.query(M).filter(
+                    M.model_type == model_type,
+                    M.version == version,
+                ).update({"is_active": True})
+                await session.commit()
+                return result > 0
+
+        try:
+            success = asyncio.get_event_loop().run_until_complete(_activate())
+            if success:
+                logger.info(f"✅ Модель {model_type} v{version} активирована")
+                self.load_active_model(model_type)
+            return success
+        except Exception as e:
+            logger.error(f"Ошибка активации модели {model_type} v{version}: {e}")
+            return False
+
+    def get_active_model(self, model_type: str) -> Optional[dict]:
+        """Получить активную модель (из кэша или загрузить)."""
+        if model_type in self._active_models:
+            return self._active_models[model_type]
+        return self.load_active_model(model_type)
+
+
+class MLInference:
+    """Инференс ML моделей (предсказания)."""
+
+    def __init__(self):
+        self.registry = ModelRegistry()
+        self._models: dict[str, Any] = {}
+
+    def load_model(self, model_type: str, model_path: str) -> bool:
+        """Загрузить модель из файла."""
+        try:
+            with open(model_path, "rb") as f:
+                data = pickle.load(f)
+            self._models[model_type] = data
+            logger.info(f"ML модель загружена: {model_type} из {model_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка загрузки модели {model_type}: {e}")
+            return False
+
+    def predict_direction(
+        self,
+        features: dict[str, float],
+        model_type: str = "direction_classifier",
+    ) -> Optional[dict]:
+        """
+        Предсказать направление на основе фичей.
+        Возвращает {proba_up, proba_down, proba_neutral, feature_importance}
+        """
+        model_data = self._models.get(model_type)
+        if model_data is None:
+            # Попробовать загрузить из реестра
+            active = self.registry.get_active_model(model_type)
+            if active and active.get("model_path"):
+                if self.load_model(model_type, active["model_path"]):
+                    model_data = self._models.get(model_type)
+
+        if model_data is None:
+            logger.warning(f"ML модель {model_type} не загружена, предсказание невозможно")
+            return None
+
+        model = model_data["model"]
+        feature_cols = model_data.get("feature_cols", [])
+
+        # Подготовка признаков
+        X = []
+        for col in feature_cols:
+            val = features.get(col, 0)
+            X.append(val)
+
+        if len(X) != len(feature_cols):
+            logger.warning(f"Не все признаки предоставлены: {len(X)} vs {len(feature_cols)}")
+            return None
+
+        # Предсказание
+        try:
+            proba = model.predict_proba([X])[0]
+            classes = model.classes_
+
+            # Составляем результат
+            result = {
+                "proba_up": float(proba[1]) if 1 in classes else 0.0,
+                "proba_down": float(proba[-1]) if -1 in classes else 0.0,
+                "proba_neutral": float(proba[0]) if 0 in classes else 1.0 - float(proba[1]) - float(proba[-1]),
+            }
+
+            # Feature importance (если доступно)
+            if hasattr(model, "feature_importances_"):
+                result["feature_importance"] = dict(zip(feature_cols, model.feature_importances_))
+
+            logger.debug(f"ML Inference: P(up)={result['proba_up']:.2f} P(down)={result['proba_down']:.2f}")
+            return result
+
+        except Exception as e:
+            logger.error(f"Ошибка инференса модели {model_type}: {e}")
+            return None
+
+    def predict_volatility(
+        self,
+        features: dict[str, float],
+    ) -> Optional[float]:
+        """Предсказать волатильность."""
+        model_data = self._models.get("volatility_predictor")
+        if model_data is None:
+            active = self.registry.get_active_model("volatility_predictor")
+            if active and active.get("model_path"):
+                if self.load_model("volatility_predictor", active["model_path"]):
+                    model_data = self._models.get("volatility_predictor")
+
+        if model_data is None:
+            return None
+
+        model = model_data["model"]
+        feature_cols = model_data.get("feature_cols", [])
+
+        X = []
+        for col in feature_cols:
+            val = features.get(col, 0)
+            X.append(val)
+
+        try:
+            pred = model.predict([X])[0]
+            return float(pred)
+        except Exception as e:
+            logger.error(f"Ошибка инференса volatility: {e}")
+            return None
+
+
+# Глобальные экземпляры
+feature_store = FeatureStore()
+model_trainer = ModelTrainer()
+model_registry = ModelRegistry()
+ml_inference = MLInference()
