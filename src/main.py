@@ -10,7 +10,6 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from src.config import settings
 from src.utils.logging import setup_logging, logger
-from src.db.session import init_db
 from src.event_bus import event_bus
 from src.data_ingest.market_data import MarketDataIngest
 from src.data_ingest.coinglass_client import get_coinglass_client
@@ -47,9 +46,10 @@ class TradingBot:
         setup_logging()
         logger.info("🚀 Инициализация CryptoBot Pro...")
 
-        # База данных
-        await init_db()
-        logger.info("✅ База данных инициализирована")
+        # Схема БД управляется через Alembic (см. README) — её нужно
+        # применить заранее командой `alembic upgrade head`, а не при
+        # каждом старте бота (иначе она конфликтует с миграциями:
+        # create_all() создаёт таблицы в обход alembic_version).
 
         # Feature engine
         self.feature_engine = get_feature_engine()
