@@ -15,10 +15,9 @@ from typing import Optional
 
 from alembic import op
 from sqlalchemy import (
-    BigInteger, Boolean, Column, DateTime, Float, Integer, JSON, String, Text,
+    BigInteger, Boolean, Column, DateTime, DECIMAL, Float, Integer, JSON, String, Text,
     ForeignKey, Index, UniqueConstraint, Text as SqlText,
 )
-from sqlalchemy.dialects.postgresql import DECIMAL
 
 # Импортируем все модели, чтобы Alembic мог сгенерировать миграции
 # В продакшене это не требуется, так как миграции уже сгенерированы

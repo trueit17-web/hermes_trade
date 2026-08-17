@@ -13,6 +13,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Копирование исходного кода
 COPY src/ ./src/
+COPY alembic.ini .
+COPY alembic/ ./alembic/
 
 # Создание директорий (data/ гитигнорится и монтируется как volume в docker-compose.yml)
 RUN mkdir -p /app/data/logs /app/data/models
