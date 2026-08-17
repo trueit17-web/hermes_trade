@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import sys
+from datetime import datetime
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -81,7 +82,7 @@ class TradingBot:
 
         # ML inference
         self.ml_inference = ml_inference
-        active_model = model_registry.get_active_model("direction_classifier")
+        active_model = await model_registry.get_active_model("direction_classifier")
         if active_model and active_model.get("model_path"):
             self.ml_inference.load_model("direction_classifier", active_model["model_path"])
             logger.info(f"✅ ML модель загружена: {active_model['model_type']} v{active_model['version']}")
@@ -94,9 +95,15 @@ class TradingBot:
 
         # Telegram (опционально)
         if settings.telegram_api_id and settings.telegram_api_hash:
-            await init_telegram()
-            subscribe_telegram_signal(self._on_telegram_signal)
-            logger.info("✅ Telegram клиент инициализирован")
+            telegram_client = await init_telegram()
+            if telegram_client:
+                subscribe_telegram_signal(self._on_telegram_signal)
+                logger.info("✅ Telegram клиент инициализирован")
+            else:
+                logger.warning(
+                    "⚠️ Telegram клиент не инициализирован (см. ошибку выше) — "
+                    "мониторинг каналов отключён на этот запуск"
+                )
 
         # Планировщик
         self.scheduler = AsyncIOScheduler()
@@ -145,10 +152,10 @@ class TradingBot:
                 return
 
             logger.info(f"ML retraining: {trades_count} сделок")
-            result = model_trainer.train_direction_classifier()
+            result = await model_trainer.train_direction_classifier()
             if result:
                 logger.info(f"✅ Direction classifier: v{result['version']}")
-                model_registry.activate_model("direction_classifier", result["version"])
+                await model_registry.activate_model("direction_classifier", result["version"])
                 if self.ml_inference:
                     self.ml_inference.load_model("direction_classifier", result["model_path"])
         except Exception as e:
@@ -315,7 +322,7 @@ class TradingBot:
 
         # ML inference
         if self.ml_inference:
-            ml_result = self.ml_inference.predict_direction(strategy_data)
+            ml_result = await self.ml_inference.predict_direction(strategy_data)
             if ml_result:
                 strategy_data["ml_proba_up"] = ml_result.get("proba_up")
                 strategy_data["ml_proba_down"] = ml_result.get("proba_down")
@@ -347,9 +354,10 @@ class TradingBot:
 
         # ML score log
         if "ml_proba_up" in strategy_data:
+            active_model = await model_registry.get_active_model("direction_classifier")
             decision_logger.log_ml_score(
                 model_type="direction_classifier",
-                model_version=model_registry.get_active_model("direction_classifier", {}).get("version", 1),
+                model_version=(active_model or {}).get("version", 1),
                 proba_up=strategy_data["ml_proba_up"],
                 proba_down=strategy_data["ml_proba_down"],
                 proba_neutral=strategy_data["ml_proba_neutral"],

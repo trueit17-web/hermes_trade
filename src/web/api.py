@@ -195,8 +195,8 @@ async def get_status():
         "paper_balance": execution_engine.get_paper_balance() if settings.is_paper else None,
         "paper_positions": execution_engine.get_paper_positions() if settings.is_paper else None,
         "active_strategies": strategy_registry.list_strategies(),
-        "ml_models": model_registry.list_models(),
-        "ml_active_model": model_registry.get_active_model("direction_classifier"),
+        "ml_models": await model_registry.list_models(),
+        "ml_active_model": await model_registry.get_active_model("direction_classifier"),
         "telegram_channels": telegram_channels,
         "event_bus_history_size": len(event_bus.get_history()),
         "timestamp": datetime.utcnow().isoformat(),
@@ -412,13 +412,13 @@ async def list_orders(limit: int = 100):
 @app.get("/ml/models")
 async def list_ml_models(model_type: Optional[str] = None):
     """Список ML моделей."""
-    return {"models": model_registry.list_models(model_type)}
+    return {"models": await model_registry.list_models(model_type)}
 
 
 @app.get("/ml/models/{model_type}/active")
 async def get_active_ml_model(model_type: str):
     """Получить активную модель."""
-    model = model_registry.get_active_model(model_type)
+    model = await model_registry.get_active_model(model_type)
     if not model:
         raise HTTPException(status_code=404, detail=f"Активная модель {model_type} не найдена")
     return model
@@ -427,7 +427,7 @@ async def get_active_ml_model(model_type: str):
 @app.post("/ml/models/{model_type}/{version}/activate")
 async def activate_ml_model(model_type: str, version: int):
     """Активировать модель."""
-    success = model_registry.activate_model(model_type, version)
+    success = await model_registry.activate_model(model_type, version)
     if not success:
         raise HTTPException(status_code=404, detail=f"Модель {model_type} v{version} не найдена")
     return {"success": True, "model_type": model_type, "version": version}
@@ -437,10 +437,10 @@ async def activate_ml_model(model_type: str, version: int):
 async def trigger_retrain():
     """Запустить переобучение моделей."""
     logger.info("Запуск переобучения ML моделей...")
-    result = model_trainer.train_direction_classifier()
+    result = await model_trainer.train_direction_classifier()
     if result:
         logger.info(f"Direction classifier переобучен: v{result['version']}")
-        model_registry.activate_model("direction_classifier", result["version"])
+        await model_registry.activate_model("direction_classifier", result["version"])
     return {
         "success": result is not None,
         "result": result,

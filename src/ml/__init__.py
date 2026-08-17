@@ -1,5 +1,4 @@
 """ML компоненты: Feature Store, Trainer, Model Registry, Inference."""
-import asyncio
 import logging
 import os
 import pickle
@@ -31,7 +30,7 @@ class FeatureStore:
     def __init__(self):
         self._online_features: dict[str, dict] = {}
 
-    def add_features(
+    async def add_features(
         self,
         symbol: str,
         timeframe: str,
@@ -43,8 +42,7 @@ class FeatureStore:
         key = f"{symbol}:{timeframe}:{timestamp.isoformat()}"
         self._online_features[key] = features
 
-        # Сохранение в БД
-        async def _save():
+        try:
             async with get_session() as session:
                 feature = MLFeature(
                     symbol=symbol,
@@ -57,19 +55,16 @@ class FeatureStore:
                 )
                 session.add(feature)
                 await session.commit()
-
-        try:
-            asyncio.get_event_loop().run_until_complete(_save())
         except Exception as e:
             logger.debug(f"Не удалось сохранить фичи в БД: {e}")
 
-    def get_latest_features(self, symbol: str, timeframe: str = "1h") -> Optional[dict]:
+    async def get_latest_features(self, symbol: str, timeframe: str = "1h") -> Optional[dict]:
         """Получить последние фичи для символа (из онлайн-кэша или БД)."""
         cached = self._online_features.get(f"{symbol}:{timeframe}:latest")
         if cached is not None:
             return cached
 
-        async def _get():
+        try:
             async with get_session() as session:
                 from src.db.models import MLFeature as MF
                 result = await session.execute(
@@ -80,20 +75,17 @@ class FeatureStore:
                 )
                 feature = result.scalar_one_or_none()
                 return dict(feature.features) if feature else None
-
-        try:
-            return asyncio.get_event_loop().run_until_complete(_get())
         except Exception as e:
             logger.error(f"Ошибка получения последних фичей для {symbol}: {e}")
             return None
 
-    def get_features_for_training(
+    async def get_features_for_training(
         self,
         symbol: Optional[str] = None,
         limit: int = 10000,
     ) -> Optional[pd.DataFrame]:
         """Получить фичи для обучения из БД."""
-        async def _get():
+        try:
             async with get_session() as session:
                 from src.db.models import MLFeature as MF
                 query = select(MF).order_by(MF.timestamp.desc())
@@ -111,9 +103,6 @@ class FeatureStore:
                     row["label_volatility"] = f.label_volatility
                     data.append(row)
                 return pd.DataFrame(data) if data else None
-
-        try:
-            return asyncio.get_event_loop().run_until_complete(_get())
         except Exception as e:
             logger.error(f"Ошибка получения фичей для обучения: {e}")
             return None
@@ -130,7 +119,7 @@ class ModelTrainer:
         self.feature_store = FeatureStore()
         self.last_training_time: Optional[datetime] = None
 
-    def train_direction_classifier(
+    async def train_direction_classifier(
         self,
         symbol: Optional[str] = None,
         training_data: Optional[pd.DataFrame] = None,
@@ -142,7 +131,7 @@ class ModelTrainer:
         logger.info(f"Начато обучение direction classifier" + (f" для {symbol}" if symbol else ""))
 
         if training_data is None:
-            training_data = self.feature_store.get_features_for_training(symbol)
+            training_data = await self.feature_store.get_features_for_training(symbol)
 
         if training_data is None or training_data.empty:
             logger.warning("Нет данных для обучения direction classifier")
@@ -219,7 +208,7 @@ class ModelTrainer:
         f1 = f1_score(y_val, y_pred, average="weighted", zero_division=0)
 
         # Сохранение модели
-        version = self._get_next_version("direction_classifier")
+        version = await self._get_next_version("direction_classifier")
         model_path = MODELS_DIR / f"direction_classifier_v{version}.pkl"
         with open(model_path, "wb") as f:
             pickle.dump({
@@ -235,7 +224,7 @@ class ModelTrainer:
         )
 
         # Регистрация в БД
-        async def _register():
+        try:
             async with get_session() as session:
                 model_record = MLModel(
                     model_type="direction_classifier",
@@ -260,9 +249,6 @@ class ModelTrainer:
                 )
                 session.add(model_record)
                 await session.commit()
-
-        try:
-            asyncio.get_event_loop().run_until_complete(_register())
         except Exception as e:
             logger.warning(f"Не удалось зарегистрировать модель в БД: {e}")
 
@@ -279,7 +265,7 @@ class ModelTrainer:
             "trained_at": datetime.utcnow().isoformat(),
         }
 
-    def train_volatility_predictor(
+    async def train_volatility_predictor(
         self,
         symbol: Optional[str] = None,
         training_data: Optional[pd.DataFrame] = None,
@@ -288,7 +274,7 @@ class ModelTrainer:
         logger.info(f"Начато обучение volatility predictor" + (f" для {symbol}" if symbol else ""))
 
         if training_data is None:
-            training_data = self.feature_store.get_features_for_training(symbol)
+            training_data = await self.feature_store.get_features_for_training(symbol)
 
         if training_data is None or training_data.empty or "label_volatility" not in training_data.columns:
             logger.warning("Нет данных для обучения volatility predictor")
@@ -325,7 +311,7 @@ class ModelTrainer:
         mse = np.mean((y_val - y_pred) ** 2)
         mae = np.mean(np.abs(y_val - y_pred))
 
-        version = self._get_next_version("volatility_predictor")
+        version = await self._get_next_version("volatility_predictor")
         model_path = MODELS_DIR / f"volatility_predictor_v{version}.pkl"
         with open(model_path, "wb") as f:
             pickle.dump({
@@ -344,9 +330,9 @@ class ModelTrainer:
             "trained_at": datetime.utcnow().isoformat(),
         }
 
-    def _get_next_version(self, model_type: str) -> int:
+    async def _get_next_version(self, model_type: str) -> int:
         """Получить следующую версию модели."""
-        async def _get():
+        try:
             async with get_session() as session:
                 from src.db.models import MLModel as M
                 result = await session.execute(
@@ -354,9 +340,6 @@ class ModelTrainer:
                 )
                 last = result.scalar_one_or_none()
                 return (last.version if last else 0) + 1
-
-        try:
-            return asyncio.get_event_loop().run_until_complete(_get())
         except Exception:
             return 1
 
@@ -375,9 +358,9 @@ class ModelRegistry:
     def __init__(self):
         self._active_models: dict[str, dict] = {}
 
-    def load_active_model(self, model_type: str) -> Optional[dict]:
+    async def load_active_model(self, model_type: str) -> Optional[dict]:
         """Загрузить активную модель из БД."""
-        async def _load():
+        try:
             async with get_session() as session:
                 from src.db.models import MLModel as M
                 result = await session.execute(
@@ -388,28 +371,25 @@ class ModelRegistry:
                 )
                 model = result.scalar_one_or_none()
                 if model:
-                    return {
+                    loaded = {
                         "id": model.id,
+                        "model_type": model_type,
                         "version": model.version,
                         "model_path": model.model_path,
                         "params": model.params,
                         "metrics": model.metrics,
                         "released_at": model.released_at.isoformat() if model.released_at else None,
                     }
+                    self._active_models[model_type] = loaded
+                    return loaded
             return None
-
-        try:
-            result = asyncio.get_event_loop().run_until_complete(_load())
-            if result:
-                self._active_models[model_type] = result
-            return result
         except Exception as e:
             logger.error(f"Ошибка загрузки активной модели {model_type}: {e}")
             return None
 
-    def get_model_version(self, model_type: str, version: int) -> Optional[dict]:
+    async def get_model_version(self, model_type: str, version: int) -> Optional[dict]:
         """Получить конкретную версию модели."""
-        async def _get():
+        try:
             async with get_session() as session:
                 from src.db.models import MLModel as M
                 result = await session.execute(
@@ -419,6 +399,7 @@ class ModelRegistry:
                 if model:
                     return {
                         "id": model.id,
+                        "model_type": model_type,
                         "version": model.version,
                         "model_path": model.model_path,
                         "params": model.params,
@@ -427,16 +408,13 @@ class ModelRegistry:
                         "is_active": model.is_active,
                     }
             return None
-
-        try:
-            return asyncio.get_event_loop().run_until_complete(_get())
         except Exception as e:
             logger.error(f"Ошибка получения версии модели {model_type} v{version}: {e}")
             return None
 
-    def list_models(self, model_type: Optional[str] = None) -> list[dict]:
+    async def list_models(self, model_type: Optional[str] = None) -> list[dict]:
         """Список моделей."""
-        async def _list():
+        try:
             async with get_session() as session:
                 from src.db.models import MLModel as M
                 query = select(M)
@@ -456,16 +434,13 @@ class ModelRegistry:
                     }
                     for m in models
                 ]
-
-        try:
-            return asyncio.get_event_loop().run_until_complete(_list())
         except Exception as e:
             logger.error(f"Ошибка получения списка моделей: {e}")
             return []
 
-    def activate_model(self, model_type: str, version: int) -> bool:
+    async def activate_model(self, model_type: str, version: int) -> bool:
         """Активировать модель определённой версии."""
-        async def _activate():
+        try:
             async with get_session() as session:
                 from src.db.models import MLModel as M
                 # Deactivate all
@@ -479,23 +454,20 @@ class ModelRegistry:
                     .values(is_active=True)
                 )
                 await session.commit()
-                return result.rowcount > 0
-
-        try:
-            success = asyncio.get_event_loop().run_until_complete(_activate())
+                success = result.rowcount > 0
             if success:
                 logger.info(f"✅ Модель {model_type} v{version} активирована")
-                self.load_active_model(model_type)
+                await self.load_active_model(model_type)
             return success
         except Exception as e:
             logger.error(f"Ошибка активации модели {model_type} v{version}: {e}")
             return False
 
-    def get_active_model(self, model_type: str) -> Optional[dict]:
+    async def get_active_model(self, model_type: str) -> Optional[dict]:
         """Получить активную модель (из кэша или загрузить)."""
         if model_type in self._active_models:
             return self._active_models[model_type]
-        return self.load_active_model(model_type)
+        return await self.load_active_model(model_type)
 
 
 class MLInference:
@@ -517,7 +489,7 @@ class MLInference:
             logger.error(f"Ошибка загрузки модели {model_type}: {e}")
             return False
 
-    def predict_direction(
+    async def predict_direction(
         self,
         features: dict[str, float],
         model_type: str = "direction_classifier",
@@ -529,7 +501,7 @@ class MLInference:
         model_data = self._models.get(model_type)
         if model_data is None:
             # Попробовать загрузить из реестра
-            active = self.registry.get_active_model(model_type)
+            active = await self.registry.get_active_model(model_type)
             if active and active.get("model_path"):
                 if self.load_model(model_type, active["model_path"]):
                     model_data = self._models.get(model_type)
@@ -574,14 +546,14 @@ class MLInference:
             logger.error(f"Ошибка инференса модели {model_type}: {e}")
             return None
 
-    def predict_volatility(
+    async def predict_volatility(
         self,
         features: dict[str, float],
     ) -> Optional[float]:
         """Предсказать волатильность."""
         model_data = self._models.get("volatility_predictor")
         if model_data is None:
-            active = self.registry.get_active_model("volatility_predictor")
+            active = await self.registry.get_active_model("volatility_predictor")
             if active and active.get("model_path"):
                 if self.load_model("volatility_predictor", active["model_path"]):
                     model_data = self._models.get("volatility_predictor")
