@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 import lightgbm as lgb
 import numpy as np
+import optuna
 import pandas as pd
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.model_selection import train_test_split
@@ -20,6 +21,26 @@ from src.utils.logging import logger
 from src.utils.timeutils import utcnow
 
 logger = logging.getLogger(__name__)
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+DEFAULT_CLASSIFIER_PARAMS = {
+    "n_estimators": 200,
+    "max_depth": 5,
+    "learning_rate": 0.05,
+    "num_leaves": 31,
+    "feature_fraction": 0.8,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 5,
+    "min_child_samples": 20,
+    "reg_alpha": 0.1,
+    "reg_lambda": 0.1,
+}
+
+DEFAULT_REGRESSOR_PARAMS = {
+    "n_estimators": 100,
+    "max_depth": 4,
+    "learning_rate": 0.05,
+}
 
 MODELS_DIR = Path(__file__).parent.parent.parent / "data" / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -174,21 +195,17 @@ class ModelTrainer:
             X, y, test_size=0.2, random_state=42, stratify=y if len(y.unique()) > 1 else None
         )
 
+        # Подбор гиперпараметров (Optuna) при достаточном объёме данных
+        if len(X_train) >= settings.ml_optuna_min_samples:
+            best_params = self._tune_classifier_params(
+                X_train, y_train, X_val, y_val, settings.ml_optuna_trials
+            )
+            logger.info(f"Optuna: лучшие параметры direction classifier: {best_params}")
+        else:
+            best_params = dict(DEFAULT_CLASSIFIER_PARAMS)
+
         # Тренировка LightGBM
-        model = lgb.LGBMClassifier(
-            n_estimators=200,
-            max_depth=5,
-            learning_rate=0.05,
-            num_leaves=31,
-            feature_fraction=0.8,
-            bagging_fraction=0.8,
-            bagging_freq=5,
-            min_child_samples=20,
-            reg_alpha=0.1,
-            reg_lambda=0.1,
-            random_state=42,
-            verbose=-1,
-        )
+        model = lgb.LGBMClassifier(**best_params, random_state=42, verbose=-1)
 
         model.fit(
             X_train, y_train,
@@ -232,9 +249,7 @@ class ModelTrainer:
                     version=version,
                     model_path=str(model_path),
                     params={
-                        "n_estimators": 200,
-                        "max_depth": 5,
-                        "learning_rate": 0.05,
+                        **best_params,
                         "feature_cols": available_cols,
                     },
                     metrics={
@@ -298,13 +313,15 @@ class ModelTrainer:
 
         X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
 
-        model = lgb.LGBMRegressor(
-            n_estimators=100,
-            max_depth=4,
-            learning_rate=0.05,
-            random_state=42,
-            verbose=-1,
-        )
+        if len(X_train) >= settings.ml_optuna_min_samples:
+            best_params = self._tune_regressor_params(
+                X_train, y_train, X_val, y_val, settings.ml_optuna_trials
+            )
+            logger.info(f"Optuna: лучшие параметры volatility predictor: {best_params}")
+        else:
+            best_params = dict(DEFAULT_REGRESSOR_PARAMS)
+
+        model = lgb.LGBMRegressor(**best_params, random_state=42, verbose=-1)
 
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)])
 
@@ -330,6 +347,61 @@ class ModelTrainer:
             "metrics": {"mse": round(mse, 6), "mae": round(mae, 6)},
             "trained_at": utcnow().isoformat(),
         }
+
+    def _tune_classifier_params(self, X_train, y_train, X_val, y_val, n_trials: int) -> dict:
+        """Подобрать гиперпараметры LightGBM-классификатора через Optuna."""
+
+        def objective(trial: optuna.Trial) -> float:
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 100, 400),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                "num_leaves": trial.suggest_int("num_leaves", 15, 127),
+                "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
+                "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
+                "bagging_freq": trial.suggest_int("bagging_freq", 1, 10),
+                "min_child_samples": trial.suggest_int("min_child_samples", 5, 50),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
+            }
+            model = lgb.LGBMClassifier(**params, random_state=42, verbose=-1)
+            model.fit(
+                X_train, y_train,
+                eval_set=[(X_val, y_val)],
+                callbacks=[lgb.early_stopping(stopping_rounds=30, verbose=False)],
+            )
+            preds = model.predict(X_val)
+            return f1_score(y_val, preds, average="weighted", zero_division=0)
+
+        study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+        return study.best_params
+
+    def _tune_regressor_params(self, X_train, y_train, X_val, y_val, n_trials: int) -> dict:
+        """Подобрать гиперпараметры LightGBM-регрессора через Optuna."""
+
+        def objective(trial: optuna.Trial) -> float:
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "max_depth": trial.suggest_int("max_depth", 3, 8),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                "num_leaves": trial.suggest_int("num_leaves", 15, 100),
+                "min_child_samples": trial.suggest_int("min_child_samples", 5, 50),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
+            }
+            model = lgb.LGBMRegressor(**params, random_state=42, verbose=-1)
+            model.fit(
+                X_train, y_train,
+                eval_set=[(X_val, y_val)],
+                callbacks=[lgb.early_stopping(stopping_rounds=30, verbose=False)],
+            )
+            preds = model.predict(X_val)
+            return float(np.mean((y_val - preds) ** 2))
+
+        study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=42))
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+        return study.best_params
 
     async def _get_next_version(self, model_type: str) -> int:
         """Получить следующую версию модели."""

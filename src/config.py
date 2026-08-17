@@ -54,6 +54,8 @@ class Settings(BaseSettings):
     ml_retraining_interval_hours: int = 6
     ml_max_trades_for_retrain: int = 200
     ml_active_model_version: int = 1
+    ml_optuna_trials: int = 30
+    ml_optuna_min_samples: int = 150
 
     # === Риск ===
     risk_daily_loss_limit_usd: float = 500.0
