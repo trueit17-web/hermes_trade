@@ -8,9 +8,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Копирование исходного кода
 COPY src/ ./src/
-COPY data/ ./data/
 
-# Создание директорий
+# Создание директорий (data/ гитигнорится и монтируется как volume в docker-compose.yml)
 RUN mkdir -p /app/data/logs /app/data/models
 
 # Переменные окружения
