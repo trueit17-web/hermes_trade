@@ -172,7 +172,7 @@ docker-compose logs bot --tail=50
 ```bash
 sudo apt install nginx certbot python3-certbot-nginx
 
-# Конфигурация nginx (см. docker-compose.yml — секция nginx)
+# Конфигурация nginx (nginx.conf в корне репозитория — заменить your-domain.com на свой домен)
 sudo cp nginx.conf /etc/nginx/sites-available/cryptobot
 sudo ln -s /etc/nginx/sites-available/cryptobot /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
