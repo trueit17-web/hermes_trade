@@ -193,6 +193,144 @@
     transition: .2s; pointer-events: none;
   }
   .toast.show { opacity: 1; transform: translateY(0); }
+
+  .tabs { display: flex; gap: 4px; }
+  .tab-btn {
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--text-dim);
+    font-weight: 600;
+    padding: 7px 14px;
+  }
+  .tab-btn.active { background: var(--panel); border-color: var(--panel-border); color: var(--text); }
+  .header-actions { display: flex; align-items: center; gap: 14px; }
+  .btn-logout { background: transparent; border-color: var(--panel-border); color: var(--text-dim); padding: 7px 12px; }
+
+  .settings-layout {
+    display: grid;
+    grid-template-columns: 1fr 380px;
+    gap: 20px;
+    align-items: start;
+  }
+  @media (max-width: 900px) {
+    .settings-layout { grid-template-columns: 1fr; }
+  }
+  .settings-group {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 16px;
+  }
+  .settings-group h3 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--text-dim);
+    margin: 0 0 12px;
+  }
+  .settings-field {
+    display: grid;
+    grid-template-columns: 1fr 200px;
+    gap: 12px;
+    align-items: center;
+    padding: 7px 0;
+  }
+  .settings-field label { color: var(--text-dim); font-size: 13px; }
+  .settings-field input[type="text"],
+  .settings-field input[type="number"],
+  .settings-field input[type="password"],
+  .settings-field select {
+    font: inherit;
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--panel-border);
+    color: var(--text);
+    padding: 7px 10px;
+    border-radius: 8px;
+  }
+  .settings-save-bar {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 16px;
+  }
+
+  .side-panel {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    margin-bottom: 20px;
+    overflow: hidden;
+  }
+  .side-panel > h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--text-dim);
+    margin: 0;
+    padding: 14px 16px 10px;
+  }
+  .conn-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 8px 16px;
+    font-size: 13px;
+    border-top: 1px solid var(--panel-border);
+  }
+  .conn-row:first-of-type { border-top: none; }
+  .conn-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--text-dim);
+    flex-shrink: 0;
+    position: relative; top: -1px;
+  }
+  .conn-connected, .conn-configured { background: var(--green); }
+  .conn-paper_mode { background: var(--blue); }
+  .conn-not_configured, .conn-not_connected { background: var(--yellow); }
+  .conn-error { background: var(--red); }
+  .conn-name { font-weight: 600; }
+  .conn-detail { font-size: 12px; }
+
+  .log-filters {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 0 16px 12px;
+  }
+  .log-filters select,
+  .log-filters input {
+    font: inherit;
+    font-size: 12px;
+    background: var(--bg);
+    border: 1px solid var(--panel-border);
+    color: var(--text);
+    padding: 6px 8px;
+    border-radius: 6px;
+  }
+  .log-filters input { flex: 1; min-width: 100px; }
+  .logs-box {
+    max-height: 480px;
+    overflow-y: auto;
+    border-top: 1px solid var(--panel-border);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11.5px;
+  }
+  .log-line {
+    padding: 4px 16px;
+    display: flex;
+    gap: 8px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    border-bottom: 1px solid rgba(255,255,255,.03);
+  }
+  .log-time { color: var(--text-dim); flex-shrink: 0; }
+  .log-level { flex-shrink: 0; font-weight: 700; width: 52px; }
+  .log-logger { flex-shrink: 0; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .log-DEBUG .log-level { color: var(--text-dim); }
+  .log-INFO .log-level { color: var(--blue); }
+  .log-WARNING .log-level { color: var(--yellow); }
+  .log-ERROR .log-level, .log-CRITICAL .log-level { color: var(--red); }
 </style>
 </head>
 <body>
@@ -201,10 +339,19 @@
   <h1>⚙️ CryptoBot Pro
     <span class="badges" id="headerBadges"></span>
   </h1>
-  <div id="lastUpdated">—</div>
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="dashboard">Дашборд</button>
+    <button class="tab-btn" data-tab="settings">Настройки</button>
+  </nav>
+  <div class="header-actions">
+    <div id="lastUpdated">—</div>
+    <button id="btnLogout" class="btn-logout">Выйти</button>
+  </div>
 </header>
 
 <main>
+
+<div id="tabDashboard" class="tab-panel">
 
   <div class="stats" id="statCards"></div>
 
@@ -275,6 +422,44 @@
     </div>
   </section>
 
+</div>
+
+<div id="tabSettings" class="tab-panel" style="display:none">
+  <div class="settings-layout">
+
+    <div class="settings-col">
+      <div class="settings-save-bar">
+        <button id="btnSaveSettings" class="btn-primary">💾 Сохранить настройки</button>
+      </div>
+      <div id="settingsGroups"><div class="muted">Загрузка…</div></div>
+    </div>
+
+    <div class="settings-side">
+      <div class="side-panel">
+        <h2>Статусы подключений</h2>
+        <div id="connectionsBody"><div class="conn-row muted">Загрузка…</div></div>
+      </div>
+
+      <div class="side-panel">
+        <h2>Логи</h2>
+        <div class="log-filters">
+          <select id="logLevelFilter">
+            <option value="">Все уровни</option>
+            <option value="DEBUG">DEBUG+</option>
+            <option value="INFO" selected>INFO+</option>
+            <option value="WARNING">WARNING+</option>
+            <option value="ERROR">ERROR+</option>
+          </select>
+          <input type="text" id="logSearchFilter" placeholder="Поиск по тексту…">
+          <input type="text" id="logLoggerFilter" placeholder="Модуль, напр. src.execution">
+        </div>
+        <div class="logs-box" id="logsBox"><div class="muted" style="padding:12px 16px">Загрузка…</div></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
 </main>
 
 <div class="toast" id="toast"></div>
@@ -301,12 +486,22 @@ async function api(path, opts = {}) {
     headers: { "Content-Type": "application/json" },
     ...opts,
   });
+  if (res.status === 401) {
+    window.location.href = "/login";
+    throw new Error("Требуется вход");
+  }
   if (!res.ok) {
     let detail = res.statusText;
     try { detail = (await res.json()).detail || detail; } catch (e) {}
     throw new Error(detail);
   }
   return res.json();
+}
+
+function escapeHtml(s) {
+  const div = document.createElement("div");
+  div.textContent = s ?? "";
+  return div.innerHTML;
 }
 
 function renderHeader(status) {
@@ -532,6 +727,171 @@ document.getElementById("addChannelForm").addEventListener("submit", async (e) =
     showToast(`Ошибка: ${err.message}`, true);
   }
 });
+
+let currentTab = "dashboard";
+
+function switchTab(tab) {
+  currentTab = tab;
+  document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+  document.getElementById("tabDashboard").style.display = tab === "dashboard" ? "" : "none";
+  document.getElementById("tabSettings").style.display = tab === "settings" ? "" : "none";
+  if (tab === "settings") {
+    loadSettings();
+    loadConnections();
+    loadLogs();
+  }
+}
+
+document.querySelectorAll(".tab-btn").forEach(b => b.addEventListener("click", () => switchTab(b.dataset.tab)));
+
+document.getElementById("btnLogout").addEventListener("click", async () => {
+  try { await fetch("/auth/logout", { method: "POST" }); } catch (e) {}
+  window.location.href = "/login";
+});
+
+// === Настройки ===
+
+function renderSettingsField(f) {
+  const id = `set_${f.key}`;
+  let inputHtml;
+  if (f.type === "select") {
+    inputHtml = `<select id="${id}" data-key="${f.key}" data-type="${f.type}">
+      ${f.options.map(o => `<option value="${o}" ${o === f.value ? "selected" : ""}>${o}</option>`).join("")}
+    </select>`;
+  } else if (f.type === "bool") {
+    inputHtml = `<label class="toggle"><input type="checkbox" id="${id}" data-key="${f.key}" data-type="${f.type}" ${f.value ? "checked" : ""}><span class="slider"></span></label>`;
+  } else if (f.type === "secret") {
+    const placeholder = f.configured ? `сохранено (${f.value}) — оставьте пустым` : "не задано";
+    inputHtml = `<input type="password" id="${id}" data-key="${f.key}" data-type="${f.type}" placeholder="${placeholder}" autocomplete="off">`;
+  } else if (f.type === "int" || f.type === "float") {
+    inputHtml = `<input type="number" ${f.type === "float" ? 'step="any"' : 'step="1"'} id="${id}" data-key="${f.key}" data-type="${f.type}" value="${f.value ?? ""}">`;
+  } else {
+    inputHtml = `<input type="text" id="${id}" data-key="${f.key}" data-type="${f.type}" value="${escapeHtml(f.value ?? "")}">`;
+  }
+  return `<div class="settings-field"><label for="${id}">${f.label}</label>${inputHtml}</div>`;
+}
+
+async function loadSettings() {
+  const container = document.getElementById("settingsGroups");
+  try {
+    const data = await api("/settings");
+    const fields = data.settings || [];
+    const groups = [];
+    const byGroup = {};
+    fields.forEach(f => {
+      if (!byGroup[f.group]) { byGroup[f.group] = []; groups.push(f.group); }
+      byGroup[f.group].push(f);
+    });
+    container.innerHTML = groups.map(g => `
+      <div class="settings-group">
+        <h3>${g}</h3>
+        ${byGroup[g].map(renderSettingsField).join("")}
+      </div>
+    `).join("");
+  } catch (err) {
+    container.innerHTML = `<div class="muted">Ошибка загрузки: ${err.message}</div>`;
+  }
+}
+
+function collectSettingsValues() {
+  const values = {};
+  document.querySelectorAll("#settingsGroups [data-key]").forEach(el => {
+    const key = el.dataset.key;
+    values[key] = el.dataset.type === "bool" ? el.checked : el.value;
+  });
+  return values;
+}
+
+document.getElementById("btnSaveSettings").addEventListener("click", async () => {
+  const values = collectSettingsValues();
+  try {
+    const result = await api("/settings", { method: "POST", body: JSON.stringify({ values }) });
+    const errCount = Object.keys(result.errors || {}).length;
+    if (errCount) {
+      showToast(`Сохранено ${result.updated.length}, ошибок: ${Object.entries(result.errors).map(([k, v]) => `${k} — ${v}`).join("; ")}`, true);
+    } else {
+      showToast(`Настройки сохранены (${result.updated.length})`);
+    }
+    await loadSettings();
+  } catch (err) {
+    showToast(`Ошибка: ${err.message}`, true);
+  }
+});
+
+// === Статусы подключений ===
+
+const CONN_STATUS_LABELS = {
+  connected: "Подключено",
+  configured: "Настроено",
+  paper_mode: "Paper режим",
+  not_configured: "Не настроено",
+  not_connected: "Не подключено",
+  error: "Ошибка",
+};
+
+async function loadConnections() {
+  const body = document.getElementById("connectionsBody");
+  try {
+    const data = await api("/connections/status");
+    const items = data.connections || [];
+    body.innerHTML = items.map(c => `
+      <div class="conn-row">
+        <span class="conn-dot conn-${c.status}"></span>
+        <span class="conn-name">${c.name}</span>
+        <span class="conn-detail muted">${CONN_STATUS_LABELS[c.status] || c.status}${c.detail ? " — " + escapeHtml(c.detail) : ""}</span>
+      </div>
+    `).join("");
+  } catch (err) {
+    body.innerHTML = `<div class="conn-row muted">Ошибка загрузки: ${err.message}</div>`;
+  }
+}
+
+// === Логи ===
+
+let logsFilterTimer = null;
+
+async function loadLogs() {
+  const level = document.getElementById("logLevelFilter").value;
+  const search = document.getElementById("logSearchFilter").value.trim();
+  const loggerName = document.getElementById("logLoggerFilter").value.trim();
+  const params = new URLSearchParams({ limit: "300" });
+  if (level) params.set("level", level);
+  if (search) params.set("search", search);
+  if (loggerName) params.set("logger_name", loggerName);
+
+  const box = document.getElementById("logsBox");
+  try {
+    const data = await api(`/logs?${params.toString()}`);
+    const logs = data.logs || [];
+    const wasAtBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+    box.innerHTML = logs.length ? logs.map(l => `
+      <div class="log-line log-${l.level}">
+        <span class="log-time">${(l.timestamp || "").slice(11, 19)}</span>
+        <span class="log-level">${l.level}</span>
+        <span class="log-logger muted">${escapeHtml(l.logger)}</span>
+        <span class="log-msg">${escapeHtml(l.message)}</span>
+      </div>
+    `).join("") : `<div class="muted" style="padding:12px 16px">Нет записей по текущему фильтру</div>`;
+    if (wasAtBottom) box.scrollTop = box.scrollHeight;
+  } catch (err) {
+    box.innerHTML = `<div class="muted" style="padding:12px 16px">Ошибка загрузки: ${err.message}</div>`;
+  }
+}
+
+["logLevelFilter"].forEach(id => document.getElementById(id).addEventListener("change", loadLogs));
+["logSearchFilter", "logLoggerFilter"].forEach(id => {
+  document.getElementById(id).addEventListener("input", () => {
+    clearTimeout(logsFilterTimer);
+    logsFilterTimer = setTimeout(loadLogs, 400);
+  });
+});
+
+setInterval(() => {
+  if (currentTab === "settings") {
+    loadConnections();
+    loadLogs();
+  }
+}, REFRESH_MS);
 
 async function refreshAll() {
   try {

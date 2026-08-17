@@ -4,9 +4,9 @@ import logging
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -17,7 +17,7 @@ from src.risk.risk_manager import risk_manager
 from src.execution.executor import execution_engine
 from src.ml import model_registry, model_trainer
 from src.strategy import strategy_registry
-from src.utils.logging import logger
+from src.utils.logging import logger, get_recent_logs
 from src.utils.timeutils import utcnow
 from src.db.session import get_session
 from src.db.models import (
@@ -30,6 +30,9 @@ from src.db.models import (
     TelegramChannel,
     TelegramSignal,
 )
+from src.web import auth
+from src.web.settings_store import get_settings_snapshot, apply_settings_update
+from src.web.connections_status import get_connections_status
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +52,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Пути, доступные без авторизации (страница логина сама, health-check для
+# docker-compose, и сам эндпоинт логина).
+_PUBLIC_PATHS = {"/login", "/auth/login", "/health"}
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """Простая cookie-авторизация: закрывает всю панель, кроме /login и /health."""
+    path = request.url.path
+    if path in _PUBLIC_PATHS or path.startswith(("/docs", "/openapi", "/redoc")):
+        return await call_next(request)
+
+    token = request.cookies.get(auth.SESSION_COOKIE_NAME)
+    if not auth.verify_session(token):
+        if "text/html" in request.headers.get("accept", ""):
+            return RedirectResponse(url="/login")
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+    return await call_next(request)
+
 
 # === WebSocket менеджер для real-time обновлений ===
 
@@ -88,6 +112,11 @@ ws_manager = WebSocketManager()
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket эндпоинт для real-time обновлений."""
+    token = websocket.cookies.get(auth.SESSION_COOKIE_NAME)
+    if not auth.verify_session(token):
+        await websocket.close(code=4401)
+        return
+
     await ws_manager.connect(websocket)
     try:
         while True:
@@ -103,6 +132,17 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # === Pydantic схемы ===
+
+class LoginRequest(BaseModel):
+    """Запрос на вход в панель."""
+    username: str
+    password: str
+
+
+class SettingsUpdateRequest(BaseModel):
+    """Запрос на обновление настроек бота (вкладка «Настройки»)."""
+    values: dict[str, Any] = Field(default_factory=dict)
+
 
 class ConfigUpdateRequest(BaseModel):
     """Запрос на обновление конфигурации."""
@@ -168,12 +208,47 @@ async def root():
 
 
 DASHBOARD_HTML_PATH = Path(__file__).parent / "static" / "dashboard.html"
+LOGIN_HTML_PATH = Path(__file__).parent / "static" / "login.html"
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     """Веб-дашборд управления ботом (статус, позиции, сделки, стратегии, риск-контролы)."""
     return HTMLResponse(DASHBOARD_HTML_PATH.read_text(encoding="utf-8"))
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    """Страница входа в панель."""
+    return HTMLResponse(LOGIN_HTML_PATH.read_text(encoding="utf-8"))
+
+
+@app.post("/auth/login")
+async def login(payload: LoginRequest):
+    """Проверить логин/пароль и выдать cookie-сессию."""
+    if not auth.authenticate(payload.username, payload.password):
+        raise HTTPException(status_code=401, detail="Неверный логин или пароль")
+
+    token = auth.create_session()
+    response = JSONResponse(content={"success": True})
+    response.set_cookie(
+        key=auth.SESSION_COOKIE_NAME,
+        value=token,
+        max_age=auth.SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=settings.web_cookie_secure,
+    )
+    return response
+
+
+@app.post("/auth/logout")
+async def logout(request: Request):
+    """Завершить сессию."""
+    auth.revoke_session(request.cookies.get(auth.SESSION_COOKIE_NAME))
+    response = JSONResponse(content={"success": True})
+    response.delete_cookie(auth.SESSION_COOKIE_NAME)
+    return response
 
 
 @app.get("/health")
@@ -520,15 +595,48 @@ async def set_trading_mode(mode: str):
         raise HTTPException(status_code=400, detail="Режим должен быть paper или real")
 
     settings.trading_mode = mode
-    settings.is_paper = (mode == "paper")
+    # is_paper/is_real — вычисляемые @property от trading_mode, отдельно их
+    # выставлять не нужно (и нельзя — у них нет сеттера).
 
     logger.info(f"Режим торговли изменён на: {mode}")
 
     # Переинициализация execution engine
     if mode == "real" and execution_engine.is_paper:
         await execution_engine.initialize("binance")
+    elif mode == "paper":
+        execution_engine.is_paper = True
 
     return {"success": True, "mode": mode}
+
+
+@app.get("/settings")
+async def get_settings():
+    """Все редактируемые настройки бота (для вкладки «Настройки»), сгруппированные."""
+    return {"settings": get_settings_snapshot()}
+
+
+@app.post("/settings")
+async def update_settings(request: SettingsUpdateRequest):
+    """Обновить настройки бота — применяется немедленно и сохраняется на будущие перезапуски."""
+    result = await apply_settings_update(request.values)
+    return {"success": not result["errors"], **result}
+
+
+@app.get("/logs")
+async def get_logs(
+    level: Optional[str] = None,
+    search: Optional[str] = None,
+    logger_name: Optional[str] = None,
+    limit: int = 200,
+):
+    """Последние логи процесса (из ring-буфера в памяти) с фильтрами для веб-панели."""
+    return {"logs": get_recent_logs(level=level, search=search, logger_name=logger_name, limit=min(limit, 2000))}
+
+
+@app.get("/connections/status")
+async def connections_status():
+    """Статусы внешних подключений (БД, биржа, Telegram, CoinGlass)."""
+    return {"connections": await get_connections_status()}
 
 
 @app.get("/telegram/channels")

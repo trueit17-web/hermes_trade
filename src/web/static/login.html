@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CryptoBot Pro — Вход</title>
+<style>
+  :root {
+    --bg: #0f1420;
+    --panel: #161d2e;
+    --panel-border: #232c42;
+    --text: #e6e9f0;
+    --text-dim: #8a93a8;
+    --red: #ff5d6c;
+    --blue: #5b8cff;
+    --accent: #7c5cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+  }
+  .login-box {
+    width: 320px;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 12px;
+    padding: 28px 26px;
+  }
+  .login-box h1 {
+    font-size: 17px;
+    margin: 0 0 4px;
+    text-align: center;
+  }
+  .login-box .sub {
+    color: var(--text-dim);
+    font-size: 12px;
+    text-align: center;
+    margin-bottom: 22px;
+  }
+  label {
+    display: block;
+    font-size: 12px;
+    color: var(--text-dim);
+    margin: 12px 0 6px;
+  }
+  input {
+    width: 100%;
+    font: inherit;
+    background: var(--bg);
+    border: 1px solid var(--panel-border);
+    color: var(--text);
+    padding: 9px 11px;
+    border-radius: 8px;
+  }
+  input:focus { outline: 1px solid var(--accent); }
+  button {
+    width: 100%;
+    margin-top: 20px;
+    font: inherit;
+    cursor: pointer;
+    border: 1px solid var(--blue);
+    background: var(--blue);
+    color: #fff;
+    padding: 10px 16px;
+    border-radius: 8px;
+    font-weight: 600;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: .6; cursor: default; }
+  .error {
+    color: var(--red);
+    font-size: 12px;
+    margin-top: 12px;
+    text-align: center;
+    min-height: 16px;
+  }
+</style>
+</head>
+<body>
+
+<form class="login-box" id="loginForm">
+  <h1>⚙️ CryptoBot Pro</h1>
+  <div class="sub">Вход в панель управления</div>
+
+  <label for="username">Логин</label>
+  <input type="text" id="username" autocomplete="username" required autofocus>
+
+  <label for="password">Пароль</label>
+  <input type="password" id="password" autocomplete="current-password" required>
+
+  <button type="submit" id="submitBtn">Войти</button>
+  <div class="error" id="errorMsg"></div>
+</form>
+
+<script>
+document.getElementById("loginForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const btn = document.getElementById("submitBtn");
+  const errorMsg = document.getElementById("errorMsg");
+  errorMsg.textContent = "";
+  btn.disabled = true;
+  try {
+    const res = await fetch("/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: document.getElementById("username").value,
+        password: document.getElementById("password").value,
+      }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.detail || "Неверный логин или пароль");
+    }
+    window.location.href = "/dashboard";
+  } catch (err) {
+    errorMsg.textContent = err.message;
+    btn.disabled = false;
+  }
+});
+</script>
+
+</body>
+</html>

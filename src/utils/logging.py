@@ -2,6 +2,7 @@
 import json
 import logging
 import sys
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -13,6 +14,50 @@ from src.config import settings
 
 console = Console()
 logger = logging.getLogger(__name__)
+
+_LEVEL_ORDER = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+
+
+class RingBufferHandler(logging.Handler):
+    """Хранит последние N лог-записей в памяти для отображения в веб-панели."""
+
+    def __init__(self, capacity: int = 2000):
+        super().__init__()
+        self.records: deque = deque(maxlen=capacity)
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            self.records.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "level": record.levelname,
+                "logger": record.name,
+                "message": record.getMessage(),
+            })
+        except Exception:
+            pass
+
+
+ring_buffer_handler = RingBufferHandler()
+
+
+def get_recent_logs(
+    level: Optional[str] = None,
+    search: Optional[str] = None,
+    logger_name: Optional[str] = None,
+    limit: int = 200,
+) -> list[dict]:
+    """Отфильтровать записи из ring-буфера логов для веб-панели."""
+    min_level = _LEVEL_ORDER.get((level or "").upper())
+    result = []
+    for r in ring_buffer_handler.records:
+        if min_level is not None and _LEVEL_ORDER.get(r["level"], 0) < min_level:
+            continue
+        if logger_name and logger_name.lower() not in r["logger"].lower():
+            continue
+        if search and search.lower() not in r["message"].lower():
+            continue
+        result.append(r)
+    return result[-limit:]
 
 # Кастомная тема для Rich
 trading_theme = Theme({
@@ -110,6 +155,10 @@ def setup_logging(level: Optional[str] = None):
         logger.info(f"Логи пишутся в {log_file}")
     except Exception as e:
         logger.warning(f"Не удалось настроить файловое логирование: {e}")
+
+    # Ring-буфер в памяти — источник для /logs в веб-панели
+    ring_buffer_handler.setLevel(logging.DEBUG)
+    root_logger.addHandler(ring_buffer_handler)
 
     # Специальные логгеры для модулей
     for module_logger_name in ["src.data_ingest", "src.strategy", "src.risk",

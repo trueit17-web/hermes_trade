@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     # === Веб сервер ===
     web_host: str = "0.0.0.0"
     web_port: int = 8000
+    web_admin_username: str = "admin"
+    web_admin_password: str = "changeme"
+    web_cookie_secure: bool = False
 
     # === Пары и таймфреймы ===
     default_symbols: list[str] = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]

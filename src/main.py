@@ -26,6 +26,7 @@ from src.telegram.notifier import send_notification
 from src.utils.crypto import generate_encryption_key
 from src.utils.timeutils import utcnow
 from src.web.api import app as web_app
+from src.web.settings_store import load_settings_overrides
 
 
 class TradingBot:
@@ -52,6 +53,11 @@ class TradingBot:
         """Инициализация всех компонентов."""
         setup_logging()
         logger.info("🚀 Инициализация CryptoBot Pro...")
+
+        # Настройки, изменённые через веб-панель на предыдущем запуске
+        # (bot_config в БД) — применяются до всего, что от них зависит
+        # (ключи бирж, Telegram, CoinGlass).
+        await load_settings_overrides()
 
         # Схема БД управляется через Alembic (см. README) — её нужно
         # применить заранее командой `alembic upgrade head`, а не при
