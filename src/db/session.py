@@ -15,9 +15,20 @@ from src.db.models import Base
 
 logger = logging.getLogger(__name__)
 
+# Engine и session maker создаются один раз и переиспользуются: каждый
+# create_async_engine() открывает собственный пул соединений к БД, и без
+# кэширования он никогда не освобождается — на долгоживущем процессе это
+# постепенно исчерпывает max_connections у Postgres.
+_engine = None
+_session_maker = None
+
 
 def get_engine():
-    """Создать асинхронный engine для БД."""
+    """Получить (или создать один раз) асинхронный engine для БД."""
+    global _engine
+    if _engine is not None:
+        return _engine
+
     db_url = settings.database_url
     logger.info(f"Инициализация БД: {db_url}")
 
@@ -26,26 +37,31 @@ def get_engine():
     if "sqlite" in db_url:
         connect_args = {"check_same_thread": False}
 
-    engine = create_async_engine(
+    _engine = create_async_engine(
         db_url,
         echo=False,
         future=True,
         connect_args=connect_args,
     )
-    return engine
+    return _engine
 
 
 def get_session_maker(engine=None):
-    """Создать фабрику сессий."""
+    """Получить (или создать один раз) фабрику сессий."""
+    global _session_maker
+    if _session_maker is not None:
+        return _session_maker
+
     if engine is None:
         engine = get_engine()
-    return async_sessionmaker(
+    _session_maker = async_sessionmaker(
         engine,
         class_=AsyncSession,
         expire_on_commit=False,
         autocommit=False,
         autoflush=False,
     )
+    return _session_maker
 
 
 async def init_db(engine=None):
