@@ -40,7 +40,11 @@ class DecisionLogger:
     ):
         """Записать шаг решения."""
         if self._current_trade_id is None:
-            logger.warning(f"DecisionLogger: попытка log_step без текущей сделки (step_type={step_type})")
+            # start_trade() сейчас нигде не вызывается — вся эта цепочка шагов
+            # накапливается только в момент открытия реальной сделки, поэтому
+            # холостые вызовы (market_data/strategy_signal без исполнения) —
+            # ожидаемая, а не аварийная ситуация.
+            logger.debug(f"DecisionLogger: попытка log_step без текущей сделки (step_type={step_type})")
             return
 
         step_order = len(self._steps) + 1

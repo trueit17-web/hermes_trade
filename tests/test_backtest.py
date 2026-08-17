@@ -494,10 +494,11 @@ class TestDecisionLogger(unittest.TestCase):
         self.assertEqual(self.logger._steps[0]["step_type"], "execution")
 
     def test_no_trade_id_log(self):
-        """Лог без trade ID — предупреждение."""
+        """Лог без trade ID — шаг тихо пропускается (start_trade нигде не вызван по умолчанию)."""
         with patch("src.execution.decision_logger.logger") as mock_logger:
             self.logger.log_market_data("BTC/USDT", "1h", 50000.0, {})
-            mock_logger.warning.assert_called()
+            mock_logger.debug.assert_called()
+            self.assertEqual(len(self.logger._steps), 0)
 
 
 if __name__ == "__main__":
