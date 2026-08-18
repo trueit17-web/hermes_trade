@@ -432,6 +432,7 @@
     <button id="btnPauseResume" class="btn-warn">…</button>
     <button id="btnKillSwitch" class="btn-danger">🔴 Kill Switch</button>
     <button id="btnClearKill" class="btn-ghost">Сбросить Kill Switch</button>
+    <button id="btnResetPaper" class="btn-danger" title="Удалить всю paper-историю и начать с чистого баланса">🗑 Сбросить paper-аккаунт</button>
     <button id="btnRefresh" class="btn-primary">↻ Обновить</button>
   </div>
 
@@ -1299,6 +1300,26 @@ document.getElementById("btnClearKill").addEventListener("click", async () => {
     await refreshAll();
   } catch (err) {
     showToast(`Ошибка: ${err.message}`, true);
+  }
+});
+
+document.getElementById("btnResetPaper").addEventListener("click", async () => {
+  if (!confirm(
+    "Сбросить paper-аккаунт? Это НЕОБРАТИМО удалит всю историю paper-ордеров " +
+    "и сделок (win rate по каналам, decision log, графики производительности " +
+    "начнутся с нуля) и вернёт баланс к стартовому капиталу. Реальный (real) " +
+    "режим не затрагивается."
+  )) return;
+  const btn = document.getElementById("btnResetPaper");
+  btn.disabled = true;
+  try {
+    const result = await api("/paper/reset", { method: "POST" });
+    showToast(`Paper-аккаунт сброшен: удалено ордеров ${result.orders_deleted}, сделок ${result.trades_deleted}`);
+    await refreshAll();
+  } catch (err) {
+    showToast(`Ошибка: ${err.message}`, true);
+  } finally {
+    btn.disabled = false;
   }
 });
 

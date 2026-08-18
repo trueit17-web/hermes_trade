@@ -5,13 +5,13 @@ import uuid
 from typing import Any, Optional
 
 import ccxt.async_support as ccxt
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update, delete
 from sqlalchemy.orm import selectinload
 
 from src.config import settings
 from src.db.session import get_session
 from src.db.models import (
-    Order, Trade, Strategy, Symbol, Exchange,
+    Order, Trade, Strategy, Symbol, Exchange, TelegramSignal, TradeDecisionLog,
 )
 from src.risk.risk_manager import risk_manager
 from src.event_bus import (
@@ -246,6 +246,81 @@ class ExecutionEngine:
             )
         else:
             logger.info("Открытых реальных позиций в БД нет")
+
+    async def reset_paper_account(self) -> dict:
+        """
+        Полностью сбросить paper-аккаунт: удалить всю историю paper-ордеров
+        и сделок (только для paper-бирж — реальные данные не затрагиваются,
+        они хранятся под отдельным Exchange-рядом, см. _resolve_symbol_id)
+        и вернуть баланс к startup_capital_usdt. Нужно, когда накопленная
+        история — результат уже исправленных багов (див. dev-changelog) и
+        нет смысла держать её как базу для расчёта просадки/win rate.
+
+        Возвращает {"orders_deleted", "trades_deleted"}.
+        """
+        async with get_session() as session:
+            paper_exchange_ids = [
+                e.id for e in (
+                    await session.execute(select(Exchange).where(Exchange.is_paper == True))  # noqa: E712
+                ).scalars().all()
+            ]
+            if not paper_exchange_ids:
+                order_ids, trade_ids = [], []
+            else:
+                symbol_ids = [
+                    s.id for s in (
+                        await session.execute(
+                            select(Symbol).where(Symbol.exchange_id.in_(paper_exchange_ids))
+                        )
+                    ).scalars().all()
+                ]
+                order_ids = [
+                    o.id for o in (
+                        await session.execute(
+                            select(Order).where(Order.exchange_id.in_(paper_exchange_ids))
+                        )
+                    ).scalars().all()
+                ]
+                trade_ids = [
+                    t.id for t in (
+                        await session.execute(
+                            select(Trade).where(Trade.symbol_id.in_(symbol_ids))
+                        )
+                    ).scalars().all()
+                ] if symbol_ids else []
+
+                # Telegram-сигналы отвязываем, а не удаляем — сырое
+                # сообщение и решение бота остаются в истории канала,
+                # просто теряют ссылку на удалённые ордер/сделку.
+                if order_ids:
+                    await session.execute(
+                        update(TelegramSignal)
+                        .where(TelegramSignal.executed_order_id.in_(order_ids))
+                        .values(executed_order_id=None)
+                    )
+                if trade_ids:
+                    await session.execute(
+                        update(TelegramSignal)
+                        .where(TelegramSignal.executed_trade_id.in_(trade_ids))
+                        .values(executed_trade_id=None)
+                    )
+                    await session.execute(
+                        delete(TradeDecisionLog).where(TradeDecisionLog.trade_id.in_(trade_ids))
+                    )
+                    await session.execute(delete(Trade).where(Trade.id.in_(trade_ids)))
+                if order_ids:
+                    await session.execute(delete(Order).where(Order.id.in_(order_ids)))
+
+            await session.commit()
+
+        self.paper_positions = {}
+        self.paper_balance = settings.startup_capital_usdt
+
+        logger.warning(
+            f"🔄 Paper-аккаунт сброшен: удалено ордеров={len(order_ids)}, сделок={len(trade_ids)}, "
+            f"баланс возвращён к {self.paper_balance:.2f}"
+        )
+        return {"orders_deleted": len(order_ids), "trades_deleted": len(trade_ids)}
 
     async def close(self):
         """Закрыть соединение с биржей."""

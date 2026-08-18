@@ -956,5 +956,114 @@ class TestTelegramChannelDelete(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(remaining, [])
 
 
+class TestPaperAccountReset(unittest.IsolatedAsyncioTestCase):
+    """
+    Кнопка "Сбросить paper-аккаунт" (для случаев, когда накопленная paper-
+    история искажена уже исправленными багами): должна удалить только
+    paper-историю, не трогая real, и корректно отвязывать/каскадировать
+    связанные Telegram-сигналы и decision log.
+    """
+
+    async def test_reset_deletes_only_paper_history(self):
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import (
+            Order, Trade, Symbol, Exchange, TelegramChannel, TelegramSignal, TradeDecisionLog,
+        )
+        from src.execution.executor import ExecutionEngine
+        from src.risk.risk_manager import RiskManager
+        from src.utils.timeutils import utcnow
+
+        async with get_session() as session:
+            paper_ex = (
+                await session.execute(select(Exchange).where(Exchange.name == "binance_paper"))
+            ).scalar_one_or_none()
+            if paper_ex is None:
+                paper_ex = Exchange(name="binance_paper", is_paper=True)
+                session.add(paper_ex)
+            real_ex = (
+                await session.execute(select(Exchange).where(Exchange.name == "binance", Exchange.is_paper == False))
+            ).scalar_one_or_none()
+            if real_ex is None:
+                real_ex = Exchange(name="binance", is_paper=False)
+                session.add(real_ex)
+            await session.flush()
+
+            paper_sym = Symbol(exchange_id=paper_ex.id, symbol="RESETCOIN/USDT", base_asset="RESETCOIN", quote_asset="USDT")
+            real_sym = Symbol(exchange_id=real_ex.id, symbol="RESETCOIN/USDT", base_asset="RESETCOIN", quote_asset="USDT")
+            session.add_all([paper_sym, real_sym])
+            await session.flush()
+
+            paper_order = Order(exchange_id=paper_ex.id, symbol_id=paper_sym.id, side="buy", order_type="market",
+                                 amount=1.0, price=100.0, status="filled", filled_amount=1.0, filled_price=100.0, fee=1.0)
+            real_order = Order(exchange_id=real_ex.id, symbol_id=real_sym.id, side="buy", order_type="market",
+                                amount=1.0, price=100.0, status="filled", filled_amount=1.0, filled_price=100.0, fee=1.0)
+            session.add_all([paper_order, real_order])
+            await session.flush()
+
+            paper_trade = Trade(symbol_id=paper_sym.id, direction="long", entry_price=100, exit_price=90,
+                                 amount=1.0, pnl=-10.0, pnl_pct=-10.0, outcome="loss", is_open=False,
+                                 order_open_id=paper_order.id, closed_at=utcnow())
+            real_trade = Trade(symbol_id=real_sym.id, direction="long", entry_price=100, exit_price=110,
+                                amount=1.0, pnl=10.0, pnl_pct=10.0, outcome="win", is_open=False,
+                                order_open_id=real_order.id, closed_at=utcnow())
+            session.add_all([paper_trade, real_trade])
+            await session.flush()
+
+            session.add(TradeDecisionLog(trade_id=paper_trade.id, step_order=1, step_type="execution", description="x", details={}))
+            session.add(TradeDecisionLog(trade_id=real_trade.id, step_order=1, step_type="execution", description="y", details={}))
+
+            channel = TelegramChannel(channel_id="@reset_unittest", channel_title="X", active=True)
+            session.add(channel)
+            await session.flush()
+            session.add(TelegramSignal(
+                channel_id=channel.id, raw_message="m", message_date=utcnow(),
+                parsed_pair="RESETCOIN/USDT", parsed_side="long", parsed_entry=100.0,
+                decision="executed", executed_order_id=paper_order.id, executed_trade_id=paper_trade.id,
+            ))
+            await session.commit()
+            paper_trade_id, real_trade_id = paper_trade.id, real_trade.id
+            paper_order_id, real_order_id, channel_id = paper_order.id, real_order.id, channel.id
+
+        engine = ExecutionEngine()
+        engine.is_paper = True
+        engine.paper_balance = 100.0
+        engine.paper_positions = {"RESETCOIN/USDT": {"amount": 1.0, "entry_price": 100.0, "side": "long"}}
+        rm = RiskManager()
+        rm.state.total_drawdown_pct = 90.0
+        rm.state.paused = True
+
+        result = await engine.reset_paper_account()
+        rm.reset_for_new_paper_account()
+
+        self.assertEqual(engine.paper_positions, {})
+        self.assertEqual(engine.paper_balance, settings.startup_capital_usdt)
+        self.assertEqual(rm.state.total_drawdown_pct, 0.0)
+        self.assertFalse(rm.state.paused)
+
+        async with get_session() as session:
+            self.assertIsNone(
+                (await session.execute(select(Order).where(Order.id == paper_order_id))).scalar_one_or_none()
+            )
+            self.assertIsNone(
+                (await session.execute(select(Trade).where(Trade.id == paper_trade_id))).scalar_one_or_none()
+            )
+            self.assertIsNotNone(
+                (await session.execute(select(Order).where(Order.id == real_order_id))).scalar_one_or_none()
+            )
+            self.assertIsNotNone(
+                (await session.execute(select(Trade).where(Trade.id == real_trade_id))).scalar_one_or_none()
+            )
+            remaining_logs = (await session.execute(select(TradeDecisionLog))).scalars().all()
+            self.assertTrue(all(log.trade_id != paper_trade_id for log in remaining_logs))
+            self.assertTrue(any(log.trade_id == real_trade_id for log in remaining_logs))
+
+            sig = (
+                await session.execute(select(TelegramSignal).where(TelegramSignal.channel_id == channel_id))
+            ).scalar_one()
+            self.assertIsNone(sig.executed_order_id)
+            self.assertIsNone(sig.executed_trade_id)
+
+
 if __name__ == "__main__":
     unittest.main()

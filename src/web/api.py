@@ -323,6 +323,24 @@ async def get_status():
     }
 
 
+@app.post("/paper/reset")
+async def reset_paper_account():
+    """
+    Полностью сбросить paper-аккаунт: удалить всю paper-историю ордеров и
+    сделок, вернуть баланс к startup_capital_usdt, сбросить просадку/дневной
+    PnL и снять паузу (если её причиной была именно эта просадка).
+    Необратимо — реальные (real-режим) данные не затрагиваются.
+    """
+    if not settings.is_paper:
+        raise HTTPException(status_code=400, detail="Доступно только в paper-режиме")
+
+    result = await execution_engine.reset_paper_account()
+    risk_manager.reset_for_new_paper_account()
+
+    logger.warning(f"🔄 Paper-аккаунт сброшен через веб-панель: {result}")
+    return {"success": True, **result}
+
+
 @app.post("/positions/close")
 async def close_position_manually(request: PositionCloseRequest):
     """Закрыть открытую позицию вручную (кнопка в дашборде)."""

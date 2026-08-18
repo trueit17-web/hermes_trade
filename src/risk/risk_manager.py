@@ -247,6 +247,26 @@ class RiskManager:
         self.profile.update(params)
         self._sync_state_from_profile()
 
+    def reset_for_new_paper_account(self):
+        """
+        Сбросить риск-состояние вместе со сбросом paper-аккаунта
+        (execution_engine.reset_paper_account): базу для просадки и дневной
+        PnL — на стартовый капитал, снять паузу, если она была вызвана
+        именно старой просадкой (kill switch — отдельный, более серьёзный
+        стоп, сбрасывается только вручную через /risk/clear-kill-switch).
+        """
+        self.state.start_balance = settings.startup_capital_usdt
+        self.state.current_balance = settings.startup_capital_usdt
+        self.state.daily_pnl = 0.0
+        self.state.daily_loss_limit_reached = False
+        self.state.total_drawdown_pct = 0.0
+        self.state.max_drawdown_reached = 0.0
+        self.state.open_positions_count = 0
+        self.state.open_positions = {}
+        if not self.state.kill_switch_active:
+            self.state.paused = False
+        logger.warning(f"🔄 Риск-состояние сброшено вместе с paper-аккаунтом: старт={self.state.start_balance:.2f}")
+
     def get_state(self) -> dict:
         """Получить текущее состояние риска."""
         return {
