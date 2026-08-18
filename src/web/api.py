@@ -375,6 +375,17 @@ async def close_position_manually(request: PositionCloseRequest):
     risk_manager.on_position_closed(symbol)
     risk_manager.on_trade_closed(result["pnl"])
 
+    if result.get("trade_id"):
+        from src.execution.decision_logger import decision_logger
+        await decision_logger.flush_for_trade(
+            position.get("order_id"), result["trade_id"],
+            close_description=f"Позиция закрыта вручную | PnL {result['pnl']:+.2f} ({result['pnl_pct']:+.2f}%)",
+            close_details={
+                "reason": "manual", "pnl": result["pnl"],
+                "pnl_pct": result["pnl_pct"], "outcome": result.get("outcome"),
+            },
+        )
+
     # Если позиция была открыта по Telegram-сигналу — довязать исход сделки
     # к сигналу для статистики канала (обычно это делает основной цикл при
     # автозакрытии по SL/TP, здесь закрытие идёт в обход него).

@@ -546,7 +546,10 @@ class TradingBot:
                 strategy_data["ml_proba_down"] = ml_result.get("proba_down")
                 strategy_data["ml_proba_neutral"] = ml_result.get("proba_neutral")
 
-        # Decision logger: market data
+        # Decision logger: новая цепочка решений для этого символа/итерации —
+        # шаги ниже накапливаются в памяти и привязываются к ордеру только
+        # если по итогу будет реально открыта позиция (см. attach_to_order).
+        decision_logger.begin()
         decision_logger.log_market_data(
             symbol=symbol, timeframe="1h", price=close,
             features={k: round(v, 4) if isinstance(v, float) else v
@@ -648,6 +651,7 @@ class TradingBot:
                     order_id=order.client_order_id, order_type="market",
                     amount=amount, price=entry_price, status="filled", fee=order.fee,
                 )
+                decision_logger.attach_to_order(order.id)
                 self.open_positions[symbol] = {
                     "side": signal.side, "entry_price": entry_price,
                     "amount": amount, "strategy_id": signal.strategy_id,
@@ -773,6 +777,14 @@ class TradingBot:
         logger.info(
             f"{emoji} Позиция закрыта: {symbol} {side.upper()} | {reason_ru} @ {current_price:.4f} | "
             f"PnL: {result['pnl']:+.2f} ({result['pnl_pct']:+.2f}%)"
+        )
+        await decision_logger.flush_for_trade(
+            position.get("order_id"), result["trade_id"],
+            close_description=f"Позиция закрыта: {reason_ru} @ {current_price:.4f} | PnL {result['pnl']:+.2f} ({result['pnl_pct']:+.2f}%)",
+            close_details={
+                "reason": reason, "exit_price": current_price,
+                "pnl": result["pnl"], "pnl_pct": result["pnl_pct"], "outcome": result.get("outcome"),
+            },
         )
         await send_notification(
             f"{emoji} Закрыта {side.upper()} {symbol}\n"

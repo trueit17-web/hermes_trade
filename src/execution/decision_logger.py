@@ -3,7 +3,7 @@ import logging
 from typing import Any, Optional
 
 from src.db.session import get_session
-from src.db.models import TradeDecisionLog, Trade
+from src.db.models import TradeDecisionLog
 from src.utils.logging import logger
 from src.utils.timeutils import utcnow
 
@@ -21,16 +21,24 @@ class DecisionLogger:
     3. ml_score — ML предсказание (если использовалось)
     4. risk_check — результат проверки риск-менеджером
     5. execution — исполнение ордера
+    6. position_update — закрытие позиции (SL/TP/ручное)
+
+    TradeDecisionLog.trade_id — это FK на Trade, а Trade создаётся только
+    при ЗАКРЫТИИ позиции (открытие даёт только Order). Поэтому шаги нельзя
+    писать в БД сразу: они копятся в памяти по order_id открывающего ордера
+    (attach_to_order) и сбрасываются в БД только когда позиция закрывается
+    и появляется настоящий trade_id (flush_for_trade). Если ордер так и не
+    привёл к сделке (сигнал отклонён риском/качеством), накопленные шаги
+    просто отбрасываются — писать их некуда, Trade для них никогда не будет.
     """
 
     def __init__(self):
-        self._current_trade_id: Optional[int] = None
-        self._steps: list[dict] = []
+        self._active_steps: list[dict] = []
+        self._pending_by_order: dict[int, list[dict]] = {}
 
-    def start_trade(self, trade_id: int):
-        """Начать логирование для сделки."""
-        self._current_trade_id = trade_id
-        self._steps = []
+    def begin(self):
+        """Начать новую цепочку решений (перед обработкой одного символа/сигнала)."""
+        self._active_steps = []
 
     def log_step(
         self,
@@ -38,25 +46,16 @@ class DecisionLogger:
         description: str,
         details: Optional[dict] = None,
     ):
-        """Записать шаг решения."""
-        if self._current_trade_id is None:
-            # start_trade() сейчас нигде не вызывается — вся эта цепочка шагов
-            # накапливается только в момент открытия реальной сделки, поэтому
-            # холостые вызовы (market_data/strategy_signal без исполнения) —
-            # ожидаемая, а не аварийная ситуация.
-            logger.debug(f"DecisionLogger: попытка log_step без текущей сделки (step_type={step_type})")
-            return
-
-        step_order = len(self._steps) + 1
+        """Записать шаг в текущую (ещё не привязанную к ордеру) цепочку."""
+        step_order = len(self._active_steps) + 1
         step = {
-            "trade_id": self._current_trade_id,
             "step_order": step_order,
             "step_type": step_type,
             "description": description,
             "details": details or {},
             "timestamp": utcnow(),
         }
-        self._steps.append(step)
+        self._active_steps.append(step)
         logger.debug(f"DecisionLog [{step_order}] {step_type}: {description}")
 
     def log_market_data(self, symbol: str, timeframe: str, price: float, features: dict):
@@ -163,50 +162,57 @@ class DecisionLogger:
             },
         )
 
-    def log_position_update(
-        self,
-        position_id: int,
-        current_price: float,
-        unrealized_pnl: float,
-        unrealized_pnl_pct: float,
-    ):
-        """Лог обновления позиции."""
-        self.log_step(
-            "position_update",
-            f"Позиция #{position_id}: цена {current_price:.2f}, PnL {unrealized_pnl:+.2f} ({unrealized_pnl_pct:+.2f}%)",
-            {
-                "position_id": position_id,
-                "current_price": current_price,
-                "unrealized_pnl": unrealized_pnl,
-                "unrealized_pnl_pct": unrealized_pnl_pct,
-            },
-        )
+    def attach_to_order(self, order_id: Optional[int]):
+        """
+        Привязать накопленную с последнего begin() цепочку шагов к id
+        открывающего ордера — она будет ждать закрытия позиции, чтобы
+        попасть в БД вместе с настоящим trade_id (см. flush_for_trade).
+        """
+        if order_id is not None and self._active_steps:
+            self._pending_by_order[order_id] = self._active_steps
+        self._active_steps = []
 
-    def save_to_db(self) -> list[int]:
-        """Сохранить все шаги в БД. Возвращает список сохранённых ID."""
-        if self._current_trade_id is None or not self._steps:
+    async def flush_for_trade(
+        self,
+        order_id: Optional[int],
+        trade_id: int,
+        close_description: Optional[str] = None,
+        close_details: Optional[dict] = None,
+    ) -> list[int]:
+        """
+        Записать в БД цепочку шагов, накопленную при открытии ордера
+        order_id, привязав её к закрытой сделке trade_id, вместе с
+        завершающим шагом о закрытии позиции. Возвращает id сохранённых
+        записей (пустой список, если писать было нечего).
+        """
+        steps = list(self._pending_by_order.pop(order_id, [])) if order_id is not None else []
+
+        if close_description is not None:
+            steps.append({
+                "step_order": len(steps) + 1,
+                "step_type": "position_update",
+                "description": close_description,
+                "details": close_details or {},
+            })
+
+        if not steps:
             return []
 
         saved_ids = []
         try:
-            async def _save():
-                async with get_session() as session:
-                    for step in self._steps:
-                        log_entry = TradeDecisionLog(
-                            trade_id=self._current_trade_id,
-                            step_order=step["step_order"],
-                            step_type=step["step_type"],
-                            description=step["description"],
-                            details=step["details"],
-                        )
-                        session.add(log_entry)
-                        await session.flush()
-                        saved_ids.append(log_entry.id)
-                    await session.commit()
-
-            import asyncio
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(_save())
+            async with get_session() as session:
+                for step in steps:
+                    log_entry = TradeDecisionLog(
+                        trade_id=trade_id,
+                        step_order=step["step_order"],
+                        step_type=step["step_type"],
+                        description=step["description"],
+                        details=step["details"],
+                    )
+                    session.add(log_entry)
+                    await session.flush()
+                    saved_ids.append(log_entry.id)
+                await session.commit()
         except Exception as e:
             logger.error(f"Ошибка сохранения decision log в БД: {e}")
 

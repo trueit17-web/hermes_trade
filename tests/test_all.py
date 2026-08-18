@@ -779,48 +779,74 @@ class TestDecisionLogger(unittest.TestCase):
 
     def test_log_market_data(self):
         """Лог market data."""
-        self.logger.start_trade(123)
+        self.logger.begin()
         self.logger.log_market_data(
             symbol="BTC/USDT", timeframe="1h", price=50000.0,
             features={"rsi_14": 28.5, "ema_20": 49500.0},
         )
-        self.assertEqual(len(self.logger._steps), 1)
-        self.assertEqual(self.logger._steps[0]["step_type"], "market_data")
+        self.assertEqual(len(self.logger._active_steps), 1)
+        self.assertEqual(self.logger._active_steps[0]["step_type"], "market_data")
 
     def test_log_strategy_signal(self):
         """Лог сигнала."""
-        self.logger.start_trade(123)
+        self.logger.begin()
         self.logger.log_strategy_signal(
             strategy_id="rsi_mr", strategy_name="RSI Mean Reversion",
             signal_side="long", confidence=0.85, entry_price=50000.0,
             stop_loss=49000.0, take_profit=51000.0, rationale="RSI oversold",
         )
-        self.assertEqual(len(self.logger._steps), 1)
-        self.assertEqual(self.logger._steps[0]["step_type"], "strategy_signal")
+        self.assertEqual(len(self.logger._active_steps), 1)
+        self.assertEqual(self.logger._active_steps[0]["step_type"], "strategy_signal")
 
     def test_log_ml_score(self):
         """Лог ML score."""
-        self.logger.start_trade(123)
+        self.logger.begin()
         self.logger.log_ml_score(
             model_type="direction_classifier", model_version=1,
             proba_up=0.75, proba_down=0.15, proba_neutral=0.10,
         )
-        self.assertEqual(len(self.logger._steps), 1)
-        self.assertEqual(self.logger._steps[0]["step_type"], "ml_score")
+        self.assertEqual(len(self.logger._active_steps), 1)
+        self.assertEqual(self.logger._active_steps[0]["step_type"], "ml_score")
 
     def test_log_risk_check(self):
         """Лог risk check."""
-        self.logger.start_trade(123)
+        self.logger.begin()
         self.logger.log_risk_check("allowed", "All checks passed", {})
-        self.assertEqual(len(self.logger._steps), 1)
-        self.assertEqual(self.logger._steps[0]["step_type"], "risk_check")
+        self.assertEqual(len(self.logger._active_steps), 1)
+        self.assertEqual(self.logger._active_steps[0]["step_type"], "risk_check")
 
     def test_log_execution(self):
         """Лог исполнения."""
-        self.logger.start_trade(123)
+        self.logger.begin()
         self.logger.log_execution("ORD-123", "market", 0.01, 50000.0, "filled", 5.0)
-        self.assertEqual(len(self.logger._steps), 1)
-        self.assertEqual(self.logger._steps[0]["step_type"], "execution")
+        self.assertEqual(len(self.logger._active_steps), 1)
+        self.assertEqual(self.logger._active_steps[0]["step_type"], "execution")
+
+    def test_attach_and_flush_roundtrip(self):
+        """attach_to_order копит шаги до закрытия сделки, flush_for_trade пишет их в БД под trade_id."""
+        self.logger.begin()
+        self.logger.log_market_data(symbol="BTC/USDT", timeframe="1h", price=50000.0, features={})
+        self.logger.log_execution("ORD-1", "market", 0.01, 50000.0, "filled", 5.0)
+        self.logger.attach_to_order(999)
+
+        self.assertEqual(self.logger._active_steps, [])
+        self.assertIn(999, self.logger._pending_by_order)
+        self.assertEqual(len(self.logger._pending_by_order[999]), 2)
+
+        saved_ids = asyncio.run(
+            self.logger.flush_for_trade(999, trade_id=1, close_description="closed")
+        )
+        self.assertEqual(len(saved_ids), 3)
+        self.assertNotIn(999, self.logger._pending_by_order)
+
+    def test_rejected_signal_without_order_is_discarded(self):
+        """Если сигнал не привёл к ордеру, накопленные шаги должны просто пропадать при следующем begin()."""
+        self.logger.begin()
+        self.logger.log_market_data(symbol="ETH/USDT", timeframe="1h", price=3000.0, features={})
+        self.logger.log_risk_check("rejected", "max positions", {})
+        self.logger.begin()
+        self.assertEqual(self.logger._active_steps, [])
+        self.assertEqual(self.logger._pending_by_order, {})
 
 
 if __name__ == "__main__":
