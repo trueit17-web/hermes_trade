@@ -215,12 +215,21 @@
   @media (max-width: 900px) {
     .settings-layout { grid-template-columns: 1fr; }
   }
+  #settingsGroups {
+    column-count: 2;
+    column-gap: 16px;
+  }
+  @media (max-width: 700px) {
+    #settingsGroups { column-count: 1; }
+  }
   .settings-group {
     background: var(--panel);
     border: 1px solid var(--panel-border);
     border-radius: 10px;
     padding: 14px 16px;
     margin-bottom: 16px;
+    break-inside: avoid;
+    -webkit-column-break-inside: avoid;
   }
   .settings-group h3 {
     font-size: 13px;
@@ -231,8 +240,8 @@
   }
   .settings-field {
     display: grid;
-    grid-template-columns: 1fr 200px;
-    gap: 12px;
+    grid-template-columns: 1fr minmax(110px, 150px);
+    gap: 10px;
     align-items: center;
     padding: 7px 0;
   }
@@ -414,10 +423,13 @@
       </label>
       <button type="submit" class="btn-primary">+ Добавить канал</button>
     </form>
+    <div class="muted" style="padding:0 16px 12px;font-size:12px">
+      Добавление/удаление канала применяется к прослушиванию сообщений только после перезапуска бота.
+    </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Канал</th><th>ID</th><th>Порог</th><th>Автоисполнение</th><th>Сигналов</th><th>Активен</th><th></th></tr></thead>
-        <tbody id="telegramBody"><tr class="empty-row"><td colspan="7">Загрузка…</td></tr></tbody>
+        <thead><tr><th>Канал</th><th>ID</th><th>Порог</th><th>Автоисполнение</th><th>Сигналов</th><th>Исполнено</th><th>Win rate</th><th>PnL</th><th>Активен</th><th></th></tr></thead>
+        <tbody id="telegramBody"><tr class="empty-row"><td colspan="10">Загрузка…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -664,23 +676,37 @@ async function renderMlModels() {
 async function renderTelegram() {
   const body = document.getElementById("telegramBody");
   try {
-    const data = await api("/telegram/channels");
-    const channels = data.channels || [];
+    const [channelsData, statsData] = await Promise.all([
+      api("/telegram/channels"),
+      api("/telegram/channels/stats"),
+    ]);
+    const channels = channelsData.channels || [];
+    const statsById = Object.fromEntries((statsData.channels || []).map(s => [s.channel_id, s]));
+
     if (!channels.length) {
-      body.innerHTML = `<tr class="empty-row"><td colspan="7">Каналы не настроены</td></tr>`;
+      body.innerHTML = `<tr class="empty-row"><td colspan="10">Каналы не настроены</td></tr>`;
       return;
     }
-    body.innerHTML = channels.map(c => `
+    body.innerHTML = channels.map(c => {
+      const s = statsById[c.id] || {};
+      const winRate = s.win_rate === null || s.win_rate === undefined ? "—" : `${fmt(s.win_rate, 1)}%`;
+      const pnlClass = s.total_pnl > 0 ? "pnl-pos" : (s.total_pnl < 0 ? "pnl-neg" : "");
+      const pnl = s.total_pnl === null || s.total_pnl === undefined ? "—" : `${s.total_pnl >= 0 ? "+" : ""}${fmt(s.total_pnl)}`;
+      return `
       <tr>
         <td>${c.channel_title || "—"}</td>
         <td class="muted">${c.channel_id}</td>
         <td>${fmt(c.quality_threshold, 2)}</td>
         <td>${c.auto_execute ? "✅" : "—"}</td>
-        <td>${c.signals_count}</td>
+        <td>${s.total_signals ?? c.signals_count}</td>
+        <td>${s.executed ?? 0}</td>
+        <td>${winRate}</td>
+        <td class="${pnlClass}">${pnl}</td>
         <td>${c.active ? "✅" : "—"}</td>
         <td><button class="btn-icon-danger" data-delete-channel="${c.id}" title="Удалить">✕</button></td>
       </tr>
-    `).join("");
+    `;
+    }).join("");
 
     body.querySelectorAll("[data-delete-channel]").forEach(btn => {
       btn.addEventListener("click", async () => {
@@ -696,7 +722,7 @@ async function renderTelegram() {
       });
     });
   } catch (err) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="7">Ошибка загрузки: ${err.message}</td></tr>`;
+    body.innerHTML = `<tr class="empty-row"><td colspan="10">Ошибка загрузки: ${err.message}</td></tr>`;
   }
 }
 

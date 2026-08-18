@@ -409,7 +409,7 @@ class ExecutionEngine:
         )
         await event_bus.publish(trade_event)
 
-        return {"pnl": pnl, "pnl_pct": pnl_pct, "outcome": outcome}
+        return {"pnl": pnl, "pnl_pct": pnl_pct, "outcome": outcome, "trade_id": trade_id}
 
     async def _execute_real_order(self, order_data: dict) -> Optional[Order]:
         """Реальный ордер через биржу."""

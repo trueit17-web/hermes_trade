@@ -243,6 +243,10 @@ class TelegramSignal(Base):
     decision: Mapped[str] = mapped_column(
         String(30), default="pending"
     )  # executed, rejected, pending
+    # order, открытый по этому сигналу (проставляется сразу при исполнении);
+    # executed_trade_id проставляется позже, когда позиция закрывается и
+    # известен итоговый исход (нужен для расчёта win rate по каналу).
+    executed_order_id: Mapped[Optional[int]] = mapped_column(ForeignKey("orders.id"))
     executed_trade_id: Mapped[Optional[int]] = mapped_column(ForeignKey("trades.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 

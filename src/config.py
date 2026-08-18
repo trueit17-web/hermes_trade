@@ -78,8 +78,14 @@ class Settings(BaseSettings):
     web_admin_password: str = "changeme"
     web_cookie_secure: bool = False
 
-    # === Пары и таймфреймы ===
-    default_symbols: list[str] = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    # === Торговая вселенная ===
+    # Вместо фиксированного списка пар — торгуются все активные spot-пары
+    # с котировкой symbol_quote_currency, кроме symbol_blacklist (топ
+    # symbol_universe_max по 24ч объёму; см. MarketDataIngest.get_tradable_symbols).
+    symbol_quote_currency: str = "USDT"
+    symbol_blacklist: list[str] = []
+    symbol_universe_max: int = 30
+    symbol_universe_refresh_hours: int = 12
     default_timeframes: list[str] = ["1h", "4h"]
     candlesticks_cache_size: int = 500
 

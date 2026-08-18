@@ -9,6 +9,7 @@ import pandas as pd
 import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from sqlalchemy import select
 
 from src.config import settings
 from src.utils.logging import setup_logging, logger
@@ -21,10 +22,14 @@ from src.risk.risk_manager import risk_manager
 from src.execution.executor import execution_engine
 from src.execution.decision_logger import decision_logger
 from src.ml import model_trainer, model_registry, ml_inference, feature_store
-from src.telegram.channel_monitor import init_telegram, close_telegram, subscribe_telegram_signal
+from src.telegram.channel_monitor import (
+    init_telegram, close_telegram, subscribe_telegram_signal, monitor_channels,
+)
 from src.telegram.notifier import send_notification
 from src.utils.crypto import generate_encryption_key
 from src.utils.timeutils import utcnow
+from src.db.session import get_session
+from src.db.models import TelegramChannel, TelegramSignal
 from src.web.api import app as web_app
 from src.web.settings_store import load_settings_overrides
 
@@ -48,6 +53,8 @@ class TradingBot:
         self.daily_pnl_reset_date = None
         self._kill_switch_notified = False
         self._last_ml_feature_ts: dict[str, Any] = {}
+        self.active_symbols: list[str] = []
+        self._telegram_channel_db_ids: dict[str, int] = {}
 
     async def initialize(self):
         """Инициализация всех компонентов."""
@@ -74,13 +81,10 @@ class TradingBot:
         self.ingest = MarketDataIngest("binance")
         await self.ingest.initialize()
 
-        # Загрузка исторических данных
-        for symbol in settings.default_symbols:
-            df = await self.ingest.fetch_ohlcv(symbol, "1h", limit=200)
-            if df is not None:
-                self.ingest.update_buffer(symbol, df)
-                self.candles_buffer[symbol] = df
-                logger.info(f"📊 Загружено 200 свечей для {symbol}")
+        # Торговая вселенная: все активные spot-пары к symbol_quote_currency
+        # (минус symbol_blacklist и плечевые токены), топ symbol_universe_max
+        # по 24ч объёму — вместо фиксированного списка пар.
+        await self._refresh_symbol_universe(initial=True)
 
         # ML inference
         self.ml_inference = ml_inference
@@ -100,6 +104,7 @@ class TradingBot:
             telegram_client = await init_telegram()
             if telegram_client:
                 subscribe_telegram_signal(self._on_telegram_signal)
+                await self._start_telegram_monitoring()
                 logger.info("✅ Telegram клиент инициализирован")
             else:
                 logger.warning(
@@ -119,6 +124,11 @@ class TradingBot:
             IntervalTrigger(hours=settings.ml_retraining_interval_hours),
             id="ml_retrainer",
         )
+        self.scheduler.add_job(
+            self._refresh_symbol_universe,
+            IntervalTrigger(hours=settings.symbol_universe_refresh_hours),
+            id="symbol_universe_refresh",
+        )
         self.scheduler.start()
         logger.info(f"✅ Планировщик запущен")
 
@@ -129,8 +139,51 @@ class TradingBot:
         logger.info("✅ Инициализация завершена")
         await send_notification(
             f"🚀 CryptoBot Pro запущен | режим: {settings.trading_mode} | "
-            f"символы: {', '.join(settings.default_symbols)}"
+            f"пар в торговой вселенной: {len(self.active_symbols)}"
         )
+
+    async def _refresh_symbol_universe(self, initial: bool = False):
+        """Пересчитать торговую вселенную (все активные пары symbol_quote_currency
+        минус symbol_blacklist, топ symbol_universe_max по объёму) и подгрузить
+        историю для новых пар. Открытые позиции никогда не выпадают из мониторинга,
+        даже если пара выпала из топа по объёму или попала в блэклист."""
+        try:
+            new_symbols = await self.ingest.get_tradable_symbols(
+                quote=settings.symbol_quote_currency,
+                blacklist=settings.symbol_blacklist,
+                max_symbols=settings.symbol_universe_max,
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось получить список торговых пар: {e}")
+            new_symbols = []
+
+        if not new_symbols:
+            if not self.active_symbols:
+                logger.warning("Торговая вселенная пуста — аварийный фоллбэк: BTC/USDT")
+                new_symbols = ["BTC/USDT"]
+            else:
+                logger.warning("Не удалось обновить торговую вселенную — оставляем прежний список")
+                return
+
+        kept_for_open_positions = [s for s in self.open_positions if s not in new_symbols]
+        combined = list(dict.fromkeys(new_symbols + kept_for_open_positions))
+
+        added = [s for s in combined if s not in self.candles_buffer]
+        removed = [s for s in self.active_symbols if s not in combined]
+
+        for symbol in added:
+            df = await self.ingest.fetch_ohlcv(symbol, "1h", limit=200)
+            if df is not None:
+                self.ingest.update_buffer(symbol, df)
+                self.candles_buffer[symbol] = df
+                logger.info(f"📊 Загружено 200 свечей для {symbol}")
+
+        self.active_symbols = combined
+
+        if initial:
+            logger.info(f"📈 Торговая вселенная: {len(combined)} пар — {', '.join(combined)}")
+        elif added or removed:
+            logger.info(f"🔄 Торговая вселенная обновлена: +{len(added)} -{len(removed)} (всего {len(combined)})")
 
     async def _on_trade_event(self, event):
         """Отправить Telegram-уведомление об открытой сделке."""
@@ -179,6 +232,34 @@ class TradingBot:
         except Exception as e:
             logger.error(f"ML retraining: {e}")
 
+    async def _start_telegram_monitoring(self):
+        """Загрузить активные каналы из БД и запустить их мониторинг.
+
+        Список фиксируется на момент старта бота: добавление/удаление
+        канала через дашборд начинает применяться только после рестарта
+        (см. пометку "требуется рестарт" в веб-панели).
+        """
+        async with get_session() as session:
+            channels = (
+                await session.execute(select(TelegramChannel).where(TelegramChannel.active == True))
+            ).scalars().all()
+            channel_dicts = [
+                {
+                    "channel_id": c.channel_id,
+                    "channel_title": c.channel_title or "",
+                    "parser_config": c.parser_config or {},
+                }
+                for c in channels
+            ]
+            self._telegram_channel_db_ids = {c.channel_id: c.id for c in channels}
+
+        if not channel_dicts:
+            logger.info("Telegram: нет активных каналов для мониторинга")
+            return
+
+        await monitor_channels(channel_dicts)
+        logger.info(f"👂 Мониторинг Telegram-каналов запущен: {len(channel_dicts)}")
+
     async def _on_telegram_signal(self, signal_event: dict):
         """Обработка Telegram сигнала."""
         channel_id = signal_event.get("channel_id", "")
@@ -195,18 +276,48 @@ class TradingBot:
         quality = signal_quality_scorer.score_signal(signal_event, channel_id)
         logger.info(f"📲 Telegram сигнал: {pair} {side.upper()} | quality={quality:.2f}")
 
+        decision = "pending"
+        order = None
         if quality < settings.telegram_signals_quality_threshold:
+            decision = "rejected"
             logger.info(f"🚫 Сигнал отклонён (quality={quality:.2f})")
-            return
-
-        if settings.telegram_signals_auto_execute:
+        elif settings.telegram_signals_auto_execute:
             logger.info(f"🤖 Автоматическое исполнение")
-            await self._execute_telegram_signal(signal_event)
+            order = await self._execute_telegram_signal(signal_event)
+            decision = "executed" if order else "rejected"
         else:
             logger.info(f"⏳ Сигнал ожидает подтверждения")
 
+        await self._save_telegram_signal(signal_event, quality, decision, order)
+
+    async def _save_telegram_signal(
+        self, signal_event: dict, quality: float, decision: str, order,
+    ):
+        """Сохранить сигнал в БД (для статистики по каналам)."""
+        db_channel_id = self._telegram_channel_db_ids.get(signal_event.get("channel_id", ""))
+        if db_channel_id is None:
+            return
+        try:
+            async with get_session() as session:
+                session.add(TelegramSignal(
+                    channel_id=db_channel_id,
+                    raw_message=signal_event.get("raw_message", ""),
+                    message_date=signal_event.get("message_date") or utcnow(),
+                    parsed_pair=signal_event.get("parsed_pair"),
+                    parsed_side=signal_event.get("parsed_side"),
+                    parsed_entry=signal_event.get("parsed_entry"),
+                    parsed_sl=signal_event.get("parsed_sl"),
+                    parsed_tp=signal_event.get("parsed_tp"),
+                    quality_score=quality,
+                    decision=decision,
+                    executed_order_id=order.id if order else None,
+                ))
+                await session.commit()
+        except Exception as e:
+            logger.warning(f"Не удалось сохранить Telegram-сигнал в БД: {e}")
+
     async def _execute_telegram_signal(self, signal_event: dict):
-        """Исполнение Telegram сигнала."""
+        """Исполнение Telegram сигнала. Возвращает созданный Order или None."""
         pair = signal_event.get("parsed_pair", "")
         side = signal_event.get("parsed_side", "long")
         entry = signal_event.get("parsed_entry", 0)
@@ -230,9 +341,24 @@ class TradingBot:
             order_type="market",
             stop_loss=sl,
             take_profit=tp,
+            strategy_id="telegram_signal",
         )
         if order:
             logger.info(f"✅ Ордер исполнен: {order.client_order_id}")
+            # Регистрируем позицию так же, как для стратегийных сигналов —
+            # иначе _check_position_exit никогда её не увидит, SL/TP не
+            # сработают и позиция не закроется (а значит, executed_trade_id
+            # у сигнала никогда не проставится).
+            self.open_positions[symbol] = {
+                "side": side, "entry_price": entry,
+                "amount": amount, "strategy_id": "telegram_signal",
+                "rationale": "Telegram сигнал", "sl": sl, "tp": tp,
+                "opened_at": utcnow(),
+                "order_id": order.id, "entry_fee": order.fee,
+            }
+            risk_manager.on_position_added(symbol, 5.0)
+            self.daily_pnl = getattr(risk_manager.state, "daily_pnl", 0.0)
+        return order
 
     async def run(self):
         """Основной цикл торговли."""
@@ -272,7 +398,7 @@ class TradingBot:
             self.daily_pnl = 0.0
             self.daily_pnl_reset_date = today
 
-        for symbol in settings.default_symbols:
+        for symbol in self.active_symbols:
             await self._process_symbol(symbol)
 
     async def _process_symbol(self, symbol: str):
@@ -555,6 +681,9 @@ class TradingBot:
         risk_manager.on_trade_closed(result["pnl"])
         self.daily_pnl = getattr(risk_manager.state, "daily_pnl", 0.0)
 
+        if position.get("strategy_id") == "telegram_signal" and result.get("trade_id"):
+            await self._link_telegram_signal_trade(position.get("order_id"), result["trade_id"])
+
         emoji = "✅" if result["pnl"] > 0 else "❌"
         reason_ru = "Stop Loss" if reason == "stop_loss" else "Take Profit"
         logger.info(
@@ -567,6 +696,22 @@ class TradingBot:
             f"PnL: {result['pnl']:+.2f} USDT ({result['pnl_pct']:+.2f}%)"
         )
         return True
+
+    async def _link_telegram_signal_trade(self, order_id: Optional[int], trade_id: int):
+        """Проставить executed_trade_id у Telegram-сигнала, чей ордер только что закрылся."""
+        if order_id is None:
+            return
+        try:
+            async with get_session() as session:
+                result = await session.execute(
+                    select(TelegramSignal).where(TelegramSignal.executed_order_id == order_id)
+                )
+                signal = result.scalar_one_or_none()
+                if signal:
+                    signal.executed_trade_id = trade_id
+                    await session.commit()
+        except Exception as e:
+            logger.warning(f"Не удалось связать Telegram-сигнал со сделкой #{trade_id}: {e}")
 
     async def _cleanup(self):
         """Очистка."""

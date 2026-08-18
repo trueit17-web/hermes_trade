@@ -23,9 +23,13 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "trading_mode", "label": "Режим торговли", "group": "Общие", "type": "select", "options": ["paper", "real"]},
     {"key": "startup_capital_usdt", "label": "Стартовый капитал (USDT)", "group": "Общие", "type": "float"},
     {"key": "log_level", "label": "Уровень логирования", "group": "Общие", "type": "select", "options": ["DEBUG", "INFO", "WARNING", "ERROR"]},
-    {"key": "default_symbols", "label": "Торговые пары (через запятую)", "group": "Общие", "type": "list"},
     {"key": "default_timeframes", "label": "Таймфреймы (через запятую)", "group": "Общие", "type": "list"},
     {"key": "candlesticks_cache_size", "label": "Размер кэша свечей", "group": "Общие", "type": "int"},
+
+    {"key": "symbol_quote_currency", "label": "Quote-валюта (напр. USDT)", "group": "Торговая вселенная", "type": "str"},
+    {"key": "symbol_blacklist", "label": "Блэклист пар (через запятую)", "group": "Торговая вселенная", "type": "list"},
+    {"key": "symbol_universe_max", "label": "Макс. пар в работе (топ по объёму)", "group": "Торговая вселенная", "type": "int"},
+    {"key": "symbol_universe_refresh_hours", "label": "Обновление вселенной (ч)", "group": "Торговая вселенная", "type": "int"},
 
     {"key": "risk_daily_loss_limit_usd", "label": "Дневной лимит убытка (USD)", "group": "Риск", "type": "float"},
     {"key": "risk_max_open_positions", "label": "Макс. открытых позиций", "group": "Риск", "type": "int"},

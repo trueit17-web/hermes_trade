@@ -97,6 +97,47 @@ class MarketDataIngest:
             logger.error(f"[{self.exchange_id}] Ошибка загрузки {symbol} {timeframe}: {e}")
             return None
 
+    # Плечевые токены (3x/5x, автоматически "сгорающие" от ежедневного
+    # ребалансинга) — исключаются из динамической торговой вселенной всегда,
+    # независимо от symbol_blacklist: они формально являются spot-парами на
+    # Binance, но по своей природе не подходят для стратегий этого бота.
+    _LEVERAGED_TOKEN_MARKERS = ("UP/", "DOWN/", "BULL/", "BEAR/")
+
+    async def get_tradable_symbols(
+        self,
+        quote: str = "USDT",
+        blacklist: Optional[list[str]] = None,
+        max_symbols: int = 30,
+    ) -> list[str]:
+        """
+        Активные spot-пары биржи с заданной quote-валютой, минус блэклист и
+        плечевые токены, отсортированные по 24ч объёму (топ max_symbols).
+        """
+        if not self.exchange or not self.exchange.markets:
+            logger.warning(f"[{self.exchange_id}] Рынки не загружены — вернуть список пар невозможно")
+            return []
+
+        blacklist_set = set(blacklist or [])
+        candidates = [
+            symbol for symbol, market in self.exchange.markets.items()
+            if market.get("spot")
+            and market.get("active")
+            and market.get("quote") == quote
+            and symbol not in blacklist_set
+            and not any(marker in symbol for marker in self._LEVERAGED_TOKEN_MARKERS)
+        ]
+
+        if not candidates:
+            return []
+
+        try:
+            tickers = await self.exchange.fetch_tickers(candidates)
+            candidates.sort(key=lambda s: (tickers.get(s) or {}).get("quoteVolume") or 0, reverse=True)
+        except Exception as e:
+            logger.warning(f"[{self.exchange_id}] Не удалось получить объёмы для сортировки пар: {e}")
+
+        return candidates[:max_symbols]
+
     async def fetch_ohlcv_batch(
         self,
         symbols: list[str],

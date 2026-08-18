@@ -715,6 +715,40 @@ async def delete_telegram_channel(channel_id: int):
         return {"success": True}
 
 
+@app.get("/telegram/channels/stats")
+async def telegram_channels_stats():
+    """Статистика по каждому Telegram-каналу: сигналы, исполнение, win rate, PnL."""
+    async with get_session() as session:
+        channels = (await session.execute(select(TelegramChannel))).scalars().all()
+
+        result = []
+        for c in channels:
+            signals = (
+                await session.execute(
+                    select(TelegramSignal)
+                    .options(selectinload(TelegramSignal.executed_trade))
+                    .where(TelegramSignal.channel_id == c.id)
+                )
+            ).scalars().all()
+
+            executed = [s for s in signals if s.decision == "executed"]
+            closed_trades = [s.executed_trade for s in executed if s.executed_trade is not None]
+            wins = sum(1 for t in closed_trades if t.outcome == "win")
+            scored = [s.quality_score for s in signals if s.quality_score is not None]
+
+            result.append({
+                "channel_id": c.id,
+                "total_signals": len(signals),
+                "executed": len(executed),
+                "closed_trades": len(closed_trades),
+                "win_rate": round(wins / len(closed_trades) * 100, 1) if closed_trades else None,
+                "total_pnl": round(sum(float(t.pnl) for t in closed_trades), 2) if closed_trades else None,
+                "avg_quality": round(sum(scored) / len(scored), 2) if scored else None,
+            })
+
+        return {"channels": result}
+
+
 @app.get("/telegram/signals")
 async def list_telegram_signals(limit: int = 100):
     """Список Telegram сигналов."""
