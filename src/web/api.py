@@ -360,12 +360,18 @@ async def close_position_manually(request: PositionCloseRequest):
         async with get_session() as session:
             sig = (
                 await session.execute(
-                    select(TelegramSignal).where(TelegramSignal.executed_order_id == order_id)
+                    select(TelegramSignal)
+                    .options(selectinload(TelegramSignal.channel))
+                    .where(TelegramSignal.executed_order_id == order_id)
                 )
             ).scalar_one_or_none()
             if sig:
                 sig.executed_trade_id = result["trade_id"]
+                channel_id = sig.channel.channel_id if sig.channel else None
                 await session.commit()
+                if channel_id:
+                    from src.telegram.quality_scorer import signal_quality_scorer
+                    signal_quality_scorer.update_channel_stats(channel_id, result.get("outcome") == "win")
 
     emoji = "✅" if result["pnl"] > 0 else "❌"
     logger.info(f"Позиция {symbol} закрыта вручную через веб-панель | PnL: {result['pnl']:+.2f}")

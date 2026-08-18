@@ -10,6 +10,7 @@ import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from src.config import settings
 from src.utils.logging import setup_logging, logger
@@ -317,9 +318,20 @@ class TradingBot:
             decision = "rejected"
             logger.info(f"🚫 Сигнал отклонён (quality={quality:.2f})")
         elif settings.telegram_signals_auto_execute:
-            logger.info(f"🤖 Автоматическое исполнение")
-            order = await self._execute_telegram_signal(signal_event)
-            decision = "executed" if order else "rejected"
+            if pair in self.open_positions:
+                # В отличие от стратегийного пути (risk_manager.check_signal
+                # блокирует повторный вход по уже открытому символу),
+                # Telegram-исполнение шло напрямую в execution_engine и
+                # могло столкнуться с уже открытой позицией — доливка long
+                # пересчитывала бы entry_price неверно, а sell-сигнал против
+                # существующего long тихо превращался бы в его закрытие
+                # вместо открытия short. Проще и безопаснее отклонить.
+                decision = "rejected"
+                logger.info(f"🚫 Сигнал по {pair} отклонён: уже есть открытая позиция")
+            else:
+                logger.info(f"🤖 Автоматическое исполнение")
+                order = await self._execute_telegram_signal(signal_event)
+                decision = "executed" if order else "rejected"
         else:
             logger.info(f"⏳ Сигнал ожидает подтверждения")
 
@@ -736,7 +748,9 @@ class TradingBot:
         self.daily_pnl = getattr(risk_manager.state, "daily_pnl", 0.0)
 
         if position.get("strategy_id") == "telegram_signal" and result.get("trade_id"):
-            await self._link_telegram_signal_trade(position.get("order_id"), result["trade_id"])
+            await self._link_telegram_signal_trade(
+                position.get("order_id"), result["trade_id"], result.get("outcome"),
+            )
 
         emoji = "✅" if result["pnl"] > 0 else "❌"
         reason_ru = "Stop Loss" if reason == "stop_loss" else "Take Profit"
@@ -751,19 +765,33 @@ class TradingBot:
         )
         return True
 
-    async def _link_telegram_signal_trade(self, order_id: Optional[int], trade_id: int):
-        """Проставить executed_trade_id у Telegram-сигнала, чей ордер только что закрылся."""
+    async def _link_telegram_signal_trade(
+        self, order_id: Optional[int], trade_id: int, outcome: Optional[str] = None,
+    ):
+        """
+        Проставить executed_trade_id у Telegram-сигнала, чей ордер только что
+        закрылся, и обновить статистику канала для quality_scorer — без этого
+        historical-accuracy компонент оценки качества (35% веса) навсегда
+        оставался бы нейтральным 0.5, ни разу не узнав реальный win rate канала.
+        """
         if order_id is None:
             return
         try:
             async with get_session() as session:
                 result = await session.execute(
-                    select(TelegramSignal).where(TelegramSignal.executed_order_id == order_id)
+                    select(TelegramSignal)
+                    .options(selectinload(TelegramSignal.channel))
+                    .where(TelegramSignal.executed_order_id == order_id)
                 )
                 signal = result.scalar_one_or_none()
                 if signal:
                     signal.executed_trade_id = trade_id
+                    channel_id = signal.channel.channel_id if signal.channel else None
                     await session.commit()
+
+            if channel_id and outcome is not None:
+                from src.telegram.quality_scorer import signal_quality_scorer
+                signal_quality_scorer.update_channel_stats(channel_id, outcome == "win")
         except Exception as e:
             logger.warning(f"Не удалось связать Telegram-сигнал со сделкой #{trade_id}: {e}")
 

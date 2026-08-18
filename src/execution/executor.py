@@ -319,24 +319,30 @@ class ExecutionEngine:
 
         # Обновление paper баланса и позиций
         position_value = amount * price
+        is_opening_order = False
         if side == "buy":
             self.paper_balance -= position_value + fee
             if symbol not in self.paper_positions:
                 self.paper_positions[symbol] = {"amount": 0, "entry_price": 0, "side": "long"}
-            self.paper_positions[symbol]["amount"] += amount
-            self.paper_positions[symbol]["entry_price"] = (
-                (self.paper_positions[symbol]["entry_price"] * self.paper_positions[symbol]["amount"] + price * amount)
-                / (self.paper_positions[symbol]["amount"])
-            )
-            self.paper_positions[symbol]["side"] = "long"
+            pos = self.paper_positions[symbol]
+            # Средневзвешенная цена входа считается по СТАРОМУ количеству —
+            # раньше формула брала уже обновлённое (amount+=amount) значение
+            # как вес старой цены, задваивая её вклад при любой доливке
+            # позиции (напр. 1@100 + 1@200 давало entry_price=200 вместо
+            # верных 150).
+            new_amount = pos["amount"] + amount
+            pos["entry_price"] = (pos["entry_price"] * pos["amount"] + price * amount) / new_amount
+            pos["amount"] = new_amount
+            pos["side"] = "long"
             # Источник сигнала, SL/TP — для отображения и ручного закрытия
             # в дашборде; при доливке позиции другим ордером отражают
             # последний ордер, не историю целиком.
-            self.paper_positions[symbol]["strategy_id"] = order_data.get("strategy_id")
-            self.paper_positions[symbol]["stop_loss"] = order_data.get("stop_loss")
-            self.paper_positions[symbol]["take_profit"] = order_data.get("take_profit")
+            pos["strategy_id"] = order_data.get("strategy_id")
+            pos["stop_loss"] = order_data.get("stop_loss")
+            pos["take_profit"] = order_data.get("take_profit")
+            is_opening_order = True
         else:
-            if symbol in self.paper_positions:
+            if symbol in self.paper_positions and self.paper_positions[symbol].get("side") == "long":
                 pos = self.paper_positions[symbol]
                 if pos["amount"] >= amount:
                     self.paper_balance += position_value - fee
@@ -347,6 +353,30 @@ class ExecutionEngine:
                 else:
                     logger.warning(f"Paper: недостаточно позиции {symbol} для закрытия")
                     return None
+            elif symbol not in self.paper_positions:
+                # Открытие SHORT-позиции. Раньше этот путь не делал вообще
+                # ничего (ни self.paper_positions, ни self.paper_balance не
+                # менялись), но код ниже всё равно логировал "ордер
+                # исполнен", создавал Order со статусом filled и публиковал
+                # TradeEvent — то есть КАЖДЫЙ short-сигнал от любой стратегии
+                # тихо становился фантомным ордером без реальной позиции.
+                # Как и close_paper_position() для шортов, маржа при
+                # открытии не резервируется — баланс корректируется только
+                # на реализованный PnL в момент закрытия (это уже
+                # заложенное упрощение модели, не новое поведение).
+                self.paper_positions[symbol] = {
+                    "amount": amount, "entry_price": price, "side": "short",
+                    "strategy_id": order_data.get("strategy_id"),
+                    "stop_loss": order_data.get("stop_loss"),
+                    "take_profit": order_data.get("take_profit"),
+                }
+                is_opening_order = True
+            else:
+                logger.warning(
+                    f"Paper: уже есть {self.paper_positions[symbol].get('side')}-позиция {symbol}, "
+                    f"доливка/переворот сейчас не поддерживается"
+                )
+                return None
 
         logger.info(f"📄 Paper ордер исполнен: {side.upper()} {amount:.4f} {symbol} @ {price:.2f}")
 
@@ -376,28 +406,38 @@ class ExecutionEngine:
             order_id = order.id
             await session.commit()
 
-        if side == "buy" and symbol in self.paper_positions:
-            self.paper_positions[symbol]["order_id"] = order_id
-            self.paper_positions[symbol]["entry_fee"] = fee
-            self.paper_positions[symbol].setdefault("opened_at", utcnow())
+        # order_id/entry_fee/opened_at нужны только для ордеров, которые
+        # ОТКРЫВАЮТ позицию (buy-long или sell-short), не для тех, что её
+        # уменьшают/закрывают.
+        if is_opening_order and symbol in self.paper_positions:
+            pos = self.paper_positions[symbol]
+            pos["order_id"] = order_id
+            pos["entry_fee"] = fee
+            pos.setdefault("opened_at", utcnow())
 
-        # Создание TradeEvent
-        trade_event = TradeEvent(
-            type="trade_event",
-            trade_id=order_id,
-            symbol=symbol,
-            direction="long" if side == "buy" else "short",
-            entry_price=price,
-            exit_price=price,
-            amount=amount,
-            pnl=0,
-            pnl_pct=0,
-            holding_seconds=0,
-            outcome="pending",
-            is_opening=True,
-            timestamp=utcnow_timestamp(),
-        )
-        await event_bus.publish(trade_event)
+        # Создание TradeEvent — только для ордеров, которые реально
+        # открывают позицию; частичное/полное закрытие long через plain
+        # sell (доливка телеграм-сигналом против существующей позиции)
+        # раньше тоже публиковало is_opening=True с direction="short",
+        # что выглядело как открытие короткой позиции в уведомлениях,
+        # хотя на деле длинная позиция просто уменьшалась.
+        if is_opening_order:
+            trade_event = TradeEvent(
+                type="trade_event",
+                trade_id=order_id,
+                symbol=symbol,
+                direction="long" if side == "buy" else "short",
+                entry_price=price,
+                exit_price=price,
+                amount=amount,
+                pnl=0,
+                pnl_pct=0,
+                holding_seconds=0,
+                outcome="pending",
+                is_opening=True,
+                timestamp=utcnow_timestamp(),
+            )
+            await event_bus.publish(trade_event)
 
         return order
 
