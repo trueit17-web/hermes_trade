@@ -440,8 +440,8 @@
     <h2>Открытые позиции</h2>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Символ</th><th>Сторона</th><th>Кол-во</th><th>Цена входа</th><th>Текущая цена</th><th>Stop Loss</th><th>Take Profit</th><th>PnL</th><th>Источник</th><th></th></tr></thead>
-        <tbody id="positionsBody"><tr class="empty-row"><td colspan="10">Загрузка…</td></tr></tbody>
+        <thead><tr><th>Символ</th><th>Сторона</th><th>Кол-во</th><th>Цена входа</th><th>Текущая цена</th><th>Stop Loss</th><th>Take Profit</th><th>Сумма сделки</th><th>PnL</th><th>Источник</th><th></th></tr></thead>
+        <tbody id="positionsBody"><tr class="empty-row"><td colspan="11">Загрузка…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -460,8 +460,8 @@
     <h2>Последние сделки</h2>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Символ</th><th>Сторона</th><th>Вход</th><th>Выход</th><th>PnL</th><th>Итог</th><th>Источник</th><th>Закрыта</th></tr></thead>
-        <tbody id="tradesBody"><tr class="empty-row"><td colspan="8">Загрузка…</td></tr></tbody>
+        <thead><tr><th>Символ</th><th>Сторона</th><th>Вход</th><th>Выход</th><th>Сумма сделки</th><th>PnL</th><th>Итог</th><th>Источник</th><th>В сделке</th><th>Закрыта</th></tr></thead>
+        <tbody id="tradesBody"><tr class="empty-row"><td colspan="10">Загрузка…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -560,6 +560,26 @@ function fmt(n, digits = 2) {
   return Number(n).toLocaleString("ru-RU", { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 
+// Полная точность без округления — для цен (entry/current/SL/TP), где
+// fmt(n, 2) превращал бы, например, 0.00000821 (типичная цена альт-пары)
+// в бесполезные "0.00".
+function fmtPrice(n) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  return Number(n).toLocaleString("ru-RU", { minimumFractionDigits: 0, maximumFractionDigits: 12 });
+}
+
+function fmtDuration(seconds) {
+  if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return "—";
+  const s = Math.max(0, Math.floor(seconds));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}д ${h}ч`;
+  if (h > 0) return `${h}ч ${m}м`;
+  if (m > 0) return `${m}м`;
+  return `${s}с`;
+}
+
 function showToast(msg, isError = false) {
   const t = document.getElementById("toast");
   t.textContent = msg;
@@ -645,7 +665,7 @@ function renderPositions(status) {
   const positions = status.paper_positions || {};
   const rows = Object.entries(positions);
   if (!rows.length) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="10">Нет открытых позиций</td></tr>`;
+    body.innerHTML = `<tr class="empty-row"><td colspan="11">Нет открытых позиций</td></tr>`;
     return;
   }
   body.innerHTML = rows.map(([symbol, pos]) => {
@@ -656,15 +676,17 @@ function renderPositions(status) {
       const pnlPct = dir * (cur - pos.entry_price) / pos.entry_price * 100;
       pnlHtml = `<span class="${pnlPct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${pnlPct >= 0 ? "+" : ""}${fmt(pnlPct, 2)}%</span>`;
     }
+    const tradeValue = pos.entry_price ? pos.amount * pos.entry_price : null;
     return `
     <tr>
       <td>${symbol}</td>
       <td class="side-${pos.side === 'long' ? 'long' : 'short'}">${(pos.side || '').toUpperCase()}</td>
       <td>${fmt(pos.amount, 6)}</td>
-      <td>${fmt(pos.entry_price)}</td>
-      <td>${cur !== null && cur !== undefined ? fmt(cur) : "—"}</td>
-      <td class="muted">${pos.stop_loss ? fmt(pos.stop_loss) : "—"}</td>
-      <td class="muted">${pos.take_profit ? fmt(pos.take_profit) : "—"}</td>
+      <td>${fmtPrice(pos.entry_price)}</td>
+      <td>${cur !== null && cur !== undefined ? fmtPrice(cur) : "—"}</td>
+      <td class="muted">${pos.stop_loss ? fmtPrice(pos.stop_loss) : "—"}</td>
+      <td class="muted">${pos.take_profit ? fmtPrice(pos.take_profit) : "—"}</td>
+      <td>${tradeValue !== null ? "$" + fmt(tradeValue) : "—"}</td>
       <td>${pnlHtml}</td>
       <td class="muted">${pos.source || "—"}</td>
       <td><button class="btn-icon-danger" data-close-position="${symbol}" title="Закрыть по рынку">✕</button></td>
@@ -739,24 +761,29 @@ async function renderTrades() {
     const data = await api("/trades?limit=20");
     const trades = data.trades || [];
     if (!trades.length) {
-      body.innerHTML = `<tr class="empty-row"><td colspan="8">Сделок пока нет</td></tr>`;
+      body.innerHTML = `<tr class="empty-row"><td colspan="10">Сделок пока нет</td></tr>`;
       return;
     }
-    body.innerHTML = trades.map(t => `
+    body.innerHTML = trades.map(t => {
+      const tradeValue = t.amount && t.entry_price ? t.amount * t.entry_price : null;
+      return `
       <tr>
         <td>${t.symbol || ("#" + t.symbol_id)}</td>
         <td class="side-${t.direction === 'long' ? 'long' : 'short'}">${(t.direction || '').toUpperCase()}</td>
-        <td>${fmt(t.entry_price)}</td>
-        <td>${t.exit_price !== null ? fmt(t.exit_price) : "—"}</td>
+        <td>${fmtPrice(t.entry_price)}</td>
+        <td>${t.exit_price !== null ? fmtPrice(t.exit_price) : "—"}</td>
+        <td>${tradeValue !== null ? "$" + fmt(tradeValue) : "—"}</td>
         <td class="${t.pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${t.pnl >= 0 ? "+" : ""}${fmt(t.pnl)} (${fmt(t.pnl_pct, 2)}%)</td>
         <td>${t.outcome || (t.is_open ? "открыта" : "—")}</td>
         <td class="muted">${t.source || "—"}</td>
+        <td class="muted">${fmtDuration(t.holding_seconds)}</td>
         <td class="muted">${t.closed_at ? new Date(t.closed_at + "Z").toLocaleString("ru-RU") : "—"}</td>
       </tr>
-    `).join("");
+    `;
+    }).join("");
     return trades;
   } catch (err) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="7">Ошибка загрузки: ${err.message}</td></tr>`;
+    body.innerHTML = `<tr class="empty-row"><td colspan="10">Ошибка загрузки: ${err.message}</td></tr>`;
     return [];
   }
 }
@@ -891,7 +918,7 @@ function renderChannelSignalsTable(signals) {
         <tbody>
           ${signals.map(s => {
             const order = s.order
-              ? `${s.order.side.toUpperCase()} ${fmt(s.order.amount, 6)} @ ${fmt(s.order.filled_price ?? s.order.price)} <span class="muted">(${s.order.status})</span>`
+              ? `${s.order.side.toUpperCase()} ${fmt(s.order.amount, 6)} @ ${fmtPrice(s.order.filled_price ?? s.order.price)} <span class="muted">(${s.order.status})</span>`
               : "—";
             let outcome = "—";
             if (s.trade) {
@@ -907,9 +934,9 @@ function renderChannelSignalsTable(signals) {
               <td class="muted">${s.created_at ? new Date(s.created_at + "Z").toLocaleString("ru-RU") : "—"}</td>
               <td>${s.parsed_pair || "—"}</td>
               <td class="side-${s.parsed_side === 'long' ? 'long' : 'short'}">${(s.parsed_side || "—").toUpperCase()}</td>
-              <td>${s.parsed_entry !== null ? fmt(s.parsed_entry) : "—"}</td>
-              <td>${s.parsed_sl !== null ? fmt(s.parsed_sl) : "—"}</td>
-              <td>${s.parsed_tp !== null ? fmt(s.parsed_tp) : "—"}</td>
+              <td>${s.parsed_entry !== null ? fmtPrice(s.parsed_entry) : "—"}</td>
+              <td>${s.parsed_sl !== null ? fmtPrice(s.parsed_sl) : "—"}</td>
+              <td>${s.parsed_tp !== null ? fmtPrice(s.parsed_tp) : "—"}</td>
               <td>${s.quality_score !== null ? fmt(s.quality_score, 2) : "—"}</td>
               <td>${signalDecisionBadge(s.decision)}</td>
               <td>${order}</td>

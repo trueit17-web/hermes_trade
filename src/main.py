@@ -88,6 +88,18 @@ class TradingBot:
         self.ingest = MarketDataIngest("binance")
         await self.ingest.initialize()
 
+        # Execution engine — до расчёта торговой вселенной: _refresh_symbol_universe
+        # держит в работе символы уже открытых позиций (kept_for_open_positions),
+        # читая self.open_positions — если вызвать её раньше восстановления
+        # позиций из БД, self.open_positions ещё пуст, и позиция на паре вне
+        # топ-N по объёму (например, открытая по Telegram-сигналу на альте)
+        # осталась бы без обновления цены до следующего планового
+        # обновления вселенной (по умолчанию раз в 12 часов).
+        await execution_engine.initialize("binance")
+        logger.info(f"✅ Execution Engine: {'paper' if settings.is_paper else 'real'} режим")
+        self._sync_open_positions_from_execution_engine()
+        await risk_manager.restore_daily_pnl_from_db()
+
         # Торговая вселенная: все активные spot-пары к symbol_quote_currency
         # (минус symbol_blacklist и плечевые токены), топ symbol_universe_max
         # по 24ч объёму — вместо фиксированного списка пар.
@@ -101,12 +113,6 @@ class TradingBot:
             logger.info(f"✅ ML модель загружена: {active_model['model_type']} v{active_model['version']}")
         else:
             logger.warning("⚠️ ML модель не найдена — используются только rule-based стратегии")
-
-        # Execution engine
-        await execution_engine.initialize("binance")
-        logger.info(f"✅ Execution Engine: {'paper' if settings.is_paper else 'real'} режим")
-        self._sync_open_positions_from_execution_engine()
-        await risk_manager.restore_daily_pnl_from_db()
 
         # Telegram (опционально)
         if settings.telegram_api_id and settings.telegram_api_hash:
@@ -503,6 +509,15 @@ class TradingBot:
             }
             risk_manager.on_position_added(symbol, 5.0)
             self.daily_pnl = getattr(risk_manager.state, "daily_pnl", 0.0)
+
+            # Telegram-сигналы приходят по любой паре, а не только по тем,
+            # что уже в топ-N по объёму (active_symbols) — без этого цена
+            # по такой позиции не обновлялась бы до следующего планового
+            # обновления вселенной (по умолчанию раз в 12 часов): SL/TP не
+            # проверялись бы, а на дашборде "текущая цена" висела бы пустой.
+            if symbol not in self.active_symbols:
+                self.active_symbols.append(symbol)
+                await self._refresh_symbol_candles(symbol)
         return order
 
     async def run(self):
@@ -588,15 +603,36 @@ class TradingBot:
         for symbol in self.active_symbols:
             await self._process_symbol(symbol)
 
-    async def _process_symbol(self, symbol: str):
-        """Обработка одной пары."""
+    async def _refresh_symbol_candles(self, symbol: str) -> Optional[pd.DataFrame]:
+        """
+        Обновить буфер свечей для пары и вернуть его.
+
+        Раньше буфер запрашивался у биржи только пока в нём < 50 свечей —
+        once len(df) >= 50 (почти сразу после старта), пара больше никогда
+        не перезапрашивалась за всё время жизни процесса: close/индикаторы/
+        цена для SL-TP и дашборда застревали на значении с момента старта
+        бота (или последнего добавления пары в торговую вселенную), пока
+        бот не перезапускали. Теперь при уже заполненном буфере подтягиваем
+        только последние свечи (а не весь 200-свечной снимок) — этого
+        достаточно, чтобы close оставался живым каждую итерацию, а текущая
+        ещё не закрытая часовая свеча обновлялась вместе с ценой.
+        """
         df = self.candles_buffer.get(symbol)
         if df is None or df.empty or len(df) < 50:
-            df = await self.ingest.fetch_ohlcv(symbol, "1h", limit=50)
+            df = await self.ingest.fetch_ohlcv(symbol, "1h", limit=200)
             if df is not None:
                 self.ingest.update_buffer(symbol, df)
-                self.candles_buffer[symbol] = df
+                df = self.candles_buffer[symbol]
+        else:
+            fresh = await self.ingest.fetch_ohlcv(symbol, "1h", limit=3)
+            if fresh is not None:
+                self.ingest.update_buffer(symbol, fresh)
+                df = self.candles_buffer[symbol]
+        return df
 
+    async def _process_symbol(self, symbol: str):
+        """Обработка одной пары."""
+        df = await self._refresh_symbol_candles(symbol)
         if df is None or df.empty or len(df) < 50:
             return
 
