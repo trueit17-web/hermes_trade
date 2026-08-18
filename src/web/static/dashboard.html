@@ -624,7 +624,7 @@ function renderStats(status, trades) {
   const winRate = closedTrades.length ? (wins / closedTrades.length * 100) : null;
 
   const cards = [
-    { label: "Баланс (paper)", value: status.is_paper ? `$${fmt(status.paper_balance)}` : "—" },
+    { label: status.is_paper ? "Баланс (paper)" : "Баланс (real)", value: status.paper_balance !== null && status.paper_balance !== undefined ? `$${fmt(status.paper_balance)}` : "—" },
     { label: "Дневной PnL", value: `${fmt(rs.daily_pnl)} USDT`, cls: rs.daily_pnl >= 0 ? "pos" : "neg" },
     { label: "Открытые позиции", value: `${rs.open_positions_count} / ${rs.max_open_positions}` },
     { label: "Win rate (посл. сделки)", value: winRate === null ? "—" : `${fmt(winRate, 1)}%` },
