@@ -525,6 +525,31 @@ class TradingBot:
 
         await self._cleanup()
 
+    def _compute_equity(self, cash_balance: float) -> float:
+        """
+        Полный капитал = свободный cash + стоимость открытых позиций.
+
+        Открытие long-позиции списывает amount*price+fee с cash-баланса —
+        это не потеря денег, а обмен cash на актив, поэтому для long
+        добавляем текущую рыночную стоимость обратно. Открытие short в
+        paper-режиме вообще не резервирует маржу (см. _execute_paper_order),
+        так что для short на equity влияет только нереализованный PnL, а
+        не полная стоимость позиции. Пока текущая цена символа ещё не
+        известна (последняя итерация), используем entry_price — консервативно
+        (без искусственной прибыли/убытка), а не 0.
+        """
+        equity = cash_balance
+        for symbol, pos in self.open_positions.items():
+            price = self.last_prices.get(symbol)
+            if price is None:
+                price = pos["entry_price"]
+            amount = pos["amount"]
+            if pos["side"] == "long":
+                equity += amount * price
+            else:
+                equity += (pos["entry_price"] - price) * amount
+        return equity
+
     async def _trading_iteration(self):
         """Одна итерация торговли."""
         if risk_manager.state.kill_switch_active:
@@ -546,12 +571,19 @@ class TradingBot:
         # Баланс для контроля max_drawdown_pct — без этого вызова
         # risk_manager.state.start_balance/current_balance никогда не
         # обновлялись, и защита по просадке была мертва.
+        #
+        # _compute_equity() пересчитывает cash в полный капитал (cash +
+        # стоимость открытых позиций) — иначе открытие позиции (деньги
+        # просто меняют форму: cash -> актив, а не исчезают) выглядело бы
+        # как просадка, и бот мог поставить себя на паузу просто за то,
+        # что открыл несколько сделок подряд.
         if settings.is_paper:
-            risk_manager.on_balance_update(execution_engine.get_paper_balance())
+            equity = self._compute_equity(execution_engine.get_paper_balance())
+            risk_manager.on_balance_update(equity)
         else:
             real_balance = await execution_engine.get_real_balance()
             if real_balance is not None:
-                risk_manager.on_balance_update(real_balance)
+                risk_manager.on_balance_update(self._compute_equity(real_balance))
 
         for symbol in self.active_symbols:
             await self._process_symbol(symbol)
