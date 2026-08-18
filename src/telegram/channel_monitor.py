@@ -160,6 +160,28 @@ def unsubscribe_telegram_signal(callback: callable):
 
 # === Парсер сигналов ===
 
+_KNOWN_QUOTES = ("USDT", "BUSD", "USDC", "USD")
+
+
+def normalize_pair(pair: str) -> str:
+    """
+    Привести пару к ccxt-формату "BASE/QUOTE".
+    Регэкспы парсера умеют матчить и "BTC/USDT", и "BTCUSDT" (без разделителя) —
+    но весь остальной код (active_symbols, fetch_ticker, fetch_ohlcv) работает
+    только с ccxt unified-символами вида "BASE/QUOTE". Без нормализации сигнал
+    в формате "BTCUSDT" создавал позицию под символом, который никогда не
+    попадал в active_symbols — SL/TP по ней никогда не проверялись, а закрыть
+    её вручную тоже было нельзя (нет known current_price) — позиция зависала
+    навсегда.
+    """
+    if "/" in pair:
+        return pair
+    for quote in _KNOWN_QUOTES:
+        if pair.endswith(quote) and len(pair) > len(quote):
+            return f"{pair[:-len(quote)]}/{quote}"
+    return pair
+
+
 def parse_telegram_signal(text: str, channel_config: Optional[dict] = None) -> Optional[dict]:
     """
     Попытаться распарсить торговый сигнал из текста сообщения.
@@ -214,6 +236,8 @@ def parse_with_regex(text: str) -> Optional[dict]:
 
     if not pair:
         return None
+
+    pair = normalize_pair(pair)
 
     # Ищем направление
     side = None
