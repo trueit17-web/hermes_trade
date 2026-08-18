@@ -1,15 +1,16 @@
 """CryptoBot Pro — автономный самообучающийся крипто-трейдер бот."""
 import asyncio
 import logging
+import statistics
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import pandas as pd
 import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 
 from src.config import settings
@@ -30,7 +31,7 @@ from src.telegram.notifier import send_notification
 from src.utils.crypto import generate_encryption_key
 from src.utils.timeutils import utcnow
 from src.db.session import get_session
-from src.db.models import TelegramChannel, TelegramSignal
+from src.db.models import TelegramChannel, TelegramSignal, Trade, Symbol, Exchange, PerformanceSnapshot
 from src.web.api import app as web_app
 from src.web.settings_store import load_settings_overrides
 
@@ -137,8 +138,14 @@ class TradingBot:
             IntervalTrigger(hours=settings.symbol_universe_refresh_hours),
             id="symbol_universe_refresh",
         )
+        self.scheduler.add_job(
+            self._save_performance_snapshot,
+            IntervalTrigger(hours=settings.performance_snapshot_interval_hours),
+            id="performance_snapshot",
+        )
         self.scheduler.start()
         logger.info(f"✅ Планировщик запущен")
+        await self._save_performance_snapshot()
 
         # Telegram-уведомления (алерты о сделках/ошибках, без приёма команд)
         event_bus.subscribe("trade_event", self._on_trade_event)
@@ -192,6 +199,83 @@ class TradingBot:
             logger.info(f"📈 Торговая вселенная: {len(combined)} пар — {', '.join(combined)}")
         elif added or removed:
             logger.info(f"🔄 Торговая вселенная обновлена: +{len(added)} -{len(removed)} (всего {len(combined)})")
+
+    async def _save_performance_snapshot(self):
+        """
+        Сохранить периодический снимок производительности (для графиков в
+        аналитике). Таблица performance_snapshots существовала с самого
+        начала, но её никто никогда не заполнял — GET /performance всегда
+        возвращал пустой список.
+        """
+        try:
+            balance = (
+                execution_engine.get_paper_balance() if settings.is_paper
+                else (await execution_engine.get_real_balance() or 0.0)
+            )
+
+            open_pnl = 0.0
+            for symbol, pos in self.open_positions.items():
+                price = self.last_prices.get(symbol)
+                if price is None:
+                    continue
+                entry = pos["entry_price"]
+                amount = pos["amount"]
+                if pos["side"] == "long":
+                    open_pnl += (price - entry) * amount
+                else:
+                    open_pnl += (entry - price) * amount
+
+            week_ago = utcnow() - timedelta(days=7)
+            today_start = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+            async with get_session() as session:
+                base_query = (
+                    select(Trade)
+                    .join(Symbol, Trade.symbol_id == Symbol.id)
+                    .join(Exchange, Symbol.exchange_id == Exchange.id)
+                    .where(Exchange.is_paper == settings.is_paper, Trade.is_open == False)
+                )
+                closed_trades = (await session.execute(base_query)).scalars().all()
+
+                realized_pnl = sum(float(t.pnl) for t in closed_trades)
+                weekly_pnl = sum(
+                    float(t.pnl) for t in closed_trades
+                    if t.closed_at and t.closed_at >= week_ago
+                )
+                num_trades_today = sum(
+                    1 for t in closed_trades if t.closed_at and t.closed_at >= today_start
+                )
+                wins = sum(1 for t in closed_trades if t.outcome == "win")
+                win_rate = (wins / len(closed_trades) * 100) if closed_trades else None
+
+                pnl_pcts = [float(t.pnl_pct) for t in closed_trades if t.pnl_pct is not None]
+                sharpe_ratio = None
+                if len(pnl_pcts) >= 2:
+                    stdev = statistics.pstdev(pnl_pcts)
+                    if stdev > 0:
+                        sharpe_ratio = statistics.mean(pnl_pcts) / stdev
+
+                session.add(PerformanceSnapshot(
+                    snapshot_time=utcnow(),
+                    total_balance=balance,
+                    open_pnl=open_pnl,
+                    realized_pnl=realized_pnl,
+                    daily_pnl=self.daily_pnl,
+                    weekly_pnl=weekly_pnl,
+                    num_open_positions=len(self.open_positions),
+                    num_trades_today=num_trades_today,
+                    max_drawdown=risk_manager.state.max_drawdown_reached,
+                    sharpe_ratio=sharpe_ratio,
+                    win_rate=win_rate,
+                ))
+                await session.commit()
+
+            logger.debug(
+                f"📸 Снимок производительности: баланс={balance:.2f} open_pnl={open_pnl:+.2f} "
+                f"daily_pnl={self.daily_pnl:+.2f}"
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось сохранить снимок производительности: {e}")
 
     def _sync_open_positions_from_execution_engine(self):
         """

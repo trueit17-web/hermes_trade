@@ -45,6 +45,8 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "paper_slippage_pct", "label": "Paper: слиппедж (%)", "group": "Paper trading", "type": "float"},
     {"key": "paper_fee_pct", "label": "Paper: комиссия (%)", "group": "Paper trading", "type": "float"},
 
+    {"key": "performance_snapshot_interval_hours", "label": "Интервал снимка производительности (ч)", "group": "Аналитика", "type": "int"},
+
     {"key": "coinglass_update_interval_hours", "label": "Интервал обновления CoinGlass (ч)", "group": "CoinGlass", "type": "int"},
     {"key": "coinglass_api_key", "label": "CoinGlass API key", "group": "CoinGlass", "type": "secret"},
 

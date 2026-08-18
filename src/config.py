@@ -93,6 +93,9 @@ class Settings(BaseSettings):
     paper_slippage_pct: float = 0.05
     paper_fee_pct: float = 0.1
 
+    # === Аналитика ===
+    performance_snapshot_interval_hours: int = 1
+
     @property
     def data_dir(self) -> Path:
         """Директория для данных (логи, модели, БД)."""
