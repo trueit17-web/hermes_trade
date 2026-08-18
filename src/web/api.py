@@ -426,39 +426,31 @@ async def get_risk_state():
 @app.post("/risk/configure")
 async def configure_risk(config: RiskConfigUpdate):
     """Обновить риск-конфигурацию."""
-    params = {}
-    if config.daily_loss_limit_usd is not None:
-        params["daily_loss_limit_usd"] = config.daily_loss_limit_usd
-    if config.max_open_positions is not None:
-        params["max_open_positions"] = config.max_open_positions
-    if config.max_position_size_pct is not None:
-        params["max_position_size_pct"] = config.max_position_size_pct
-    if config.max_drawdown_pct is not None:
-        params["max_drawdown_pct"] = config.max_drawdown_pct
-    if config.cooldown_seconds is not None:
-        params["cooldown_seconds"] = config.cooldown_seconds
+    # Раньше этот endpoint писал изменения в BotConfig под короткими
+    # ключами (daily_loss_limit_usd и т.д.), а load_settings_overrides()
+    # при старте бота ищет только ключи из SETTINGS_SCHEMA (risk_*) — эти
+    # записи никогда не подхватывались и молча пропадали при рестарте.
+    # Используем тот же путь сохранения, что и вкладка "Настройки" в
+    # дашборде, чтобы изменение реально переживало рестарт.
+    field_map = {
+        "daily_loss_limit_usd": "risk_daily_loss_limit_usd",
+        "max_open_positions": "risk_max_open_positions",
+        "max_position_size_pct": "risk_max_position_size_pct",
+        "max_drawdown_pct": "risk_max_drawdown_pct",
+        "cooldown_seconds": "risk_cooldown_seconds",
+    }
+    updates = {
+        schema_key: getattr(config, short_key)
+        for short_key, schema_key in field_map.items()
+        if getattr(config, short_key) is not None
+    }
 
-    risk_manager.configure(params)
+    result = await apply_settings_update(updates)
+    if result["errors"]:
+        raise HTTPException(status_code=400, detail=result["errors"])
 
-    # Сохранить в БД
-    async with get_session() as session:
-        for key, value in params.items():
-            config_record = (
-                await session.execute(select(BotConfig).where(BotConfig.config_key == key))
-            ).scalar_one_or_none()
-            if config_record:
-                config_record.config_value = {"value": value}
-            else:
-                session.add(BotConfig(
-                    config_key=key,
-                    config_value={"value": value},
-                    source="api",
-                    updated_by="api",
-                ))
-        await session.commit()
-
-    logger.info(f"Risk конфигурация обновлена: {params}")
-    return {"success": True, "config": params}
+    logger.info(f"Risk конфигурация обновлена: {updates}")
+    return {"success": True, "config": {k: getattr(settings, k) for k in updates}}
 
 
 @app.post("/risk/pause")
@@ -722,18 +714,16 @@ async def set_trading_mode(mode: str):
     if mode not in ["paper", "real"]:
         raise HTTPException(status_code=400, detail="Режим должен быть paper или real")
 
-    settings.trading_mode = mode
-    # is_paper/is_real — вычисляемые @property от trading_mode, отдельно их
-    # выставлять не нужно (и нельзя — у них нет сеттера).
+    # Раньше это применялось только к живому settings.trading_mode и никогда
+    # не сохранялось в BotConfig — после рестарта бот тихо возвращался в
+    # режим из .env. apply_settings_update — тот же путь, что и вкладка
+    # "Настройки", уже применяет live-эффект (переинициализацию execution
+    # engine) и сохраняет для будущих рестартов.
+    result = await apply_settings_update({"trading_mode": mode})
+    if result["errors"]:
+        raise HTTPException(status_code=400, detail=result["errors"])
 
     logger.info(f"Режим торговли изменён на: {mode}")
-
-    # Переинициализация execution engine
-    if mode == "real" and execution_engine.is_paper:
-        await execution_engine.initialize("binance")
-    elif mode == "paper":
-        execution_engine.is_paper = True
-
     return {"success": True, "mode": mode}
 
 

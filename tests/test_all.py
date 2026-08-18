@@ -915,5 +915,46 @@ class TestDecisionLogger(unittest.TestCase):
         self.assertEqual(self.logger._pending_by_order, {})
 
 
+class TestTelegramChannelDelete(unittest.IsolatedAsyncioTestCase):
+    """
+    Удаление канала с сигналами падало с IntegrityError (FK
+    telegram_signals.channel_id без каскада) на Postgres, куда бот
+    деплоится в проде — практически гарантированно после любого периода
+    мониторинга у канала уже есть хотя бы один сигнал.
+    """
+
+    async def test_delete_channel_with_signals_cascades(self):
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import TelegramChannel, TelegramSignal
+        from src.utils.timeutils import utcnow
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@delete_cascade_test", channel_title="X", active=True)
+            session.add(channel)
+            await session.flush()
+            for i in range(2):
+                session.add(TelegramSignal(
+                    channel_id=channel.id, raw_message=f"m{i}", message_date=utcnow(),
+                    parsed_pair="BTC/USDT", parsed_side="long", parsed_entry=100.0,
+                    decision="pending",
+                ))
+            await session.commit()
+            channel_id = channel.id
+
+        async with get_session() as session:
+            ch = (
+                await session.execute(select(TelegramChannel).where(TelegramChannel.id == channel_id))
+            ).scalar_one()
+            await session.delete(ch)
+            await session.commit()  # раньше падало здесь
+
+        async with get_session() as session:
+            remaining = (
+                await session.execute(select(TelegramSignal).where(TelegramSignal.channel_id == channel_id))
+            ).scalars().all()
+        self.assertEqual(remaining, [])
+
+
 if __name__ == "__main__":
     unittest.main()

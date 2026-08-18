@@ -223,7 +223,13 @@ class TelegramChannel(Base):
         DateTime, default=utcnow, onupdate=utcnow
     )
 
-    signals: Mapped[list["TelegramSignal"]] = relationship(back_populates="channel")
+    # cascade — без него удаление канала (DELETE /telegram/channels/{id})
+    # падало с IntegrityError на Postgres (FK telegram_signals.channel_id
+    # без ON DELETE CASCADE) сразу же, как только у канала появлялся хотя
+    # бы один сигнал — то есть почти всегда после недолгого мониторинга.
+    signals: Mapped[list["TelegramSignal"]] = relationship(
+        back_populates="channel", cascade="all, delete-orphan",
+    )
 
 
 class TelegramSignal(Base):
