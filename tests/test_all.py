@@ -646,15 +646,16 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
 
 
 class TestTelegramSignalParser(unittest.TestCase):
-    """Тесты для парсера Telegram сигналов."""
+    """Тесты для парсера Telegram сигналов (живой parse_with_regex из channel_monitor —
+    src/telegram/signal_parser.py был неиспользуемым дублем и был удалён)."""
 
     def setUp(self):
-        from src.telegram.signal_parser import telegram_signal_parser
-        self.parser = telegram_signal_parser
+        from src.telegram.channel_monitor import parse_with_regex
+        self.parse = parse_with_regex
 
     def test_parse_btc_long(self):
         """Парсинг BTC/USDT Long сигнала."""
-        result = self.parser.parse("BTC/USDT Long 69000 SL 68000 TP 72000")
+        result = self.parse("BTC/USDT Long 69000 SL 68000 TP 72000")
         self.assertIsNotNone(result)
         self.assertEqual(result["pair"], "BTC/USDT")
         self.assertEqual(result["side"], "long")
@@ -662,7 +663,7 @@ class TestTelegramSignalParser(unittest.TestCase):
 
     def test_parse_eth_short(self):
         """Парсинг ETH/USDT Short сигнала."""
-        result = self.parser.parse("ETH/USDT Short | Entry: 3500 | Stop: 3600 | Target: 3200")
+        result = self.parse("ETH/USDT Short | Entry: 3500 | Stop: 3600 | Target: 3200")
         self.assertIsNotNone(result)
         self.assertEqual(result["pair"], "ETH/USDT")
         self.assertEqual(result["side"], "short")
@@ -670,8 +671,14 @@ class TestTelegramSignalParser(unittest.TestCase):
 
     def test_parse_no_signal(self):
         """Текст без сигнала."""
-        result = self.parser.parse("Привет! Как дела?")
+        result = self.parse("Привет! Как дела?")
         self.assertIsNone(result)
+
+    def test_parse_pair_without_slash_is_normalized(self):
+        """"BTCUSDT" (без слэша) должен нормализоваться в ccxt-формат "BTC/USDT"."""
+        result = self.parse("BTCUSDT LONG 1.85 SL 1.70 TP 2.10")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "BTC/USDT")
 
 
 class TestQualificationScorer(unittest.TestCase):

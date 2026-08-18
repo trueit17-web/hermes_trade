@@ -224,15 +224,6 @@ class FeatureEngine:
         df.set_index("open_time", inplace=True)
         df.sort_index(inplace=True)
 
-        # Переименуем колонки в 기대하는 названия
-        df.rename(columns={
-            "open": "open",
-            "high": "high",
-            "low": "low",
-            "close": "close",
-            "volume": "volume",
-        }, inplace=True)
-
         return self.compute_all_indicators(df, timeframe)
 
     def get_latest_features(self, df: pd.DataFrame) -> dict[str, float]:

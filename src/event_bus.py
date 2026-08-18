@@ -125,7 +125,6 @@ class EventBus:
         self._subscribers: dict[str, list[Callable[[Event], Any]]] = {}
         self._historic: list[Event] = []
         self._max_history = 10000
-        self._loop = asyncio.get_event_loop()
 
     def subscribe(self, event_type: str, callback: Callable[[Event], Any]) -> None:
         """Подписаться на события определённого типа."""

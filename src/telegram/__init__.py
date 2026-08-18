@@ -14,9 +14,6 @@ from src.telegram.channel_monitor import (
     unsubscribe_telegram_signal,
     parse_telegram_signal,
 )
-from src.telegram.signal_parser import (
-    telegram_signal_parser,
-)
 from src.telegram.quality_scorer import (
     signal_quality_scorer,
 )
