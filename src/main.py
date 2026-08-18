@@ -379,7 +379,13 @@ class TradingBot:
         symbol = pair
         order_side = "buy" if side == "long" else "sell"
 
-        balance = execution_engine.get_paper_balance() if settings.is_paper else 10000
+        if settings.is_paper:
+            balance = execution_engine.get_paper_balance()
+        else:
+            # Раньше здесь был захардкожен фейковый баланс 10000 — размер
+            # реальной позиции считался от него, а не от реального баланса
+            # на бирже.
+            balance = await execution_engine.get_real_balance() or 0.0
         size_pct = 5.0
         position_value = balance * (size_pct / 100)
         amount = position_value / entry
@@ -480,7 +486,7 @@ class TradingBot:
         self.last_prices[symbol] = close
         execution_engine.last_prices[symbol] = close
 
-        if settings.is_paper and await self._check_position_exit(symbol, close):
+        if await self._check_position_exit(symbol, close):
             return  # позиция закрыта в этой итерации — новый сигнал сгенерируем в следующем цикле
 
         # Фичи
@@ -602,7 +608,10 @@ class TradingBot:
                 logger.info(f"🚫 Сигнал отклонён (risk): {symbol} {signal.side} — {reason}")
                 continue
 
-            balance = execution_engine.get_paper_balance() if settings.is_paper else 10000
+            if settings.is_paper:
+                balance = execution_engine.get_paper_balance()
+            else:
+                balance = await execution_engine.get_real_balance() or 0.0
             size_pct = signal.position_size_pct
             position_value = balance * (size_pct / 100)
             entry_price = signal.entry_price if signal.entry_price > 0 else close
@@ -705,7 +714,8 @@ class TradingBot:
         # "Закрыть" в дашборде, POST /positions/close) — execution_engine
         # уже не знает о ней, но self.open_positions ещё не подчищен.
         # Без этой проверки мы бы попытались закрыть её второй раз здесь.
-        if symbol not in execution_engine.paper_positions:
+        tracked = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
+        if symbol not in tracked:
             del self.open_positions[symbol]
             return False
 
@@ -731,7 +741,8 @@ class TradingBot:
         opened_at = position.get("opened_at")
         holding_seconds = int((utcnow() - opened_at).total_seconds()) if opened_at else 0
 
-        result = await execution_engine.close_paper_position(
+        close_fn = execution_engine.close_paper_position if settings.is_paper else execution_engine.close_real_position
+        result = await close_fn(
             symbol=symbol,
             side=side,
             entry_price=position["entry_price"],

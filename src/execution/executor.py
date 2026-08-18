@@ -35,8 +35,13 @@ class ExecutionEngine:
         self.is_paper: bool = settings.is_paper
         self.paper_balance: float = settings.startup_capital_usdt
         self.paper_positions: dict[str, dict] = {}
+        self.real_positions: dict[str, dict] = {}
         self.last_prices: dict[str, float] = {}
         self.order_counter = 0
+
+    def get_open_positions(self) -> dict:
+        """Открытые позиции для текущего режима (paper или real)."""
+        return dict(self.paper_positions if self.is_paper else self.real_positions)
 
     async def initialize(self, exchange_id: str = "binance"):
         """Инициализация подключения к бирже."""
@@ -96,55 +101,74 @@ class ExecutionEngine:
             except Exception as e:
                 logger.warning(f"Не удалось получить баланс: {e}")
 
+            await self._restore_real_positions_from_db()
+
         except Exception as e:
             logger.error(f"Ошибка инициализации биржи {exchange_id}: {e}")
             self.is_paper = True
 
-    async def _restore_paper_state_from_db(self):
+    async def _load_open_positions_from_db(
+        self, is_paper: bool,
+    ) -> tuple[Optional[dict[str, dict]], float, float]:
         """
-        Восстановить paper_balance и paper_positions из БД при старте процесса.
+        Реконструировать открытые позиции из БД для указанного режима (paper/real).
 
-        paper_positions/paper_balance раньше существовали только в памяти —
-        каждый рестарт бота (в т.ч. через кнопку в дашборде) молча обнулял
-        баланс до startup_capital_usdt и "терял" все открытые позиции, хотя
-        в БД (Order/Trade) вся история оставалась цела. Реконструируем:
-        - открытая позиция = BUY-ордер (status=filled), для которого нет
-          Trade с order_open_id на него (Trade создаётся только при закрытии);
-        - баланс = startup_capital + сумма pnl всех закрытых Trade минус
-          сумма (amount*entry_price + entry_fee) всех ещё открытых ордеров
-          (эти деньги были списаны при открытии и ещё не вернулись).
+        Открытая позиция = BUY-ордер (status=filled) на бирже нужного типа
+        (Order.exchange -> Exchange.is_paper), который не участвует ни в
+        одном Trade — ни как order_open_id (позиция уже закрыта), ни как
+        order_close_id. Последнее важно для закрытия SHORT-позиций: close
+        для short создаёт BUY-ордер (см. close_paper_position/close_real_position),
+        который иначе неотличим от новой открытой long-позиции.
+        Возвращает (позиции, реализованный PnL, себестоимость открытых позиций)
+        или (None, 0, 0) при ошибке запроса.
         """
-        self.paper_balance = settings.startup_capital_usdt
-        self.paper_positions = {}
-
         try:
             async with get_session() as session:
-                closed_order_ids = set(
+                trade_order_ids = set(
                     (
                         await session.execute(
                             select(Trade.order_open_id).where(Trade.order_open_id.is_not(None))
                         )
                     ).scalars().all()
+                ) | set(
+                    (
+                        await session.execute(
+                            select(Trade.order_close_id).where(Trade.order_close_id.is_not(None))
+                        )
+                    ).scalars().all()
                 )
+                # PnL и открытые ордера должны считаться в рамках одного режима —
+                # иначе, например, реальный PnL просачивался бы в paper-баланс.
                 realized_pnl = (
-                    await session.execute(select(func.sum(Trade.pnl)))
+                    await session.execute(
+                        select(func.sum(Trade.pnl))
+                        .join(Symbol, Trade.symbol_id == Symbol.id)
+                        .join(Exchange, Symbol.exchange_id == Exchange.id)
+                        .where(Exchange.is_paper == is_paper)
+                    )
                 ).scalar() or 0
 
                 orders = (
                     await session.execute(
                         select(Order)
+                        .join(Exchange, Order.exchange_id == Exchange.id)
                         .options(selectinload(Order.symbol), selectinload(Order.strategy))
-                        .where(Order.side == "buy", Order.status == "filled")
+                        .where(
+                            Order.side == "buy",
+                            Order.status == "filled",
+                            Exchange.is_paper == is_paper,
+                        )
                         .order_by(Order.created_at.asc())
                     )
                 ).scalars().all()
         except Exception as e:
-            logger.warning(f"Не удалось восстановить paper-состояние из БД: {e}")
-            return
+            logger.warning(f"Не удалось восстановить открытые позиции из БД: {e}")
+            return None, 0.0, 0.0
 
+        positions: dict[str, dict] = {}
         cost_basis = 0.0
         for o in orders:
-            if o.id in closed_order_ids or o.symbol is None:
+            if o.id in trade_order_ids or o.symbol is None:
                 continue
 
             symbol = o.symbol.symbol
@@ -153,7 +177,7 @@ class ExecutionEngine:
             fee = float(o.fee or 0)
             cost_basis += amount * price + fee
 
-            pos = self.paper_positions.setdefault(symbol, {
+            pos = positions.setdefault(symbol, {
                 "amount": 0.0, "entry_price": 0.0, "side": "long",
                 "strategy_id": None, "stop_loss": None, "take_profit": None,
                 "order_id": None, "entry_fee": 0.0, "opened_at": None,
@@ -171,7 +195,26 @@ class ExecutionEngine:
             if pos["opened_at"] is None:
                 pos["opened_at"] = o.created_at
 
-        self.paper_balance = settings.startup_capital_usdt + float(realized_pnl) - cost_basis
+        return positions, float(realized_pnl), cost_basis
+
+    async def _restore_paper_state_from_db(self):
+        """
+        Восстановить paper_balance и paper_positions из БД при старте процесса.
+
+        paper_positions/paper_balance раньше существовали только в памяти —
+        каждый рестарт бота (в т.ч. через кнопку в дашборде) молча обнулял
+        баланс до startup_capital_usdt и "терял" все открытые позиции, хотя
+        в БД (Order/Trade) вся история оставалась цела.
+        """
+        self.paper_balance = settings.startup_capital_usdt
+        self.paper_positions = {}
+
+        positions, realized_pnl, cost_basis = await self._load_open_positions_from_db(is_paper=True)
+        if positions is None:
+            return
+
+        self.paper_positions = positions
+        self.paper_balance = settings.startup_capital_usdt + realized_pnl - cost_basis
 
         if self.paper_positions:
             logger.info(
@@ -181,6 +224,29 @@ class ExecutionEngine:
         else:
             logger.info(f"📄 Открытых позиций в БД нет | баланс: {self.paper_balance:.2f}")
 
+    async def _restore_real_positions_from_db(self):
+        """
+        Восстановить real_positions из БД при старте процесса (см.
+        _restore_paper_state_from_db — тот же смысл, для реального режима).
+        Баланс для real режима не реконструируется — он всегда берётся
+        напрямую с биржи через fetch_balance().
+        """
+        self.real_positions = {}
+
+        positions, _, _ = await self._load_open_positions_from_db(is_paper=False)
+        if positions is None:
+            return
+
+        self.real_positions = positions
+
+        if self.real_positions:
+            logger.info(
+                f"♻️ Восстановлено {len(self.real_positions)} открытых реальных позиций из БД: "
+                f"{list(self.real_positions.keys())}"
+            )
+        else:
+            logger.info("Открытых реальных позиций в БД нет")
+
     async def close(self):
         """Закрыть соединение с биржей."""
         if self.exchange:
@@ -189,7 +255,14 @@ class ExecutionEngine:
 
     async def _resolve_symbol_id(self, session, symbol: str) -> tuple[int, int]:
         """Получить (или создать) id биржи и торговой пары в БД."""
-        exchange_name = self.exchange_id or "paper"
+        base_name = self.exchange_id or "paper"
+        # Exchange.name уникально, а paper- и real-исполнение используют один
+        # и тот же exchange_id (например "binance") — раньше это заставляло
+        # оба режима писать ордера в один и тот же Exchange-ряд, чей is_paper
+        # отражал только то, какой режим создал ряд первым (обычно paper).
+        # Разносим по имени, иначе восстановление открытых позиций не может
+        # отличить paper-ордера от реальных.
+        exchange_name = base_name if not self.is_paper else f"{base_name}_paper"
 
         exchange = (
             await session.execute(select(Exchange).where(Exchange.name == exchange_name))
@@ -569,6 +642,13 @@ class ExecutionEngine:
 
             logger.info(f"✅ Ордер исполнен на бирже: {order['id']} | {side.upper()} {amount:.4f} {symbol}")
 
+            # ccxt возвращает order["fee"] как dict {"cost": ..., "currency": ...}
+            # (или None), а не число — писать его напрямую в DECIMAL-колонку
+            # было ошибкой. Аналогично order["price"] у маркет-ордеров обычно
+            # None (заполняется только order["average"]).
+            fill_price = order.get("average") or order.get("price") or price
+            fill_fee = (order.get("fee") or {}).get("cost") or 0
+
             async with get_session() as session:
                 exchange_id, symbol_id = await self._resolve_symbol_id(session, symbol)
                 strategy_db_id = await self._resolve_strategy_id(session, order_data.get("strategy_id"))
@@ -582,8 +662,8 @@ class ExecutionEngine:
                     price=price,
                     status="filled",
                     filled_amount=order["filled"] or amount,
-                    filled_price=order["price"],
-                    fee=order["fee"] or 0,
+                    filled_price=fill_price,
+                    fee=fill_fee,
                     stop_loss=order_data["stop_loss"],
                     take_profit=order_data["take_profit"],
                     order_id_exchange=order["id"],
@@ -593,13 +673,30 @@ class ExecutionEngine:
                 await session.flush()
                 order_id = order_obj.id
 
+            # Регистрируем открытую реальную позицию так же, как paper —
+            # без этого SL/TP по ней никогда не проверялись бы (см.
+            # close_real_position / _check_position_exit в main.py), а
+            # закрыть её вручную из дашборда было бы нельзя.
+            if side == "buy":
+                self.real_positions[symbol] = {
+                    "amount": amount,
+                    "entry_price": fill_price,
+                    "side": "long",
+                    "strategy_id": order_data.get("strategy_id"),
+                    "stop_loss": order_data.get("stop_loss"),
+                    "take_profit": order_data.get("take_profit"),
+                    "order_id": order_id,
+                    "entry_fee": fill_fee,
+                    "opened_at": utcnow(),
+                }
+
             trade_event = TradeEvent(
                 type="trade_event",
                 trade_id=order_id,
                 symbol=symbol,
                 direction="long" if side == "buy" else "short",
-                entry_price=price,
-                exit_price=price,
+                entry_price=fill_price,
+                exit_price=fill_price,
                 amount=amount,
                 pnl=0,
                 pnl_pct=0,
@@ -615,6 +712,116 @@ class ExecutionEngine:
         except Exception as e:
             logger.error(f"❌ Ошибка исполнения реального ордера {symbol}: {e}")
             return None
+
+    async def close_real_position(
+        self,
+        symbol: str,
+        side: str,  # long, short
+        entry_price: float,
+        amount: float,
+        reason: str,
+        entry_fee: float = 0.0,
+        holding_seconds: int = 0,
+        strategy_id: Optional[str] = None,
+        order_open_id: Optional[int] = None,
+        **_ignored,
+    ) -> Optional[dict]:
+        """
+        Закрыть реальную позицию рыночным ордером на бирже: посчитать PnL по
+        фактической цене исполнения, записать закрывающий Order + Trade в БД,
+        опубликовать закрывающий TradeEvent. Возвращает {"pnl", "pnl_pct",
+        "outcome", "trade_id"} или None при ошибке.
+
+        Только long: на споте нет встроенного шорта, а _execute_real_order
+        уже не позволяет открыть short-позицию (create_market_sell_order без
+        имеющегося актива на споте просто упадёт с ошибкой недостатка
+        баланса — исполнение вернёт None и позиция никогда не будет создана).
+        """
+        if side != "long":
+            logger.error(f"close_real_position: закрытие {side}-позиции не поддерживается на споте: {symbol}")
+            return None
+
+        try:
+            order = await self.exchange.create_market_sell_order(symbol, amount)
+        except Exception as e:
+            logger.error(f"❌ Не удалось закрыть реальную позицию {symbol}: {e}")
+            return None
+
+        exit_price = order.get("average") or order.get("price") or entry_price
+        exit_fee = (order.get("fee") or {}).get("cost") or 0
+
+        pnl = (exit_price - entry_price) * amount - entry_fee - exit_fee
+        pnl_pct = (pnl / (entry_price * amount) * 100) if entry_price and amount else 0.0
+        outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "break-even")
+
+        self.real_positions.pop(symbol, None)
+
+        async with get_session() as session:
+            exchange_id, symbol_id = await self._resolve_symbol_id(session, symbol)
+            strategy_db_id = await self._resolve_strategy_id(session, strategy_id)
+
+            close_order = Order(
+                exchange_id=exchange_id,
+                symbol_id=symbol_id,
+                strategy_id=strategy_db_id,
+                side="sell",
+                order_type="market",
+                amount=amount,
+                price=exit_price,
+                status="filled",
+                filled_amount=order["filled"] or amount,
+                filled_price=exit_price,
+                fee=exit_fee,
+                order_id_exchange=order["id"],
+                client_order_id=str(uuid.uuid4())[:12],
+                notes=f"Real close ({reason})",
+            )
+            session.add(close_order)
+            await session.flush()
+
+            trade = Trade(
+                symbol_id=symbol_id,
+                strategy_id=strategy_db_id,
+                order_open_id=order_open_id,
+                order_close_id=close_order.id,
+                direction=side,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                amount=amount,
+                pnl=pnl,
+                pnl_pct=pnl_pct,
+                holding_seconds=holding_seconds,
+                outcome=outcome,
+                is_open=False,
+                closed_at=utcnow(),
+            )
+            session.add(trade)
+            await session.commit()
+            trade_id = trade.id
+
+        logger.info(
+            f"💰 Реальная позиция закрыта: {symbol} {side.upper()} | {reason} | "
+            f"PnL: {pnl:+.2f} ({pnl_pct:+.2f}%)"
+        )
+
+        trade_event = TradeEvent(
+            type="trade_event",
+            trade_id=trade_id,
+            symbol=symbol,
+            direction=side,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            amount=amount,
+            pnl=pnl,
+            pnl_pct=pnl_pct,
+            holding_seconds=holding_seconds,
+            outcome=outcome,
+            is_opening=False,
+            timestamp=utcnow_timestamp(),
+        )
+        await event_bus.publish(trade_event)
+
+        return {"pnl": pnl, "pnl_pct": pnl_pct, "outcome": outcome, "trade_id": trade_id}
 
     def can_execute(self) -> bool:
         """Можно ли исполнить ордер?"""

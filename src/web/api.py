@@ -291,19 +291,29 @@ async def get_status():
             for c in channels
         ]
 
-    paper_positions = execution_engine.get_paper_positions() if settings.is_paper else None
-    if paper_positions:
-        for symbol, pos in paper_positions.items():
+    # Ключи "paper_balance"/"paper_positions" сохранены для совместимости с
+    # дашбордом, но теперь содержат данные текущего режима (paper или real) —
+    # раньше в real-режиме здесь всегда было None, и открытые позиции были
+    # попросту невидимы в дашборде.
+    open_positions = execution_engine.get_open_positions()
+    if open_positions:
+        for symbol, pos in open_positions.items():
             pos["source"] = _position_source_label(pos.get("strategy_id"))
             pos["current_price"] = execution_engine.last_prices.get(symbol)
+
+    balance = (
+        execution_engine.get_paper_balance()
+        if settings.is_paper
+        else await execution_engine.get_real_balance()
+    )
 
     return {
         "trading_mode": settings.trading_mode,
         "is_paper": settings.is_paper,
         "startup_capital": settings.startup_capital_usdt,
         "risk_state": risk_manager.get_state(),
-        "paper_balance": execution_engine.get_paper_balance() if settings.is_paper else None,
-        "paper_positions": paper_positions,
+        "paper_balance": balance,
+        "paper_positions": open_positions,
         "active_strategies": strategy_registry.list_strategies(),
         "ml_models": await model_registry.list_models(),
         "ml_active_model": await model_registry.get_active_model("direction_classifier"),
@@ -315,37 +325,50 @@ async def get_status():
 
 @app.post("/positions/close")
 async def close_position_manually(request: PositionCloseRequest):
-    """Закрыть открытую paper-позицию вручную по последней известной цене (кнопка в дашборде)."""
-    if not settings.is_paper:
-        raise HTTPException(status_code=400, detail="Ручное закрытие поддерживается только в paper-режиме")
-
+    """Закрыть открытую позицию вручную (кнопка в дашборде)."""
     symbol = request.symbol
-    position = execution_engine.paper_positions.get(symbol)
+    tracked = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
+    position = tracked.get(symbol)
     if not position:
         raise HTTPException(status_code=404, detail=f"Открытая позиция {symbol} не найдена")
-
-    current_price = execution_engine.last_prices.get(symbol)
-    if current_price is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Текущая цена по этому символу ещё не известна — подождите следующей торговой итерации",
-        )
 
     opened_at = position.get("opened_at")
     holding_seconds = int((utcnow() - opened_at).total_seconds()) if opened_at else 0
 
-    result = await execution_engine.close_paper_position(
-        symbol=symbol,
-        side=position["side"],
-        entry_price=position["entry_price"],
-        amount=position["amount"],
-        exit_price=current_price,
-        reason="manual",
-        entry_fee=position.get("entry_fee", 0.0),
-        holding_seconds=holding_seconds,
-        strategy_id=position.get("strategy_id"),
-        order_open_id=position.get("order_id"),
-    )
+    if settings.is_paper:
+        current_price = execution_engine.last_prices.get(symbol)
+        if current_price is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Текущая цена по этому символу ещё не известна — подождите следующей торговой итерации",
+            )
+        result = await execution_engine.close_paper_position(
+            symbol=symbol,
+            side=position["side"],
+            entry_price=position["entry_price"],
+            amount=position["amount"],
+            exit_price=current_price,
+            reason="manual",
+            entry_fee=position.get("entry_fee", 0.0),
+            holding_seconds=holding_seconds,
+            strategy_id=position.get("strategy_id"),
+            order_open_id=position.get("order_id"),
+        )
+    else:
+        # Реальное закрытие исполняется рыночным ордером на бирже —
+        # фактическая цена выхода определяется биржей, а не последней
+        # известной ценой из основного цикла.
+        result = await execution_engine.close_real_position(
+            symbol=symbol,
+            side=position["side"],
+            entry_price=position["entry_price"],
+            amount=position["amount"],
+            reason="manual",
+            entry_fee=position.get("entry_fee", 0.0),
+            holding_seconds=holding_seconds,
+            strategy_id=position.get("strategy_id"),
+            order_open_id=position.get("order_id"),
+        )
     if result is None:
         raise HTTPException(status_code=500, detail="Не удалось закрыть позицию")
 

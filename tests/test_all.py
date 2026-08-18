@@ -449,31 +449,45 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
     async def test_restore_paper_state_matches_db(self):
         """paper_balance после initialize() должен совпадать с независимо
         пересчитанным по Order/Trade значением (тестовая БД общая на сессию
-        и может содержать данные от других тестов — поэтому сравниваем со
-        значением, пересчитанным прямо здесь, а не с константой)."""
+        и может содержать данные от других тестов, в т.ч. real-режима —
+        поэтому пересчёт здесь тоже скопирован по Exchange.is_paper, как и
+        в самой реализации, а не сравнивается с константой)."""
         from sqlalchemy import select, func
         from src.db.session import get_session
-        from src.db.models import Trade, Order
+        from src.db.models import Trade, Order, Symbol, Exchange
 
         settings.trading_mode = "paper"
         settings.startup_capital_usdt = 10000.0
 
         async with get_session() as session:
-            realized = (await session.execute(select(func.sum(Trade.pnl)))).scalar() or 0
-            closed_order_ids = set(
+            realized = (
+                await session.execute(
+                    select(func.sum(Trade.pnl))
+                    .join(Symbol, Trade.symbol_id == Symbol.id)
+                    .join(Exchange, Symbol.exchange_id == Exchange.id)
+                    .where(Exchange.is_paper == True)  # noqa: E712
+                )
+            ).scalar() or 0
+            trade_order_ids = set(
                 (await session.execute(
                     select(Trade.order_open_id).where(Trade.order_open_id.is_not(None))
+                )).scalars().all()
+            ) | set(
+                (await session.execute(
+                    select(Trade.order_close_id).where(Trade.order_close_id.is_not(None))
                 )).scalars().all()
             )
             open_orders = (
                 await session.execute(
-                    select(Order).where(Order.side == "buy", Order.status == "filled")
+                    select(Order)
+                    .join(Exchange, Order.exchange_id == Exchange.id)
+                    .where(Order.side == "buy", Order.status == "filled", Exchange.is_paper == True)  # noqa: E712
                 )
             ).scalars().all()
 
         cost_basis = sum(
             float(o.filled_amount or o.amount) * float(o.filled_price or o.price) + float(o.fee or 0)
-            for o in open_orders if o.id not in closed_order_ids
+            for o in open_orders if o.id not in trade_order_ids
         )
         expected_balance = settings.startup_capital_usdt + float(realized) - cost_basis
 
@@ -548,6 +562,87 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result)
         self.assertLess(result["pnl"], 0)
         self.assertEqual(result["outcome"], "loss")
+
+    async def test_real_order_registers_position_with_correct_fee_and_price(self):
+        """
+        _execute_real_order раньше писал в БД сырой ccxt fee-dict вместо
+        числа и брал order["price"] (у market-ордеров обычно None) вместо
+        order["average"]; открытая реальная позиция нигде не регистрировалась,
+        поэтому SL/TP по ней никогда не проверялись.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "binance"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "ex-1", "filled": 0.1, "price": None, "average": 50000.0,
+            "fee": {"cost": 5.0, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="BTC/USDT", side="buy", amount=0.1, price=50000.0,
+            order_type="market", stop_loss=48000.0, take_profit=55000.0,
+        )
+        self.assertIsNotNone(order)
+        self.assertEqual(float(order.filled_price), 50000.0)
+        self.assertEqual(float(order.fee), 5.0)
+        self.assertIn("BTC/USDT", self.engine.real_positions)
+        self.assertEqual(self.engine.real_positions["BTC/USDT"]["entry_price"], 50000.0)
+
+    async def test_close_real_position_uses_actual_fill_price(self):
+        """
+        close_real_position должен считать PnL по фактической цене исполнения
+        закрывающего ордера, а не по цене, переданной вызывающим кодом
+        (последняя известная цена в торговом цикле может отличаться от
+        реального fill на бирже).
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "binance"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_sell_order.return_value = {
+            "id": "ex-2", "filled": 0.1, "price": None, "average": 52000.0,
+            "fee": {"cost": 5.2, "currency": "USDT"},
+        }
+
+        result = await self.engine.close_real_position(
+            symbol="BTC/USDT", side="long", entry_price=50000.0, amount=0.1,
+            reason="take_profit", entry_fee=5.0, holding_seconds=60,
+            exit_price=99999.0,  # должен игнорироваться
+        )
+        self.assertIsNotNone(result)
+        expected_pnl = (52000.0 - 50000.0) * 0.1 - 5.0 - 5.2
+        self.assertAlmostEqual(result["pnl"], expected_pnl, places=6)
+        self.assertNotIn("BTC/USDT", self.engine.real_positions)
+
+    async def test_restore_positions_separates_paper_and_real(self):
+        """
+        Order.exchange_id раньше был общим для paper и real (одно и то же
+        имя "binance"), поэтому Exchange.is_paper на этом ряду отражал
+        только то, какой режим создал его первым — восстановление open
+        positions при рестарте не могло отличить paper-ордера от реальных.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "binance"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "ex-3", "filled": 0.2, "price": None, "average": 3000.0,
+            "fee": {"cost": 1.5, "currency": "USDT"},
+        }
+        order = await self.engine.create_order(
+            symbol="ETH/USDT", side="buy", amount=0.2, price=3000.0,
+            order_type="market", stop_loss=2900.0, take_profit=3200.0,
+        )
+        self.assertIsNotNone(order)
+
+        real_positions, _, _ = await self.engine._load_open_positions_from_db(is_paper=False)
+        self.assertIsNotNone(real_positions)
+        self.assertIn("ETH/USDT", real_positions)
+
+        paper_positions, _, _ = await self.engine._load_open_positions_from_db(is_paper=True)
+        self.assertIsNotNone(paper_positions)
+        self.assertNotIn("ETH/USDT", paper_positions)
 
 
 class TestTelegramSignalParser(unittest.TestCase):

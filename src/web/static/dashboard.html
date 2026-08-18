@@ -1068,6 +1068,13 @@ function collectSettingsValues() {
 
 document.getElementById("btnSaveSettings").addEventListener("click", async () => {
   const values = collectSettingsValues();
+  if (values.trading_mode === "real") {
+    const ok = confirm(
+      "Вы переключаете бота в РЕАЛЬНЫЙ режим торговли — он начнёт открывать ордера " +
+      "на бирже за реальные деньги, используя API-ключи из настроек. Продолжить?"
+    );
+    if (!ok) return;
+  }
   try {
     const result = await api("/settings", { method: "POST", body: JSON.stringify({ values }) });
     const errCount = Object.keys(result.errors || {}).length;
