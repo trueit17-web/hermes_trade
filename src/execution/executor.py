@@ -246,6 +246,10 @@ class ExecutionEngine:
                 / (self.paper_positions[symbol]["amount"])
             )
             self.paper_positions[symbol]["side"] = "long"
+            # Источник сигнала (id стратегии либо "telegram_signal") — для
+            # отображения в дашборде; при доливке позиции другим источником
+            # отражает последний ордер, не историю целиком.
+            self.paper_positions[symbol]["strategy_id"] = order_data.get("strategy_id")
         else:
             if symbol in self.paper_positions:
                 pos = self.paper_positions[symbol]

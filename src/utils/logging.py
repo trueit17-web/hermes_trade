@@ -39,20 +39,48 @@ class RingBufferHandler(logging.Handler):
 
 ring_buffer_handler = RingBufferHandler()
 
+# Логгеры, которые модульная система логирования настраивает явно (см.
+# setup_logging ниже) плюс сторонние — показываются в чекбокс-фильтре
+# веб-панели даже до того, как что-то от них реально залогировалось.
+_KNOWN_LOGGER_FAMILIES = [
+    "src.main", "src.data_ingest", "src.strategy", "src.risk",
+    "src.execution", "src.ml", "src.telegram", "src.web",
+    "uvicorn", "apscheduler",
+]
+
+
+def _logger_family(name: str) -> str:
+    """Свернуть полное имя логгера (напр. src.execution.executor) до 'семейства' (src.execution)."""
+    parts = name.split(".")
+    if len(parts) > 1 and parts[0] == "src":
+        return f"{parts[0]}.{parts[1]}"
+    return parts[0]
+
+
+def get_logger_families() -> list[str]:
+    """Список 'семейств' логгеров для чекбокс-фильтра — известные + реально встретившиеся."""
+    seen = {_logger_family(r["logger"]) for r in ring_buffer_handler.records}
+    return sorted(seen | set(_KNOWN_LOGGER_FAMILIES))
+
 
 def get_recent_logs(
     level: Optional[str] = None,
     search: Optional[str] = None,
-    logger_name: Optional[str] = None,
+    loggers: Optional[list[str]] = None,
     limit: int = 200,
 ) -> list[dict]:
-    """Отфильтровать записи из ring-буфера логов для веб-панели."""
+    """Отфильтровать записи из ring-буфера логов для веб-панели.
+
+    loggers=None — без фильтра по модулю (показать всё); loggers=[...] —
+    показать только записи, чьё 'семейство' логгера входит в список (пустой
+    список фильтрует всё, что осмысленно соответствует "ни один модуль не выбран").
+    """
     min_level = _LEVEL_ORDER.get((level or "").upper())
     result = []
     for r in ring_buffer_handler.records:
         if min_level is not None and _LEVEL_ORDER.get(r["level"], 0) < min_level:
             continue
-        if logger_name and logger_name.lower() not in r["logger"].lower():
+        if loggers is not None and _logger_family(r["logger"]) not in loggers:
             continue
         if search and search.lower() not in r["message"].lower():
             continue

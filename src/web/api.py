@@ -17,7 +17,7 @@ from src.risk.risk_manager import risk_manager
 from src.execution.executor import execution_engine
 from src.ml import model_registry, model_trainer
 from src.strategy import strategy_registry
-from src.utils.logging import logger, get_recent_logs
+from src.utils.logging import logger, get_recent_logs, get_logger_families
 from src.utils.timeutils import utcnow
 from src.db.session import get_session
 from src.db.models import (
@@ -207,6 +207,16 @@ async def root():
     }
 
 
+def _position_source_label(strategy_id: Optional[str]) -> str:
+    """Человекочитаемый источник сигнала по строковому strategy_id (см. executor.py/main.py)."""
+    if not strategy_id:
+        return "—"
+    if strategy_id == "telegram_signal":
+        return "📲 Telegram"
+    strategy = strategy_registry.get(strategy_id)
+    return strategy.name if strategy else strategy_id
+
+
 DASHBOARD_HTML_PATH = Path(__file__).parent / "static" / "dashboard.html"
 LOGIN_HTML_PATH = Path(__file__).parent / "static" / "login.html"
 
@@ -274,13 +284,18 @@ async def get_status():
             for c in channels
         ]
 
+    paper_positions = execution_engine.get_paper_positions() if settings.is_paper else None
+    if paper_positions:
+        for pos in paper_positions.values():
+            pos["source"] = _position_source_label(pos.get("strategy_id"))
+
     return {
         "trading_mode": settings.trading_mode,
         "is_paper": settings.is_paper,
         "startup_capital": settings.startup_capital_usdt,
         "risk_state": risk_manager.get_state(),
         "paper_balance": execution_engine.get_paper_balance() if settings.is_paper else None,
-        "paper_positions": execution_engine.get_paper_positions() if settings.is_paper else None,
+        "paper_positions": paper_positions,
         "active_strategies": strategy_registry.list_strategies(),
         "ml_models": await model_registry.list_models(),
         "ml_active_model": await model_registry.get_active_model("direction_classifier"),
@@ -411,7 +426,7 @@ async def list_trades(limit: int = 100, offset: int = 0):
         trades = (
             await session.execute(
                 select(Trade)
-                .options(selectinload(Trade.symbol))
+                .options(selectinload(Trade.symbol), selectinload(Trade.strategy))
                 .order_by(Trade.created_at.desc())
                 .offset(offset)
                 .limit(limit)
@@ -432,6 +447,7 @@ async def list_trades(limit: int = 100, offset: int = 0):
                     "holding_seconds": t.holding_seconds,
                     "outcome": t.outcome,
                     "is_open": t.is_open,
+                    "source": _position_source_label(t.strategy.name if t.strategy else None),
                     "created_at": t.created_at.isoformat() if t.created_at else None,
                     "closed_at": t.closed_at.isoformat() if t.closed_at else None,
                 }
@@ -626,11 +642,27 @@ async def update_settings(request: SettingsUpdateRequest):
 async def get_logs(
     level: Optional[str] = None,
     search: Optional[str] = None,
-    logger_name: Optional[str] = None,
+    loggers: Optional[str] = None,
     limit: int = 200,
 ):
-    """Последние логи процесса (из ring-буфера в памяти) с фильтрами для веб-панели."""
-    return {"logs": get_recent_logs(level=level, search=search, logger_name=logger_name, limit=min(limit, 2000))}
+    """Последние логи процесса (из ring-буфера в памяти) с фильтрами для веб-панели.
+
+    loggers — список выбранных в чекбокс-фильтре 'семейств' логгеров через
+    запятую; параметр отсутствует = без фильтра, пустая строка = ничего
+    не выбрано (показать пусто).
+    """
+    logger_families = [x for x in loggers.split(",") if x] if loggers is not None else None
+    return {
+        "logs": get_recent_logs(
+            level=level, search=search, loggers=logger_families, limit=min(limit, 2000)
+        )
+    }
+
+
+@app.get("/logs/loggers")
+async def get_log_loggers():
+    """Список 'семейств' логгеров для чекбокс-фильтра в веб-панели."""
+    return {"loggers": get_logger_families()}
 
 
 @app.get("/connections/status")
