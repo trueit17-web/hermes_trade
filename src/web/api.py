@@ -34,6 +34,7 @@ from src.db.models import (
 from src.web import auth
 from src.web.settings_store import get_settings_snapshot, apply_settings_update
 from src.web.connections_status import get_connections_status
+from src.telegram.notifier import send_notification
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +197,11 @@ class BacktestRequest(BaseModel):
     paper_balance: float = 10000.0
 
 
+class PositionCloseRequest(BaseModel):
+    """Запрос на ручное закрытие открытой paper-позиции."""
+    symbol: str
+
+
 # === API эндпоинты ===
 
 @app.get("/")
@@ -287,8 +293,9 @@ async def get_status():
 
     paper_positions = execution_engine.get_paper_positions() if settings.is_paper else None
     if paper_positions:
-        for pos in paper_positions.values():
+        for symbol, pos in paper_positions.items():
             pos["source"] = _position_source_label(pos.get("strategy_id"))
+            pos["current_price"] = execution_engine.last_prices.get(symbol)
 
     return {
         "trading_mode": settings.trading_mode,
@@ -304,6 +311,70 @@ async def get_status():
         "event_bus_history_size": len(event_bus.get_history()),
         "timestamp": utcnow().isoformat(),
     }
+
+
+@app.post("/positions/close")
+async def close_position_manually(request: PositionCloseRequest):
+    """Закрыть открытую paper-позицию вручную по последней известной цене (кнопка в дашборде)."""
+    if not settings.is_paper:
+        raise HTTPException(status_code=400, detail="Ручное закрытие поддерживается только в paper-режиме")
+
+    symbol = request.symbol
+    position = execution_engine.paper_positions.get(symbol)
+    if not position:
+        raise HTTPException(status_code=404, detail=f"Открытая позиция {symbol} не найдена")
+
+    current_price = execution_engine.last_prices.get(symbol)
+    if current_price is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Текущая цена по этому символу ещё не известна — подождите следующей торговой итерации",
+        )
+
+    opened_at = position.get("opened_at")
+    holding_seconds = int((utcnow() - opened_at).total_seconds()) if opened_at else 0
+
+    result = await execution_engine.close_paper_position(
+        symbol=symbol,
+        side=position["side"],
+        entry_price=position["entry_price"],
+        amount=position["amount"],
+        exit_price=current_price,
+        reason="manual",
+        entry_fee=position.get("entry_fee", 0.0),
+        holding_seconds=holding_seconds,
+        strategy_id=position.get("strategy_id"),
+        order_open_id=position.get("order_id"),
+    )
+    if result is None:
+        raise HTTPException(status_code=500, detail="Не удалось закрыть позицию")
+
+    risk_manager.on_position_closed(symbol)
+    risk_manager.on_trade_closed(result["pnl"])
+
+    # Если позиция была открыта по Telegram-сигналу — довязать исход сделки
+    # к сигналу для статистики канала (обычно это делает основной цикл при
+    # автозакрытии по SL/TP, здесь закрытие идёт в обход него).
+    order_id = position.get("order_id")
+    if order_id and result.get("trade_id"):
+        async with get_session() as session:
+            sig = (
+                await session.execute(
+                    select(TelegramSignal).where(TelegramSignal.executed_order_id == order_id)
+                )
+            ).scalar_one_or_none()
+            if sig:
+                sig.executed_trade_id = result["trade_id"]
+                await session.commit()
+
+    emoji = "✅" if result["pnl"] > 0 else "❌"
+    logger.info(f"Позиция {symbol} закрыта вручную через веб-панель | PnL: {result['pnl']:+.2f}")
+    await send_notification(
+        f"{emoji} Закрыта вручную {position['side'].upper()} {symbol}\n"
+        f"PnL: {result['pnl']:+.2f} USDT ({result['pnl_pct']:+.2f}%)"
+    )
+
+    return {"success": True, **result}
 
 
 @app.get("/risk/state")

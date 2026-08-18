@@ -20,6 +20,20 @@ from src.utils.timeutils import utcnow
 logger = logging.getLogger(__name__)
 
 
+def min_profitable_margin_pct() -> float:
+    """
+    Минимальная дистанция TP от цены входа (в долях), при которой номинально
+    прибыльный выход (reason=take_profit) остаётся прибыльным и после
+    комиссий/слиппеджа paper-режима. Используется там, где TP считается не
+    от %, а от произвольного ценового уровня (напр. средняя полоса Боллинджера),
+    который может оказаться ближе комиссий — тогда выход по цене TP на деле
+    закрывает сделку в минус.
+    """
+    round_trip_fees = settings.paper_fee_pct * 2 / 100  # открытие + закрытие
+    entry_slippage = settings.paper_slippage_pct / 100
+    return round_trip_fees + entry_slippage + 0.002  # + запас 0.2%
+
+
 # === Сигнал от стратегии ===
 
 class StrategySignal:
@@ -333,11 +347,17 @@ class BollingerBandsStrategy(BaseStrategy):
         signal = None
 
         if mode == "mean_reversion":
+            min_margin = min_profitable_margin_pct()
+
             # Цена у показателя нижней полосы + объём выше нормы
             if close <= bb_lower * 1.005 and volume_ratio > 1.2:
                 confidence = max(0.5, 1.0 - bb_pct / 0.5)
                 sl = close * (1 - sl_pct)
-                tp = bb_mid  # прибыль на средней полосе
+                # Цель — средняя полоса, но не ближе порога окупаемости
+                # комиссий+слиппеджа: при узких полосах bb_mid мог быть
+                # в паре десятых процента от входа — номинальный take_profit
+                # после округления фактически всегда давал чистый убыток.
+                tp = max(bb_mid, close * (1 + min_margin))
 
                 signal = StrategySignal(
                     strategy_id=self.strategy_id,
@@ -355,7 +375,7 @@ class BollingerBandsStrategy(BaseStrategy):
             elif close >= bb_upper * 0.995 and volume_ratio > 1.2:
                 confidence = max(0.5, bb_pct / 0.5)
                 sl = close * (1 + sl_pct)
-                tp = bb_mid
+                tp = min(bb_mid, close * (1 - min_margin))
 
                 signal = StrategySignal(
                     strategy_id=self.strategy_id,

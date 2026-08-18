@@ -439,8 +439,8 @@
     <h2>Открытые позиции</h2>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Символ</th><th>Сторона</th><th>Кол-во</th><th>Цена входа</th><th>Источник</th></tr></thead>
-        <tbody id="positionsBody"><tr class="empty-row"><td colspan="5">Загрузка…</td></tr></tbody>
+        <thead><tr><th>Символ</th><th>Сторона</th><th>Кол-во</th><th>Цена входа</th><th>Текущая цена</th><th>Stop Loss</th><th>Take Profit</th><th>PnL</th><th>Источник</th><th></th></tr></thead>
+        <tbody id="positionsBody"><tr class="empty-row"><td colspan="10">Загрузка…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -644,18 +644,51 @@ function renderPositions(status) {
   const positions = status.paper_positions || {};
   const rows = Object.entries(positions);
   if (!rows.length) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="5">Нет открытых позиций</td></tr>`;
+    body.innerHTML = `<tr class="empty-row"><td colspan="10">Нет открытых позиций</td></tr>`;
     return;
   }
-  body.innerHTML = rows.map(([symbol, pos]) => `
+  body.innerHTML = rows.map(([symbol, pos]) => {
+    const cur = pos.current_price;
+    let pnlHtml = "—";
+    if (cur !== null && cur !== undefined && pos.entry_price) {
+      const dir = pos.side === "short" ? -1 : 1;
+      const pnlPct = dir * (cur - pos.entry_price) / pos.entry_price * 100;
+      pnlHtml = `<span class="${pnlPct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${pnlPct >= 0 ? "+" : ""}${fmt(pnlPct, 2)}%</span>`;
+    }
+    return `
     <tr>
       <td>${symbol}</td>
       <td class="side-${pos.side === 'long' ? 'long' : 'short'}">${(pos.side || '').toUpperCase()}</td>
       <td>${fmt(pos.amount, 6)}</td>
       <td>${fmt(pos.entry_price)}</td>
+      <td>${cur !== null && cur !== undefined ? fmt(cur) : "—"}</td>
+      <td class="muted">${pos.stop_loss ? fmt(pos.stop_loss) : "—"}</td>
+      <td class="muted">${pos.take_profit ? fmt(pos.take_profit) : "—"}</td>
+      <td>${pnlHtml}</td>
       <td class="muted">${pos.source || "—"}</td>
+      <td><button class="btn-icon-danger" data-close-position="${symbol}" title="Закрыть по рынку">✕</button></td>
     </tr>
-  `).join("");
+  `;
+  }).join("");
+
+  body.querySelectorAll("[data-close-position]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const symbol = btn.dataset.closePosition;
+      if (!confirm(`Закрыть позицию ${symbol} по текущей рыночной цене?`)) return;
+      btn.disabled = true;
+      try {
+        const result = await api("/positions/close", {
+          method: "POST",
+          body: JSON.stringify({ symbol }),
+        });
+        showToast(`${symbol} закрыта: ${result.pnl >= 0 ? "+" : ""}${fmt(result.pnl)} USDT (${fmt(result.pnl_pct, 2)}%)`);
+        await refreshAll();
+      } catch (err) {
+        showToast(`Ошибка: ${err.message}`, true);
+        btn.disabled = false;
+      }
+    });
+  });
 }
 
 async function renderStrategies() {

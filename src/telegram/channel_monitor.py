@@ -7,6 +7,7 @@ from typing import Any, Optional
 
 from telethon import TelegramClient, events
 from telethon.tl.types import Channel, Message
+from telethon.utils import get_peer_id
 
 from src.config import settings
 from src.utils.logging import logger
@@ -80,11 +81,32 @@ async def monitor_channels(channels: list[dict]):
 
     logger.info(f"Запуск мониторинга каналов: {[c['channel_id'] for c in channels]}")
 
-    @client.on(events.NewMessage(chats=[c["channel_id"] for c in channels]))
+    # event.chat_id из Telethon — это всегда нормализованный числовой ID
+    # (напр. -1001234567890), а channel_id в БД чаще всего — то, что ввёл
+    # пользователь в дашборде ("@channelname"). Раньше матчинг делался как
+    # `c["channel_id"] == str(event.chat_id)`, что для username-каналов не
+    # совпадало НИКОГДА — все сообщения из таких каналов тихо отбрасывались
+    # без единой ошибки в логах. Резолвим каждый канал в реальную entity
+    # заранее и матчим по числовому id, а не по исходной строке.
+    resolved: dict[int, dict] = {}
+    entities = []
+    for c in channels:
+        try:
+            entity = await client.get_entity(c["channel_id"])
+            chat_id = get_peer_id(entity)
+            resolved[chat_id] = c
+            entities.append(entity)
+        except Exception as e:
+            logger.error(f"Telegram: не удалось найти канал {c['channel_id']}: {e}")
+
+    if not resolved:
+        logger.warning("Telegram: ни один канал не удалось резолвить — мониторинг не запущен")
+        return
+
+    @client.on(events.NewMessage(chats=entities))
     async def handler(event: events.NewMessage.Event):
         message: Message = event.message
-        channel_id = event.chat_id
-        channel = next((c for c in channels if c["channel_id"] == str(channel_id)), None)
+        channel = resolved.get(event.chat_id)
 
         if channel is None:
             return
@@ -122,7 +144,7 @@ async def monitor_channels(channels: list[dict]):
                 except Exception as e:
                     logger.error(f"Ошибка уведомления подписчика Telegram сигнала: {e}")
 
-    logger.info(f"Мониторинг каналов запущен: {[c['channel_id'] for c in channels]}")
+    logger.info(f"Мониторинг каналов запущен: {[c['channel_id'] for c in resolved.values()]}")
 
 
 def subscribe_telegram_signal(callback: callable):

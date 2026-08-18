@@ -416,6 +416,7 @@ class TradingBot:
         latest = df.iloc[-1]
         close = float(latest["close"])
         self.last_prices[symbol] = close
+        execution_engine.last_prices[symbol] = close
 
         if settings.is_paper and await self._check_position_exit(symbol, close):
             return  # позиция закрыта в этой итерации — новый сигнал сгенерируем в следующем цикле
@@ -636,6 +637,14 @@ class TradingBot:
         """
         position = self.open_positions.get(symbol)
         if not position:
+            return False
+
+        # Позиция могла быть закрыта в обход основного цикла (кнопка
+        # "Закрыть" в дашборде, POST /positions/close) — execution_engine
+        # уже не знает о ней, но self.open_positions ещё не подчищен.
+        # Без этой проверки мы бы попытались закрыть её второй раз здесь.
+        if symbol not in execution_engine.paper_positions:
+            del self.open_positions[symbol]
             return False
 
         side = position["side"]

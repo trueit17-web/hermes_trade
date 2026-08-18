@@ -34,6 +34,7 @@ class ExecutionEngine:
         self.is_paper: bool = settings.is_paper
         self.paper_balance: float = settings.startup_capital_usdt
         self.paper_positions: dict[str, dict] = {}
+        self.last_prices: dict[str, float] = {}
         self.order_counter = 0
 
     async def initialize(self, exchange_id: str = "binance"):
@@ -246,10 +247,12 @@ class ExecutionEngine:
                 / (self.paper_positions[symbol]["amount"])
             )
             self.paper_positions[symbol]["side"] = "long"
-            # Источник сигнала (id стратегии либо "telegram_signal") — для
-            # отображения в дашборде; при доливке позиции другим источником
-            # отражает последний ордер, не историю целиком.
+            # Источник сигнала, SL/TP — для отображения и ручного закрытия
+            # в дашборде; при доливке позиции другим ордером отражают
+            # последний ордер, не историю целиком.
             self.paper_positions[symbol]["strategy_id"] = order_data.get("strategy_id")
+            self.paper_positions[symbol]["stop_loss"] = order_data.get("stop_loss")
+            self.paper_positions[symbol]["take_profit"] = order_data.get("take_profit")
         else:
             if symbol in self.paper_positions:
                 pos = self.paper_positions[symbol]
@@ -290,6 +293,11 @@ class ExecutionEngine:
             await session.flush()
             order_id = order.id
             await session.commit()
+
+        if side == "buy" and symbol in self.paper_positions:
+            self.paper_positions[symbol]["order_id"] = order_id
+            self.paper_positions[symbol]["entry_fee"] = fee
+            self.paper_positions[symbol].setdefault("opened_at", utcnow())
 
         # Создание TradeEvent
         trade_event = TradeEvent(
