@@ -296,7 +296,13 @@ class TradingBot:
         открывать больше позиций, чем реально разрешено max_open_positions.
         """
         self.open_positions = {}
-        for symbol, pos in execution_engine.paper_positions.items():
+        # Раньше здесь безусловно читался execution_engine.paper_positions —
+        # в real-режиме restored real_positions никогда не попадали в
+        # self.open_positions, SL/TP по ним не проверялись бы после
+        # рестарта вообще.
+        source = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
+        balance = execution_engine.paper_balance if settings.is_paper else None
+        for symbol, pos in source.items():
             self.open_positions[symbol] = {
                 "side": pos.get("side", "long"),
                 "entry_price": pos.get("entry_price"),
@@ -305,12 +311,13 @@ class TradingBot:
                 "rationale": "Восстановлено при старте бота",
                 "sl": pos.get("stop_loss"),
                 "tp": pos.get("take_profit"),
+                "tp_hit_count": pos.get("tp_hit_count", 0),
                 "opened_at": pos.get("opened_at") or utcnow(),
                 "order_id": pos.get("order_id"),
                 "entry_fee": pos.get("entry_fee", 0.0),
             }
             position_value = (pos.get("amount") or 0) * (pos.get("entry_price") or 0)
-            size_pct = (position_value / execution_engine.paper_balance * 100) if execution_engine.paper_balance else 0.0
+            size_pct = (position_value / balance * 100) if balance else 0.0
             risk_manager.on_position_added(symbol, size_pct)
 
         if self.open_positions:
@@ -504,6 +511,7 @@ class TradingBot:
                 "side": side, "entry_price": entry,
                 "amount": amount, "strategy_id": "telegram_signal",
                 "rationale": "Telegram сигнал", "sl": sl, "tp": tp,
+                "tp_hit_count": 0,
                 "opened_at": utcnow(),
                 "order_id": order.id, "entry_fee": order.fee,
             }
@@ -811,7 +819,8 @@ class TradingBot:
                     "side": signal.side, "entry_price": entry_price,
                     "amount": amount, "strategy_id": signal.strategy_id,
                     "rationale": signal.rationale, "sl": signal.stop_loss,
-                    "tp": signal.take_profit, "opened_at": utcnow(),
+                    "tp": signal.take_profit, "tp_hit_count": 0,
+                    "opened_at": utcnow(),
                     "order_id": order.id, "entry_fee": order.fee,
                 }
                 risk_manager.on_position_added(symbol, size_pct)
@@ -860,10 +869,35 @@ class TradingBot:
         except Exception as e:
             logger.debug(f"Не удалось сохранить ML-обучающий пример для {symbol}: {e}")
 
+    @staticmethod
+    def _tp_levels(entry_price: float, tp: Optional[float]) -> tuple:
+        """
+        3 уровня частичной фиксации прибыли — линейная интерполяция между
+        ценой входа и итоговым TP (TP3): TP1 = 1/3 пути, TP2 = 2/3 пути.
+        Формула симметрична для long и short (tp > entry для long,
+        tp < entry для short — интерполяция работает в обе стороны).
+        Возвращает (None, None, None), если TP не задан.
+        """
+        if not tp:
+            return None, None, None
+        tp1 = entry_price + (tp - entry_price) / 3
+        tp2 = entry_price + (tp - entry_price) * 2 / 3
+        return tp1, tp2, tp
+
+    REASON_RU = {
+        "stop_loss": "Stop Loss",
+        "take_profit_1": "Take Profit 1 (50%)",
+        "take_profit_2": "Take Profit 2 (25%)",
+        "take_profit_3": "Take Profit 3 (остаток)",
+    }
+
     async def _check_position_exit(self, symbol: str, current_price: float) -> bool:
         """
-        Проверить открытую позицию на достижение SL/TP и закрыть при необходимости.
-        Возвращает True, если позиция была закрыта в этом вызове.
+        Проверить открытую позицию на достижение SL или одного из 3 уровней
+        TP. TP1/TP2 закрывают часть позиции (50% текущего остатка каждый —
+        итого 50%/25%/25% от исходного объёма) и двигают SL в безубыток
+        после первого срабатывания; TP3 (или SL) закрывают всё, что осталось.
+        Возвращает True, если позиция была закрыта (полностью) в этом вызове.
         """
         position = self.open_positions.get(symbol)
         if not position:
@@ -880,22 +914,46 @@ class TradingBot:
 
         side = position["side"]
         sl = position.get("sl")
-        tp = position.get("tp")
+        tp_hit_count = position.get("tp_hit_count", 0)
+        tp1, tp2, tp3 = self._tp_levels(position["entry_price"], position.get("tp"))
 
         reason = None
         if side == "long":
             if sl and current_price <= sl:
                 reason = "stop_loss"
-            elif tp and current_price >= tp:
-                reason = "take_profit"
+            elif tp_hit_count < 3 and tp3 and current_price >= tp3:
+                reason = "take_profit_3"
+            elif tp_hit_count < 2 and tp2 and current_price >= tp2:
+                reason = "take_profit_2"
+            elif tp_hit_count < 1 and tp1 and current_price >= tp1:
+                reason = "take_profit_1"
         else:  # short
             if sl and current_price >= sl:
                 reason = "stop_loss"
-            elif tp and current_price <= tp:
-                reason = "take_profit"
+            elif tp_hit_count < 3 and tp3 and current_price <= tp3:
+                reason = "take_profit_3"
+            elif tp_hit_count < 2 and tp2 and current_price <= tp2:
+                reason = "take_profit_2"
+            elif tp_hit_count < 1 and tp1 and current_price <= tp1:
+                reason = "take_profit_1"
 
         if reason is None:
             return False
+
+        # TP1/TP2 закрывают половину текущего остатка; TP3 и SL — всё, что
+        # осталось. Если после частичного закрытия остаётся управляющая
+        # погрешность (пыль), закрываем полностью, а не оставляем висеть.
+        is_partial = reason in ("take_profit_1", "take_profit_2")
+        close_amount = position["amount"] * 0.5 if is_partial else position["amount"]
+        if position["amount"] - close_amount <= 1e-9:
+            is_partial = False
+            close_amount = position["amount"]
+
+        # Комиссия за открытие относится к открытому объёму пропорционально —
+        # иначе при частичном закрытии либо занижали бы, либо задваивали её
+        # в PnL следующих частей той же позиции.
+        entry_fee_total = position.get("entry_fee", 0.0)
+        entry_fee_portion = entry_fee_total * (close_amount / position["amount"]) if position["amount"] else 0.0
 
         opened_at = position.get("opened_at")
         holding_seconds = int((utcnow() - opened_at).total_seconds()) if opened_at else 0
@@ -905,10 +963,10 @@ class TradingBot:
             symbol=symbol,
             side=side,
             entry_price=position["entry_price"],
-            amount=position["amount"],
+            amount=close_amount,
             exit_price=current_price,
             reason=reason,
-            entry_fee=position.get("entry_fee", 0.0),
+            entry_fee=entry_fee_portion,
             holding_seconds=holding_seconds,
             strategy_id=position.get("strategy_id"),
             order_open_id=position.get("order_id"),
@@ -917,36 +975,47 @@ class TradingBot:
         if result is None:
             return False
 
-        del self.open_positions[symbol]
-        risk_manager.on_position_closed(symbol)
         risk_manager.on_trade_closed(result["pnl"])
         self.daily_pnl = getattr(risk_manager.state, "daily_pnl", 0.0)
 
-        if position.get("strategy_id") == "telegram_signal" and result.get("trade_id"):
-            await self._link_telegram_signal_trade(
-                position.get("order_id"), result["trade_id"], result.get("outcome"),
-            )
+        if is_partial:
+            position["amount"] -= close_amount
+            position["entry_fee"] = entry_fee_total - entry_fee_portion
+            position["tp_hit_count"] = tp_hit_count + 1
+            if position["tp_hit_count"] == 1:
+                # Безубыток: после первой частичной фиксации прибыли остаток
+                # позиции больше не может уйти в минус относительно входа.
+                position["sl"] = position["entry_price"]
+        else:
+            del self.open_positions[symbol]
+            risk_manager.on_position_closed(symbol)
+            if position.get("strategy_id") == "telegram_signal" and result.get("trade_id"):
+                await self._link_telegram_signal_trade(
+                    position.get("order_id"), result["trade_id"], result.get("outcome"),
+                )
 
         emoji = "✅" if result["pnl"] > 0 else "❌"
-        reason_ru = "Stop Loss" if reason == "stop_loss" else "Take Profit"
+        reason_ru = self.REASON_RU.get(reason, reason)
         logger.info(
-            f"{emoji} Позиция закрыта: {symbol} {side.upper()} | {reason_ru} @ {current_price:.4f} | "
+            f"{emoji} {'Частично закрыта' if is_partial else 'Позиция закрыта'}: {symbol} {side.upper()} | "
+            f"{reason_ru} @ {current_price:.4f} | объём {close_amount:.6f} | "
             f"PnL: {result['pnl']:+.2f} ({result['pnl_pct']:+.2f}%)"
         )
         await decision_logger.flush_for_trade(
             position.get("order_id"), result["trade_id"],
-            close_description=f"Позиция закрыта: {reason_ru} @ {current_price:.4f} | PnL {result['pnl']:+.2f} ({result['pnl_pct']:+.2f}%)",
+            close_description=f"{'Частично закрыта' if is_partial else 'Позиция закрыта'}: {reason_ru} @ {current_price:.4f} | PnL {result['pnl']:+.2f} ({result['pnl_pct']:+.2f}%)",
             close_details={
-                "reason": reason, "exit_price": current_price,
+                "reason": reason, "exit_price": current_price, "amount": close_amount,
                 "pnl": result["pnl"], "pnl_pct": result["pnl_pct"], "outcome": result.get("outcome"),
+                "partial": is_partial,
             },
         )
         await send_notification(
-            f"{emoji} Закрыта {side.upper()} {symbol}\n"
+            f"{emoji} {'Частично закрыта' if is_partial else 'Закрыта'} {side.upper()} {symbol}\n"
             f"Причина: {reason_ru}\n"
             f"PnL: {result['pnl']:+.2f} USDT ({result['pnl_pct']:+.2f}%)"
         )
-        return True
+        return not is_partial
 
     async def _link_telegram_signal_trade(
         self, order_id: Optional[int], trade_id: int, outcome: Optional[str] = None,

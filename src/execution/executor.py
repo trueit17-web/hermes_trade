@@ -114,29 +114,39 @@ class ExecutionEngine:
         Реконструировать открытые позиции из БД для указанного режима (paper/real).
 
         Открытая позиция = BUY-ордер (status=filled) на бирже нужного типа
-        (Order.exchange -> Exchange.is_paper), который не участвует ни в
-        одном Trade — ни как order_open_id (позиция уже закрыта), ни как
-        order_close_id. Последнее важно для закрытия SHORT-позиций: close
-        для short создаёт BUY-ордер (см. close_paper_position/close_real_position),
-        который иначе неотличим от новой открытой long-позиции.
+        (Order.exchange -> Exchange.is_paper), у которого объём ещё не
+        полностью выбран закрывающими сделками. Позиция может быть закрыта
+        ЧАСТИЧНО (уровни TP1/TP2) — остаток реконструируется как
+        filled_amount минус сумма Trade.amount всех сделок, ссылающихся на
+        этот ордер как order_open_id, а число таких сделок — это tp_hit_count
+        (сколько уровней TP уже сработало). order_close_id из этого же
+        расчёта исключается отдельно: закрытие SHORT создаёт BUY-ордер (см.
+        close_paper_position/close_real_position), который иначе неотличим
+        от новой открытой long-позиции.
         Возвращает (позиции, реализованный PnL, себестоимость открытых позиций)
         или (None, 0, 0) при ошибке запроса.
         """
         try:
             async with get_session() as session:
-                trade_order_ids = set(
-                    (
-                        await session.execute(
-                            select(Trade.order_open_id).where(Trade.order_open_id.is_not(None))
-                        )
-                    ).scalars().all()
-                ) | set(
+                close_order_ids = set(
                     (
                         await session.execute(
                             select(Trade.order_close_id).where(Trade.order_close_id.is_not(None))
                         )
                     ).scalars().all()
                 )
+                partial_trades = (
+                    await session.execute(
+                        select(Trade.order_open_id, Trade.amount)
+                        .where(Trade.order_open_id.is_not(None))
+                    )
+                ).all()
+                closed_by_order: dict[int, float] = {}
+                hits_by_order: dict[int, int] = {}
+                for order_open_id, trade_amount in partial_trades:
+                    closed_by_order[order_open_id] = closed_by_order.get(order_open_id, 0.0) + float(trade_amount)
+                    hits_by_order[order_open_id] = hits_by_order.get(order_open_id, 0) + 1
+
                 # PnL и открытые ордера должны считаться в рамках одного режима —
                 # иначе, например, реальный PnL просачивался бы в paper-баланс.
                 realized_pnl = (
@@ -168,19 +178,28 @@ class ExecutionEngine:
         positions: dict[str, dict] = {}
         cost_basis = 0.0
         for o in orders:
-            if o.id in trade_order_ids or o.symbol is None:
+            if o.id in close_order_ids or o.symbol is None:
                 continue
 
+            filled_amount = float(o.filled_amount or o.amount)
+            already_closed = closed_by_order.get(o.id, 0.0)
+            amount = filled_amount - already_closed
+            if amount <= 1e-9:
+                continue  # эта открывающая позиция уже закрыта полностью
+
             symbol = o.symbol.symbol
-            amount = float(o.filled_amount or o.amount)
             price = float(o.filled_price or o.price)
-            fee = float(o.fee or 0)
+            # Комиссия открытия относится к остатку объёма пропорционально —
+            # иначе для частично закрытой позиции она либо задваивалась бы
+            # (уже учтена в PnL прошлых частичных закрытий), либо терялась.
+            fee = float(o.fee or 0) * (amount / filled_amount) if filled_amount else 0.0
             cost_basis += amount * price + fee
 
             pos = positions.setdefault(symbol, {
                 "amount": 0.0, "entry_price": 0.0, "side": "long",
                 "strategy_id": None, "stop_loss": None, "take_profit": None,
                 "order_id": None, "entry_fee": 0.0, "opened_at": None,
+                "tp_hit_count": 0,
             })
             pos["entry_price"] = (
                 (pos["entry_price"] * pos["amount"] + price * amount) / (pos["amount"] + amount)
@@ -192,8 +211,17 @@ class ExecutionEngine:
             pos["take_profit"] = float(o.take_profit) if o.take_profit else pos["take_profit"]
             pos["order_id"] = o.id
             pos["entry_fee"] = fee
+            pos["tp_hit_count"] = max(pos["tp_hit_count"], hits_by_order.get(o.id, 0))
             if pos["opened_at"] is None:
                 pos["opened_at"] = o.created_at
+
+        # Если хотя бы один уровень TP уже сработал, SL остатка позиции был
+        # передвинут в безубыток (см. _check_position_exit в main.py) — это
+        # решение никогда не пишется в Order.stop_loss в БД, поэтому
+        # применяем то же правило здесь, а не восстанавливаем исходный SL.
+        for pos in positions.values():
+            if pos["tp_hit_count"] >= 1:
+                pos["stop_loss"] = pos["entry_price"]
 
         return positions, float(realized_pnl), cost_basis
 
@@ -625,7 +653,18 @@ class ExecutionEngine:
         pnl_pct = (pnl / (entry_price * amount) * 100) if entry_price and amount else 0.0
         outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "break-even")
 
-        self.paper_positions.pop(symbol, None)
+        # amount может быть частью открытой позиции (частичное закрытие по
+        # уровню TP1/TP2) — уменьшаем остаток вместо того, чтобы стереть
+        # позицию целиком, иначе main.py на следующей итерации решил бы,
+        # что оставшаяся часть закрыта в обход основного цикла, и потерял
+        # бы её отслеживание.
+        pos = self.paper_positions.get(symbol)
+        if pos is not None:
+            remaining = pos["amount"] - amount
+            if remaining <= 1e-9:
+                self.paper_positions.pop(symbol, None)
+            else:
+                pos["amount"] = remaining
 
         async with get_session() as session:
             exchange_id, symbol_id = await self._resolve_symbol_id(session, symbol)
@@ -829,7 +868,15 @@ class ExecutionEngine:
         pnl_pct = (pnl / (entry_price * amount) * 100) if entry_price and amount else 0.0
         outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "break-even")
 
-        self.real_positions.pop(symbol, None)
+        # amount может быть частью открытой позиции (частичное закрытие по
+        # уровню TP1/TP2) — см. тот же комментарий в close_paper_position.
+        pos = self.real_positions.get(symbol)
+        if pos is not None:
+            remaining = pos["amount"] - amount
+            if remaining <= 1e-9:
+                self.real_positions.pop(symbol, None)
+            else:
+                pos["amount"] = remaining
 
         async with get_session() as session:
             exchange_id, symbol_id = await self._resolve_symbol_id(session, symbol)

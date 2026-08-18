@@ -468,15 +468,19 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
                     .where(Exchange.is_paper == True)  # noqa: E712
                 )
             ).scalar() or 0
-            trade_order_ids = set(
-                (await session.execute(
-                    select(Trade.order_open_id).where(Trade.order_open_id.is_not(None))
-                )).scalars().all()
-            ) | set(
+            close_order_ids = set(
                 (await session.execute(
                     select(Trade.order_close_id).where(Trade.order_close_id.is_not(None))
                 )).scalars().all()
             )
+            partial_trades = (
+                await session.execute(
+                    select(Trade.order_open_id, Trade.amount).where(Trade.order_open_id.is_not(None))
+                )
+            ).all()
+            closed_by_order: dict = {}
+            for order_open_id, trade_amount in partial_trades:
+                closed_by_order[order_open_id] = closed_by_order.get(order_open_id, 0.0) + float(trade_amount)
             open_orders = (
                 await session.execute(
                     select(Order)
@@ -485,10 +489,19 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
                 )
             ).scalars().all()
 
-        cost_basis = sum(
-            float(o.filled_amount or o.amount) * float(o.filled_price or o.price) + float(o.fee or 0)
-            for o in open_orders if o.id not in trade_order_ids
-        )
+        # Позиция может быть закрыта ЧАСТИЧНО (TP1/TP2) — считаем остаток
+        # объёма и пропорциональную ему долю комиссии, а не только "открыт
+        # целиком или закрыт целиком", как в старой версии этого пересчёта.
+        cost_basis = 0.0
+        for o in open_orders:
+            if o.id in close_order_ids:
+                continue
+            filled_amount = float(o.filled_amount or o.amount)
+            remaining = filled_amount - closed_by_order.get(o.id, 0.0)
+            if remaining <= 1e-9:
+                continue
+            fee_share = float(o.fee or 0) * (remaining / filled_amount) if filled_amount else 0.0
+            cost_basis += remaining * float(o.filled_price or o.price) + fee_share
         expected_balance = settings.startup_capital_usdt + float(realized) - cost_basis
 
         await self.engine.initialize("binance")
@@ -562,6 +575,86 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result)
         self.assertLess(result["pnl"], 0)
         self.assertEqual(result["outcome"], "loss")
+
+    async def test_partial_close_reduces_position_instead_of_removing_it(self):
+        """
+        close_paper_position(amount=часть открытой позиции) — TP1/TP2 из
+        3-уровневого take-profit — должен уменьшить объём позиции, а не
+        стереть её целиком (иначе main.py на следующей итерации решил бы,
+        что остаток закрыт в обход основного цикла).
+        """
+        settings.trading_mode = "paper"
+        await self.engine.initialize("binance")
+
+        # Уникальный символ — тестовая БД общая на сессию, а другие тесты
+        # (например test_paper_create_order) тоже используют BTC/USDT и
+        # оставляют там открытые позиции, что ломает точные ассерты по amount.
+        symbol = "PARTIALCLOSE1/USDT"
+        order = await self.engine.create_order(
+            symbol=symbol, side="buy", amount=10.0, price=100.0,
+            order_type="market", stop_loss=90.0, take_profit=130.0,
+        )
+        self.assertIsNotNone(order)
+
+        result = await self.engine.close_paper_position(
+            symbol=symbol, side="long", entry_price=100.0, amount=5.0,
+            exit_price=110.0, reason="take_profit_1", entry_fee=order.fee / 2,
+            holding_seconds=60, order_open_id=order.id,
+        )
+        self.assertIsNotNone(result)
+        self.assertIn(symbol, self.engine.paper_positions)
+        self.assertAlmostEqual(self.engine.paper_positions[symbol]["amount"], 5.0)
+
+        # Второе частичное закрытие остатка (TP2) — тоже уменьшает, не удаляет
+        result2 = await self.engine.close_paper_position(
+            symbol=symbol, side="long", entry_price=100.0, amount=2.5,
+            exit_price=120.0, reason="take_profit_2", entry_fee=order.fee / 4,
+            holding_seconds=90, order_open_id=order.id,
+        )
+        self.assertIsNotNone(result2)
+        self.assertAlmostEqual(self.engine.paper_positions[symbol]["amount"], 2.5)
+
+        # Финальное закрытие остатка — теперь позиция должна исчезнуть
+        result3 = await self.engine.close_paper_position(
+            symbol=symbol, side="long", entry_price=100.0, amount=2.5,
+            exit_price=130.0, reason="take_profit_3", entry_fee=order.fee / 4,
+            holding_seconds=120, order_open_id=order.id,
+        )
+        self.assertIsNotNone(result3)
+        self.assertNotIn(symbol, self.engine.paper_positions)
+
+    async def test_restore_partially_closed_position(self):
+        """
+        _load_open_positions_from_db должен реконструировать частично
+        закрытую позицию как открытую (с уменьшенным остатком и
+        tp_hit_count = число уже сработавших уровней TP), а не считать её
+        закрытой только потому, что её order_open_id уже встречается в
+        каких-то Trade.
+        """
+        settings.trading_mode = "paper"
+        await self.engine.initialize("binance")
+
+        order = await self.engine.create_order(
+            symbol="RESTORECOIN/USDT", side="buy", amount=8.0, price=50.0,
+            order_type="market", stop_loss=45.0, take_profit=65.0,
+        )
+        self.assertIsNotNone(order)
+
+        result = await self.engine.close_paper_position(
+            symbol="RESTORECOIN/USDT", side="long", entry_price=50.0, amount=4.0,
+            exit_price=55.0, reason="take_profit_1", entry_fee=order.fee / 2,
+            holding_seconds=60, order_open_id=order.id,
+        )
+        self.assertIsNotNone(result)
+
+        positions, _, _ = await self.engine._load_open_positions_from_db(is_paper=True)
+        self.assertIsNotNone(positions)
+        self.assertIn("RESTORECOIN/USDT", positions)
+        restored = positions["RESTORECOIN/USDT"]
+        self.assertAlmostEqual(restored["amount"], 4.0)
+        self.assertEqual(restored["tp_hit_count"], 1)
+        # После TP1 остаток должен восстановиться с SL в безубытке
+        self.assertAlmostEqual(restored["stop_loss"], restored["entry_price"])
 
     async def test_real_order_registers_position_with_correct_fee_and_price(self):
         """
