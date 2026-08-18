@@ -60,12 +60,28 @@ class FeatureStore:
         features: dict[str, float],
         labels: Optional[dict] = None,
     ):
-        """Добавить фичи в онлайн-хранилище и сохранить в БД."""
+        """Добавить фичи в онлайн-хранилище и сохранить в БД (идемпотентно по symbol+timeframe+timestamp)."""
         key = f"{symbol}:{timeframe}:{timestamp.isoformat()}"
         self._online_features[key] = features
 
         try:
             async with get_session() as session:
+                # Защита от дублей в main.py (_last_ml_feature_ts) — только
+                # in-memory и слетает при рестарте бота; проверяем по БД
+                # напрямую, иначе после каждого рестарта первая попытка на
+                # символ бьётся об uq_feature_unique и логирует ERROR.
+                exists = (
+                    await session.execute(
+                        select(MLFeature.id).where(
+                            MLFeature.symbol == symbol,
+                            MLFeature.timeframe == timeframe,
+                            MLFeature.timestamp == timestamp,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if exists is not None:
+                    return
+
                 feature = MLFeature(
                     symbol=symbol,
                     timeframe=timeframe,
@@ -76,7 +92,6 @@ class FeatureStore:
                     source="live",
                 )
                 session.add(feature)
-                await session.commit()
         except Exception as e:
             logger.debug(f"Не удалось сохранить фичи в БД: {e}")
 
