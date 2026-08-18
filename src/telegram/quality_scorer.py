@@ -18,6 +18,45 @@ class SignalQualityScorer:
     def __init__(self):
         self.channel_stats: dict[str, dict] = {}
 
+    async def restore_channel_stats_from_db(self):
+        """
+        Восстановить channel_stats из истории Telegram-сигналов в БД при
+        старте бота. channel_stats существует только в памяти — без этого
+        каждый рестарт бота (в т.ч. кнопкой в дашборде) обнулял бы
+        накопленную историческую точность канала обратно к нейтральным
+        50%, хотя вся история решений и исходов сделок хранится в БД
+        (TelegramSignal.executed_trade -> Trade.outcome).
+        """
+        from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
+        from src.db.session import get_session
+        from src.db.models import TelegramChannel, TelegramSignal
+
+        try:
+            async with get_session() as session:
+                channels = (await session.execute(select(TelegramChannel))).scalars().all()
+                for channel in channels:
+                    signals = (
+                        await session.execute(
+                            select(TelegramSignal)
+                            .options(selectinload(TelegramSignal.executed_trade))
+                            .where(TelegramSignal.channel_id == channel.id)
+                        )
+                    ).scalars().all()
+                    for s in signals:
+                        if s.executed_trade is not None and s.executed_trade.outcome is not None:
+                            self.update_channel_stats(
+                                channel.channel_id, s.executed_trade.outcome == "win",
+                            )
+        except Exception as e:
+            logger.warning(f"Не удалось восстановить channel_stats из БД: {e}")
+            return
+
+        if self.channel_stats:
+            logger.info(
+                f"♻️ Восстановлена статистика качества по {len(self.channel_stats)} Telegram-каналам из БД"
+            )
+
     def update_channel_stats(self, channel_id: str, signal_was_good: bool):
         """Обновить статистику канала."""
         if channel_id not in self.channel_stats:

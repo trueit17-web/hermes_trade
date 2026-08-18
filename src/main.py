@@ -280,6 +280,9 @@ class TradingBot:
         канала через дашборд начинает применяться только после рестарта
         (см. пометку "требуется рестарт" в веб-панели).
         """
+        from src.telegram.quality_scorer import signal_quality_scorer
+        await signal_quality_scorer.restore_channel_stats_from_db()
+
         async with get_session() as session:
             channels = (
                 await session.execute(select(TelegramChannel).where(TelegramChannel.active == True))

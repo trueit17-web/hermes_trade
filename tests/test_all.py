@@ -704,6 +704,65 @@ class TestQualificationScorer(unittest.TestCase):
         self.assertLess(score, 0.5)
 
 
+class TestQualityScorerRestoreFromDb(unittest.IsolatedAsyncioTestCase):
+    """
+    channel_stats существовал только в памяти — рестарт бота обнулял
+    накопленную историческую точность канала обратно к нейтральным 50%,
+    хотя вся история решений и исходов сделок хранится в БД.
+    """
+
+    async def test_restore_channel_stats_from_db(self):
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import TelegramChannel, TelegramSignal, Trade, Symbol, Exchange
+        from src.telegram.quality_scorer import SignalQualityScorer
+        from src.utils.timeutils import utcnow
+
+        async with get_session() as session:
+            exchange = (
+                await session.execute(select(Exchange).where(Exchange.name == "binance_paper"))
+            ).scalar_one_or_none()
+            if exchange is None:
+                exchange = Exchange(name="binance_paper", is_paper=True)
+                session.add(exchange)
+                await session.flush()
+
+            symbol = Symbol(
+                exchange_id=exchange.id, symbol="TESTCOIN/USDT",
+                base_asset="TESTCOIN", quote_asset="USDT",
+            )
+            session.add(symbol)
+            await session.flush()
+
+            channel = TelegramChannel(channel_id="@qs_restore_test", channel_title="QS Restore Test", active=True)
+            session.add(channel)
+            await session.flush()
+
+            for outcome, pnl in [("win", 10.0), ("win", 5.0), ("loss", -3.0)]:
+                trade = Trade(
+                    symbol_id=symbol.id, direction="long", entry_price=100.0, exit_price=101.0,
+                    amount=1.0, pnl=pnl, pnl_pct=1.0, outcome=outcome, is_open=False, closed_at=utcnow(),
+                )
+                session.add(trade)
+                await session.flush()
+                session.add(TelegramSignal(
+                    channel_id=channel.id, raw_message="test", message_date=utcnow(),
+                    parsed_pair="TESTCOIN/USDT", parsed_side="long", parsed_entry=100.0,
+                    decision="executed", executed_trade_id=trade.id,
+                ))
+            await session.commit()
+
+        fresh_scorer = SignalQualityScorer()
+        self.assertEqual(fresh_scorer.channel_stats, {})
+        await fresh_scorer.restore_channel_stats_from_db()
+
+        self.assertIn("@qs_restore_test", fresh_scorer.channel_stats)
+        stats = fresh_scorer.channel_stats["@qs_restore_test"]
+        self.assertEqual(stats["good_signals"], 2)
+        self.assertEqual(stats["bad_signals"], 1)
+        self.assertAlmostEqual(stats["win_rate"], 2 / 3)
+
+
 class TestLogging(unittest.TestCase):
     """Тесты для логирования."""
 
