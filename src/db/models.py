@@ -251,6 +251,7 @@ class TelegramSignal(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     channel: Mapped["TelegramChannel"] = relationship(back_populates="signals")
+    executed_order: Mapped[Optional["Order"]] = relationship()
     executed_trade: Mapped[Optional["Trade"]] = relationship()
 
 

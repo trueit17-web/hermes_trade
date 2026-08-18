@@ -1,6 +1,7 @@
 """FastAPI веб-интерфейс — API для управления ботом."""
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -671,6 +672,23 @@ async def connections_status():
     return {"connections": await get_connections_status()}
 
 
+@app.post("/system/restart")
+async def restart_bot():
+    """Перезапустить процесс бота (например, чтобы подхватить добавленные/удалённые
+    Telegram-каналы — их список фиксируется при старте). Полагается на
+    `restart: unless-stopped` в docker-compose.yml: процесс просто завершается,
+    Docker поднимает контейнер заново. Без такой restart-политики (голый
+    `python -m src.main` или systemd без Restart=) бот после этого не поднимется сам."""
+    logger.warning("🔄 Перезапуск бота запрошен через веб-панель")
+
+    async def _delayed_exit():
+        await asyncio.sleep(1)  # даём HTTP-ответу время дойти до клиента
+        os._exit(0)
+
+    asyncio.create_task(_delayed_exit())
+    return {"success": True, "message": "Бот перезапускается"}
+
+
 @app.get("/telegram/channels")
 async def list_telegram_channels():
     """Список Telegram каналов."""
@@ -782,14 +800,50 @@ async def telegram_channels_stats():
 
 
 @app.get("/telegram/signals")
-async def list_telegram_signals(limit: int = 100):
-    """Список Telegram сигналов."""
+async def list_telegram_signals(channel_id: Optional[int] = None, limit: int = 100):
+    """Список Telegram сигналов (опционально по одному каналу) с данными ордера и исхода сделки."""
     async with get_session() as session:
-        signals = (
-            await session.execute(
-                select(TelegramSignal).order_by(TelegramSignal.created_at.desc()).limit(limit)
+        query = (
+            select(TelegramSignal)
+            .options(
+                selectinload(TelegramSignal.executed_order),
+                selectinload(TelegramSignal.executed_trade),
             )
-        ).scalars().all()
+            .order_by(TelegramSignal.created_at.desc())
+            .limit(limit)
+        )
+        if channel_id is not None:
+            query = query.where(TelegramSignal.channel_id == channel_id)
+        signals = (await session.execute(query)).scalars().all()
+
+        def _order_data(order):
+            if order is None:
+                return None
+            return {
+                "id": order.id,
+                "side": order.side,
+                "order_type": order.order_type,
+                "amount": float(order.amount),
+                "price": float(order.price) if order.price else None,
+                "status": order.status,
+                "filled_price": float(order.filled_price) if order.filled_price else None,
+                "fee": float(order.fee),
+                "stop_loss": float(order.stop_loss) if order.stop_loss else None,
+                "take_profit": float(order.take_profit) if order.take_profit else None,
+                "created_at": order.created_at.isoformat() if order.created_at else None,
+            }
+
+        def _trade_data(trade):
+            if trade is None:
+                return None
+            return {
+                "pnl": float(trade.pnl),
+                "pnl_pct": float(trade.pnl_pct) if trade.pnl_pct else 0,
+                "outcome": trade.outcome,
+                "is_open": trade.is_open,
+                "closed_at": trade.closed_at.isoformat() if trade.closed_at else None,
+            }
+
         return {
             "signals": [
                 {
@@ -803,6 +857,8 @@ async def list_telegram_signals(limit: int = 100):
                     "parsed_tp": float(s.parsed_tp) if s.parsed_tp else None,
                     "quality_score": s.quality_score,
                     "decision": s.decision,
+                    "order": _order_data(s.executed_order),
+                    "trade": _trade_data(s.executed_trade),
                     "created_at": s.created_at.isoformat() if s.created_at else None,
                 }
                 for s in signals
