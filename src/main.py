@@ -98,6 +98,8 @@ class TradingBot:
         # Execution engine
         await execution_engine.initialize("binance")
         logger.info(f"✅ Execution Engine: {'paper' if settings.is_paper else 'real'} режим")
+        self._sync_open_positions_from_execution_engine()
+        await risk_manager.restore_daily_pnl_from_db()
 
         # Telegram (опционально)
         if settings.telegram_api_id and settings.telegram_api_hash:
@@ -184,6 +186,39 @@ class TradingBot:
             logger.info(f"📈 Торговая вселенная: {len(combined)} пар — {', '.join(combined)}")
         elif added or removed:
             logger.info(f"🔄 Торговая вселенная обновлена: +{len(added)} -{len(removed)} (всего {len(combined)})")
+
+    def _sync_open_positions_from_execution_engine(self):
+        """
+        Пересобрать self.open_positions и счётчик открытых позиций в
+        risk_manager из execution_engine.paper_positions (который на этот
+        момент уже восстановлен из БД в execution_engine.initialize()).
+
+        Без этого восстановленные из БД позиции были бы видны в дашборде
+        (через /status), но: (1) _check_position_exit никогда не проверял
+        бы их SL/TP, потому что self.open_positions пуст после рестарта;
+        (2) risk_manager занижал бы open_positions_count и разрешил бы
+        открывать больше позиций, чем реально разрешено max_open_positions.
+        """
+        self.open_positions = {}
+        for symbol, pos in execution_engine.paper_positions.items():
+            self.open_positions[symbol] = {
+                "side": pos.get("side", "long"),
+                "entry_price": pos.get("entry_price"),
+                "amount": pos.get("amount"),
+                "strategy_id": pos.get("strategy_id"),
+                "rationale": "Восстановлено при старте бота",
+                "sl": pos.get("stop_loss"),
+                "tp": pos.get("take_profit"),
+                "opened_at": pos.get("opened_at") or utcnow(),
+                "order_id": pos.get("order_id"),
+                "entry_fee": pos.get("entry_fee", 0.0),
+            }
+            position_value = (pos.get("amount") or 0) * (pos.get("entry_price") or 0)
+            size_pct = (position_value / execution_engine.paper_balance * 100) if execution_engine.paper_balance else 0.0
+            risk_manager.on_position_added(symbol, size_pct)
+
+        if self.open_positions:
+            logger.info(f"🔗 Синхронизировано {len(self.open_positions)} открытых позиций с риск-менеджером")
 
     async def _on_trade_event(self, event):
         """Отправить Telegram-уведомление об открытой сделке."""
@@ -397,6 +432,16 @@ class TradingBot:
         if self.daily_pnl_reset_date != today:
             self.daily_pnl = 0.0
             self.daily_pnl_reset_date = today
+
+        # Баланс для контроля max_drawdown_pct — без этого вызова
+        # risk_manager.state.start_balance/current_balance никогда не
+        # обновлялись, и защита по просадке была мертва.
+        if settings.is_paper:
+            risk_manager.on_balance_update(execution_engine.get_paper_balance())
+        else:
+            real_balance = await execution_engine.get_real_balance()
+            if real_balance is not None:
+                risk_manager.on_balance_update(real_balance)
 
         for symbol in self.active_symbols:
             await self._process_symbol(symbol)

@@ -44,8 +44,12 @@ class RiskState:
     """Состояние риска в реальном времени."""
 
     def __init__(self):
-        self.start_balance = 0.0
-        self.current_balance = 0.0
+        # Стартовый капитал аккаунта, а не "баланс на момент первого вызова
+        # update_balance()" — иначе после каждого рестарта базой для расчёта
+        # просадки становился бы текущий баланс, и любая уже случившаяся
+        # просадка стала бы невидимой для max_drawdown_pct.
+        self.start_balance = settings.startup_capital_usdt
+        self.current_balance = settings.startup_capital_usdt
         self.daily_pnl = 0.0
         self.daily_loss_limit_reached = False
         self.daily_loss_reset_time: Optional[datetime] = None
@@ -68,8 +72,6 @@ class RiskState:
     def update_balance(self, balance: float):
         """Обновить текущий баланс."""
         self.current_balance = balance
-        if self.start_balance == 0:
-            self.start_balance = balance
 
     def update_daily_pnl(self, pnl: float):
         """Обновить daily PnL."""
@@ -188,6 +190,36 @@ class RiskManager:
         self.state.daily_loss_limit_usd = self.profile.daily_loss_limit_usd
         self.state.max_drawdown_pct = self.profile.max_drawdown_pct
         self.state.cooldown_seconds = self.profile.cooldown_seconds
+
+    async def restore_daily_pnl_from_db(self):
+        """
+        Восстановить daily_pnl из уже закрытых сегодня сделок при старте бота.
+
+        daily_pnl живёт только в памяти — без этого рестарт в течение дня
+        обнулял бы счётчик, и дневной лимит убытков (risk_daily_loss_limit_usd)
+        эффективно переставал действовать до конца суток, разрешая новые
+        просадки поверх уже случившихся сегодня.
+        """
+        from sqlalchemy import select, func
+        from src.db.session import get_session
+        from src.db.models import Trade
+
+        today_start = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        try:
+            async with get_session() as session:
+                total = (
+                    await session.execute(
+                        select(func.sum(Trade.pnl)).where(Trade.closed_at >= today_start)
+                    )
+                ).scalar() or 0
+        except Exception as e:
+            logger.warning(f"Не удалось восстановить дневной PnL из БД: {e}")
+            return
+
+        self.state.daily_pnl = float(total)
+        if self.state.daily_pnl <= -self.state.daily_loss_limit_usd:
+            self.state.daily_loss_limit_reached = True
+        logger.info(f"🔗 Дневной PnL восстановлен из БД: {self.state.daily_pnl:.2f}")
 
     def configure(self, params: dict):
         """Обновить конфигурацию риска."""

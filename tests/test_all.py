@@ -160,8 +160,12 @@ class TestRiskState(unittest.TestCase):
     def test_initial_state(self):
         """Начальное состояние."""
         state = RiskState()
-        self.assertEqual(state.current_balance, 0.0)
-        self.assertEqual(state.start_balance, 0.0)
+        # start_balance/current_balance предзаполняются стартовым капиталом
+        # аккаунта (а не 0), иначе после рестарта базой для расчёта
+        # просадки становился бы текущий баланс, скрывая уже случившуюся
+        # просадку от max_drawdown_pct.
+        self.assertEqual(state.current_balance, settings.startup_capital_usdt)
+        self.assertEqual(state.start_balance, settings.startup_capital_usdt)
         self.assertEqual(state.open_positions_count, 0)
         self.assertEqual(state.daily_loss_limit_reached, False)
         self.assertEqual(state.paused, False)
@@ -435,12 +439,46 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         await self.engine.close()
 
     async def test_paper_mode_initialization(self):
-        """Инициализация в paper режиме."""
+        """Инициализация в paper режиме восстанавливает баланс/позиции из БД."""
         settings.trading_mode = "paper"
         settings.startup_capital_usdt = 10000.0
         await self.engine.initialize("binance")
         self.assertTrue(self.engine.is_paper)
-        self.assertEqual(self.engine.get_paper_balance(), 10000.0)
+        self.assertIsInstance(self.engine.get_paper_balance(), float)
+
+    async def test_restore_paper_state_matches_db(self):
+        """paper_balance после initialize() должен совпадать с независимо
+        пересчитанным по Order/Trade значением (тестовая БД общая на сессию
+        и может содержать данные от других тестов — поэтому сравниваем со
+        значением, пересчитанным прямо здесь, а не с константой)."""
+        from sqlalchemy import select, func
+        from src.db.session import get_session
+        from src.db.models import Trade, Order
+
+        settings.trading_mode = "paper"
+        settings.startup_capital_usdt = 10000.0
+
+        async with get_session() as session:
+            realized = (await session.execute(select(func.sum(Trade.pnl)))).scalar() or 0
+            closed_order_ids = set(
+                (await session.execute(
+                    select(Trade.order_open_id).where(Trade.order_open_id.is_not(None))
+                )).scalars().all()
+            )
+            open_orders = (
+                await session.execute(
+                    select(Order).where(Order.side == "buy", Order.status == "filled")
+                )
+            ).scalars().all()
+
+        cost_basis = sum(
+            float(o.filled_amount or o.amount) * float(o.filled_price or o.price) + float(o.fee or 0)
+            for o in open_orders if o.id not in closed_order_ids
+        )
+        expected_balance = settings.startup_capital_usdt + float(realized) - cost_basis
+
+        await self.engine.initialize("binance")
+        self.assertAlmostEqual(self.engine.get_paper_balance(), expected_balance, places=2)
 
     async def test_can_execute_initial(self):
         """Можно исполнять в начальном состоянии."""

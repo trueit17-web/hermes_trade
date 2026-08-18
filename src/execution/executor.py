@@ -5,7 +5,8 @@ import uuid
 from typing import Any, Optional
 
 import ccxt.async_support as ccxt
-from sqlalchemy import select
+from sqlalchemy import select, func
+from sqlalchemy.orm import selectinload
 
 from src.config import settings
 from src.db.session import get_session
@@ -43,7 +44,7 @@ class ExecutionEngine:
 
         if self.is_paper:
             logger.info("📄 Execution Engine: Paper Trading режим")
-            self.paper_balance = settings.startup_capital_usdt
+            await self._restore_paper_state_from_db()
             return
 
         # Real mode: подключаемся к бирже
@@ -54,7 +55,7 @@ class ExecutionEngine:
             if not api_key or not api_secret:
                 logger.warning("⚠️ API ключи не указаны, переключаемся в paper режим")
                 self.is_paper = True
-                self.paper_balance = settings.startup_capital_usdt
+                await self._restore_paper_state_from_db()
                 return
 
             if exchange_id == "binance":
@@ -98,6 +99,87 @@ class ExecutionEngine:
         except Exception as e:
             logger.error(f"Ошибка инициализации биржи {exchange_id}: {e}")
             self.is_paper = True
+
+    async def _restore_paper_state_from_db(self):
+        """
+        Восстановить paper_balance и paper_positions из БД при старте процесса.
+
+        paper_positions/paper_balance раньше существовали только в памяти —
+        каждый рестарт бота (в т.ч. через кнопку в дашборде) молча обнулял
+        баланс до startup_capital_usdt и "терял" все открытые позиции, хотя
+        в БД (Order/Trade) вся история оставалась цела. Реконструируем:
+        - открытая позиция = BUY-ордер (status=filled), для которого нет
+          Trade с order_open_id на него (Trade создаётся только при закрытии);
+        - баланс = startup_capital + сумма pnl всех закрытых Trade минус
+          сумма (amount*entry_price + entry_fee) всех ещё открытых ордеров
+          (эти деньги были списаны при открытии и ещё не вернулись).
+        """
+        self.paper_balance = settings.startup_capital_usdt
+        self.paper_positions = {}
+
+        try:
+            async with get_session() as session:
+                closed_order_ids = set(
+                    (
+                        await session.execute(
+                            select(Trade.order_open_id).where(Trade.order_open_id.is_not(None))
+                        )
+                    ).scalars().all()
+                )
+                realized_pnl = (
+                    await session.execute(select(func.sum(Trade.pnl)))
+                ).scalar() or 0
+
+                orders = (
+                    await session.execute(
+                        select(Order)
+                        .options(selectinload(Order.symbol), selectinload(Order.strategy))
+                        .where(Order.side == "buy", Order.status == "filled")
+                        .order_by(Order.created_at.asc())
+                    )
+                ).scalars().all()
+        except Exception as e:
+            logger.warning(f"Не удалось восстановить paper-состояние из БД: {e}")
+            return
+
+        cost_basis = 0.0
+        for o in orders:
+            if o.id in closed_order_ids or o.symbol is None:
+                continue
+
+            symbol = o.symbol.symbol
+            amount = float(o.filled_amount or o.amount)
+            price = float(o.filled_price or o.price)
+            fee = float(o.fee or 0)
+            cost_basis += amount * price + fee
+
+            pos = self.paper_positions.setdefault(symbol, {
+                "amount": 0.0, "entry_price": 0.0, "side": "long",
+                "strategy_id": None, "stop_loss": None, "take_profit": None,
+                "order_id": None, "entry_fee": 0.0, "opened_at": None,
+            })
+            pos["entry_price"] = (
+                (pos["entry_price"] * pos["amount"] + price * amount) / (pos["amount"] + amount)
+                if (pos["amount"] + amount) else price
+            )
+            pos["amount"] += amount
+            pos["strategy_id"] = o.strategy.name if o.strategy else pos["strategy_id"]
+            pos["stop_loss"] = float(o.stop_loss) if o.stop_loss else pos["stop_loss"]
+            pos["take_profit"] = float(o.take_profit) if o.take_profit else pos["take_profit"]
+            pos["order_id"] = o.id
+            pos["entry_fee"] = fee
+            if pos["opened_at"] is None:
+                pos["opened_at"] = o.created_at
+
+        self.paper_balance = settings.startup_capital_usdt + float(realized_pnl) - cost_basis
+
+        if self.paper_positions:
+            logger.info(
+                f"♻️ Восстановлено {len(self.paper_positions)} открытых paper-позиций из БД: "
+                f"{list(self.paper_positions.keys())} | баланс: {self.paper_balance:.2f}"
+            )
+        else:
+            logger.info(f"📄 Открытых позиций в БД нет | баланс: {self.paper_balance:.2f}")
 
     async def close(self):
         """Закрыть соединение с биржей."""
