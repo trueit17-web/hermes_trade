@@ -2,22 +2,19 @@ services:
   bot:
     build: .
     restart: unless-stopped
+    # Все переменные из .env (ключи бирж, Telegram, торговая вселенная,
+    # ML, риск, веб-логин и т.д.) прокидываются в контейнер целиком —
+    # раньше здесь был жёстко прописанный список из части переменных,
+    # из-за чего всё, что в него не попало (включая WEB_ADMIN_PASSWORD),
+    # молча падало на дефолт из кода независимо от содержимого .env.
+    env_file:
+      - .env
     environment:
-      - TRADING_MODE=${TRADING_MODE:-paper}
-      - STARTUP_CAPITAL_USDT=${STARTUP_CAPITAL_USDT:-10000}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Эти четыре — специфичны для docker-compose сети (хосты db/redis
+      # видны только внутри неё) и намеренно переопределяют .env, если он
+      # тоже их задаёт: environment: имеет приоритет над env_file:.
       - DATABASE_URL=postgresql+asyncpg://bot:${DB_PASSWORD:-password}@db:5432/cryptobot
       - REDIS_URL=redis://redis:6379
-      - COINGLASS_API_KEY=${COINGLASS_API_KEY:-}
-      - TELEGRAM_API_ID=${TELEGRAM_API_ID:-}
-      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH:-}
-      - TELEGRAM_USER_ID=${TELEGRAM_USER_ID:-}
-      - BINANCE_API_KEY=${BINANCE_API_KEY:-}
-      - BINANCE_API_SECRET=${BINANCE_API_SECRET:-}
-      - BYBIT_API_KEY=${BYBIT_API_KEY:-}
-      - BYBIT_API_SECRET=${BYBIT_API_SECRET:-}
-      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-}
-      - ML_RETRAINING_INTERVAL_HOURS=${ML_RETRAINING_INTERVAL_HOURS:-6}
       - WEB_HOST=0.0.0.0
       - WEB_PORT=8000
     ports:
