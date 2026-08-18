@@ -191,6 +191,27 @@ class RiskManager:
         self.state.max_drawdown_pct = self.profile.max_drawdown_pct
         self.state.cooldown_seconds = self.profile.cooldown_seconds
 
+    def reload_from_settings(self):
+        """
+        Перечитать пороги риска из settings.risk_* прямо сейчас.
+
+        risk_manager — модульный синглтон, конструируется в момент импорта
+        модуля (import risk_manager в main.py), а load_settings_overrides()
+        (переопределения, сохранённые через дашборд в bot_config)
+        применяется намного позже, уже внутри TradingBot.initialize(). То
+        есть RiskProfile() в __init__ всегда читает settings.risk_* ДО того,
+        как overrides из БД успевают примениться — лимит, изменённый через
+        дашборд и корректно сохранённый, после рестарта тихо откатывался
+        обратно к значению из .env/дефолту. Нужно явно перечитать профиль
+        после load_settings_overrides().
+        """
+        self.profile.daily_loss_limit_usd = settings.risk_daily_loss_limit_usd
+        self.profile.max_open_positions = settings.risk_max_open_positions
+        self.profile.max_position_size_pct = settings.risk_max_position_size_pct
+        self.profile.max_drawdown_pct = settings.risk_max_drawdown_pct
+        self.profile.cooldown_seconds = settings.risk_cooldown_seconds
+        self._sync_state_from_profile()
+
     async def restore_daily_pnl_from_db(self):
         """
         Восстановить daily_pnl из уже закрытых сегодня сделок при старте бота.

@@ -63,9 +63,14 @@ class TradingBot:
         logger.info("🚀 Инициализация CryptoBot Pro...")
 
         # Настройки, изменённые через веб-панель на предыдущем запуске
-        # (bot_config в БД) — применяются до всего, что от них зависит
-        # (ключи бирж, Telegram, CoinGlass).
+        # (bot_config в БД) — применяются до всего, что читает settings.*
+        # заново на каждой итерации (ключи бирж, Telegram, CoinGlass).
+        # НО risk_manager/execution_engine — модульные синглтоны,
+        # сконструированные в момент импорта (до этой строки), поэтому их
+        # уже закэшированные значения нужно перечитать явно ниже.
         await load_settings_overrides()
+        risk_manager.reload_from_settings()
+        execution_engine.is_paper = settings.is_paper
 
         # Схема БД управляется через Alembic (см. README) — её нужно
         # применить заранее командой `alembic upgrade head`, а не при
