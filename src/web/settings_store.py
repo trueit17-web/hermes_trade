@@ -36,6 +36,7 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "risk_max_position_size_pct", "label": "Макс. размер позиции (%)", "group": "Риск", "type": "float"},
     {"key": "risk_max_drawdown_pct", "label": "Макс. просадка (%)", "group": "Риск", "type": "float"},
     {"key": "risk_cooldown_seconds", "label": "Cooldown после стоп-лосса (сек)", "group": "Риск", "type": "int"},
+    {"key": "trailing_stop_pct", "label": "Trailing stop (%, 0 = выключен)", "group": "Риск", "type": "float"},
 
     {"key": "protections_enabled", "label": "Protections включены", "group": "Protections", "type": "bool"},
     {"key": "protections_channel_cooldown_minutes", "label": "Cooldown источника после закрытия (мин)", "group": "Protections", "type": "int"},

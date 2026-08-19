@@ -1461,5 +1461,81 @@ class TestProtections(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await pm.locked_reason([channel_key(channel)]))
 
 
+class TestTrailingStop(unittest.IsolatedAsyncioTestCase):
+    """
+    Trailing stop-loss (портировано из clonerbot): SL подтягивается к
+    текущей цене на trailing_stop_pct и только ужесточается — никогда не
+    откатывается назад, даже если цена временно отступает.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved_pct = settings.trailing_stop_pct
+
+    def tearDown(self):
+        settings.trailing_stop_pct = self._saved_pct
+
+    def test_disabled_by_default_does_nothing(self):
+        settings.trailing_stop_pct = 0.0
+        bot = self._make_bot()
+        bot.open_positions["TRAILOFF/USDT"] = {"side": "long", "entry_price": 100.0, "sl": 90.0}
+        bot._apply_trailing_stop("TRAILOFF/USDT", 150.0)
+        self.assertEqual(bot.open_positions["TRAILOFF/USDT"]["sl"], 90.0)
+
+    def test_long_tightens_but_never_loosens(self):
+        settings.trailing_stop_pct = 1.0  # 1%
+        bot = self._make_bot()
+        bot.open_positions["TRAILLONG/USDT"] = {"side": "long", "entry_price": 100.0, "sl": 90.0}
+
+        bot._apply_trailing_stop("TRAILLONG/USDT", 110.0)
+        self.assertAlmostEqual(bot.open_positions["TRAILLONG/USDT"]["sl"], 108.9, places=6)
+
+        # Цена откатилась — SL не должен ослабнуть.
+        bot._apply_trailing_stop("TRAILLONG/USDT", 105.0)
+        self.assertAlmostEqual(bot.open_positions["TRAILLONG/USDT"]["sl"], 108.9, places=6)
+
+        # Новый максимум — SL подтягивается дальше.
+        bot._apply_trailing_stop("TRAILLONG/USDT", 120.0)
+        self.assertAlmostEqual(bot.open_positions["TRAILLONG/USDT"]["sl"], 118.8, places=6)
+
+    def test_short_tightens_but_never_loosens(self):
+        settings.trailing_stop_pct = 1.0
+        bot = self._make_bot()
+        bot.open_positions["TRAILSHORT/USDT"] = {"side": "short", "entry_price": 100.0, "sl": 110.0}
+
+        bot._apply_trailing_stop("TRAILSHORT/USDT", 90.0)
+        self.assertAlmostEqual(bot.open_positions["TRAILSHORT/USDT"]["sl"], 90.9, places=6)
+
+        # Цена откатилась вверх — SL не должен ослабнуть.
+        bot._apply_trailing_stop("TRAILSHORT/USDT", 95.0)
+        self.assertAlmostEqual(bot.open_positions["TRAILSHORT/USDT"]["sl"], 90.9, places=6)
+
+        bot._apply_trailing_stop("TRAILSHORT/USDT", 80.0)
+        self.assertAlmostEqual(bot.open_positions["TRAILSHORT/USDT"]["sl"], 80.8, places=6)
+
+    def test_does_not_undo_breakeven_stop_if_price_has_not_moved_further(self):
+        # После TP1 SL переставлен в безубыток (100). Пока цена не ушла
+        # достаточно далеко за пределы trailing-зазора выше безубытка,
+        # trailing не должен откатывать SL ниже него.
+        settings.trailing_stop_pct = 5.0  # 5%
+        bot = self._make_bot()
+        bot.open_positions["TRAILBE/USDT"] = {"side": "long", "entry_price": 100.0, "sl": 100.0}
+
+        bot._apply_trailing_stop("TRAILBE/USDT", 102.0)  # candidate = 96.9 < 100
+        self.assertEqual(bot.open_positions["TRAILBE/USDT"]["sl"], 100.0)
+
+    def test_no_open_position_is_a_noop(self):
+        settings.trailing_stop_pct = 1.0
+        bot = self._make_bot()
+        bot._apply_trailing_stop("NOSUCHPOS/USDT", 100.0)  # не должно падать
+        self.assertNotIn("NOSUCHPOS/USDT", bot.open_positions)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -63,6 +63,9 @@ class Settings(BaseSettings):
     risk_max_position_size_pct: float = 10.0
     risk_max_drawdown_pct: float = 15.0
     risk_cooldown_seconds: int = 300
+    # Trailing stop-loss: 0 = выключен. SL подтягивается к текущей цене на
+    # trailing_stop_pct и только ужесточается (никогда не откатывается назад).
+    trailing_stop_pct: float = 0.0
 
     # === Protections (freqtrade-style автопаузы после плохой серии сделок) ===
     protections_enabled: bool = True

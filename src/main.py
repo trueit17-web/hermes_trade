@@ -672,6 +672,7 @@ class TradingBot:
         self.last_prices[symbol] = close
         execution_engine.last_prices[symbol] = close
 
+        self._apply_trailing_stop(symbol, close)
         if await self._check_position_exit(symbol, close):
             return  # позиция закрыта в этой итерации — новый сигнал сгенерируем в следующем цикле
 
@@ -924,6 +925,32 @@ class TradingBot:
         "take_profit_2": "Take Profit 2 (25%)",
         "take_profit_3": "Take Profit 3 (остаток)",
     }
+
+    def _apply_trailing_stop(self, symbol: str, current_price: float) -> None:
+        """
+        Trailing stop-loss (портировано из clonerbot): SL подтягивается к
+        current_price на trailing_stop_pct, но только в выгодную сторону —
+        никогда не откатывается назад. Пересчитывается из текущей цены
+        каждый раз, поэтому автоматически не портит уже более выгодный SL
+        (например, безубыток после TP1) — новое значение принимается,
+        только если оно строго лучше того, что уже стоит.
+        """
+        if settings.trailing_stop_pct <= 0:
+            return
+        position = self.open_positions.get(symbol)
+        if not position:
+            return
+
+        t = settings.trailing_stop_pct / 100
+        sl = position.get("sl")
+        if position["side"] == "long":
+            candidate = current_price * (1 - t)
+            if sl is None or candidate > sl:
+                position["sl"] = candidate
+        else:
+            candidate = current_price * (1 + t)
+            if sl is None or candidate < sl:
+                position["sl"] = candidate
 
     async def _check_position_exit(self, symbol: str, current_price: float) -> bool:
         """
