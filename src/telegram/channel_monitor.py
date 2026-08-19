@@ -115,7 +115,7 @@ async def monitor_channels(channels: list[dict]):
         logger.debug(f"[TG] Получено сообщение из {channel['channel_id']}: {raw_text[:100]}...")
 
         # Парсинг сигнала
-        parsed = parse_telegram_signal(raw_text, channel)
+        parsed = await parse_telegram_signal(raw_text, channel)
 
         if parsed:
             signal_event = {
@@ -182,7 +182,7 @@ def normalize_pair(pair: str) -> str:
     return pair
 
 
-def parse_telegram_signal(text: str, channel_config: Optional[dict] = None) -> Optional[dict]:
+async def parse_telegram_signal(text: str, channel_config: Optional[dict] = None) -> Optional[dict]:
     """
     Попытаться распарсить торговый сигнал из текста сообщения.
     Возвращает dict с полями: pair, side, entry, sl, tp, rationale, raw.
@@ -196,10 +196,14 @@ def parse_telegram_signal(text: str, channel_config: Optional[dict] = None) -> O
     if parsed:
         return parsed
 
-    # Попытка 2: LLM/extractor (заглушка — в реальном коде интеграция с LLM API)
-    # parsed = parse_with_llm(text, channel_config)
-    # if parsed:
-    #     return parsed
+    # Попытка 2: LLM-фолбэк (выключен по умолчанию — telegram_llm_fallback_enabled) —
+    # для сообщений, которые регулярки не смогли разобрать (нестандартная
+    # формулировка, зона входа текстом и т.п.), но которые всё ещё могут
+    # быть настоящим сигналом.
+    from src.telegram.llm_parser import parse_with_llm
+    parsed = await parse_with_llm(text, channel_config)
+    if parsed:
+        return parsed
 
     return None
 

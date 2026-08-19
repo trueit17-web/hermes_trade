@@ -96,6 +96,11 @@ class Settings(BaseSettings):
     # === Telegram сигналы ===
     telegram_signals_auto_execute: bool = False
     telegram_signals_quality_threshold: float = 0.5
+    # LLM-фолбэк парсинга: когда регулярки не смогли распознать сообщение,
+    # пробуем через Anthropic API (перенос из clonerbot: parser/llm_parser.py).
+    telegram_llm_fallback_enabled: bool = False
+    anthropic_api_key: Optional[str] = None
+    anthropic_model: str = "claude-haiku-4-5-20251001"
 
     # === Веб сервер ===
     web_host: str = "0.0.0.0"

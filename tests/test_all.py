@@ -774,6 +774,125 @@ class TestTelegramSignalParser(unittest.TestCase):
         self.assertEqual(result["pair"], "BTC/USDT")
 
 
+class TestLlmSignalParser(unittest.IsolatedAsyncioTestCase):
+    """
+    LLM-фолбэк парсинга (перенос из clonerbot: parser/llm_parser.py) —
+    подключается, когда регулярки не смогли разобрать сообщение. Мокаем
+    Anthropic-клиент, чтобы не делать реальных сетевых запросов.
+    """
+
+    def setUp(self):
+        self._saved = {
+            "telegram_llm_fallback_enabled": settings.telegram_llm_fallback_enabled,
+            "anthropic_api_key": settings.anthropic_api_key,
+        }
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            setattr(settings, key, value)
+        import src.telegram.llm_parser as llm_parser_module
+        llm_parser_module._client = None
+
+    def _mock_tool_use_response(self, data: dict):
+        block = MagicMock()
+        block.type = "tool_use"
+        block.name = "emit_signal"
+        block.input = data
+        resp = MagicMock()
+        resp.content = [block]
+        return resp
+
+    async def test_disabled_returns_none_without_calling_api(self):
+        from src.telegram.llm_parser import parse_with_llm
+        settings.telegram_llm_fallback_enabled = False
+        settings.anthropic_api_key = "test-key"
+        result = await parse_with_llm("BTC to the moon, going long soon maybe")
+        self.assertIsNone(result)
+
+    async def test_parses_valid_signal(self):
+        import src.telegram.llm_parser as llm_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = "test-key"
+
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=self._mock_tool_use_response({
+            "is_signal": True, "base": "BTC", "quote": "USDT", "side": "long",
+            "entry": 69000.0, "take_profits": [70000.0, 72000.0], "stop_loss": 68000.0,
+            "confidence": 0.9,
+        }))
+        llm_parser_module._client = mock_client
+
+        result = await llm_parser_module.parse_with_llm("покупаем биток в районе 69к, стоп 68к")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "BTC/USDT")
+        self.assertEqual(result["side"], "long")
+        self.assertEqual(result["entry"], 69000.0)
+        self.assertEqual(result["sl"], 68000.0)
+        self.assertEqual(result["tp"], 72000.0)  # long -> максимальный TP
+
+    async def test_low_confidence_is_rejected(self):
+        import src.telegram.llm_parser as llm_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = "test-key"
+
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=self._mock_tool_use_response({
+            "is_signal": True, "base": "BTC", "side": "long", "entry": 69000.0,
+            "take_profits": [], "stop_loss": None, "confidence": 0.2,
+        }))
+        llm_parser_module._client = mock_client
+
+        result = await llm_parser_module.parse_with_llm("может быть покупать биток?")
+        self.assertIsNone(result)
+
+    async def test_not_a_signal_returns_none(self):
+        import src.telegram.llm_parser as llm_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = "test-key"
+
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=self._mock_tool_use_response({
+            "is_signal": False, "confidence": 0.95,
+        }))
+        llm_parser_module._client = mock_client
+
+        result = await llm_parser_module.parse_with_llm("сегодня биток вырос на 3%, отличный день")
+        self.assertIsNone(result)
+
+    async def test_api_error_returns_none_not_raises(self):
+        import src.telegram.llm_parser as llm_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = "test-key"
+
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(side_effect=RuntimeError("network down"))
+        llm_parser_module._client = mock_client
+
+        result = await llm_parser_module.parse_with_llm("покупаем биток в районе 69к, стоп 68к")
+        self.assertIsNone(result)
+
+    async def test_parse_telegram_signal_falls_back_to_llm_when_regex_fails(self):
+        import src.telegram.llm_parser as llm_parser_module
+        from src.telegram.channel_monitor import parse_telegram_signal
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = "test-key"
+
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=self._mock_tool_use_response({
+            "is_signal": True, "base": "ETH", "quote": "USDT", "side": "short",
+            "entry": 3500.0, "take_profits": [3300.0, 3200.0], "stop_loss": 3600.0,
+            "confidence": 0.8,
+        }))
+        llm_parser_module._client = mock_client
+
+        # Регулярки не найдут здесь пару/направление в явном виде — только LLM.
+        result = await parse_telegram_signal("шортим эфир около 3500, стоп 3600, цели 3300 и 3200")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "ETH/USDT")
+        self.assertEqual(result["side"], "short")
+        self.assertEqual(result["tp"], 3200.0)  # short -> минимальный TP
+
+
 class TestQualificationScorer(unittest.TestCase):
     """Тесты для scorer качества сигналов."""
 

@@ -66,6 +66,9 @@ SETTINGS_SCHEMA: list[dict] = [
 
     {"key": "telegram_signals_auto_execute", "label": "Автоисполнение Telegram-сигналов", "group": "Telegram сигналы", "type": "bool"},
     {"key": "telegram_signals_quality_threshold", "label": "Порог качества сигнала", "group": "Telegram сигналы", "type": "float"},
+    {"key": "telegram_llm_fallback_enabled", "label": "LLM-фолбэк парсинга (если регулярки не распознали)", "group": "Telegram сигналы", "type": "bool"},
+    {"key": "anthropic_api_key", "label": "Anthropic API key", "group": "Telegram сигналы", "type": "secret"},
+    {"key": "anthropic_model", "label": "Anthropic модель", "group": "Telegram сигналы", "type": "str"},
     {"key": "telegram_api_id", "label": "Telegram API ID", "group": "Telegram сигналы", "type": "secret"},
     {"key": "telegram_api_hash", "label": "Telegram API hash", "group": "Telegram сигналы", "type": "secret"},
     {"key": "telegram_user_id", "label": "Telegram user id", "group": "Telegram сигналы", "type": "secret"},
