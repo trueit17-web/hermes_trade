@@ -1218,5 +1218,100 @@ class TestTradesGrouping(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["holding_seconds"], 180)
 
 
+class TestClosePositionAtomicity(unittest.IsolatedAsyncioTestCase):
+    """
+    close_paper_position mutated paper_balance/paper_positions BEFORE
+    writing to the DB — if that write failed for any reason (a transient
+    DB hiccup), the position vanished from memory with zero Order/Trade
+    record: it disappeared from "open positions" and never showed up in
+    "closed trades" either. It must only mutate live state after the DB
+    write actually commits.
+    """
+
+    async def test_position_survives_failed_db_write(self):
+        from unittest.mock import patch
+        from src.execution.executor import ExecutionEngine
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "paper"
+        await engine.initialize("binance")
+
+        symbol = "ATOMICITY1/USDT"
+        order = await engine.create_order(
+            symbol=symbol, side="buy", amount=1.0, price=100.0, order_type="market",
+        )
+        self.assertIsNotNone(order)
+        balance_before = engine.paper_balance
+        amount_before = engine.paper_positions[symbol]["amount"]
+
+        with patch.object(ExecutionEngine, "_resolve_symbol_id", side_effect=RuntimeError("simulated DB failure")):
+            with self.assertRaises(RuntimeError):
+                await engine.close_paper_position(
+                    symbol=symbol, side="long", entry_price=100.0, amount=1.0,
+                    exit_price=110.0, reason="take_profit_3", entry_fee=0.1,
+                    holding_seconds=60, order_open_id=order.id,
+                )
+
+        self.assertIn(symbol, engine.paper_positions, "position must not vanish when the DB write fails")
+        self.assertEqual(engine.paper_positions[symbol]["amount"], amount_before)
+        self.assertEqual(engine.paper_balance, balance_before)
+
+        # A subsequent successful close still works normally.
+        result = await engine.close_paper_position(
+            symbol=symbol, side="long", entry_price=100.0, amount=1.0,
+            exit_price=110.0, reason="take_profit_3", entry_fee=0.1,
+            holding_seconds=60, order_open_id=order.id,
+        )
+        self.assertIsNotNone(result)
+        self.assertNotIn(symbol, engine.paper_positions)
+
+
+class TestTradingIterationPerSymbolIsolation(unittest.IsolatedAsyncioTestCase):
+    """
+    The for-symbol loop in _trading_iteration had no per-symbol exception
+    handling — an unhandled error processing ONE symbol (a network hiccup
+    fetching candles, anything) aborted the whole iteration, silently
+    skipping every symbol still left in active_symbols that cycle. Since
+    active_symbols barely changes between iterations, a symbol that
+    consistently errors permanently blocked SL/TP checks (and price
+    updates) for everything after it in the list, cycle after cycle,
+    until a bot restart happened to reorder the universe.
+    """
+
+    async def test_one_symbol_error_does_not_block_the_rest(self):
+        from unittest.mock import AsyncMock
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+
+        bot = main_module.TradingBot()
+        bot.active_symbols = ["A/USDT", "B/USDT", "C/USDT"]
+        bot.daily_pnl_reset_date = main_module.utcnow().date()
+        processed = []
+
+        async def fake_process_symbol(symbol):
+            if symbol == "B/USDT":
+                raise RuntimeError("simulated transient failure for B/USDT")
+            processed.append(symbol)
+
+        bot._process_symbol = fake_process_symbol
+
+        original_risk_manager = main_module.risk_manager
+        original_get_paper_balance = main_module.execution_engine.get_paper_balance
+        try:
+            main_module.risk_manager = AsyncMock()
+            main_module.risk_manager.state.kill_switch_active = False
+            main_module.risk_manager.state.paused = False
+            main_module.execution_engine.get_paper_balance = lambda: 10000.0
+
+            await bot._trading_iteration()
+        finally:
+            main_module.risk_manager = original_risk_manager
+            main_module.execution_engine.get_paper_balance = original_get_paper_balance
+
+        self.assertEqual(processed, ["A/USDT", "C/USDT"])
+
+
 if __name__ == "__main__":
     unittest.main()

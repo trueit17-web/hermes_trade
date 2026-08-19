@@ -608,8 +608,22 @@ class TradingBot:
             if real_balance is not None:
                 risk_manager.on_balance_update(self._compute_equity(real_balance))
 
+        # Раньше цикл ничем не был защищён — необработанное исключение
+        # (сетевой сбой при запросе свечей, ошибка стратегии, что угодно)
+        # для ОДНОЙ пары прерывало весь for-цикл, и все пары ПОСЛЕ неё в
+        # списке active_symbols в этой итерации вообще не обрабатывались:
+        # их SL/TP не проверялись, цена не обновлялась. Раз active_symbols
+        # между итерациями почти не меняется, пара, которая стабильно
+        # падает с ошибкой (например, из-за временных проблем биржи по
+        # конкретному инструменту), навсегда блокировала проверку всех, что
+        # идут за ней — позиция могла закрыться (или её цена — обновиться)
+        # только когда порядок символов менялся, например при перезапуске
+        # бота и пересборке торговой вселенной.
         for symbol in self.active_symbols:
-            await self._process_symbol(symbol)
+            try:
+                await self._process_symbol(symbol)
+            except Exception as e:
+                logger.error(f"Ошибка обработки {symbol}: {e}")
 
     async def _refresh_symbol_candles(self, symbol: str) -> Optional[pd.DataFrame]:
         """

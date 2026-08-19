@@ -642,32 +642,19 @@ class ExecutionEngine:
 
         if side == "long":
             pnl = (exit_price - entry_price) * amount - entry_fee - exit_fee
-            # LONG при открытии списывает принципал с баланса — при закрытии
-            # возвращаем выручку от продажи (а не только pnl)
-            self.paper_balance += amount * exit_price - exit_fee
         else:
             pnl = (entry_price - exit_price) * amount - entry_fee - exit_fee
-            # SHORT в paper-режиме сейчас не резервирует маржу при открытии
-            # (создание короткой позиции без встречной длинной не отслеживается
-            # в self.paper_positions) — учитываем только реализованный PnL
-            self.paper_balance += pnl
 
         pnl_pct = (pnl / (entry_price * amount) * 100) if entry_price and amount else 0.0
         outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "break-even")
 
-        # amount может быть частью открытой позиции (частичное закрытие по
-        # уровню TP1/TP2) — уменьшаем остаток вместо того, чтобы стереть
-        # позицию целиком, иначе main.py на следующей итерации решил бы,
-        # что оставшаяся часть закрыта в обход основного цикла, и потерял
-        # бы её отслеживание.
-        pos = self.paper_positions.get(symbol)
-        if pos is not None:
-            remaining = pos["amount"] - amount
-            if remaining <= 1e-9:
-                self.paper_positions.pop(symbol, None)
-            else:
-                pos["amount"] = remaining
-
+        # Баланс и позиция мутировались здесь, ДО записи в БД — если запись
+        # падала (сетевой сбой к Postgres, что угодно), в памяти позиция уже
+        # исчезала (или уменьшалась) без единой строки в Order/Trade, а
+        # main.py на следующей итерации видел, что символа нет в
+        # paper_positions, и тихо удалял его из своего open_positions —
+        # позиция просто пропадала, не появляясь ни в открытых, ни в
+        # закрытых. Мутируем только после успешного commit.
         async with get_session() as session:
             exchange_id, symbol_id = await self._resolve_symbol_id(session, symbol)
             strategy_db_id = await self._resolve_strategy_id(session, strategy_id)
@@ -709,6 +696,31 @@ class ExecutionEngine:
             session.add(trade)
             await session.commit()
             trade_id = trade.id
+
+        # Запись в БД прошла успешно — теперь можно безопасно применить
+        # эффект к живому состоянию.
+        if side == "long":
+            # LONG при открытии списывает принципал с баланса — при закрытии
+            # возвращаем выручку от продажи (а не только pnl)
+            self.paper_balance += amount * exit_price - exit_fee
+        else:
+            # SHORT в paper-режиме сейчас не резервирует маржу при открытии
+            # (создание короткой позиции без встречной длинной не отслеживается
+            # в self.paper_positions) — учитываем только реализованный PnL
+            self.paper_balance += pnl
+
+        # amount может быть частью открытой позиции (частичное закрытие по
+        # уровню TP1/TP2) — уменьшаем остаток вместо того, чтобы стереть
+        # позицию целиком, иначе main.py на следующей итерации решил бы,
+        # что оставшаяся часть закрыта в обход основного цикла, и потерял
+        # бы её отслеживание.
+        pos = self.paper_positions.get(symbol)
+        if pos is not None:
+            remaining = pos["amount"] - amount
+            if remaining <= 1e-9:
+                self.paper_positions.pop(symbol, None)
+            else:
+                pos["amount"] = remaining
 
         logger.info(
             f"📄 Paper позиция закрыта: {symbol} {side.upper()} | {reason} | "
@@ -870,6 +882,17 @@ class ExecutionEngine:
         pnl_pct = (pnl / (entry_price * amount) * 100) if entry_price and amount else 0.0
         outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "break-even")
 
+        # В отличие от close_paper_position, здесь позиция мутируется ДО
+        # записи в БД — намеренно: рыночный ордер на бирже (строкой выше)
+        # уже необратимо исполнился с реальными деньгами. Если бы мы
+        # отложили обновление self.real_positions до записи в БД и запись
+        # упала, следующая проверка увидела бы прежний (ещё не уменьшенный)
+        # объём и попыталась бы продать его снова — риск повторной продажи
+        # того, чего уже нет на балансе биржи. Реальный "провал записи в
+        # БД при уже исполненном на бирже ордере" остаётся редким
+        # ручным edge case для расследования по логам, а не автоматически
+        # устранимым состоянием.
+        #
         # amount может быть частью открытой позиции (частичное закрытие по
         # уровню TP1/TP2) — см. тот же комментарий в close_paper_position.
         pos = self.real_positions.get(symbol)
