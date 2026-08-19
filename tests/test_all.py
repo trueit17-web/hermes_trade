@@ -1537,5 +1537,72 @@ class TestTrailingStop(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("NOSUCHPOS/USDT", bot.open_positions)
 
 
+class TestExpectancySizing(unittest.IsolatedAsyncioTestCase):
+    """
+    Expectancy-based sizing (портировано из clonerbot: scoring/channel_scorer.py):
+    множитель размера позиции по источнику (канал/стратегия), обученный на
+    среднем pnl_pct его закрытых сделок из общего журнала risk_close_events.
+    """
+
+    def setUp(self):
+        self._saved = {
+            "expectancy_sizing_enabled": settings.expectancy_sizing_enabled,
+            "expectancy_sizing_min_trades": settings.expectancy_sizing_min_trades,
+            "expectancy_sizing_max_trades": settings.expectancy_sizing_max_trades,
+            "expectancy_sizing_min_expectancy_pct": settings.expectancy_sizing_min_expectancy_pct,
+        }
+        settings.expectancy_sizing_enabled = True
+        settings.expectancy_sizing_min_trades = 3
+        settings.expectancy_sizing_max_trades = 50
+        settings.expectancy_sizing_min_expectancy_pct = 0.0
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            setattr(settings, key, value)
+
+    async def _seed(self, scope_key: str, pnl_pcts: list[float]):
+        from src.db.session import get_session
+        from src.db.models import RiskCloseEvent
+        async with get_session() as session:
+            for pct in pnl_pcts:
+                session.add(RiskCloseEvent(
+                    scope_key=scope_key, symbol="X/USDT", reason="take_profit_3",
+                    pnl=pct, pnl_pct=pct,
+                ))
+            await session.commit()
+
+    async def test_disabled_returns_neutral_multiplier(self):
+        from src.risk import expectancy_sizing
+        settings.expectancy_sizing_enabled = False
+        await self._seed("telegram:@sizing_disabled_unittest", [-10, -10, -10])
+        mult = await expectancy_sizing.size_multiplier("telegram:@sizing_disabled_unittest")
+        self.assertEqual(mult, 1.0)
+
+    async def test_low_sample_gets_min_multiplier(self):
+        from src.risk import expectancy_sizing
+        await self._seed("telegram:@sizing_new_unittest", [5.0])  # меньше min_trades=3
+        mult = await expectancy_sizing.size_multiplier("telegram:@sizing_new_unittest")
+        self.assertEqual(mult, expectancy_sizing.MIN_MULTIPLIER)
+
+    async def test_positive_expectancy_scales_up_toward_max(self):
+        from src.risk import expectancy_sizing
+        await self._seed("telegram:@sizing_good_unittest", [3.0, 4.0, 2.5, 3.5])  # ~3.25% > цели 2%
+        mult = await expectancy_sizing.size_multiplier("telegram:@sizing_good_unittest")
+        self.assertEqual(mult, expectancy_sizing.MAX_MULTIPLIER)
+
+    async def test_non_positive_expectancy_skips_channel(self):
+        from src.risk import expectancy_sizing
+        await self._seed("telegram:@sizing_bad_unittest", [-2.0, 1.0, -3.0, -1.0])  # средний < 0
+        mult = await expectancy_sizing.size_multiplier("telegram:@sizing_bad_unittest")
+        self.assertEqual(mult, 0.0)
+
+    async def test_unknown_strategy_scope_uses_same_logic(self):
+        from src.risk import expectancy_sizing
+        from src.risk.protections import strategy_key
+        await self._seed(strategy_key("ema_crossover"), [-1.0, -2.0, -1.5])
+        mult = await expectancy_sizing.size_multiplier(strategy_key("ema_crossover"))
+        self.assertEqual(mult, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

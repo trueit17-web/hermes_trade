@@ -390,9 +390,12 @@ class RiskLock(Base):
 
 
 class RiskCloseEvent(Base):
-    """Факт полного закрытия сделки для Protections (StoplossGuard/LosingStreak) —
-    отдельная лёгкая таблица вместо добавления close_reason в Trade, т.к. нужна
-    только для скользящего окна/серии, а не для основного аудита сделок."""
+    """Факт полного закрытия сделки — общий лёгкий журнал для Protections
+    (StoplossGuard/LosingStreak по pnl/reason) и expectancy-based sizing
+    (средний pnl_pct по источнику). Отдельная таблица вместо добавления
+    этих полей в Trade, т.к. нужна только для скользящего окна/серии по
+    источнику сигнала (Telegram-канал/ML-стратегия), а не для основного
+    аудита сделок."""
     __tablename__ = "risk_close_events"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -400,6 +403,7 @@ class RiskCloseEvent(Base):
     symbol: Mapped[str] = mapped_column(String(50), nullable=False)
     reason: Mapped[str] = mapped_column(String(50), nullable=False)  # stop_loss, take_profit_3, ...
     pnl: Mapped[float] = mapped_column(DECIMAL, default=0)
+    pnl_pct: Mapped[float] = mapped_column(Float, default=0)
     closed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     __table_args__ = (

@@ -82,6 +82,14 @@ class Settings(BaseSettings):
     protections_losing_streak_count: int = 3
     protections_losing_streak_lock_min: int = 180
 
+    # === Expectancy-based sizing (по источнику сигнала: канал/стратегия) ===
+    expectancy_sizing_enabled: bool = False
+    expectancy_sizing_min_trades: int = 5
+    expectancy_sizing_max_trades: int = 50
+    # Средний % доходности на сделку, ниже/при котором источник пропускается
+    # целиком (множитель 0). 0.0 = пропускать только источники в минусе.
+    expectancy_sizing_min_expectancy_pct: float = 0.0
+
     # === CoinGlass ===
     coinglass_update_interval_hours: int = 1
 

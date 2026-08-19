@@ -46,6 +46,11 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "protections_losing_streak_count", "label": "LosingStreak: убытков подряд", "group": "Protections", "type": "int"},
     {"key": "protections_losing_streak_lock_min", "label": "LosingStreak: блокировка источника (мин)", "group": "Protections", "type": "int"},
 
+    {"key": "expectancy_sizing_enabled", "label": "Sizing по мат. ожиданию источника включён", "group": "Protections", "type": "bool"},
+    {"key": "expectancy_sizing_min_trades", "label": "Sizing: мин. сделок для оценки", "group": "Protections", "type": "int"},
+    {"key": "expectancy_sizing_max_trades", "label": "Sizing: окно последних сделок", "group": "Protections", "type": "int"},
+    {"key": "expectancy_sizing_min_expectancy_pct", "label": "Sizing: мин. средний PnL% (иначе источник пропускается)", "group": "Protections", "type": "float"},
+
     {"key": "ml_retraining_interval_hours", "label": "Интервал переобучения (ч)", "group": "ML", "type": "int"},
     {"key": "ml_max_trades_for_retrain", "label": "Сделок для переобучения", "group": "ML", "type": "int"},
     {"key": "ml_optuna_trials", "label": "Число Optuna trials", "group": "ML", "type": "int"},

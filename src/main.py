@@ -22,6 +22,7 @@ from src.data_ingest.feature_engine import get_feature_engine
 from src.strategy import strategy_registry
 from src.risk.risk_manager import risk_manager
 from src.risk.protections import protection_manager, GLOBAL_KEY, channel_key, strategy_key
+from src.risk import expectancy_sizing
 from src.execution.executor import execution_engine
 from src.execution.decision_logger import decision_logger
 from src.ml import model_trainer, model_registry, ml_inference, feature_store
@@ -494,7 +495,12 @@ class TradingBot:
             # реальной позиции считался от него, а не от реального баланса
             # на бирже.
             balance = await execution_engine.get_real_balance() or 0.0
-        size_pct = 5.0
+        channel_id = signal_event.get("channel_id", "")
+        mult = await expectancy_sizing.size_multiplier(channel_key(channel_id))
+        if mult <= 0:
+            logger.info(f"🚫 Сигнал по {pair} отклонён: канал в минусе по мат. ожиданию (expectancy sizing)")
+            return None
+        size_pct = 5.0 * mult
         position_value = balance * (size_pct / 100)
         amount = position_value / entry
 
@@ -524,7 +530,7 @@ class TradingBot:
                 "order_id": order.id, "entry_fee": order.fee,
                 "channel_id": signal_event.get("channel_id"),
             }
-            risk_manager.on_position_added(symbol, 5.0)
+            risk_manager.on_position_added(symbol, size_pct)
             self.daily_pnl = getattr(risk_manager.state, "daily_pnl", 0.0)
 
             # Telegram-сигналы приходят по любой паре, а не только по тем,
@@ -809,11 +815,16 @@ class TradingBot:
                 logger.info(f"🔒 Сигнал отклонён (protections): {symbol} {signal.side} — {lock_reason}")
                 continue
 
+            mult = await expectancy_sizing.size_multiplier(strategy_key(signal.strategy_id))
+            if mult <= 0:
+                logger.info(f"🚫 Сигнал отклонён: стратегия {signal.strategy_id} в минусе по мат. ожиданию")
+                continue
+
             if settings.is_paper:
                 balance = execution_engine.get_paper_balance()
             else:
                 balance = await execution_engine.get_real_balance() or 0.0
-            size_pct = signal.position_size_pct
+            size_pct = signal.position_size_pct * mult
             position_value = balance * (size_pct / 100)
             entry_price = signal.entry_price if signal.entry_price > 0 else close
             amount = position_value / entry_price if entry_price > 0 else 0
@@ -1054,7 +1065,9 @@ class TradingBot:
                 channel_key(position["channel_id"]) if position.get("channel_id")
                 else strategy_key(position.get("strategy_id") or "unknown")
             )
-            await protection_manager.on_close(source_key, symbol, result["pnl"], reason)
+            await protection_manager.on_close(
+                source_key, symbol, result["pnl"], reason, pnl_pct=result["pnl_pct"],
+            )
             if position.get("strategy_id") == "telegram_signal" and result.get("trade_id"):
                 await self._link_telegram_signal_trade(
                     position.get("order_id"), result["trade_id"], result.get("outcome"),

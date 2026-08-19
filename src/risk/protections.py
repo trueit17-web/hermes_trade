@@ -97,14 +97,22 @@ class ProtectionManager:
     async def locked_reason(self, keys: list[str]) -> Optional[str]:
         return await self.locks.active_reason(keys)
 
-    async def on_close(self, source_key: str, symbol: str, pnl: float, reason: str) -> None:
-        """Вызывается ПОСЛЕ каждого ПОЛНОГО (не частичного) закрытия позиции."""
+    async def on_close(
+        self, source_key: str, symbol: str, pnl: float, reason: str, pnl_pct: float = 0.0,
+    ) -> None:
+        """Вызывается ПОСЛЕ каждого ПОЛНОГО (не частичного) закрытия позиции.
+
+        Пишет событие в risk_close_events независимо от protections_enabled —
+        expectancy-based sizing (src/risk/expectancy_sizing.py) читает тот же
+        журнал и не должна замолкать вместе с Protections."""
+        async with get_session() as session:
+            session.add(RiskCloseEvent(
+                scope_key=source_key, symbol=symbol, reason=reason, pnl=pnl, pnl_pct=pnl_pct,
+            ))
+            await session.commit()
+
         if not settings.protections_enabled:
             return
-
-        async with get_session() as session:
-            session.add(RiskCloseEvent(scope_key=source_key, symbol=symbol, reason=reason, pnl=pnl))
-            await session.commit()
 
         await self.locks.add(
             source_key, settings.protections_channel_cooldown_minutes,

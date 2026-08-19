@@ -15,7 +15,8 @@ from sqlalchemy.orm import selectinload
 from src.config import settings
 from src.event_bus import event_bus
 from src.risk.risk_manager import risk_manager
-from src.risk.protections import protection_manager
+from src.risk.protections import protection_manager, channel_key
+from src.risk import expectancy_sizing
 from src.execution.executor import execution_engine
 from src.ml import model_registry, model_trainer
 from src.strategy import strategy_registry
@@ -951,6 +952,7 @@ async def telegram_channels_stats():
                 "win_rate": round(wins / len(closed_trades) * 100, 1) if closed_trades else None,
                 "total_pnl": round(sum(float(t.pnl) for t in closed_trades), 2) if closed_trades else None,
                 "avg_quality": round(sum(scored) / len(scored), 2) if scored else None,
+                "size_multiplier": await expectancy_sizing.size_multiplier(channel_key(c.channel_id)),
             })
 
         return {"channels": result}
