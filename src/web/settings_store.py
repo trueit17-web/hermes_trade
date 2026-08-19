@@ -37,6 +37,14 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "risk_max_drawdown_pct", "label": "Макс. просадка (%)", "group": "Риск", "type": "float"},
     {"key": "risk_cooldown_seconds", "label": "Cooldown после стоп-лосса (сек)", "group": "Риск", "type": "int"},
 
+    {"key": "protections_enabled", "label": "Protections включены", "group": "Protections", "type": "bool"},
+    {"key": "protections_channel_cooldown_minutes", "label": "Cooldown источника после закрытия (мин)", "group": "Protections", "type": "int"},
+    {"key": "protections_stoploss_guard_window_min", "label": "StoplossGuard: окно (мин)", "group": "Protections", "type": "int"},
+    {"key": "protections_stoploss_guard_count", "label": "StoplossGuard: стопов в окне", "group": "Protections", "type": "int"},
+    {"key": "protections_stoploss_guard_lock_min", "label": "StoplossGuard: блокировка всей торговли (мин)", "group": "Protections", "type": "int"},
+    {"key": "protections_losing_streak_count", "label": "LosingStreak: убытков подряд", "group": "Protections", "type": "int"},
+    {"key": "protections_losing_streak_lock_min", "label": "LosingStreak: блокировка источника (мин)", "group": "Protections", "type": "int"},
+
     {"key": "ml_retraining_interval_hours", "label": "Интервал переобучения (ч)", "group": "ML", "type": "int"},
     {"key": "ml_max_trades_for_retrain", "label": "Сделок для переобучения", "group": "ML", "type": "int"},
     {"key": "ml_optuna_trials", "label": "Число Optuna trials", "group": "ML", "type": "int"},

@@ -1313,5 +1313,153 @@ class TestTradingIterationPerSymbolIsolation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(processed, ["A/USDT", "C/USDT"])
 
 
+class TestProtections(unittest.IsolatedAsyncioTestCase):
+    """
+    Protections (перенесено из clonerbot, адаптировано под hermes_trade):
+    cooldown источника после закрытия, StoplossGuard (кластер стопов ->
+    глобальная пауза) и LosingStreak (серия убытков у одного источника ->
+    блокировка только этого источника).
+    """
+
+    def setUp(self):
+        self._saved = {
+            "protections_enabled": settings.protections_enabled,
+            "protections_channel_cooldown_minutes": settings.protections_channel_cooldown_minutes,
+            "protections_stoploss_guard_window_min": settings.protections_stoploss_guard_window_min,
+            "protections_stoploss_guard_count": settings.protections_stoploss_guard_count,
+            "protections_stoploss_guard_lock_min": settings.protections_stoploss_guard_lock_min,
+            "protections_losing_streak_count": settings.protections_losing_streak_count,
+            "protections_losing_streak_lock_min": settings.protections_losing_streak_lock_min,
+        }
+        settings.protections_enabled = True
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            setattr(settings, key, value)
+
+    async def test_lock_expires(self):
+        from datetime import timedelta
+        from src.risk.protections import LockStore
+        from src.utils.timeutils import utcnow
+
+        locks = LockStore()
+        key = "test:lock-expiry"
+        await locks.add(key, 10, "test lock")
+        self.assertEqual(await locks.active_reason([key]), "test lock")
+
+        # Истёкшая блокировка не должна больше действовать.
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import RiskLock
+        async with get_session() as session:
+            row = (await session.execute(select(RiskLock).where(RiskLock.scope_key == key))).scalars().first()
+            row.until = utcnow() - timedelta(minutes=1)
+            await session.commit()
+
+        self.assertIsNone(await locks.active_reason([key]))
+
+    async def test_cooldown_applied_after_any_close(self):
+        from src.risk.protections import ProtectionManager
+
+        settings.protections_channel_cooldown_minutes = 15
+        pm = ProtectionManager()
+        source_key = "telegram:@cooldown_unittest"
+
+        self.assertIsNone(await pm.locked_reason([source_key]))
+        await pm.on_close(source_key, "COOLDOWNCOIN/USDT", pnl=5.0, reason="take_profit_3")
+        reason = await pm.locked_reason([source_key])
+        self.assertIsNotNone(reason)
+        self.assertIn("cooldown", reason)
+
+    async def test_stoploss_guard_pauses_all_trading(self):
+        from datetime import timedelta
+        from sqlalchemy import select, func
+        from src.risk.protections import ProtectionManager, GLOBAL_KEY
+        from src.db.session import get_session
+        from src.db.models import RiskCloseEvent
+        from src.utils.timeutils import utcnow
+
+        settings.protections_stoploss_guard_window_min = 60
+        settings.protections_stoploss_guard_lock_min = 30
+        settings.protections_losing_streak_count = 999  # не мешать этому тесту
+
+        # БД общая на весь тестовый сеанс — другие тесты этого класса уже
+        # могли записать свои события со stop_loss. Считаем порог от текущего
+        # количества, а не от нуля, чтобы тест не зависел от порядка запуска.
+        since = utcnow() - timedelta(minutes=60)
+        async with get_session() as session:
+            baseline = (
+                await session.execute(
+                    select(func.count(RiskCloseEvent.id)).where(
+                        RiskCloseEvent.reason == "stop_loss", RiskCloseEvent.closed_at >= since,
+                    )
+                )
+            ).scalar() or 0
+        settings.protections_stoploss_guard_count = baseline + 2
+
+        pm = ProtectionManager()
+
+        self.assertIsNone(await pm.locked_reason([GLOBAL_KEY]))
+        await pm.on_close("telegram:@sg_channel_1", "SGCOIN1/USDT", pnl=-10.0, reason="stop_loss")
+        # После одного стопа глобальной паузы ещё нет.
+        self.assertIsNone(await pm.locked_reason([GLOBAL_KEY]))
+        await pm.on_close("telegram:@sg_channel_2", "SGCOIN2/USDT", pnl=-8.0, reason="stop_loss")
+        # Второй стоп (от ДРУГОГО источника) добивает до порога — StoplossGuard
+        # реагирует на кластер стопов по всем источникам сразу.
+        reason = await pm.locked_reason([GLOBAL_KEY])
+        self.assertIsNotNone(reason)
+        self.assertIn("stoploss guard", reason)
+
+    async def test_losing_streak_locks_only_that_channel(self):
+        from src.risk.protections import ProtectionManager, GLOBAL_KEY, channel_key
+
+        settings.protections_stoploss_guard_count = 999  # не мешать этому тесту
+        settings.protections_losing_streak_count = 2
+        settings.protections_losing_streak_lock_min = 60
+        pm = ProtectionManager()
+        bad_channel = "@losing_streak_unittest"
+        other_channel = "@losing_streak_unrelated"
+
+        await pm.on_close(channel_key(bad_channel), "LSCOIN/USDT", pnl=-5.0, reason="stop_loss")
+        # После первого закрытия уже есть блокировка (cooldown), но ещё не
+        # по причине losing streak — нужны два подряд убыточных закрытия.
+        reason_after_first = await pm.locked_reason([channel_key(bad_channel)])
+        self.assertNotIn("losing streak", reason_after_first or "")
+        await pm.on_close(channel_key(bad_channel), "LSCOIN/USDT", pnl=-3.0, reason="take_profit_1")
+
+        reason = await pm.locked_reason([channel_key(bad_channel)])
+        self.assertIsNotNone(reason)
+        self.assertIn("losing streak", reason)
+        # Другой канал не пострадал, и это не глобальная блокировка.
+        self.assertIsNone(await pm.locked_reason([channel_key(other_channel)]))
+        self.assertIsNone(await pm.locked_reason([GLOBAL_KEY]))
+
+    async def test_losing_streak_broken_by_a_win(self):
+        from src.risk.protections import ProtectionManager, channel_key
+
+        settings.protections_losing_streak_count = 2
+        pm = ProtectionManager()
+        channel = "@losing_streak_broken_unittest"
+
+        await pm.on_close(channel_key(channel), "LSBCOIN/USDT", pnl=-5.0, reason="stop_loss")
+        await pm.on_close(channel_key(channel), "LSBCOIN/USDT", pnl=1.0, reason="take_profit_3")
+        # win rate — win-loss-... не подряд убыточная серия, блокировки по
+        # losing streak быть не должно (кулдаун-то будет, это отдельная вещь).
+        reason = await pm.locked_reason([channel_key(channel)])
+        self.assertIsNotNone(reason)
+        self.assertIn("cooldown", reason)
+        self.assertNotIn("losing streak", reason)
+
+    async def test_protections_disabled_is_a_noop(self):
+        from src.risk.protections import ProtectionManager, channel_key
+
+        settings.protections_enabled = False
+        pm = ProtectionManager()
+        channel = "@protections_disabled_unittest"
+
+        await pm.on_close(channel_key(channel), "DISABLEDCOIN/USDT", pnl=-100.0, reason="stop_loss")
+        self.assertIsNone(await pm.locked_reason([channel_key(channel)]))
+
+
 if __name__ == "__main__":
     unittest.main()

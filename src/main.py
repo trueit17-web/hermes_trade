@@ -21,6 +21,7 @@ from src.data_ingest.coinglass_client import get_coinglass_client
 from src.data_ingest.feature_engine import get_feature_engine
 from src.strategy import strategy_registry
 from src.risk.risk_manager import risk_manager
+from src.risk.protections import protection_manager, GLOBAL_KEY, channel_key, strategy_key
 from src.execution.executor import execution_engine
 from src.execution.decision_logger import decision_logger
 from src.ml import model_trainer, model_registry, ml_inference, feature_store
@@ -434,9 +435,16 @@ class TradingBot:
                 decision = "rejected"
                 logger.info(f"🚫 Сигнал по {pair} отклонён: уже есть открытая позиция")
             else:
-                logger.info(f"🤖 Автоматическое исполнение")
-                order = await self._execute_telegram_signal(signal_event)
-                decision = "executed" if order else "rejected"
+                lock_reason = await protection_manager.locked_reason(
+                    [GLOBAL_KEY, channel_key(channel_id)]
+                )
+                if lock_reason:
+                    decision = "rejected"
+                    logger.info(f"🔒 Сигнал по {pair} отклонён (protections): {lock_reason}")
+                else:
+                    logger.info(f"🤖 Автоматическое исполнение")
+                    order = await self._execute_telegram_signal(signal_event)
+                    decision = "executed" if order else "rejected"
         else:
             logger.info(f"⏳ Сигнал ожидает подтверждения")
 
@@ -514,6 +522,7 @@ class TradingBot:
                 "tp_hit_count": 0,
                 "opened_at": utcnow(),
                 "order_id": order.id, "entry_fee": order.fee,
+                "channel_id": signal_event.get("channel_id"),
             }
             risk_manager.on_position_added(symbol, 5.0)
             self.daily_pnl = getattr(risk_manager.state, "daily_pnl", 0.0)
@@ -788,6 +797,17 @@ class TradingBot:
                 logger.info(f"🚫 Сигнал отклонён (risk): {symbol} {signal.side} — {reason}")
                 continue
 
+            lock_reason = await protection_manager.locked_reason(
+                [GLOBAL_KEY, strategy_key(signal.strategy_id)]
+            )
+            if lock_reason:
+                decision_logger.log_risk_check(
+                    decision="rejected", reason=f"protections: {lock_reason}",
+                    context={"symbol": symbol, "side": signal.side},
+                )
+                logger.info(f"🔒 Сигнал отклонён (protections): {symbol} {signal.side} — {lock_reason}")
+                continue
+
             if settings.is_paper:
                 balance = execution_engine.get_paper_balance()
             else:
@@ -1003,6 +1023,11 @@ class TradingBot:
         else:
             del self.open_positions[symbol]
             risk_manager.on_position_closed(symbol)
+            source_key = (
+                channel_key(position["channel_id"]) if position.get("channel_id")
+                else strategy_key(position.get("strategy_id") or "unknown")
+            )
+            await protection_manager.on_close(source_key, symbol, result["pnl"], reason)
             if position.get("strategy_id") == "telegram_signal" and result.get("trade_id"):
                 await self._link_telegram_signal_trade(
                     position.get("order_id"), result["trade_id"], result.get("outcome"),

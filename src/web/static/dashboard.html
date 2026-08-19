@@ -436,6 +436,16 @@
     <button id="btnRefresh" class="btn-primary">↻ Обновить</button>
   </div>
 
+  <section id="protectionsSection" style="display:none;">
+    <h2>🔒 Активные блокировки (Protections)</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Источник</th><th>Причина</th><th>До</th></tr></thead>
+        <tbody id="protectionsBody"></tbody>
+      </table>
+    </div>
+  </section>
+
   <section>
     <h2>Открытые позиции</h2>
     <div class="table-wrap">
@@ -1279,6 +1289,25 @@ setInterval(() => {
   }
 }, REFRESH_MS);
 
+async function renderProtections() {
+  const section = document.getElementById("protectionsSection");
+  const body = document.getElementById("protectionsBody");
+  try {
+    const data = await api("/risk/protections");
+    const locks = data.locks || [];
+    section.style.display = locks.length ? "" : "none";
+    body.innerHTML = locks.map(l => `
+      <tr>
+        <td>${escapeHtml(l.scope)}</td>
+        <td>${escapeHtml(l.reason)}</td>
+        <td>${new Date(l.until).toLocaleString("ru-RU")}</td>
+      </tr>
+    `).join("");
+  } catch (err) {
+    section.style.display = "none";
+  }
+}
+
 async function refreshAll() {
   try {
     const status = await api("/status");
@@ -1290,6 +1319,7 @@ async function refreshAll() {
     await renderStrategies();
     await renderMlModels();
     await renderTelegram();
+    await renderProtections();
     document.getElementById("lastUpdated").textContent =
       "Обновлено: " + new Date().toLocaleTimeString("ru-RU");
   } catch (err) {

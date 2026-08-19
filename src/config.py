@@ -64,6 +64,21 @@ class Settings(BaseSettings):
     risk_max_drawdown_pct: float = 15.0
     risk_cooldown_seconds: int = 300
 
+    # === Protections (freqtrade-style автопаузы после плохой серии сделок) ===
+    protections_enabled: bool = True
+    # После любого полного закрытия сделки источник (канал/стратегия) не
+    # торгует это время — не путать с risk_cooldown_seconds (тот блокирует
+    # ВСЮ торговлю, а не только источник, из которого пришла сделка).
+    protections_channel_cooldown_minutes: int = 15
+    # StoplossGuard: N стопов за окно minutes -> пауза ВСЕЙ торговли на lock_min.
+    protections_stoploss_guard_window_min: int = 60
+    protections_stoploss_guard_count: int = 4
+    protections_stoploss_guard_lock_min: int = 120
+    # LosingStreak: N убыточных закрытий подряд у одного источника -> блокировка
+    # только этого источника (канала/стратегии) на lock_min.
+    protections_losing_streak_count: int = 3
+    protections_losing_streak_lock_min: int = 180
+
     # === CoinGlass ===
     coinglass_update_interval_hours: int = 1
 

@@ -15,6 +15,7 @@ from sqlalchemy.orm import selectinload
 from src.config import settings
 from src.event_bus import event_bus
 from src.risk.risk_manager import risk_manager
+from src.risk.protections import protection_manager
 from src.execution.executor import execution_engine
 from src.ml import model_registry, model_trainer
 from src.strategy import strategy_registry
@@ -439,6 +440,12 @@ async def close_position_manually(request: PositionCloseRequest):
 async def get_risk_state():
     """Текущее состояние риска."""
     return risk_manager.get_state()
+
+
+@app.get("/risk/protections")
+async def get_protections():
+    """Активные блокировки Protections (cooldown/StoplossGuard/LosingStreak)."""
+    return {"enabled": settings.protections_enabled, "locks": await protection_manager.locks.active_locks()}
 
 
 @app.post("/risk/configure")

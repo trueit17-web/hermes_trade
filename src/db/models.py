@@ -372,3 +372,37 @@ class TradeDecisionLog(Base):
     __table_args__ = (
         Index("ix_decision_log_trade", "trade_id"),
     )
+
+
+class RiskLock(Base):
+    """Временная блокировка торговли (Protections) — global / telegram:<channel_id> / strategy:<strategy_id>."""
+    __tablename__ = "risk_locks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scope_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    reason: Mapped[str] = mapped_column(String(255), nullable=False)
+    until: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    __table_args__ = (
+        Index("ix_risk_locks_scope_until", "scope_key", "until"),
+    )
+
+
+class RiskCloseEvent(Base):
+    """Факт полного закрытия сделки для Protections (StoplossGuard/LosingStreak) —
+    отдельная лёгкая таблица вместо добавления close_reason в Trade, т.к. нужна
+    только для скользящего окна/серии, а не для основного аудита сделок."""
+    __tablename__ = "risk_close_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scope_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(50), nullable=False)
+    reason: Mapped[str] = mapped_column(String(50), nullable=False)  # stop_loss, take_profit_3, ...
+    pnl: Mapped[float] = mapped_column(DECIMAL, default=0)
+    closed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    __table_args__ = (
+        Index("ix_risk_close_events_scope_closed", "scope_key", "closed_at"),
+        Index("ix_risk_close_events_reason_closed", "reason", "closed_at"),
+    )
