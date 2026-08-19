@@ -120,7 +120,17 @@ update_deployment() {
 
     ssh "$VPS_USER@$VPS_HOST" "cd $DEPLOY_DIR && docker-compose up -d --force-recreate"
 
-    info "Шаг 4: Проверка статуса"
+    info "Шаг 4: Применение миграций"
+
+    # Раньше update_deployment() не запускал миграции вообще (в отличие от
+    # initial_deployment()) — любой PR, добавляющий alembic-миграцию, ронял
+    # бота на первом же запросе к новой таблице/колонке после --update,
+    # пока кто-то не применял миграцию на VPS вручную. db должна быть уже
+    # готова (docker-compose up -d ждёт service_healthy), поэтому применяем
+    # миграции сразу после пересоздания контейнера bot, до проверки /health.
+    ssh "$VPS_USER@$VPS_HOST" "cd $DEPLOY_DIR && docker-compose exec -T bot alembic upgrade head"
+
+    info "Шаг 5: Проверка статуса"
 
     sleep 10
     ssh "$VPS_USER@$VPS_HOST" "curl -s http://localhost:8000/health"
