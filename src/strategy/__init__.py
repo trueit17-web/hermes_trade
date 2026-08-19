@@ -20,6 +20,14 @@ from src.utils.timeutils import utcnow
 logger = logging.getLogger(__name__)
 
 
+def _fmt_price(value: Optional[float]) -> str:
+    """Безопасно отформатировать возможно-None цену (SL/TP) для логов —
+    f"{None:.2f}" бросает необработанный TypeError, который прерывал бы
+    ВСЮ торговую итерацию (не только эту пару), если стратегия не задала
+    stop_loss или take_profit."""
+    return f"{value:.2f}" if value is not None else "—"
+
+
 def min_profitable_margin_pct() -> float:
     """
     Минимальная дистанция TP от цены входа (в долях), при которой номинально
@@ -185,7 +193,7 @@ class RSIMeanReversionStrategy(BaseStrategy):
         if signal:
             logger.info(
                 f"[RSI] {signal.side.upper()} {signal.symbol} | "
-                f"conf={signal.confidence:.2f} | SL={signal.stop_loss:.2f} TP={signal.take_profit:.2f} | "
+                f"conf={signal.confidence:.2f} | SL={_fmt_price(signal.stop_loss)} TP={_fmt_price(signal.take_profit)} | "
                 f"{signal.rationale}"
             )
 
@@ -262,7 +270,7 @@ class EMACrossoverStrategy(BaseStrategy):
             logger.info(
                 f"[EMA] LONG {signal.symbol} | "
                 f"EMA{fast_period}={ema_fast:.2f} > EMA{slow_period}={ema_slow:.2f} | "
-                f"SL={signal.stop_loss:.2f} TP={signal.take_profit:.2f}"
+                f"SL={_fmt_price(signal.stop_loss)} TP={_fmt_price(signal.take_profit)}"
             )
 
             return signal
@@ -288,7 +296,7 @@ class EMACrossoverStrategy(BaseStrategy):
             logger.info(
                 f"[EMA] SHORT {signal.symbol} | "
                 f"EMA{fast_period}={ema_fast:.2f} < EMA{slow_period}={ema_slow:.2f} | "
-                f"SL={signal.stop_loss:.2f} TP={signal.take_profit:.2f}"
+                f"SL={_fmt_price(signal.stop_loss)} TP={_fmt_price(signal.take_profit)}"
             )
 
             return signal
@@ -423,7 +431,7 @@ class BollingerBandsStrategy(BaseStrategy):
         if signal:
             logger.info(
                 f"[BB] {signal.side.upper()} {signal.symbol} | "
-                f"conf={signal.confidence:.2f} | SL={signal.stop_loss:.2f} TP={signal.take_profit:.2f} | "
+                f"conf={signal.confidence:.2f} | SL={_fmt_price(signal.stop_loss)} TP={_fmt_price(signal.take_profit)} | "
                 f"{signal.rationale}"
             )
 
@@ -525,7 +533,7 @@ class FundingRateStrategy(BaseStrategy):
             logger.info(
                 f"[FUNDING] {signal.side.upper()} {signal.symbol} | "
                 f"conf={signal.confidence:.2f} | funding={current_funding:.4f} | "
-                f"SL={signal.stop_loss:.2f} TP={signal.take_profit:.2f} | {signal.rationale}"
+                f"SL={_fmt_price(signal.stop_loss)} TP={_fmt_price(signal.take_profit)} | {signal.rationale}"
             )
 
         return signal
@@ -624,7 +632,7 @@ class LiquidationStrategy(BaseStrategy):
             logger.info(
                 f"[LIQ] {signal.side.upper()} {signal.symbol} | "
                 f"conf={signal.confidence:.2f} | dist={liquidation_distance:.1f}% | "
-                f"LSR={long_short_ratio:.2f} | SL={signal.stop_loss:.2f} TP={signal.take_profit:.2f}"
+                f"LSR={long_short_ratio:.2f} | SL={_fmt_price(signal.stop_loss)} TP={_fmt_price(signal.take_profit)}"
             )
 
         return signal
@@ -744,7 +752,7 @@ class MLDirectionClassifierStrategy(BaseStrategy):
             logger.info(
                 f"[ML] {signal.side.upper()} {signal.symbol} | "
                 f"conf={signal.confidence:.2f} | P(up)={ml_proba_up:.2f} P(down)={ml_proba_down:.2f} | "
-                f"SL={signal.stop_loss:.2f} TP={signal.take_profit:.2f} | {signal.rationale}"
+                f"SL={_fmt_price(signal.stop_loss)} TP={_fmt_price(signal.take_profit)} | {signal.rationale}"
             )
 
         return signal

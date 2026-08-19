@@ -467,9 +467,11 @@ class ExecutionEngine:
             "signal_data": signal_data,
         }
 
+        sl_str = f"{stop_loss:.2f}" if stop_loss is not None else "—"
+        tp_str = f"{take_profit:.2f}" if take_profit is not None else "—"
         logger.info(
             f"📝 Создание ордера: {side.upper()} {amount:.4f} {symbol} @ {execution_price:.2f} | "
-            f"SL={stop_loss:.2f} TP={take_profit:.2f} | ID={client_order_id}"
+            f"SL={sl_str} TP={tp_str} | ID={client_order_id}"
         )
 
         if self.is_paper:

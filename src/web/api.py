@@ -543,39 +543,70 @@ async def update_strategy(strategy_id: str, request: StrategyUpdateRequest):
 
 @app.get("/trades")
 async def list_trades(limit: int = 100, offset: int = 0):
-    """Список сделок."""
+    """
+    Список сделок, сгруппированных по позиции (order_open_id): частичные
+    закрытия одной позиции по уровням TP1/TP2/TP3 показываются одной
+    строкой с суммарными объёмом/PnL, а не как отдельные сделки.
+    """
     async with get_session() as session:
-        trades = (
+        # Берём сырые Trade-строки с запасом, чтобы после группировки (до
+        # 3 частей на позицию) точно хватило на limit+offset готовых строк.
+        raw_trades = (
             await session.execute(
                 select(Trade)
                 .options(selectinload(Trade.symbol), selectinload(Trade.strategy))
-                .order_by(Trade.created_at.desc())
-                .offset(offset)
-                .limit(limit)
+                .order_by(Trade.closed_at.desc(), Trade.created_at.desc())
+                .limit((limit + offset) * 3 + 50)
             )
         ).scalars().all()
+
+        groups: dict = {}
+        for t in raw_trades:
+            key = t.order_open_id if t.order_open_id is not None else f"single-{t.id}"
+            groups.setdefault(key, []).append(t)
+
+        aggregated = []
+        for group in groups.values():
+            group.sort(key=lambda t: t.closed_at or t.created_at)
+            first, last = group[0], group[-1]
+            total_amount = sum(float(t.amount) for t in group)
+            total_pnl = sum(float(t.pnl) for t in group)
+            entry_price = float(first.entry_price)
+            priced = [t for t in group if t.exit_price is not None]
+            exit_price = (
+                sum(float(t.exit_price) * float(t.amount) for t in priced) / sum(float(t.amount) for t in priced)
+                if priced else None
+            )
+            pnl_pct = (total_pnl / (entry_price * total_amount) * 100) if entry_price and total_amount else 0.0
+            outcome = "win" if total_pnl > 0 else ("loss" if total_pnl < 0 else "break-even")
+            aggregated.append({
+                "id": last.id,
+                "symbol_id": last.symbol_id,
+                "symbol": last.symbol.symbol if last.symbol else None,
+                "direction": last.direction,
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "amount": total_amount,
+                "pnl": total_pnl,
+                "pnl_pct": pnl_pct,
+                "holding_seconds": last.holding_seconds,
+                "outcome": outcome,
+                "is_open": last.is_open,
+                "parts": len(group),
+                "source": _position_source_label(last.strategy.name if last.strategy else None),
+                "created_at": first.created_at.isoformat() if first.created_at else None,
+                "closed_at": last.closed_at.isoformat() if last.closed_at else None,
+                "_sort_key": (last.closed_at or last.created_at).isoformat(),
+            })
+
+        aggregated.sort(key=lambda r: r["_sort_key"], reverse=True)
+        page = aggregated[offset:offset + limit]
+        for row in page:
+            del row["_sort_key"]
+
         return {
-            "trades": [
-                {
-                    "id": t.id,
-                    "symbol_id": t.symbol_id,
-                    "symbol": t.symbol.symbol if t.symbol else None,
-                    "direction": t.direction,
-                    "entry_price": float(t.entry_price),
-                    "exit_price": float(t.exit_price) if t.exit_price else None,
-                    "amount": float(t.amount),
-                    "pnl": float(t.pnl),
-                    "pnl_pct": float(t.pnl_pct) if t.pnl_pct else 0,
-                    "holding_seconds": t.holding_seconds,
-                    "outcome": t.outcome,
-                    "is_open": t.is_open,
-                    "source": _position_source_label(t.strategy.name if t.strategy else None),
-                    "created_at": t.created_at.isoformat() if t.created_at else None,
-                    "closed_at": t.closed_at.isoformat() if t.closed_at else None,
-                }
-                for t in trades
-            ],
-            "total": len(trades),
+            "trades": page,
+            "total": len(aggregated),
         }
 
 

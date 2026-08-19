@@ -1158,5 +1158,65 @@ class TestPaperAccountReset(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(sig.executed_trade_id)
 
 
+class TestCreateOrderWithoutSlTp(unittest.IsolatedAsyncioTestCase):
+    """
+    create_order()'s own log line did f"{stop_loss:.2f}" unconditionally —
+    a Telegram signal from a channel that posts no stop-loss (very common)
+    passes stop_loss=None, which crashed with an unhandled TypeError before
+    the order was ever created. Not wrapped in a try/except anywhere in the
+    call chain, so it silently killed the whole trading iteration.
+    """
+
+    async def test_create_order_without_stop_loss_or_take_profit(self):
+        from src.execution.executor import ExecutionEngine
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "paper"
+        await engine.initialize("binance")
+
+        order = await engine.create_order(
+            symbol="NOSLTP/USDT", side="buy", amount=1.0, price=10.0,
+            order_type="market", stop_loss=None, take_profit=None,
+        )
+        self.assertIsNotNone(order)
+
+
+class TestTradesGrouping(unittest.IsolatedAsyncioTestCase):
+    """GET /trades должен объединять частичные закрытия одной позиции
+    (TP1/TP2/TP3) в одну строку с суммарными показателями."""
+
+    async def test_partial_closes_grouped_into_one_row(self):
+        from src.execution.executor import ExecutionEngine
+        from src.web.api import list_trades
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "paper"
+        await engine.initialize("binance")
+
+        symbol = "TRADESGROUP1/USDT"
+        order = await engine.create_order(
+            symbol=symbol, side="buy", amount=10.0, price=200.0, order_type="market",
+        )
+        self.assertIsNotNone(order)
+        await engine.close_paper_position(
+            symbol=symbol, side="long", entry_price=200.0, amount=5.0,
+            exit_price=220.0, reason="take_profit_1", entry_fee=1.0,
+            holding_seconds=60, order_open_id=order.id,
+        )
+        await engine.close_paper_position(
+            symbol=symbol, side="long", entry_price=200.0, amount=5.0,
+            exit_price=240.0, reason="take_profit_3", entry_fee=1.0,
+            holding_seconds=180, order_open_id=order.id,
+        )
+
+        result = await list_trades(limit=200, offset=0)
+        rows = [t for t in result["trades"] if t["symbol"] == symbol]
+        self.assertEqual(len(rows), 1, "две частичные сделки одной позиции должны стать одной строкой")
+        row = rows[0]
+        self.assertEqual(row["parts"], 2)
+        self.assertAlmostEqual(row["amount"], 10.0)
+        self.assertEqual(row["holding_seconds"], 180)
+
+
 if __name__ == "__main__":
     unittest.main()

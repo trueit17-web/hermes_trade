@@ -14,7 +14,7 @@ from rich.panel import Panel
 from rich import box
 
 from src.config import settings
-from src.strategy import StrategySignal, BaseStrategy
+from src.strategy import StrategySignal, BaseStrategy, _fmt_price
 from src.risk.risk_manager import RiskManager
 from src.utils.logging import logger
 
@@ -435,7 +435,7 @@ class BacktestEngine:
                 logger.debug(
                     f"  Открытие позиции: {signal.side.upper()} {signal.symbol} | "
                     f"цена {entry_price:.2f} | количество {amount:.6f} | "
-                    f"SL {signal.stop_loss:.2f} TP {signal.take_profit:.2f} | "
+                    f"SL {_fmt_price(signal.stop_loss)} TP {_fmt_price(signal.take_profit)} | "
                     f"{signal.rationale[:80]}"
                 )
 
