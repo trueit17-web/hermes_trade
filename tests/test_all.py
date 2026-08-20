@@ -1723,5 +1723,60 @@ class TestExpectancySizing(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mult, 0.0)
 
 
+class TestMlTrainingReadiness(unittest.IsolatedAsyncioTestCase):
+    """
+    /ml/training-readiness (FeatureStore.get_training_readiness): отвечает
+    на "сколько записей есть для обучения модели" — раньше единственным
+    способом узнать это было читать таблицу ml_features напрямую в БД.
+    """
+
+    async def test_counts_labeled_rows_separately_per_label_type(self):
+        from datetime import timedelta
+        from src.db.session import get_session
+        from src.db.models import MLFeature
+        from src.ml import feature_store, MIN_TRAINING_SAMPLES
+        from src.utils.timeutils import utcnow
+
+        symbol = "MLREADINESS1/USDT"
+        async with get_session() as session:
+            # 2 строки с обоими лейблами, 1 только с direction, 1 вообще без лейблов.
+            session.add(MLFeature(
+                symbol=symbol, timeframe="1h", timestamp=utcnow(),
+                features={"rsi_14": 50.0}, label_direction=1, label_volatility=0.02, source="live",
+            ))
+            session.add(MLFeature(
+                symbol=symbol, timeframe="1h", timestamp=utcnow() + timedelta(seconds=1),
+                features={"rsi_14": 55.0}, label_direction=-1, label_volatility=0.01, source="live",
+            ))
+            session.add(MLFeature(
+                symbol=symbol, timeframe="1h", timestamp=utcnow() + timedelta(seconds=2),
+                features={"rsi_14": 60.0}, label_direction=0, label_volatility=None, source="live",
+            ))
+            session.add(MLFeature(
+                symbol=symbol, timeframe="1h", timestamp=utcnow() + timedelta(seconds=3),
+                features={"rsi_14": 65.0}, label_direction=None, label_volatility=None, source="live",
+            ))
+            await session.commit()
+
+        result = await feature_store.get_training_readiness(symbol=symbol)
+        self.assertEqual(result["total_features"], 4)
+        self.assertEqual(result["labeled_direction"], 3)
+        self.assertEqual(result["labeled_volatility"], 2)
+        self.assertEqual(result["min_training_samples"], MIN_TRAINING_SAMPLES)
+        self.assertFalse(result["direction_ready"])  # 3 < 100
+        self.assertFalse(result["volatility_ready"])  # 2 < 100
+        self.assertIn({"symbol": symbol, "count": 4}, result["by_symbol"])
+
+    async def test_endpoint_returns_the_same_shape(self):
+        from src.ml import feature_store
+        result = await feature_store.get_training_readiness()
+        for key in (
+            "total_features", "labeled_direction", "labeled_volatility",
+            "min_training_samples", "direction_ready", "volatility_ready",
+            "trades_count", "min_trades_for_retrain_attempt", "by_symbol",
+        ):
+            self.assertIn(key, result)
+
+
 if __name__ == "__main__":
     unittest.main()

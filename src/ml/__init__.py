@@ -12,11 +12,11 @@ import optuna
 import pandas as pd
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.model_selection import train_test_split
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func
 
 from src.config import settings
 from src.db.session import get_session
-from src.db.models import MLModel, MLFeature, Strategy
+from src.db.models import MLModel, MLFeature, Strategy, Trade
 from src.utils.logging import logger
 from src.utils.timeutils import utcnow
 
@@ -44,6 +44,17 @@ DEFAULT_REGRESSOR_PARAMS = {
 
 MODELS_DIR = Path(__file__).parent.parent.parent / "data" / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Ниже этого числа валидных (после dropna по признакам) строк ML-модель не
+# обучается вообще — train_direction_classifier/train_volatility_predictor
+# просто возвращают None. Вынесено в константу, т.к. раньше было
+# продублированным магическим числом в обеих функциях.
+MIN_TRAINING_SAMPLES = 100
+
+# _retrain_ml() в main.py не пытается переобучать модель, пока сделок
+# меньше этого числа — отдельный, более ранний гейт, чем MIN_TRAINING_SAMPLES
+# (сделки и ml_features — разные таблицы с разным темпом накопления).
+MIN_TRADES_FOR_RETRAIN_ATTEMPT = 50
 
 
 class FeatureStore:
@@ -148,6 +159,59 @@ class FeatureStore:
         """Очистить онлайн кэш."""
         self._online_features.clear()
 
+    async def get_training_readiness(self, symbol: Optional[str] = None) -> dict:
+        """
+        Сколько данных сейчас доступно для обучения и сколько нужно —
+        чтобы ответить на вопрос "почему модель не обучилась/не загружена"
+        без необходимости лезть в БД руками. Два независимых порога:
+        сделки (Trade) для _retrain_ml() (решает, пытаться ли вообще
+        переобучать) и размеченные строки ml_features для самого обучения
+        (решает, получится ли обучение, если оно запустится).
+        """
+        async with get_session() as session:
+            feature_filter = [MLFeature.symbol == symbol] if symbol else []
+
+            total_features = (
+                await session.execute(
+                    select(func.count()).select_from(MLFeature).where(*feature_filter)
+                )
+            ).scalar_one()
+            labeled_direction = (
+                await session.execute(
+                    select(func.count()).select_from(MLFeature)
+                    .where(*feature_filter, MLFeature.label_direction.is_not(None))
+                )
+            ).scalar_one()
+            labeled_volatility = (
+                await session.execute(
+                    select(func.count()).select_from(MLFeature)
+                    .where(*feature_filter, MLFeature.label_volatility.is_not(None))
+                )
+            ).scalar_one()
+            by_symbol = (
+                await session.execute(
+                    select(MLFeature.symbol, func.count())
+                    .where(*feature_filter)
+                    .group_by(MLFeature.symbol)
+                    .order_by(func.count().desc())
+                )
+            ).all()
+            trades_count = (
+                await session.execute(select(func.count()).select_from(Trade))
+            ).scalar_one()
+
+        return {
+            "total_features": total_features,
+            "labeled_direction": labeled_direction,
+            "labeled_volatility": labeled_volatility,
+            "min_training_samples": MIN_TRAINING_SAMPLES,
+            "direction_ready": labeled_direction >= MIN_TRAINING_SAMPLES,
+            "volatility_ready": labeled_volatility >= MIN_TRAINING_SAMPLES,
+            "trades_count": trades_count,
+            "min_trades_for_retrain_attempt": MIN_TRADES_FOR_RETRAIN_ATTEMPT,
+            "by_symbol": [{"symbol": s, "count": c} for s, c in by_symbol],
+        }
+
 
 class ModelTrainer:
     """Тренер ML моделей (LightGBM)."""
@@ -201,8 +265,8 @@ class ModelTrainer:
         X = training_data[available_cols].dropna()
         y = training_data.loc[X.index, "label_direction"]
 
-        if len(X) < 100:
-            logger.warning(f"Слишком мало данных для обучения: {len(X)}")
+        if len(X) < MIN_TRAINING_SAMPLES:
+            logger.warning(f"Слишком мало данных для обучения: {len(X)} (нужно ≥{MIN_TRAINING_SAMPLES})")
             return None
 
         # Разделение на train/validation
@@ -323,7 +387,8 @@ class ModelTrainer:
         X = training_data[available_cols].dropna()
         y = training_data.loc[X.index, "label_volatility"]
 
-        if len(X) < 100:
+        if len(X) < MIN_TRAINING_SAMPLES:
+            logger.warning(f"Слишком мало данных для обучения volatility predictor: {len(X)} (нужно ≥{MIN_TRAINING_SAMPLES})")
             return None
 
         X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)

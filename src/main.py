@@ -352,13 +352,14 @@ class TradingBot:
 
             from src.db.models import Trade
             from src.db.session import get_session
+            from src.ml import MIN_TRADES_FOR_RETRAIN_ATTEMPT
 
             async with get_session() as session:
                 trades_count = (
                     await session.execute(select(func.count()).select_from(Trade))
                 ).scalar_one()
 
-            if trades_count < 50:
+            if trades_count < MIN_TRADES_FOR_RETRAIN_ATTEMPT:
                 logger.debug(f"ML retraining пропущен: {trades_count} сделок")
                 return
 

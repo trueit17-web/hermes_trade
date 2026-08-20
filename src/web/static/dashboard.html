@@ -486,6 +486,7 @@
 
   <section>
     <h2>ML модели</h2>
+    <div id="mlReadiness" class="muted" style="margin-bottom:10px;">Загрузка…</div>
     <div class="table-wrap">
       <table>
         <thead><tr><th>Тип</th><th>Версия</th><th>Активна</th><th>Метрики</th></tr></thead>
@@ -808,11 +809,26 @@ async function renderTrades() {
 
 async function renderMlModels() {
   const body = document.getElementById("mlBody");
+  const readinessEl = document.getElementById("mlReadiness");
+
+  try {
+    const r = await api("/ml/training-readiness");
+    const directionMark = r.direction_ready ? "✅" : "⏳";
+    const volatilityMark = r.volatility_ready ? "✅" : "⏳";
+    readinessEl.innerHTML =
+      `Данных для обучения: <b>${r.total_features}</b> строк ` +
+      `(размечено под direction: ${r.labeled_direction}, под volatility: ${r.labeled_volatility}; нужно ≥${r.min_training_samples}) ` +
+      `${directionMark} direction / ${volatilityMark} volatility` +
+      ` &nbsp;·&nbsp; Сделок для запуска переобучения: ${r.trades_count} / ${r.min_trades_for_retrain_attempt}`;
+  } catch (err) {
+    readinessEl.textContent = `Ошибка загрузки статистики обучения: ${err.message}`;
+  }
+
   try {
     const data = await api("/ml/models");
     const models = data.models || [];
     if (!models.length) {
-      body.innerHTML = `<tr class="empty-row"><td colspan="4">Моделей пока нет — недостаточно данных для обучения</td></tr>`;
+      body.innerHTML = `<tr class="empty-row"><td colspan="4">Моделей пока нет — недостаточно данных для обучения (см. статистику выше)</td></tr>`;
       return;
     }
     body.innerHTML = models.map(m => `

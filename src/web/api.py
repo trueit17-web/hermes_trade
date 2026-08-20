@@ -690,6 +690,16 @@ async def list_ml_models(model_type: Optional[str] = None):
     return {"models": await model_registry.list_models(model_type)}
 
 
+@app.get("/ml/training-readiness")
+async def get_ml_training_readiness(symbol: Optional[str] = None):
+    """
+    Сколько данных сейчас накоплено для обучения ML-моделей и сколько нужно —
+    отвечает на вопрос "почему модель не обучилась/не загружена" без
+    необходимости смотреть в БД напрямую.
+    """
+    return await model_trainer.feature_store.get_training_readiness(symbol)
+
+
 @app.get("/ml/models/{model_type}/active")
 async def get_active_ml_model(model_type: str):
     """Получить активную модель."""
