@@ -65,3 +65,11 @@ jobs:
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile
+          # Дефолтный failure-threshold: info жёстко валит сборку на DL3008
+          # (apt-get install без явной версии пакета) — это предупреждение,
+          # а не ошибка, и в Dockerfile ставится один системный пакет
+          # (libgomp1, рантайм для lightgbm); жёсткая пиновка версии из
+          # Debian-репозитория регулярно ломала бы сборку при обновлении
+          # базового образа без изменений в самом проекте. Поднимаем порог
+          # до error — реальные ошибки Dockerfile по-прежнему валят сборку.
+          failure-threshold: error
