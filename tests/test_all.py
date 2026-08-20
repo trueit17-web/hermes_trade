@@ -2026,5 +2026,67 @@ class TestProtectionsLockTimestampFormat(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(row["until"].endswith("Z"), row["until"])
 
 
+class TestGetTradableSymbols(unittest.IsolatedAsyncioTestCase):
+    """
+    MarketDataIngest.get_tradable_symbols раньше звал fetch_tickers(candidates)
+    со списком из сотен пар — регулярно ловило "'str' object has no attribute
+    'keys'" в проде (кривой/неожиданный ответ биржи на такой запрос,
+    который ccxt не всегда корректно отличает от ошибки). Один запрос "все
+    тикеры" без списка символов + локальная фильтрация работает так же и
+    без этого риска.
+    """
+
+    def _make_ingest(self, markets: dict):
+        from src.data_ingest.market_data import MarketDataIngest
+        ingest = MarketDataIngest("binance")
+        ingest.exchange = AsyncMock()
+        ingest.exchange.markets = markets
+        return ingest
+
+    def _spot_market(self, quote="USDT"):
+        return {"spot": True, "active": True, "quote": quote}
+
+    async def test_fetch_tickers_called_without_symbol_list(self):
+        ingest = self._make_ingest({
+            "BTC/USDT": self._spot_market(), "ETH/USDT": self._spot_market(),
+        })
+        ingest.exchange.fetch_tickers.return_value = {
+            "BTC/USDT": {"quoteVolume": 100}, "ETH/USDT": {"quoteVolume": 200},
+        }
+        await ingest.get_tradable_symbols(quote="USDT", max_symbols=10)
+        ingest.exchange.fetch_tickers.assert_awaited_once_with()
+
+    async def test_sorted_by_volume_descending(self):
+        ingest = self._make_ingest({
+            "BTC/USDT": self._spot_market(), "ETH/USDT": self._spot_market(),
+            "XRP/USDT": self._spot_market(),
+        })
+        ingest.exchange.fetch_tickers.return_value = {
+            "BTC/USDT": {"quoteVolume": 100}, "ETH/USDT": {"quoteVolume": 300},
+            "XRP/USDT": {"quoteVolume": 200},
+        }
+        result = await ingest.get_tradable_symbols(quote="USDT", max_symbols=10)
+        self.assertEqual(result, ["ETH/USDT", "XRP/USDT", "BTC/USDT"])
+
+    async def test_fetch_tickers_error_falls_back_without_crashing(self):
+        ingest = self._make_ingest({
+            "BTC/USDT": self._spot_market(), "ETH/USDT": self._spot_market(),
+        })
+        ingest.exchange.fetch_tickers.side_effect = RuntimeError("'str' object has no attribute 'keys'")
+        result = await ingest.get_tradable_symbols(quote="USDT", max_symbols=10)
+        self.assertEqual(set(result), {"BTC/USDT", "ETH/USDT"})
+
+    async def test_excludes_leveraged_tokens_and_blacklist(self):
+        ingest = self._make_ingest({
+            "BTC/USDT": self._spot_market(), "BTCUP/USDT": self._spot_market(),
+            "ETH/USDT": self._spot_market(), "BNB/BTC": self._spot_market(quote="BTC"),
+        })
+        ingest.exchange.fetch_tickers.return_value = {}
+        result = await ingest.get_tradable_symbols(
+            quote="USDT", blacklist=["ETH/USDT"], max_symbols=10,
+        )
+        self.assertEqual(set(result), {"BTC/USDT"})
+
+
 if __name__ == "__main__":
     unittest.main()

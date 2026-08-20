@@ -128,7 +128,15 @@ class MarketDataIngest:
             return []
 
         try:
-            tickers = await self.exchange.fetch_tickers(candidates)
+            # Без списка символов — один лёгкий запрос "все тикеры" (у Binance
+            # это /ticker/24hr без параметра symbols). Передача сотен
+            # символов в fetch_tickers(candidates) регулярно роняла запрос
+            # (URL на грани лимита длины у биржи, кривые ответы, которые
+            # ccxt не всегда корректно распознаёт как ошибку — отсюда
+            # обманчивое "'str' object has no attribute 'keys'": в tickers
+            # прилетала строка вместо dict). Локальная фильтрация по
+            # candidates ниже работает так же, но без этого риска.
+            tickers = await self.exchange.fetch_tickers()
             candidates.sort(key=lambda s: (tickers.get(s) or {}).get("quoteVolume") or 0, reverse=True)
         except Exception as e:
             logger.warning(f"[{self.exchange_id}] Не удалось получить объёмы для сортировки пар: {e}")
