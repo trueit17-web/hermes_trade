@@ -98,6 +98,21 @@
   .btn-danger { background: var(--red); border-color: var(--red); color: #fff; }
   .btn-ghost { background: transparent; }
 
+  .pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 12px 0 2px;
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+  .pagination button {
+    padding: 5px 12px;
+    font-weight: 500;
+    font-size: 13px;
+  }
+
   .add-channel-form {
     display: flex;
     flex-wrap: wrap;
@@ -327,6 +342,7 @@
 
   .log-filters {
     display: flex;
+    align-items: center;
     gap: 8px;
     flex-wrap: wrap;
     padding: 0 16px 12px;
@@ -482,6 +498,7 @@
         <tbody id="tradesBody"><tr class="empty-row"><td colspan="10">Загрузка…</td></tr></tbody>
       </table>
     </div>
+    <div class="pagination" id="tradesPagination"></div>
   </section>
 
   <section>
@@ -774,15 +791,32 @@ async function renderStrategies() {
   }
 }
 
+const TRADES_PAGE_SIZE = 10;
+let tradesPage = 0;
+
 async function renderTrades() {
   const body = document.getElementById("tradesBody");
+  const pagination = document.getElementById("tradesPagination");
   try {
-    const data = await api("/trades?limit=20");
+    const offset = tradesPage * TRADES_PAGE_SIZE;
+    const data = await api(`/trades?limit=${TRADES_PAGE_SIZE}&offset=${offset}`);
     const trades = data.trades || [];
-    if (!trades.length) {
+    const total = data.total || 0;
+
+    if (!total) {
       body.innerHTML = `<tr class="empty-row"><td colspan="10">Сделок пока нет</td></tr>`;
-      return;
+      pagination.innerHTML = "";
+      return trades;
     }
+
+    // Если удалили сделки (сброс paper-аккаунта) или текущая страница
+    // оказалась за пределами данных — вернуться на последнюю доступную.
+    const lastPage = Math.max(0, Math.ceil(total / TRADES_PAGE_SIZE) - 1);
+    if (tradesPage > lastPage) {
+      tradesPage = lastPage;
+      return renderTrades();
+    }
+
     body.innerHTML = trades.map(t => {
       const tradeValue = t.amount && t.entry_price ? t.amount * t.entry_price : null;
       return `
@@ -796,10 +830,24 @@ async function renderTrades() {
         <td>${t.outcome || (t.is_open ? "открыта" : "—")}</td>
         <td class="muted">${t.source || "—"}</td>
         <td class="muted">${fmtDuration(t.holding_seconds)}</td>
-        <td class="muted">${t.closed_at ? new Date(t.closed_at + "Z").toLocaleString("ru-RU") : "—"}</td>
+        <td class="muted">${t.closed_at ? new Date(t.closed_at).toLocaleString("ru-RU") : "—"}</td>
       </tr>
     `;
     }).join("");
+
+    const pageCount = lastPage + 1;
+    pagination.innerHTML = `
+      <button class="btn-ghost" id="tradesPrevBtn" ${tradesPage === 0 ? "disabled" : ""}>← Назад</button>
+      <span>Страница ${tradesPage + 1} из ${pageCount} (всего сделок: ${total})</span>
+      <button class="btn-ghost" id="tradesNextBtn" ${tradesPage >= lastPage ? "disabled" : ""}>Вперёд →</button>
+    `;
+    document.getElementById("tradesPrevBtn").addEventListener("click", () => {
+      if (tradesPage > 0) { tradesPage--; renderTrades(); }
+    });
+    document.getElementById("tradesNextBtn").addEventListener("click", () => {
+      if (tradesPage < lastPage) { tradesPage++; renderTrades(); }
+    });
+
     return trades;
   } catch (err) {
     body.innerHTML = `<tr class="empty-row"><td colspan="10">Ошибка загрузки: ${err.message}</td></tr>`;
@@ -870,8 +918,16 @@ async function renderTelegram() {
       <tr class="channel-row" data-channel-id="${c.id}" title="Показать историю сигналов">
         <td><span class="expand-arrow">▸</span>${c.channel_title || "—"}</td>
         <td class="muted">${c.channel_id}</td>
-        <td>${fmt(c.quality_threshold, 2)}</td>
-        <td>${c.auto_execute ? "✅" : "—"}</td>
+        <td>
+          <input type="number" class="channel-threshold-input" data-channel-id="${c.id}"
+                 value="${c.quality_threshold}" step="0.05" min="0" max="1" style="width:64px;">
+        </td>
+        <td>
+          <label class="toggle">
+            <input type="checkbox" class="channel-autoexec-input" data-channel-id="${c.id}" ${c.auto_execute ? "checked" : ""}>
+            <span class="slider"></span>
+          </label>
+        </td>
         <td>${s.total_signals ?? c.signals_count}</td>
         <td>${s.executed ?? 0}</td>
         <td>${winRate}</td>
@@ -901,8 +957,47 @@ async function renderTelegram() {
 
     body.querySelectorAll(".channel-row").forEach(row => {
       row.addEventListener("click", (e) => {
-        if (e.target.closest("[data-delete-channel]")) return;
+        if (e.target.closest("[data-delete-channel]") || e.target.closest(".channel-editable")) return;
         toggleChannelSignals(row);
+      });
+    });
+
+    body.querySelectorAll(".channel-threshold-input").forEach(input => {
+      input.closest("td").classList.add("channel-editable");
+      input.addEventListener("click", (e) => e.stopPropagation());
+      input.addEventListener("change", async () => {
+        const id = input.dataset.channelId;
+        const value = parseFloat(input.value);
+        if (isNaN(value) || value < 0 || value > 1) {
+          showToast("Порог должен быть числом от 0 до 1", true);
+          return;
+        }
+        try {
+          await api(`/telegram/channels/${id}`, {
+            method: "PATCH", body: JSON.stringify({ quality_threshold: value }),
+          });
+          showToast("Порог качества обновлён");
+        } catch (err) {
+          showToast(`Ошибка: ${err.message}`, true);
+        }
+      });
+    });
+
+    body.querySelectorAll(".channel-autoexec-input").forEach(input => {
+      input.closest("td").classList.add("channel-editable");
+      input.addEventListener("click", (e) => e.stopPropagation());
+      input.addEventListener("change", async () => {
+        const id = input.dataset.channelId;
+        const checked = input.checked;
+        try {
+          await api(`/telegram/channels/${id}`, {
+            method: "PATCH", body: JSON.stringify({ auto_execute: checked }),
+          });
+          showToast(checked ? "Автоисполнение включено" : "Автоисполнение выключено");
+        } catch (err) {
+          input.checked = !checked;
+          showToast(`Ошибка: ${err.message}`, true);
+        }
       });
     });
   } catch (err) {
@@ -969,7 +1064,7 @@ function renderChannelSignalsTable(signals) {
             }
             return `
             <tr>
-              <td class="muted">${s.created_at ? new Date(s.created_at + "Z").toLocaleString("ru-RU") : "—"}</td>
+              <td class="muted">${s.created_at ? new Date(s.created_at).toLocaleString("ru-RU") : "—"}</td>
               <td>${s.parsed_pair || "—"}</td>
               <td class="side-${s.parsed_side === 'long' ? 'long' : 'short'}">${(s.parsed_side || "—").toUpperCase()}</td>
               <td>${s.parsed_entry !== null ? fmtPrice(s.parsed_entry) : "—"}</td>
@@ -1195,12 +1290,42 @@ let allModules = [];
 let selectedModules = new Set();
 let modulesInitialized = false;
 
+const LOG_MODULES_STORAGE_KEY = "cryptobot_log_modules";
+
+// Выбор модулей раньше жил только в памяти вкладки — любая перезагрузка
+// страницы (в т.ч. просто открыть дашборд заново) сбрасывала фильтр
+// обратно на "выбраны все", даже если пользователь осознанно снял часть
+// галочек. Сохраняем выбор в localStorage браузера и восстанавливаем при
+// загрузке.
+function saveSelectedModules() {
+  try {
+    localStorage.setItem(LOG_MODULES_STORAGE_KEY, JSON.stringify(Array.from(selectedModules)));
+  } catch (e) {}
+}
+
+function loadSavedModules() {
+  try {
+    const raw = localStorage.getItem(LOG_MODULES_STORAGE_KEY);
+    return raw ? new Set(JSON.parse(raw)) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function loadModuleList() {
   try {
     const data = await api("/logs/loggers");
     const newModules = data.loggers || [];
     if (!modulesInitialized) {
-      newModules.forEach(m => selectedModules.add(m));
+      const saved = loadSavedModules();
+      if (saved) {
+        // Восстанавливаем ровно сохранённый выбор (пересечение с реально
+        // существующими сейчас модулями) — модуль, впервые появившийся
+        // после последнего сохранения, по умолчанию не отмечен.
+        newModules.forEach(m => { if (saved.has(m)) selectedModules.add(m); });
+      } else {
+        newModules.forEach(m => selectedModules.add(m));
+      }
       modulesInitialized = true;
     } else {
       newModules.forEach(m => { if (!allModules.includes(m)) selectedModules.add(m); });
@@ -1237,6 +1362,7 @@ function renderModuleCheckboxes() {
 }
 
 function updateModuleDropdownLabel() {
+  saveSelectedModules();
   const btn = document.getElementById("moduleDropdownBtn");
   if (selectedModules.size === allModules.length) {
     btn.textContent = "Модули: все ▾";

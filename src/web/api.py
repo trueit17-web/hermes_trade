@@ -183,6 +183,13 @@ class TelegramChannelCreate(BaseModel):
     auto_execute: bool = False
 
 
+class TelegramChannelUpdate(BaseModel):
+    """Обновление настроек существующего Telegram канала. Незаданные поля не меняются."""
+    channel_title: Optional[str] = None
+    quality_threshold: Optional[float] = None
+    auto_execute: Optional[bool] = None
+
+
 class TelegramSignalConfirm(BaseModel):
     """Подтверждение Telegram сигнала."""
     signal_id: int
@@ -212,7 +219,7 @@ async def root():
     return {
         "status": "running",
         "mode": settings.trading_mode,
-        "timestamp": utcnow().isoformat(),
+        "timestamp": utcnow().isoformat() + "Z",
     }
 
 
@@ -277,7 +284,7 @@ async def health():
         "status": "ok",
         "trading_mode": settings.trading_mode,
         "bot_running": True,
-        "timestamp": utcnow().isoformat(),
+        "timestamp": utcnow().isoformat() + "Z",
     }
 
 
@@ -321,7 +328,7 @@ async def get_status():
         "ml_active_model": await model_registry.get_active_model("direction_classifier"),
         "telegram_channels": telegram_channels,
         "event_bus_history_size": len(event_bus.get_history()),
-        "timestamp": utcnow().isoformat(),
+        "timestamp": utcnow().isoformat() + "Z",
     }
 
 
@@ -602,9 +609,9 @@ async def list_trades(limit: int = 100, offset: int = 0):
                 "is_open": last.is_open,
                 "parts": len(group),
                 "source": _position_source_label(last.strategy.name if last.strategy else None),
-                "created_at": first.created_at.isoformat() if first.created_at else None,
-                "closed_at": last.closed_at.isoformat() if last.closed_at else None,
-                "_sort_key": (last.closed_at or last.created_at).isoformat(),
+                "created_at": first.created_at.isoformat() + "Z" if first.created_at else None,
+                "closed_at": last.closed_at.isoformat() + "Z" if last.closed_at else None,
+                "_sort_key": (last.closed_at or last.created_at).isoformat() + "Z",
             })
 
         aggregated.sort(key=lambda r: r["_sort_key"], reverse=True)
@@ -639,7 +646,7 @@ async def get_trade_decision_log(trade_id: int):
                     "step_type": log.step_type,
                     "description": log.description,
                     "details": log.details,
-                    "created_at": log.created_at.isoformat() if log.created_at else None,
+                    "created_at": log.created_at.isoformat() + "Z" if log.created_at else None,
                 }
                 for log in logs
             ],
@@ -675,8 +682,8 @@ async def list_orders(limit: int = 100):
                     "stop_loss": float(o.stop_loss) if o.stop_loss else None,
                     "take_profit": float(o.take_profit) if o.take_profit else None,
                     "client_order_id": o.client_order_id,
-                    "created_at": o.created_at.isoformat() if o.created_at else None,
-                    "closed_at": o.closed_at.isoformat() if o.closed_at else None,
+                    "created_at": o.created_at.isoformat() + "Z" if o.created_at else None,
+                    "closed_at": o.closed_at.isoformat() + "Z" if o.closed_at else None,
                 }
                 for o in orders
             ],
@@ -744,7 +751,7 @@ async def get_config():
                     "value": c.config_value,
                     "source": c.source,
                     "updated_by": c.updated_by,
-                    "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+                    "updated_at": c.updated_at.isoformat() + "Z" if c.updated_at else None,
                 }
                 for c in configs
             ]
@@ -877,7 +884,7 @@ async def list_telegram_channels():
                     "active": c.active,
                     "quality_threshold": c.quality_threshold,
                     "signals_count": len(c.signals),
-                    "created_at": c.created_at.isoformat() if c.created_at else None,
+                    "created_at": c.created_at.isoformat() + "Z" if c.created_at else None,
                 }
                 for c in channels
             ]
@@ -916,6 +923,29 @@ async def create_telegram_channel(channel: TelegramChannelCreate):
             "parser_type": new_channel.parser_type,
             "auto_execute": new_channel.auto_execute,
         }}
+
+
+@app.patch("/telegram/channels/{channel_id}")
+async def update_telegram_channel(channel_id: int, update: TelegramChannelUpdate):
+    """
+    Изменить настройки существующего канала (порог качества, автоисполнение,
+    название). quality_threshold/auto_execute читаются "вживую" из БД при
+    обработке каждого Telegram-сигнала (см. TradingBot._get_channel_quality_threshold
+    в main.py), поэтому применяются сразу, без перезапуска бота — в отличие
+    от списка отслеживаемых каналов, который фиксируется при старте.
+    """
+    async with get_session() as session:
+        channel = await session.get(TelegramChannel, channel_id)
+        if channel is None:
+            raise HTTPException(status_code=404, detail="Канал не найден")
+
+        updates = update.model_dump(exclude_unset=True)
+        for key, value in updates.items():
+            setattr(channel, key, value)
+        await session.commit()
+
+    logger.info(f"Telegram канал {channel_id} обновлён: {updates}")
+    return {"success": True, "updated": list(updates.keys())}
 
 
 @app.delete("/telegram/channels/{channel_id}")
@@ -999,7 +1029,7 @@ async def list_telegram_signals(channel_id: Optional[int] = None, limit: int = 1
                 "fee": float(order.fee),
                 "stop_loss": float(order.stop_loss) if order.stop_loss else None,
                 "take_profit": float(order.take_profit) if order.take_profit else None,
-                "created_at": order.created_at.isoformat() if order.created_at else None,
+                "created_at": order.created_at.isoformat() + "Z" if order.created_at else None,
             }
 
         def _trade_data(trade):
@@ -1010,7 +1040,7 @@ async def list_telegram_signals(channel_id: Optional[int] = None, limit: int = 1
                 "pnl_pct": float(trade.pnl_pct) if trade.pnl_pct else 0,
                 "outcome": trade.outcome,
                 "is_open": trade.is_open,
-                "closed_at": trade.closed_at.isoformat() if trade.closed_at else None,
+                "closed_at": trade.closed_at.isoformat() + "Z" if trade.closed_at else None,
             }
 
         return {
@@ -1028,7 +1058,7 @@ async def list_telegram_signals(channel_id: Optional[int] = None, limit: int = 1
                     "decision": s.decision,
                     "order": _order_data(s.executed_order),
                     "trade": _trade_data(s.executed_trade),
-                    "created_at": s.created_at.isoformat() if s.created_at else None,
+                    "created_at": s.created_at.isoformat() + "Z" if s.created_at else None,
                 }
                 for s in signals
             ],
@@ -1048,7 +1078,7 @@ async def get_performance():
         return {
             "snapshots": [
                 {
-                    "time": s.snapshot_time.isoformat() if s.snapshot_time else None,
+                    "time": s.snapshot_time.isoformat() + "Z" if s.snapshot_time else None,
                     "total_balance": float(s.total_balance),
                     "open_pnl": float(s.open_pnl),
                     "realized_pnl": float(s.realized_pnl),
@@ -1085,7 +1115,7 @@ async def get_decision_logs(limit: int = 100, trade_id: Optional[int] = None):
                     "step_type": log.step_type,
                     "description": log.description,
                     "details": log.details,
-                    "created_at": log.created_at.isoformat() if log.created_at else None,
+                    "created_at": log.created_at.isoformat() + "Z" if log.created_at else None,
                 }
                 for log in logs
             ]

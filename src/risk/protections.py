@@ -85,7 +85,7 @@ class LockStore:
                 )
             ).scalars().all()
             return [
-                {"scope": r.scope_key, "reason": r.reason, "until": r.until.isoformat()}
+                {"scope": r.scope_key, "reason": r.reason, "until": r.until.isoformat() + "Z"}
                 for r in rows
             ]
 

@@ -404,6 +404,35 @@ class TradingBot:
         await monitor_channels(channel_dicts)
         logger.info(f"👂 Мониторинг Telegram-каналов запущен: {len(channel_dicts)}")
 
+    async def _get_channel_settings(self, channel_id: str) -> tuple[float, bool]:
+        """
+        Порог качества и автоисполнение конкретного Telegram-канала.
+
+        Раньше main.py вообще не читал TelegramChannel.quality_threshold/
+        auto_execute — оба параметра брались из общих
+        settings.telegram_signals_quality_threshold/auto_execute для ВСЕХ
+        каналов сразу, поэтому индивидуальный порог/автоисполнение,
+        выставленные при добавлении канала или через дашборд, не имели
+        никакого эффекта (канал вёл себя как будто там всегда 0.5/False).
+
+        Читаем из БД "вживую" на каждый сигнал, а не кэшируем при старте —
+        иначе изменение через дашборд не действовало бы без перезапуска
+        бота (в отличие от списка отслеживаемых каналов, который
+        фиксируется при старте намеренно — см. _start_telegram_monitoring).
+        Канал не найден (удалён/не резолвился) — используем глобальные
+        настройки как запасной вариант.
+        """
+        db_id = self._telegram_channel_db_ids.get(channel_id)
+        if db_id is not None:
+            try:
+                async with get_session() as session:
+                    channel = await session.get(TelegramChannel, db_id)
+                    if channel is not None:
+                        return channel.quality_threshold, channel.auto_execute
+            except Exception as e:
+                logger.warning(f"Не удалось прочитать настройки канала {channel_id}: {e}")
+        return settings.telegram_signals_quality_threshold, settings.telegram_signals_auto_execute
+
     async def _on_telegram_signal(self, signal_event: dict):
         """Обработка Telegram сигнала."""
         channel_id = signal_event.get("channel_id", "")
@@ -418,14 +447,17 @@ class TradingBot:
 
         from src.telegram.quality_scorer import signal_quality_scorer
         quality = signal_quality_scorer.score_signal(signal_event, channel_id)
-        logger.info(f"📲 Telegram сигнал: {pair} {side.upper()} | quality={quality:.2f}")
+        quality_threshold, auto_execute = await self._get_channel_settings(channel_id)
+        logger.info(
+            f"📲 Telegram сигнал: {pair} {side.upper()} | quality={quality:.2f} (порог канала {quality_threshold:.2f})"
+        )
 
         decision = "pending"
         order = None
-        if quality < settings.telegram_signals_quality_threshold:
+        if quality < quality_threshold:
             decision = "rejected"
-            logger.info(f"🚫 Сигнал отклонён (quality={quality:.2f})")
-        elif settings.telegram_signals_auto_execute:
+            logger.info(f"🚫 Сигнал отклонён (quality={quality:.2f} < {quality_threshold:.2f})")
+        elif auto_execute:
             if pair in self.open_positions:
                 # В отличие от стратегийного пути (risk_manager.check_signal
                 # блокирует повторный вход по уже открытому символу),

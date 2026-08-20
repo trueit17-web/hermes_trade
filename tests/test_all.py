@@ -1827,5 +1827,118 @@ class TestMlTrainingReadiness(unittest.IsolatedAsyncioTestCase):
             self.assertIn(key, result)
 
 
+class TestChannelQualitySettings(unittest.IsolatedAsyncioTestCase):
+    """
+    TradingBot._get_channel_settings — раньше не существовал, main.py всегда
+    использовал ГЛОБАЛЬНЫЕ settings.telegram_signals_quality_threshold/
+    auto_execute для всех каналов сразу, поэтому индивидуальный порог/
+    автоисполнение канала, выставленные при добавлении или через дашборд,
+    не имели никакого эффекта на реальное исполнение сигналов.
+    """
+
+    async def test_reads_per_channel_threshold_and_auto_execute(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+
+        from src.db.session import get_session
+        from src.db.models import TelegramChannel
+
+        async with get_session() as session:
+            channel = TelegramChannel(
+                channel_id="@channelsettings_unittest", channel_title="X",
+                quality_threshold=0.85, auto_execute=True, active=True,
+            )
+            session.add(channel)
+            await session.commit()
+            db_id = channel.id
+
+        bot = main_module.TradingBot()
+        bot._telegram_channel_db_ids = {"@channelsettings_unittest": db_id}
+
+        threshold, auto_execute = await bot._get_channel_settings("@channelsettings_unittest")
+        self.assertAlmostEqual(threshold, 0.85)
+        self.assertTrue(auto_execute)
+
+    async def test_falls_back_to_global_settings_for_unknown_channel(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+
+        bot = main_module.TradingBot()
+        bot._telegram_channel_db_ids = {}
+
+        threshold, auto_execute = await bot._get_channel_settings("@unknown_channel_unittest")
+        self.assertEqual(threshold, settings.telegram_signals_quality_threshold)
+        self.assertEqual(auto_execute, settings.telegram_signals_auto_execute)
+
+
+class TestUpdateTelegramChannel(unittest.IsolatedAsyncioTestCase):
+    """PATCH /telegram/channels/{id} — делает настройки существующего канала
+    редактируемыми (раньше можно было только создать/удалить канал целиком)."""
+
+    async def test_partial_update_only_changes_given_fields(self):
+        from src.db.session import get_session
+        from src.db.models import TelegramChannel
+        from src.web.api import update_telegram_channel, TelegramChannelUpdate
+
+        async with get_session() as session:
+            channel = TelegramChannel(
+                channel_id="@patchchannel_unittest", channel_title="Original",
+                quality_threshold=0.5, auto_execute=False, active=True,
+            )
+            session.add(channel)
+            await session.commit()
+            db_id = channel.id
+
+        result = await update_telegram_channel(
+            db_id, TelegramChannelUpdate(quality_threshold=0.7)
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(result["updated"], ["quality_threshold"])
+
+        async with get_session() as session:
+            refreshed = await session.get(TelegramChannel, db_id)
+            self.assertAlmostEqual(refreshed.quality_threshold, 0.7)
+            self.assertFalse(refreshed.auto_execute)  # не тронуто
+            self.assertEqual(refreshed.channel_title, "Original")  # не тронуто
+
+        await update_telegram_channel(db_id, TelegramChannelUpdate(auto_execute=True))
+        async with get_session() as session:
+            refreshed = await session.get(TelegramChannel, db_id)
+            self.assertTrue(refreshed.auto_execute)
+            self.assertAlmostEqual(refreshed.quality_threshold, 0.7)  # сохранился с прошлого апдейта
+
+    async def test_update_unknown_channel_raises_404(self):
+        from fastapi import HTTPException
+        from src.web.api import update_telegram_channel, TelegramChannelUpdate
+
+        with self.assertRaises(HTTPException) as ctx:
+            await update_telegram_channel(999999999, TelegramChannelUpdate(quality_threshold=0.9))
+        self.assertEqual(ctx.exception.status_code, 404)
+
+
+class TestProtectionsLockTimestampFormat(unittest.IsolatedAsyncioTestCase):
+    """
+    active_locks() отдавал naive-UTC datetime без суффикса 'Z' — браузер
+    парсит такую ISO-строку как ЛОКАЛЬНОЕ время (не UTC), из-за чего ещё
+    активная блокировка могла отображаться так, будто она уже давно истекла
+    (расхождение на величину смещения часового пояса пользователя).
+    """
+
+    async def test_until_has_utc_suffix(self):
+        from src.risk.protections import LockStore
+
+        locks = LockStore()
+        key = "test:iso-format-unittest"
+        await locks.add(key, 10, "test lock")
+
+        rows = await locks.active_locks()
+        row = next(r for r in rows if r["scope"] == key)
+        self.assertTrue(row["until"].endswith("Z"), row["until"])
+
+
 if __name__ == "__main__":
     unittest.main()
