@@ -626,6 +626,94 @@ async def list_trades(limit: int = 100, offset: int = 0):
         }
 
 
+@app.get("/trades/{trade_id}/detail")
+async def get_trade_detail(trade_id: int):
+    """
+    Подробности по сделке для разворачиваемой строки на дашборде: сама
+    сделка — это последняя (закрывающая) часть позиции, возможно
+    частично закрытой по уровням TP1/TP2/TP3 (см. GET /trades); здесь
+    подтягиваем ВСЕ части той же позиции (по order_open_id) и decision
+    log по каждой из них — каждое частичное закрытие пишет свой decision
+    log под своим Trade.id, поэтому лог по последней части в одиночку
+    не показал бы, почему сработали более ранние уровни TP.
+    """
+    async with get_session() as session:
+        from src.db.models import TradeDecisionLog
+
+        trade = (
+            await session.execute(
+                select(Trade)
+                .options(selectinload(Trade.symbol), selectinload(Trade.strategy))
+                .where(Trade.id == trade_id)
+            )
+        ).scalar_one_or_none()
+        if trade is None:
+            raise HTTPException(status_code=404, detail="Сделка не найдена")
+
+        if trade.order_open_id is not None:
+            group = (
+                await session.execute(
+                    select(Trade)
+                    .where(Trade.order_open_id == trade.order_open_id)
+                    .order_by(Trade.closed_at.asc(), Trade.created_at.asc())
+                )
+            ).scalars().all()
+        else:
+            group = [trade]
+
+        leg_ids = [t.id for t in group]
+        logs = (
+            await session.execute(
+                select(TradeDecisionLog)
+                .where(TradeDecisionLog.trade_id.in_(leg_ids))
+                .order_by(TradeDecisionLog.created_at.asc(), TradeDecisionLog.step_order.asc())
+            )
+        ).scalars().all()
+
+        total_amount = sum(float(t.amount) for t in group)
+        total_pnl = sum(float(t.pnl) for t in group)
+        entry_price = float(group[0].entry_price)
+
+        return {
+            "trade_id": trade_id,
+            "symbol": trade.symbol.symbol if trade.symbol else None,
+            "direction": trade.direction,
+            "source": _position_source_label(trade.strategy.name if trade.strategy else None),
+            "entry_price": entry_price,
+            "amount": total_amount,
+            "pnl": total_pnl,
+            "pnl_pct": (total_pnl / (entry_price * total_amount) * 100) if entry_price and total_amount else 0.0,
+            "outcome": trade.outcome,
+            "is_open": trade.is_open,
+            "created_at": group[0].created_at.isoformat() + "Z" if group[0].created_at else None,
+            "closed_at": trade.closed_at.isoformat() + "Z" if trade.closed_at else None,
+            "legs": [
+                {
+                    "id": t.id,
+                    "exit_price": float(t.exit_price) if t.exit_price is not None else None,
+                    "amount": float(t.amount),
+                    "pnl": float(t.pnl),
+                    "pnl_pct": t.pnl_pct,
+                    "outcome": t.outcome,
+                    "holding_seconds": t.holding_seconds,
+                    "closed_at": t.closed_at.isoformat() + "Z" if t.closed_at else None,
+                }
+                for t in group
+            ],
+            "decision_log": [
+                {
+                    "trade_id": log.trade_id,
+                    "step_order": log.step_order,
+                    "step_type": log.step_type,
+                    "description": log.description,
+                    "details": log.details,
+                    "created_at": log.created_at.isoformat() + "Z" if log.created_at else None,
+                }
+                for log in logs
+            ],
+        }
+
+
 @app.get("/trades/{trade_id}/decision-log")
 async def get_trade_decision_log(trade_id: int):
     """Получить decision log для сделки (почему сделка была открыта/закрыта)."""

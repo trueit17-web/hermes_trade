@@ -1386,6 +1386,68 @@ class TestTradesGrouping(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["holding_seconds"], 180)
 
 
+class TestTradeDetail(unittest.IsolatedAsyncioTestCase):
+    """
+    GET /trades/{trade_id}/detail — разворачиваемая строка на дашборде по
+    клику на закрытую сделку. Должен собрать ВСЕ части частично закрытой
+    позиции (не только последнюю) и decision log по каждой из них, т.к.
+    каждое частичное закрытие пишет свой decision log под своим Trade.id.
+    """
+
+    async def test_aggregates_legs_and_decision_log_across_partial_closes(self):
+        from src.execution.executor import ExecutionEngine
+        from src.web.api import get_trade_detail
+        from src.db.session import get_session
+        from src.db.models import TradeDecisionLog
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "paper"
+        await engine.initialize("binance")
+
+        symbol = "TRADEDETAIL1/USDT"
+        order = await engine.create_order(
+            symbol=symbol, side="buy", amount=10.0, price=100.0, order_type="market",
+        )
+        self.assertIsNotNone(order)
+
+        result1 = await engine.close_paper_position(
+            symbol=symbol, side="long", entry_price=100.0, amount=5.0,
+            exit_price=110.0, reason="take_profit_1", entry_fee=1.0,
+            holding_seconds=60, order_open_id=order.id,
+        )
+        result2 = await engine.close_paper_position(
+            symbol=symbol, side="long", entry_price=100.0, amount=5.0,
+            exit_price=130.0, reason="take_profit_3", entry_fee=1.0,
+            holding_seconds=180, order_open_id=order.id,
+        )
+
+        async with get_session() as session:
+            session.add(TradeDecisionLog(
+                trade_id=result1["trade_id"], step_order=1, step_type="execution",
+                description="TP1 leg step", details={},
+            ))
+            session.add(TradeDecisionLog(
+                trade_id=result2["trade_id"], step_order=1, step_type="execution",
+                description="TP3 leg step", details={},
+            ))
+            await session.commit()
+
+        detail = await get_trade_detail(result2["trade_id"])
+        self.assertEqual(detail["symbol"], symbol)
+        self.assertEqual(len(detail["legs"]), 2)
+        self.assertAlmostEqual(detail["amount"], 10.0)
+        descriptions = {log["description"] for log in detail["decision_log"]}
+        self.assertEqual(descriptions, {"TP1 leg step", "TP3 leg step"})
+
+    async def test_unknown_trade_raises_404(self):
+        from fastapi import HTTPException
+        from src.web.api import get_trade_detail
+
+        with self.assertRaises(HTTPException) as ctx:
+            await get_trade_detail(999999999)
+        self.assertEqual(ctx.exception.status_code, 404)
+
+
 class TestClosePositionAtomicity(unittest.IsolatedAsyncioTestCase):
     """
     close_paper_position mutated paper_balance/paper_positions BEFORE
