@@ -262,6 +262,14 @@
     padding: 7px 0;
   }
   .settings-field label { color: var(--text-dim); font-size: 13px; }
+  .settings-field-desc {
+    grid-column: 1 / -1;
+    color: var(--text-dim);
+    font-size: 12px;
+    opacity: .75;
+    line-height: 1.4;
+    margin-top: -2px;
+  }
   .settings-field input[type="text"],
   .settings-field input[type="number"],
   .settings-field input[type="password"],
@@ -1074,7 +1082,8 @@ function renderSettingsField(f) {
   } else {
     inputHtml = `<input type="text" id="${id}" data-key="${f.key}" data-type="${f.type}" value="${escapeHtml(f.value ?? "")}">`;
   }
-  return `<div class="settings-field"><label for="${id}">${f.label}</label>${inputHtml}</div>`;
+  const descHtml = f.description ? `<div class="settings-field-desc">${escapeHtml(f.description)}</div>` : "";
+  return `<div class="settings-field"><label for="${id}">${f.label}</label>${inputHtml}${descHtml}</div>`;
 }
 
 async function loadSettings() {
