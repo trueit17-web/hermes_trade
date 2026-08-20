@@ -656,6 +656,55 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         # После TP1 остаток должен восстановиться с SL в безубытке
         self.assertAlmostEqual(restored["stop_loss"], restored["entry_price"])
 
+    async def test_restore_open_short_position(self):
+        """
+        _load_open_positions_from_db раньше запрашивал только Order.side ==
+        "buy" — открытая SHORT-позиция (side="sell", без предшествующего
+        buy на этот символ) при рестарте молча пропадала из paper_positions
+        без единой закрывающей Trade-записи, поэтому никогда не появлялась
+        и в истории закрытых сделок. Проверяем, что short восстанавливается
+        с правильной стороной/объёмом, и что его условная стоимость не
+        списывается с paper_balance (маржа при открытии short не
+        резервируется — см. _execute_paper_order).
+        """
+        settings.trading_mode = "paper"
+        settings.startup_capital_usdt = 10000.0
+        await self.engine.initialize("binance")
+        balance_before = self.engine.get_paper_balance()
+
+        order = await self.engine.create_order(
+            symbol="RESTORESHORT1/USDT", side="sell", amount=2.0, price=100.0,
+            order_type="market", stop_loss=110.0, take_profit=80.0,
+        )
+        self.assertIsNotNone(order)
+        self.assertIn("RESTORESHORT1/USDT", self.engine.paper_positions)
+        # Открытие short не резервирует маржу — баланс не должен меняться
+        # (кроме, возможно, комиссии, которая тоже не списывается при открытии).
+        self.assertAlmostEqual(self.engine.get_paper_balance(), balance_before, places=6)
+
+        positions, realized_pnl, cost_basis = await self.engine._load_open_positions_from_db(is_paper=True)
+        self.assertIsNotNone(positions)
+        self.assertIn("RESTORESHORT1/USDT", positions)
+        restored = positions["RESTORESHORT1/USDT"]
+        self.assertEqual(restored["side"], "short")
+        self.assertAlmostEqual(restored["amount"], 2.0)
+        # ~100 минус paper-слиппедж на sell-стороне, не ровно 100.
+        self.assertAlmostEqual(restored["entry_price"], 100.0, delta=1.0)
+        # cost_basis здесь может быть ненулевым из-за прочих открытых long-
+        # позиций в общей тестовой БД (см. docstring теста класса) — сам факт,
+        # что restored_balance ниже совпадает с balance_before, доказывает,
+        # что именно ЭТОТ short не внёс вклад в cost_basis.
+
+        # Симулируем полный рестарт процесса новым экземпляром движка.
+        engine2 = ExecutionEngine()
+        try:
+            await engine2.initialize("binance")
+            self.assertIn("RESTORESHORT1/USDT", engine2.paper_positions)
+            self.assertEqual(engine2.paper_positions["RESTORESHORT1/USDT"]["side"], "short")
+            self.assertAlmostEqual(engine2.get_paper_balance(), balance_before, places=2)
+        finally:
+            await engine2.close()
+
     async def test_real_order_registers_position_with_correct_fee_and_price(self):
         """
         _execute_real_order раньше писал в БД сырой ccxt fee-dict вместо

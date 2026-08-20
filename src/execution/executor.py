@@ -113,16 +113,22 @@ class ExecutionEngine:
         """
         Реконструировать открытые позиции из БД для указанного режима (paper/real).
 
-        Открытая позиция = BUY-ордер (status=filled) на бирже нужного типа
+        Открытая позиция = ордер (status=filled) на бирже нужного типа
         (Order.exchange -> Exchange.is_paper), у которого объём ещё не
-        полностью выбран закрывающими сделками. Позиция может быть закрыта
-        ЧАСТИЧНО (уровни TP1/TP2) — остаток реконструируется как
-        filled_amount минус сумма Trade.amount всех сделок, ссылающихся на
-        этот ордер как order_open_id, а число таких сделок — это tp_hit_count
-        (сколько уровней TP уже сработало). order_close_id из этого же
-        расчёта исключается отдельно: закрытие SHORT создаёт BUY-ордер (см.
-        close_paper_position/close_real_position), который иначе неотличим
-        от новой открытой long-позиции.
+        полностью выбран закрывающими сделками. BUY-ордер открывает LONG,
+        SELL-ордер открывает SHORT — раньше здесь смотрели только на
+        side=="buy", из-за чего любая открытая SHORT-позиция при рестарте
+        бота молча пропадала из paper_positions/real_positions (без единой
+        закрывающей Trade-записи — она никогда не появлялась и в истории
+        закрытых сделок). Позиция может быть закрыта ЧАСТИЧНО (уровни
+        TP1/TP2) — остаток реконструируется как filled_amount минус сумма
+        Trade.amount всех сделок, ссылающихся на этот ордер как
+        order_open_id, а число таких сделок — это tp_hit_count (сколько
+        уровней TP уже сработало). order_close_id из этого же расчёта
+        исключается отдельно: закрытие SHORT создаёт BUY-ордер, а закрытие
+        LONG — SELL-ордер (см. close_paper_position/close_real_position),
+        которые иначе неотличимы от новой открытой позиции противоположной
+        стороны.
         Возвращает (позиции, реализованный PnL, себестоимость открытых позиций)
         или (None, 0, 0) при ошибке запроса.
         """
@@ -164,7 +170,7 @@ class ExecutionEngine:
                         .join(Exchange, Order.exchange_id == Exchange.id)
                         .options(selectinload(Order.symbol), selectinload(Order.strategy))
                         .where(
-                            Order.side == "buy",
+                            Order.side.in_(("buy", "sell")),
                             Order.status == "filled",
                             Exchange.is_paper == is_paper,
                         )
@@ -189,14 +195,19 @@ class ExecutionEngine:
 
             symbol = o.symbol.symbol
             price = float(o.filled_price or o.price)
+            position_side = "long" if o.side == "buy" else "short"
             # Комиссия открытия относится к остатку объёма пропорционально —
             # иначе для частично закрытой позиции она либо задваивалась бы
             # (уже учтена в PnL прошлых частичных закрытий), либо терялась.
             fee = float(o.fee or 0) * (amount / filled_amount) if filled_amount else 0.0
-            cost_basis += amount * price + fee
+            # cost_basis (спишется с paper_balance ниже) осмыслен только для
+            # long — открытие long списывает amount*price+fee с баланса,
+            # открытие short маржу не резервирует (см. _execute_paper_order).
+            if position_side == "long":
+                cost_basis += amount * price + fee
 
             pos = positions.setdefault(symbol, {
-                "amount": 0.0, "entry_price": 0.0, "side": "long",
+                "amount": 0.0, "entry_price": 0.0, "side": position_side,
                 "strategy_id": None, "stop_loss": None, "take_profit": None,
                 "order_id": None, "entry_fee": 0.0, "opened_at": None,
                 "tp_hit_count": 0,
@@ -206,6 +217,7 @@ class ExecutionEngine:
                 if (pos["amount"] + amount) else price
             )
             pos["amount"] += amount
+            pos["side"] = position_side
             pos["strategy_id"] = o.strategy.name if o.strategy else pos["strategy_id"]
             pos["stop_loss"] = float(o.stop_loss) if o.stop_loss else pos["stop_loss"]
             pos["take_profit"] = float(o.take_profit) if o.take_profit else pos["take_profit"]
