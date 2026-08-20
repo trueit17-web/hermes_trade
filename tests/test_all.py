@@ -1628,6 +1628,30 @@ class TestProtections(unittest.IsolatedAsyncioTestCase):
         await pm.on_close(channel_key(channel), "DISABLEDCOIN/USDT", pnl=-100.0, reason="stop_loss")
         self.assertIsNone(await pm.locked_reason([channel_key(channel)]))
 
+    async def test_disabling_protections_bypasses_a_lock_created_earlier(self):
+        """
+        locked_reason() раньше не смотрел на protections_enabled вообще —
+        выключатель в настройках останавливал только создание НОВЫХ
+        блокировок, но уже существующая (поставленная ДО выключения)
+        по-прежнему находилась и отклоняла сигналы: выключатель на практике
+        ничего не менял, пока старая блокировка не истекала сама.
+        """
+        from src.risk.protections import ProtectionManager, channel_key
+
+        settings.protections_enabled = True
+        pm = ProtectionManager()
+        channel = "@toggle_bypass_unittest"
+
+        await pm.on_close(channel_key(channel), "TOGGLECOIN/USDT", pnl=-5.0, reason="stop_loss")
+        self.assertIsNotNone(await pm.locked_reason([channel_key(channel)]))
+
+        settings.protections_enabled = False
+        self.assertIsNone(await pm.locked_reason([channel_key(channel)]))
+
+        # Включили обратно — ещё не истёкшая блокировка снова действует.
+        settings.protections_enabled = True
+        self.assertIsNotNone(await pm.locked_reason([channel_key(channel)]))
+
 
 class TestTrailingStop(unittest.IsolatedAsyncioTestCase):
     """

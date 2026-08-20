@@ -95,6 +95,18 @@ class ProtectionManager:
         self.locks = LockStore()
 
     async def locked_reason(self, keys: list[str]) -> Optional[str]:
+        """
+        Причина активной блокировки, либо None — включая случай, когда
+        Protections выключены целиком. Раньше этот метод не смотрел на
+        settings.protections_enabled вообще: выключатель в настройках
+        останавливал только СОЗДАНИЕ новых блокировок (on_close), но уже
+        существующие блокировки (например, ещё не истёкший StoplossGuard
+        или LosingStreak, поставленные ДО выключения) по-прежнему находились
+        здесь и продолжали отклонять сигналы — выключатель не имел эффекта
+        до тех пор, пока эти блокировки не истекали сами по себе.
+        """
+        if not settings.protections_enabled:
+            return None
         return await self.locks.active_reason(keys)
 
     async def on_close(
