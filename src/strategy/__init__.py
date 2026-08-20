@@ -1,26 +1,15 @@
 """Стратегии торговли — правиловые и ML-стратегии."""
-import asyncio
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Optional
-
-import pandas as pd
-import numpy as np
+from typing import Any
 
 from src.config import settings
-from src.event_bus import (
-    event_bus,
-    SignalGeneratedEvent,
-    MarketDataEvent,
-    TradeEvent,
-)
-from src.utils.logging import logger
 from src.utils.timeutils import utcnow
 
 logger = logging.getLogger(__name__)
 
 
-def _fmt_price(value: Optional[float]) -> str:
+def _fmt_price(value: float | None) -> str:
     """Безопасно отформатировать возможно-None цену (SL/TP) для логов —
     f"{None:.2f}" бросает необработанный TypeError, который прерывал бы
     ВСЮ торговую итерацию (не только эту пару), если стратегия не задала
@@ -52,9 +41,9 @@ class StrategySignal:
         symbol: str,
         side: str,  # long, short
         confidence: float = 0.5,
-        entry_price: Optional[float] = None,
-        stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None,
+        entry_price: float | None = None,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
         position_size_pct: float = 5.0,
         timeframe: str = "1h",
         rationale: str = "",
@@ -77,7 +66,7 @@ class StrategySignal:
 class BaseStrategy(ABC):
     """Базовый класс стратегии."""
 
-    def __init__(self, strategy_id: str, name: str, params: Optional[dict] = None):
+    def __init__(self, strategy_id: str, name: str, params: dict | None = None):
         self.strategy_id = strategy_id
         self.name = name
         self.params = params or {}
@@ -85,9 +74,8 @@ class BaseStrategy(ABC):
         self.weight = 1.0
 
     @abstractmethod
-    def generate_signal(self, data: dict[str, Any]) -> Optional[StrategySignal]:
+    def generate_signal(self, data: dict[str, Any]) -> StrategySignal | None:
         """Сгенерировать сигнал на основе данных. Возвращает None если сигнала нет."""
-        pass
 
     def get_config_schema(self) -> dict:
         """JSON schema для настроек стратегии."""
@@ -106,7 +94,7 @@ class RSIMeanReversionStrategy(BaseStrategy):
     Short: когда RSI > overbought_level (например, 70)
     """
 
-    def __init__(self, params: Optional[dict] = None):
+    def __init__(self, params: dict | None = None):
         super().__init__(
             strategy_id="rsi_mr",
             name="RSI Mean Reversion",
@@ -126,7 +114,7 @@ class RSIMeanReversionStrategy(BaseStrategy):
             },
         }
 
-    def generate_signal(self, data: dict[str, Any]) -> Optional[StrategySignal]:
+    def generate_signal(self, data: dict[str, Any]) -> StrategySignal | None:
         rsi = data.get("rsi_14")
         close = data.get("close")
         ema20 = data.get("ema_20")
@@ -136,10 +124,10 @@ class RSIMeanReversionStrategy(BaseStrategy):
         if rsi is None or close is None:
             return None
 
-        rsi_period = self.params.get("rsi_period", 14)
+        self.params.get("rsi_period", 14)
         oversold = self.params.get("oversold_level", 30)
         overbought = self.params.get("overbought_level", 70)
-        cooldown = self.params.get("cooldown_period", 3)
+        self.params.get("cooldown_period", 3)
         size_pct = self.params.get("position_size_pct", 5.0)
         use_ml = self.params.get("use_ml_confidence", True)
 
@@ -209,7 +197,7 @@ class EMACrossoverStrategy(BaseStrategy):
     Short: когда быстрая EMA пересекает медленную сверху вниз
     """
 
-    def __init__(self, params: Optional[dict] = None):
+    def __init__(self, params: dict | None = None):
         super().__init__(
             strategy_id="ema_cross",
             name="EMA Crossover",
@@ -229,7 +217,7 @@ class EMACrossoverStrategy(BaseStrategy):
             },
         }
 
-    def generate_signal(self, data: dict[str, Any]) -> Optional[StrategySignal]:
+    def generate_signal(self, data: dict[str, Any]) -> StrategySignal | None:
         ema_fast = data.get(f"ema_{self.params.get('fast_ema_period', 9)}")
         ema_slow = data.get(f"ema_{self.params.get('slow_ema_period', 21)}")
         close = data.get("close")
@@ -313,7 +301,7 @@ class BollingerBandsStrategy(BaseStrategy):
     Breakout: покупаем при пробое верхней полосы (тренд).
     """
 
-    def __init__(self, params: Optional[dict] = None):
+    def __init__(self, params: dict | None = None):
         super().__init__(
             strategy_id="bb_strategy",
             name="Bollinger Bands",
@@ -333,7 +321,7 @@ class BollingerBandsStrategy(BaseStrategy):
             },
         }
 
-    def generate_signal(self, data: dict[str, Any]) -> Optional[StrategySignal]:
+    def generate_signal(self, data: dict[str, Any]) -> StrategySignal | None:
         bb_upper = data.get("bb_upper")
         bb_lower = data.get("bb_lower")
         bb_mid = data.get("bb_mid")
@@ -447,7 +435,7 @@ class FundingRateStrategy(BaseStrategy):
     Если фандинг отрицательный — long позиции переоценены → short bias
     """
 
-    def __init__(self, params: Optional[dict] = None):
+    def __init__(self, params: dict | None = None):
         super().__init__(
             strategy_id="funding_rate",
             name="Funding Rate",
@@ -467,7 +455,7 @@ class FundingRateStrategy(BaseStrategy):
             },
         }
 
-    def generate_signal(self, data: dict[str, Any]) -> Optional[StrategySignal]:
+    def generate_signal(self, data: dict[str, Any]) -> StrategySignal | None:
         funding_rate = data.get("funding_rate")
         current_funding = data.get("current_funding_rate")
         oi_change = data.get("oi_change_1h")
@@ -548,7 +536,7 @@ class LiquidationStrategy(BaseStrategy):
     можно торговать в направлении, противоположном доминантной стороне.
     """
 
-    def __init__(self, params: Optional[dict] = None):
+    def __init__(self, params: dict | None = None):
         super().__init__(
             strategy_id="liquidation",
             name="Liquidation Zones",
@@ -567,11 +555,11 @@ class LiquidationStrategy(BaseStrategy):
             },
         }
 
-    def generate_signal(self, data: dict[str, Any]) -> Optional[StrategySignal]:
+    def generate_signal(self, data: dict[str, Any]) -> StrategySignal | None:
         liquidation_distance = data.get("liquidation_distance_pct")
         long_short_ratio = data.get("long_short_ratio")
         close = data.get("close")
-        liquidation_imbalance = data.get("liquidation_imbalance", 0)
+        data.get("liquidation_imbalance", 0)
 
         symbol = data.get("symbol", "")
         timeframe = data.get("timeframe", "1h")
@@ -646,7 +634,7 @@ class MLDirectionClassifierStrategy(BaseStrategy):
     Предсказывает P(up), P(down), P(neutral) и генерирует сигнал при достаточной уверенности.
     """
 
-    def __init__(self, params: Optional[dict] = None):
+    def __init__(self, params: dict | None = None):
         super().__init__(
             strategy_id="ml_classifier",
             name="ML Direction Classifier",
@@ -669,10 +657,10 @@ class MLDirectionClassifierStrategy(BaseStrategy):
             },
         }
 
-    def generate_signal(self, data: dict[str, Any]) -> Optional[StrategySignal]:
+    def generate_signal(self, data: dict[str, Any]) -> StrategySignal | None:
         ml_proba_up = data.get("ml_proba_up")
         ml_proba_down = data.get("ml_proba_down")
-        ml_proba_neutral = data.get("ml_proba_neutral")
+        data.get("ml_proba_neutral")
         close = data.get("close")
         ml_features_used = data.get("ml_features_used", "")
 
@@ -695,7 +683,7 @@ class MLDirectionClassifierStrategy(BaseStrategy):
             if require_indicators:
                 # Дополнительная фильтрация индикаторами
                 rsi = data.get("rsi_14", 50)
-                ema20 = data.get("ema_20")
+                data.get("ema_20")
                 ema50 = data.get("ema_50")
 
                 # Не входим в long если RSI > 70 (перекупленность) или цена далеко от EMA
@@ -724,7 +712,7 @@ class MLDirectionClassifierStrategy(BaseStrategy):
         elif ml_proba_down > confidence_threshold and ml_proba_down > ml_proba_up:
             if require_indicators:
                 rsi = data.get("rsi_14", 50)
-                ema20 = data.get("ema_20")
+                data.get("ema_20")
                 ema50 = data.get("ema_50")
 
                 if rsi < 25 or (ema50 and close > ema50 * 1.01):
@@ -766,7 +754,7 @@ class EnsembleVoterStrategy(BaseStrategy):
     Веса могут быть от ML (ensemble weight optimizer).
     """
 
-    def __init__(self, params: Optional[dict] = None):
+    def __init__(self, params: dict | None = None):
         super().__init__(
             strategy_id="ensemble_voter",
             name="Ensemble Voter",
@@ -795,7 +783,7 @@ class EnsembleVoterStrategy(BaseStrategy):
         """Установить вес стратегии."""
         self.strategy_weights[strategy_id] = weight
 
-    def generate_signal(self, data: dict[str, Any]) -> Optional[StrategySignal]:
+    def generate_signal(self, data: dict[str, Any]) -> StrategySignal | None:
         """
         В Ensemble VoterStrategy сигнал генерируется не напрямую,
         а через агрегацию сигналов от strategy_engine.
@@ -808,7 +796,7 @@ class EnsembleVoterStrategy(BaseStrategy):
     def aggregate_signals(
         self,
         signals: list[StrategySignal],
-    ) -> Optional[StrategySignal]:
+    ) -> StrategySignal | None:
         """
         Агрегировать сигналы от разных стратегий в один.
         Возвращает объединённый сигнал или None.
@@ -910,7 +898,7 @@ class StrategyRegistry:
         self.strategies[strategy.strategy_id] = strategy
         logger.info(f"Стратегия зарегистрирована: {strategy.name} ({strategy.strategy_id})")
 
-    def get(self, strategy_id: str) -> Optional[BaseStrategy]:
+    def get(self, strategy_id: str) -> BaseStrategy | None:
         """Получить стратегию по ID."""
         return self.strategies.get(strategy_id)
 

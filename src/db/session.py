@@ -1,14 +1,13 @@
 """Асинхронные сессии БД (SQLite + PostgreSQL)."""
 import logging
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.orm import declarative_base
 
 from src.config import settings
 from src.db.models import Base

@@ -1,22 +1,22 @@
 """Backtest Engine — тестирование стратегий на исторических данных."""
 import asyncio
 import logging
-from collections import defaultdict
 from datetime import datetime, timedelta
-from decimal import Decimal
-from typing import Any, Callable, Optional
 
-import pandas as pd
 import numpy as np
+import pandas as pd
+from rich import box
 from rich.console import Console
 from rich.table import Table
-from rich.panel import Panel
-from rich import box
 
-from src.config import settings
-from src.strategy import StrategySignal, BaseStrategy, _fmt_price
 from src.risk.risk_manager import RiskManager
-from src.utils.logging import logger
+from src.strategy import (
+    BaseStrategy,
+    BollingerBandsStrategy,
+    EMACrossoverStrategy,
+    RSIMeanReversionStrategy,
+    _fmt_price,
+)
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -32,8 +32,8 @@ class BacktestPosition:
         entry_price: float,
         amount: float,
         entry_time: datetime,
-        stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
         strategy_id: str = "",
         rationale: str = "",
     ):
@@ -46,10 +46,10 @@ class BacktestPosition:
         self.take_profit = take_profit
         self.strategy_id = strategy_id
         self.rationale = rationale
-        self.exit_price: Optional[float] = None
-        self.exit_time: Optional[datetime] = None
-        self.pnl: Optional[float] = None
-        self.pnl_pct: Optional[float] = None
+        self.exit_price: float | None = None
+        self.exit_time: datetime | None = None
+        self.pnl: float | None = None
+        self.pnl_pct: float | None = None
         self.closed = False
         self.trades: list[dict] = []  # сделки внутри позиции (для частичного закрытия)
 
@@ -60,19 +60,13 @@ class BacktestPosition:
 
         # Проверка Stop Loss
         if self.stop_loss is not None:
-            if self.direction == "long" and current_price <= self.stop_loss:
-                self._close(current_price, current_time, "stop_loss")
-                return
-            elif self.direction == "short" and current_price >= self.stop_loss:
+            if self.direction == "long" and current_price <= self.stop_loss or self.direction == "short" and current_price >= self.stop_loss:
                 self._close(current_price, current_time, "stop_loss")
                 return
 
         # Проверка Take Profit
         if self.take_profit is not None:
-            if self.direction == "long" and current_price >= self.take_profit:
-                self._close(current_price, current_time, "take_profit")
-                return
-            elif self.direction == "short" and current_price <= self.take_profit:
+            if self.direction == "long" and current_price >= self.take_profit or self.direction == "short" and current_price <= self.take_profit:
                 self._close(current_price, current_time, "take_profit")
                 return
 
@@ -121,8 +115,8 @@ class BacktestTrade:
         pnl_pct: float,
         strategy_id: str,
         rationale: str = "",
-        stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
     ):
         self.symbol = symbol
         self.direction = direction
@@ -157,8 +151,8 @@ class BacktestResult:
         self.losing_trades: int = 0
         self.break_even_trades: int = 0
         self.max_drawdown: float = 0.0
-        self.max_drawdown_start: Optional[datetime] = None
-        self.max_drawdown_end: Optional[datetime] = None
+        self.max_drawdown_start: datetime | None = None
+        self.max_drawdown_end: datetime | None = None
         self.max_drawdown_peak: float = 0.0
         self.equity_curve: list[tuple[datetime, float]] = []
         self.sharpe_ratio: float = 0.0
@@ -170,8 +164,8 @@ class BacktestResult:
         self.expectancy: float = 0.0
         self.total_trades: int = 0
         self.duration: timedelta = timedelta(0)
-        self.start_time: Optional[datetime] = None
-        self.end_time: Optional[datetime] = None
+        self.start_time: datetime | None = None
+        self.end_time: datetime | None = None
         self.running_capital: float = 0.0
 
     def compute_metrics(self):
@@ -269,7 +263,7 @@ class BacktestEngine:
     def __init__(
         self,
         initial_capital: float = 10000.0,
-        risk_manager: Optional[RiskManager] = None,
+        risk_manager: RiskManager | None = None,
         fee_pct: float = 0.1,  # 0.1% комиссия
         slippage_pct: float = 0.05,  # 0.05% slippage
     ):
@@ -286,8 +280,8 @@ class BacktestEngine:
         strategies: list[BaseStrategy],
         symbol: str = "BTC/USDT",
         timeframe: str = "1h",
-        start_date: Optional[datetime] = None,
-        end_date: Optional[datetime] = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
         position_size_pct: float = 5.0,
     ) -> BacktestResult:
         """
@@ -510,8 +504,8 @@ class BacktestEngine:
         strategy_configs: list[dict],
         symbol: str = "BTC/USDT",
         timeframe: str = "1h",
-        start_date: Optional[datetime] = None,
-        end_date: Optional[datetime] = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
         position_size_pct: float = 5.0,
     ) -> list[BacktestResult]:
         """
@@ -556,7 +550,6 @@ class BacktestEngine:
         table.add_column("Expectancy", justify="right")
 
         for name, result in zip(strategies_names, results):
-            color = "green" if result.total_pnl > 0 else "red"
             table.add_row(
                 name,
                 str(result.total_trades),
@@ -608,7 +601,7 @@ class BacktestDataLoader:
         exchange_id: str = "binance",
         symbol: str = "BTC/USDT",
         timeframe: str = "1h",
-        since: Optional[int] = None,
+        since: int | None = None,
         limit: int = 1000,
     ) -> pd.DataFrame:
         """Загрузить данные из ccxt (исторические свечи)."""

@@ -6,13 +6,13 @@ settings и сохраняются в таблицу bot_config, откуда п
 следующем старте бота (см. load_settings_overrides(), вызывается из
 TradingBot.initialize()).
 """
-from typing import Any, Optional
+from typing import Any
 
 from sqlalchemy import select
 
 from src.config import settings
-from src.db.session import get_session
 from src.db.models import BotConfig
+from src.db.session import get_session
 from src.utils.logging import logger
 
 # Поля БД/инфраструктуры сюда намеренно не включены (database_url, web_host,

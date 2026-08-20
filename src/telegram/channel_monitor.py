@@ -1,16 +1,13 @@
 """Telegram канал мониторинг — получение сигналов из Telegram каналов."""
-import asyncio
 import logging
 import re
 from pathlib import Path
-from typing import Any, Optional
 
 from telethon import TelegramClient, events
-from telethon.tl.types import Channel, Message
+from telethon.tl.types import Message
 from telethon.utils import get_peer_id
 
 from src.config import settings
-from src.utils.logging import logger
 from src.utils.timeutils import utcnow
 
 logger = logging.getLogger(__name__)
@@ -23,7 +20,7 @@ SESSION_DIR.mkdir(parents=True, exist_ok=True)
 SESSION_PATH = str(SESSION_DIR / "crypto_bot_sessions")
 
 # Глобальный экземпляр клиента
-_telegram_client: Optional[TelegramClient] = None
+_telegram_client: TelegramClient | None = None
 _subscribers: list[callable] = []
 
 
@@ -33,7 +30,6 @@ async def init_telegram():
 
     api_id = settings.telegram_api_id
     api_hash = settings.telegram_api_hash
-    user_id = settings.telegram_user_id
 
     if not api_id or not api_hash:
         logger.warning("Telegram API credentials not configured — monitoring disabled")
@@ -61,7 +57,7 @@ async def close_telegram():
         _telegram_client = None
 
 
-def get_telegram_client() -> Optional[TelegramClient]:
+def get_telegram_client() -> TelegramClient | None:
     """Получить Telegram клиент."""
     return _telegram_client
 
@@ -71,8 +67,6 @@ async def monitor_channels(channels: list[dict]):
     Запустить мониторинг каналов.
     channels: [{"channel_id": "@channelname", "channel_title": "Channel Name", "parser_config": {...}}]
     """
-    global _telegram_client, _subscribers
-
     if not _telegram_client:
         logger.warning("Telegram клиент не инициализирован")
         return
@@ -182,7 +176,7 @@ def normalize_pair(pair: str) -> str:
     return pair
 
 
-async def parse_telegram_signal(text: str, channel_config: Optional[dict] = None) -> Optional[dict]:
+async def parse_telegram_signal(text: str, channel_config: dict | None = None) -> dict | None:
     """
     Попытаться распарсить торговый сигнал из текста сообщения.
     Возвращает dict с полями: pair, side, entry, sl, tp, rationale, raw.
@@ -208,7 +202,7 @@ async def parse_telegram_signal(text: str, channel_config: Optional[dict] = None
     return None
 
 
-def parse_with_regex(text: str) -> Optional[dict]:
+def parse_with_regex(text: str) -> dict | None:
     """
     Парсинг сигнала с помощью регулярных выражений.
     Поддерживает форматы:
@@ -302,7 +296,7 @@ def extract_price(
     text: str,
     side: str,
     *keywords,
-) -> Optional[float]:
+) -> float | None:
     """
     Извлечь цену из текста по ключевым словам.
     """

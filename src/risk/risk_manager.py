@@ -1,16 +1,9 @@
 """Risk Manager — управление рисками: лимиты, sizing, SL/TP, circuit breakers."""
-import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any
 
 from src.config import settings
-from src.event_bus import (
-    event_bus,
-    SignalGeneratedEvent,
-    TradeEvent,
-)
-from src.utils.logging import logger
 from src.utils.timeutils import utcnow
 
 logger = logging.getLogger(__name__)
@@ -19,7 +12,7 @@ logger = logging.getLogger(__name__)
 class RiskProfile:
     """Профиль риска для бота — все параметры риск-менеджмента."""
 
-    def __init__(self, params: Optional[dict] = None):
+    def __init__(self, params: dict | None = None):
         self.params = params or {}
         self.daily_loss_limit_usd = self.params.get("daily_loss_limit_usd", settings.risk_daily_loss_limit_usd)
         self.max_open_positions = self.params.get("max_open_positions", settings.risk_max_open_positions)
@@ -52,12 +45,12 @@ class RiskState:
         self.current_balance = settings.startup_capital_usdt
         self.daily_pnl = 0.0
         self.daily_loss_limit_reached = False
-        self.daily_loss_reset_time: Optional[datetime] = None
+        self.daily_loss_reset_time: datetime | None = None
         self.open_positions_count = 0
         self.open_positions: dict[str, float] = {}  # symbol -> size_pct
         self.total_drawdown_pct = 0.0
         self.max_drawdown_reached = 0.0
-        self.last_trade_time: Optional[datetime] = None
+        self.last_trade_time: datetime | None = None
         self.cooldown_active = False
         self.paused = False
         self.kill_switch_active = False
@@ -146,8 +139,7 @@ class RiskState:
         if self.start_balance > 0:
             drawdown = (self.start_balance - current_equity) / self.start_balance * 100
             self.total_drawdown_pct = drawdown
-            if drawdown > self.max_drawdown_reached:
-                self.max_drawdown_reached = drawdown
+            self.max_drawdown_reached = max(self.max_drawdown_reached, drawdown)
             return drawdown > self.max_drawdown_pct
         return False
 
@@ -178,11 +170,11 @@ class RiskManager:
     Риск-менеджер — проверяет каждое действие на соответствие профилю риска.
     """
 
-    def __init__(self, profile: Optional[RiskProfile] = None):
+    def __init__(self, profile: RiskProfile | None = None):
         self.profile = profile or RiskProfile()
         self.state = RiskState()
         self._sync_state_from_profile()
-        self.last_pnl_update: Optional[datetime] = None
+        self.last_pnl_update: datetime | None = None
 
     def _sync_state_from_profile(self):
         """Синхронизировать пороговые значения state с текущим профилем риска."""
@@ -221,9 +213,10 @@ class RiskManager:
         эффективно переставал действовать до конца суток, разрешая новые
         просадки поверх уже случившихся сегодня.
         """
-        from sqlalchemy import select, func
-        from src.db.session import get_session
+        from sqlalchemy import func, select
+
         from src.db.models import Trade
+        from src.db.session import get_session
 
         today_start = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         try:
@@ -298,11 +291,9 @@ class RiskManager:
             return False
         if self.state.cooldown_active:
             return False
-        if self.state.check_max_positions():
-            return False
-        return True
+        return not self.state.check_max_positions()
 
-    def check_signal(self, signal: Any) -> tuple[bool, Optional[str]]:
+    def check_signal(self, signal: Any) -> tuple[bool, str | None]:
         """
         Проверить сигнал на соответствие риск-профилю.
         Возвращает (can_execute, reason).
@@ -361,7 +352,6 @@ class RiskManager:
         self.state.update_daily_pnl(trade_pnl)
         self.state.record_trade_time()
 
-        outcome = "win" if trade_pnl > 0 else "loss"
         logger.info(
             f"📊 Сделка закрыта | PnL: {trade_pnl:.2f} USDT | "
             f"Дневной PnL: {self.state.daily_pnl:.2f} | "

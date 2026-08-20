@@ -25,7 +25,6 @@ Position-строка с полем close_reason, здесь — audit-trail Ord
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Optional
 
 from sqlalchemy import delete, select
 
@@ -58,7 +57,7 @@ class LockStore:
             await session.commit()
         logger.warning(f"🔒 Protections: '{scope_key}' заблокирован на {minutes} мин — {reason}")
 
-    async def active_reason(self, keys: list[str]) -> Optional[str]:
+    async def active_reason(self, keys: list[str]) -> str | None:
         """Причина активной блокировки по любому из ключей, иначе None."""
         async with get_session() as session:
             row = (
@@ -94,7 +93,7 @@ class ProtectionManager:
     def __init__(self) -> None:
         self.locks = LockStore()
 
-    async def locked_reason(self, keys: list[str]) -> Optional[str]:
+    async def locked_reason(self, keys: list[str]) -> str | None:
         """
         Причина активной блокировки, либо None — включая случай, когда
         Protections выключены целиком. Раньше этот метод не смотрел на

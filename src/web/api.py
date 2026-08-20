@@ -3,7 +3,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,30 +13,31 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from src.config import settings
-from src.event_bus import event_bus
-from src.risk.risk_manager import risk_manager
-from src.risk.protections import protection_manager, channel_key
-from src.risk import expectancy_sizing
-from src.execution.executor import execution_engine
-from src.ml import model_registry, model_trainer
-from src.strategy import strategy_registry
-from src.utils.logging import logger, get_recent_logs, get_logger_families
-from src.utils.timeutils import utcnow
-from src.db.session import get_session
 from src.db.models import (
-    Strategy as StrategyModel,
-    Trade,
-    Order,
-    Signal as SignalModel,
-    PerformanceSnapshot,
     BotConfig,
+    Order,
+    PerformanceSnapshot,
     TelegramChannel,
     TelegramSignal,
+    Trade,
 )
-from src.web import auth
-from src.web.settings_store import get_settings_snapshot, apply_settings_update
-from src.web.connections_status import get_connections_status
+from src.db.models import (
+    Strategy as StrategyModel,
+)
+from src.db.session import get_session
+from src.event_bus import event_bus
+from src.execution.executor import execution_engine
+from src.ml import model_registry, model_trainer
+from src.risk import expectancy_sizing
+from src.risk.protections import channel_key, protection_manager
+from src.risk.risk_manager import risk_manager
+from src.strategy import strategy_registry
 from src.telegram.notifier import send_notification
+from src.utils.logging import get_logger_families, get_recent_logs
+from src.utils.timeutils import utcnow
+from src.web import auth
+from src.web.connections_status import get_connections_status
+from src.web.settings_store import apply_settings_update, get_settings_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -156,11 +157,11 @@ class ConfigUpdateRequest(BaseModel):
 
 class RiskConfigUpdate(BaseModel):
     """Обновление риск-конфигурации."""
-    daily_loss_limit_usd: Optional[float] = None
-    max_open_positions: Optional[int] = None
-    max_position_size_pct: Optional[float] = None
-    max_drawdown_pct: Optional[float] = None
-    cooldown_seconds: Optional[int] = None
+    daily_loss_limit_usd: float | None = None
+    max_open_positions: int | None = None
+    max_position_size_pct: float | None = None
+    max_drawdown_pct: float | None = None
+    cooldown_seconds: int | None = None
 
 
 class StrategyToggleRequest(BaseModel):
@@ -176,7 +177,7 @@ class StrategyUpdateRequest(BaseModel):
 class TelegramChannelCreate(BaseModel):
     """Создание Telegram канала."""
     channel_id: str
-    channel_title: Optional[str] = None
+    channel_title: str | None = None
     parser_type: str = "regex"
     parser_config: dict = Field(default_factory=dict)
     quality_threshold: float = 0.5
@@ -185,9 +186,9 @@ class TelegramChannelCreate(BaseModel):
 
 class TelegramChannelUpdate(BaseModel):
     """Обновление настроек существующего Telegram канала. Незаданные поля не меняются."""
-    channel_title: Optional[str] = None
-    quality_threshold: Optional[float] = None
-    auto_execute: Optional[bool] = None
+    channel_title: str | None = None
+    quality_threshold: float | None = None
+    auto_execute: bool | None = None
 
 
 class TelegramSignalConfirm(BaseModel):
@@ -223,7 +224,7 @@ async def root():
     }
 
 
-def _position_source_label(strategy_id: Optional[str]) -> str:
+def _position_source_label(strategy_id: str | None) -> str:
     """Человекочитаемый источник сигнала по строковому strategy_id (см. executor.py/main.py)."""
     if not strategy_id:
         return "—"
@@ -293,7 +294,7 @@ async def get_status():
     """Получить текущий статус бота."""
     async with get_session() as session:
         channels = (
-            await session.execute(select(TelegramChannel).where(TelegramChannel.active == True))
+            await session.execute(select(TelegramChannel).where(TelegramChannel.active == True))  # noqa: E712
         ).scalars().all()
         telegram_channels = [
             {"id": c.id, "channel_id": c.channel_id, "channel_title": c.channel_title}
@@ -692,13 +693,13 @@ async def list_orders(limit: int = 100):
 
 
 @app.get("/ml/models")
-async def list_ml_models(model_type: Optional[str] = None):
+async def list_ml_models(model_type: str | None = None):
     """Список ML моделей."""
     return {"models": await model_registry.list_models(model_type)}
 
 
 @app.get("/ml/training-readiness")
-async def get_ml_training_readiness(symbol: Optional[str] = None):
+async def get_ml_training_readiness(symbol: str | None = None):
     """
     Сколько данных сейчас накоплено для обучения ML-моделей и сколько нужно —
     отвечает на вопрос "почему модель не обучилась/не загружена" без
@@ -816,9 +817,9 @@ async def update_settings(request: SettingsUpdateRequest):
 
 @app.get("/logs")
 async def get_logs(
-    level: Optional[str] = None,
-    search: Optional[str] = None,
-    loggers: Optional[str] = None,
+    level: str | None = None,
+    search: str | None = None,
+    loggers: str | None = None,
     limit: int = 200,
 ):
     """Последние логи процесса (из ring-буфера в памяти) с фильтрами для веб-панели.
@@ -999,7 +1000,7 @@ async def telegram_channels_stats():
 
 
 @app.get("/telegram/signals")
-async def list_telegram_signals(channel_id: Optional[int] = None, limit: int = 100):
+async def list_telegram_signals(channel_id: int | None = None, limit: int = 100):
     """Список Telegram сигналов (опционально по одному каналу) с данными ордера и исхода сделки."""
     async with get_session() as session:
         query = (
@@ -1096,7 +1097,7 @@ async def get_performance():
 
 
 @app.get("/analytics/decision-log")
-async def get_decision_logs(limit: int = 100, trade_id: Optional[int] = None):
+async def get_decision_logs(limit: int = 100, trade_id: int | None = None):
     """Decision logs для анализа."""
     async with get_session() as session:
         from src.db.models import TradeDecisionLog

@@ -1,6 +1,5 @@
 """Конфигурация бота — Pydantic Settings."""
 from pathlib import Path
-from typing import Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -24,31 +23,31 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # === Биржи ===
-    binance_api_key: Optional[str] = None
-    binance_api_secret: Optional[str] = None
-    bybit_api_key: Optional[str] = None
-    bybit_api_secret: Optional[str] = None
+    binance_api_key: str | None = None
+    binance_api_secret: str | None = None
+    bybit_api_key: str | None = None
+    bybit_api_secret: str | None = None
 
     # === CoinGlass API ===
-    coinglass_api_key: Optional[str] = None
+    coinglass_api_key: str | None = None
 
     # === Telegram мониторинг ===
-    telegram_api_id: Optional[int] = None
-    telegram_api_hash: Optional[str] = None
-    telegram_user_id: Optional[int] = None
+    telegram_api_id: int | None = None
+    telegram_api_hash: str | None = None
+    telegram_user_id: int | None = None
 
     # === Telegram уведомления ===
-    telegram_bot_token: Optional[str] = None
-    telegram_chat_id: Optional[int] = None
+    telegram_bot_token: str | None = None
+    telegram_chat_id: int | None = None
 
     # === База данных ===
     database_url: str = "sqlite+aiosqlite:///./data/cryptobot.db"
 
     # === Redis (опционально, для production event bus) ===
-    redis_url: Optional[str] = None
+    redis_url: str | None = None
 
     # === Шифрование ===
-    encryption_key: Optional[str] = None
+    encryption_key: str | None = None
 
     # === ML ===
     ml_retraining_interval_hours: int = 6
@@ -99,7 +98,7 @@ class Settings(BaseSettings):
     # LLM-фолбэк парсинга: когда регулярки не смогли распознать сообщение,
     # пробуем через Anthropic API (перенос из clonerbot: parser/llm_parser.py).
     telegram_llm_fallback_enabled: bool = False
-    anthropic_api_key: Optional[str] = None
+    anthropic_api_key: str | None = None
     anthropic_model: str = "claude-haiku-4-5-20251001"
 
     # === Веб сервер ===

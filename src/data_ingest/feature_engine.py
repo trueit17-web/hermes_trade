@@ -1,13 +1,10 @@
 """Feature Engineering — построение признаков для стратегий и ML."""
 import logging
-from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
-
-from src.utils.logging import logger
 
 logger = logging.getLogger(__name__)
 
@@ -258,7 +255,7 @@ class FeatureEngine:
         # Trend
         ema20 = latest.get("ema_20", 0)
         ema50 = latest.get("ema_50", 0)
-        close = latest.get("close", 0)
+        latest.get("close", 0)
         ema_slope = latest.get("ema_20_slope", 0)
 
         if ema20 > ema50 * 1.02 and ema_slope > 0:
@@ -304,7 +301,7 @@ class FeatureEngine:
 
 
 # Глобальный экземпляр
-_feature_engine: Optional[FeatureEngine] = None
+_feature_engine: FeatureEngine | None = None
 
 
 def get_feature_engine() -> FeatureEngine:

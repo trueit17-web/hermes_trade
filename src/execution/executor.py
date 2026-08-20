@@ -1,26 +1,27 @@
 """Execution Engine — отправка ордеров, исполнение, трекинг."""
-import asyncio
 import logging
 import uuid
-from typing import Any, Optional
 
 import ccxt.async_support as ccxt
-from sqlalchemy import select, func, update, delete
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import selectinload
 
 from src.config import settings
-from src.db.session import get_session
 from src.db.models import (
-    Order, Trade, Strategy, Symbol, Exchange, TelegramSignal, TradeDecisionLog,
+    Exchange,
+    Order,
+    Strategy,
+    Symbol,
+    TelegramSignal,
+    Trade,
+    TradeDecisionLog,
+)
+from src.db.session import get_session
+from src.event_bus import (
+    TradeEvent,
+    event_bus,
 )
 from src.risk.risk_manager import risk_manager
-from src.event_bus import (
-    event_bus,
-    OrderEvent,
-    TradeEvent,
-)
-from src.utils.logging import logger, log_trade
-from src.utils.crypto import decrypt_api_key, decrypt_secret
 from src.utils.timeutils import utcnow, utcnow_timestamp
 
 logger = logging.getLogger(__name__)
@@ -30,8 +31,8 @@ class ExecutionEngine:
     """Движок исполнения ордеров."""
 
     def __init__(self):
-        self.exchange: Optional[ccxt.Exchange] = None
-        self.exchange_id: Optional[str] = None
+        self.exchange: ccxt.Exchange | None = None
+        self.exchange_id: str | None = None
         self.is_paper: bool = settings.is_paper
         self.paper_balance: float = settings.startup_capital_usdt
         self.paper_positions: dict[str, dict] = {}
@@ -109,7 +110,7 @@ class ExecutionEngine:
 
     async def _load_open_positions_from_db(
         self, is_paper: bool,
-    ) -> tuple[Optional[dict[str, dict]], float, float]:
+    ) -> tuple[dict[str, dict] | None, float, float]:
         """
         Реконструировать открытые позиции из БД для указанного режима (paper/real).
 
@@ -405,7 +406,7 @@ class ExecutionEngine:
 
         return exchange.id, symbol_row.id
 
-    async def _resolve_strategy_id(self, session, strategy_name: Optional[str]) -> Optional[int]:
+    async def _resolve_strategy_id(self, session, strategy_name: str | None) -> int | None:
         """Получить (или создать) id стратегии в БД по её строковому идентификатору."""
         if not strategy_name:
             return None
@@ -425,13 +426,13 @@ class ExecutionEngine:
         symbol: str,
         side: str,
         amount: float,
-        price: Optional[float] = None,
+        price: float | None = None,
         order_type: str = "market",
-        stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None,
-        strategy_id: Optional[int] = None,
-        signal_data: Optional[dict] = None,
-    ) -> Optional[Order]:
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+        strategy_id: int | None = None,
+        signal_data: dict | None = None,
+    ) -> Order | None:
         """
         Создать ордер.
         Возвращает Order объект (сохранённый в БД) или None.
@@ -491,7 +492,7 @@ class ExecutionEngine:
         else:
             return await self._execute_real_order(order_data)
 
-    async def _execute_paper_order(self, order_data: dict) -> Optional[Order]:
+    async def _execute_paper_order(self, order_data: dict) -> Order | None:
         """Экземпляр paper trading ордера."""
         symbol = order_data["symbol"]
         side = order_data["side"]
@@ -589,7 +590,7 @@ class ExecutionEngine:
                 stop_loss=order_data["stop_loss"],
                 take_profit=order_data["take_profit"],
                 client_order_id=order_data["client_order_id"],
-                notes=f"Paper trading",
+                notes="Paper trading",
             )
             session.add(order)
             await session.flush()
@@ -641,9 +642,9 @@ class ExecutionEngine:
         reason: str,
         entry_fee: float = 0.0,
         holding_seconds: int = 0,
-        strategy_id: Optional[str] = None,
-        order_open_id: Optional[int] = None,
-    ) -> Optional[dict]:
+        strategy_id: str | None = None,
+        order_open_id: int | None = None,
+    ) -> dict | None:
         """
         Закрыть paper-позицию: посчитать PnL, обновить баланс, записать закрывающий
         Order + Trade в БД, опубликовать закрывающий TradeEvent.
@@ -758,7 +759,7 @@ class ExecutionEngine:
 
         return {"pnl": pnl, "pnl_pct": pnl_pct, "outcome": outcome, "trade_id": trade_id}
 
-    async def _execute_real_order(self, order_data: dict) -> Optional[Order]:
+    async def _execute_real_order(self, order_data: dict) -> Order | None:
         """Реальный ордер через биржу."""
         symbol = order_data["symbol"]
         side = order_data["side"]
@@ -862,10 +863,10 @@ class ExecutionEngine:
         reason: str,
         entry_fee: float = 0.0,
         holding_seconds: int = 0,
-        strategy_id: Optional[str] = None,
-        order_open_id: Optional[int] = None,
+        strategy_id: str | None = None,
+        order_open_id: int | None = None,
         **_ignored,
-    ) -> Optional[dict]:
+    ) -> dict | None:
         """
         Закрыть реальную позицию рыночным ордером на бирже: посчитать PnL по
         фактической цене исполнения, записать закрывающий Order + Trade в БД,
@@ -994,7 +995,7 @@ class ExecutionEngine:
         """Текущие paper позиции."""
         return dict(self.paper_positions)
 
-    async def get_real_balance(self) -> Optional[float]:
+    async def get_real_balance(self) -> float | None:
         """Получить реальный баланс в USDT."""
         if not self.exchange:
             return None

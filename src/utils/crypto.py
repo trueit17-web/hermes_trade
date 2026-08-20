@@ -2,7 +2,6 @@
 import base64
 import logging
 import os
-from typing import Optional
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -11,7 +10,7 @@ from src.config import settings
 logger = logging.getLogger(__name__)
 
 # Глобальный экземпляр шифровщика
-_crypto: Optional[Fernet] = None
+_crypto: Fernet | None = None
 
 
 def get_crypto() -> Fernet:

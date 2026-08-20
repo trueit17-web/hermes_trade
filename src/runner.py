@@ -1,19 +1,16 @@
 """Runner — утилита для запуска бота и бэктестов."""
 import argparse
 import asyncio
-import logging
 import sys
 
-from src.config import settings
-from src.utils.logging import setup_logging
-from src.backtest.engine import BacktestEngine, BacktestDataLoader
-from src.strategy import (
-    RSIMeanReversionStrategy,
-    EMACrossoverStrategy,
-    BollingerBandsStrategy,
-)
-from src.execution.executor import execution_engine
+from src.backtest.engine import BacktestDataLoader, BacktestEngine
 from src.db.session import init_db
+from src.strategy import (
+    BollingerBandsStrategy,
+    EMACrossoverStrategy,
+    RSIMeanReversionStrategy,
+)
+from src.utils.logging import setup_logging
 
 
 def run_bot():
@@ -209,7 +206,7 @@ def run_health_check():
     try:
         response = requests.get("http://localhost:8000/status", timeout=5)
         status = response.json()
-        print(f"\n📊 Статус:")
+        print("\n📊 Статус:")
         print(f"   Режим: {status.get('trading_mode', 'unknown')}")
         print(f"   Капитал: ${status.get('paper_balance', 0):,.2f}")
         print(f"   Позиции: {len(status.get('paper_positions', {}))}")

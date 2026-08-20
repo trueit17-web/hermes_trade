@@ -1,10 +1,8 @@
 """Decision Tree Logger — записывает полную цепочку решений для каждой сделки."""
 import logging
-from typing import Any, Optional
 
-from src.db.session import get_session
 from src.db.models import TradeDecisionLog
-from src.utils.logging import logger
+from src.db.session import get_session
 from src.utils.timeutils import utcnow
 
 logger = logging.getLogger(__name__)
@@ -44,7 +42,7 @@ class DecisionLogger:
         self,
         step_type: str,
         description: str,
-        details: Optional[dict] = None,
+        details: dict | None = None,
     ):
         """Записать шаг в текущую (ещё не привязанную к ордеру) цепочку."""
         step_order = len(self._active_steps) + 1
@@ -106,7 +104,7 @@ class DecisionLogger:
         proba_up: float,
         proba_down: float,
         proba_neutral: float,
-        feature_importance: Optional[dict] = None,
+        feature_importance: dict | None = None,
     ):
         """Лог ML предсказания."""
         self.log_step(
@@ -162,7 +160,7 @@ class DecisionLogger:
             },
         )
 
-    def attach_to_order(self, order_id: Optional[int]):
+    def attach_to_order(self, order_id: int | None):
         """
         Привязать накопленную с последнего begin() цепочку шагов к id
         открывающего ордера — она будет ждать закрытия позиции, чтобы
@@ -174,10 +172,10 @@ class DecisionLogger:
 
     async def flush_for_trade(
         self,
-        order_id: Optional[int],
+        order_id: int | None,
         trade_id: int,
-        close_description: Optional[str] = None,
-        close_details: Optional[dict] = None,
+        close_description: str | None = None,
+        close_details: dict | None = None,
     ) -> list[int]:
         """
         Записать в БД цепочку шагов, накопленную при открытии ордера

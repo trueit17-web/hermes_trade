@@ -1,10 +1,9 @@
 """Настройка логирования с поддержкой цветного вывода и структурированных логов."""
 import json
 import logging
-import sys
 from collections import deque
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import UTC, datetime
+from typing import Any
 
 from rich.console import Console
 from rich.logging import RichHandler
@@ -28,7 +27,7 @@ class RingBufferHandler(logging.Handler):
     def emit(self, record: logging.LogRecord):
         try:
             self.records.append({
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
                 "level": record.levelname,
                 "logger": record.name,
                 "message": record.getMessage(),
@@ -64,9 +63,9 @@ def get_logger_families() -> list[str]:
 
 
 def get_recent_logs(
-    level: Optional[str] = None,
-    search: Optional[str] = None,
-    loggers: Optional[list[str]] = None,
+    level: str | None = None,
+    search: str | None = None,
+    loggers: list[str] | None = None,
     limit: int = 200,
 ) -> list[dict]:
     """Отфильтровать записи из ring-буфера логов для веб-панели.
@@ -119,7 +118,7 @@ class StructuredFormatter(logging.Formatter):
 
     def _format_structured(self, record: logging.LogRecord) -> str:
         log_obj: dict[str, Any] = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -131,7 +130,7 @@ class StructuredFormatter(logging.Formatter):
         return json.dumps(log_obj, ensure_ascii=False)
 
 
-def setup_logging(level: Optional[str] = None):
+def setup_logging(level: str | None = None):
     """
     Настроить логирование для всего приложения.
     level: строка уровня (INFO, DEBUG, WARNING, ERROR) или None для значения из settings.

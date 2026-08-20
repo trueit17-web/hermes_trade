@@ -7,12 +7,12 @@ datetime в UTC, вычисленный через datetime.now(timezone.utc) б
 поэтому её можно безопасно использовать и как default= для колонок
 DateTime (без timezone=True) в src/db/models.py — тип колонок не меняется.
 """
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 def utcnow() -> datetime:
     """Текущее время в UTC как наивный datetime (замена datetime.utcnow())."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def utcnow_timestamp() -> float:
@@ -22,4 +22,4 @@ def utcnow_timestamp() -> float:
     значение как локальное время, а не UTC, и даёт неверный результат
     вне контейнеров/машин с TZ=UTC.
     """
-    return datetime.now(timezone.utc).timestamp()
+    return datetime.now(UTC).timestamp()

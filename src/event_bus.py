@@ -1,15 +1,11 @@
 """Event Bus — асинхронная шина событий с pub/sub моделью."""
 import asyncio
-import functools
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Generic, TypeVar, cast
+from typing import Any, TypeVar
 
 from rich.console import Console
-from rich.table import Table
-from rich.live import Live
-
-from src.config import settings
 
 console = Console()
 logger = logging.getLogger(__name__)

@@ -2,7 +2,6 @@
 import hmac
 import secrets
 import time
-from typing import Optional
 
 from src.config import settings
 
@@ -29,7 +28,7 @@ def create_session() -> str:
     return token
 
 
-def verify_session(token: Optional[str]) -> bool:
+def verify_session(token: str | None) -> bool:
     """Проверить, что токен существует и не истёк."""
     if not token:
         return False
@@ -42,7 +41,7 @@ def verify_session(token: Optional[str]) -> bool:
     return True
 
 
-def revoke_session(token: Optional[str]):
+def revoke_session(token: str | None):
     """Удалить сессию (logout)."""
     if token:
         _sessions.pop(token, None)

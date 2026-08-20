@@ -1,12 +1,8 @@
 """WebSocket расширения для веб-интерфейса."""
 import logging
-from typing import Optional
 
-from fastapi import WebSocket
-
+from src.event_bus import Event, event_bus
 from src.web.api import ws_manager
-from src.event_bus import event_bus, Event
-from src.utils.logging import logger
 
 logger = logging.getLogger(__name__)
 

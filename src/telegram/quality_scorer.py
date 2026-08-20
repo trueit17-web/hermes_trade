@@ -1,10 +1,5 @@
 """Telegram signal quality scorer — оценка качества сигналов."""
 import logging
-from typing import Optional
-
-import numpy as np
-
-from src.utils.logging import logger
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +24,9 @@ class SignalQualityScorer:
         """
         from sqlalchemy import select
         from sqlalchemy.orm import selectinload
-        from src.db.session import get_session
+
         from src.db.models import TelegramChannel, TelegramSignal
+        from src.db.session import get_session
 
         try:
             async with get_session() as session:
@@ -85,7 +81,7 @@ class SignalQualityScorer:
         self,
         signal: dict,
         channel_id: str,
-        market_context: Optional[dict] = None,
+        market_context: dict | None = None,
     ) -> float:
         """
         Оценить качество сигнала (0.0 - 1.0).
@@ -110,9 +106,7 @@ class SignalQualityScorer:
             trend = market_context.get("trend", "neutral")
             signal_side = signal.get("side", "")
 
-            if trend == "bull" and signal_side == "long":
-                score += 0.1
-            elif trend == "bear" and signal_side == "short":
+            if trend == "bull" and signal_side == "long" or trend == "bear" and signal_side == "short":
                 score += 0.1
             elif trend != "neutral":
                 score -= 0.1  # против тренда — штраф

@@ -1,9 +1,8 @@
 """Pydantic схемы для веб-интерфейса."""
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field
-
 
 # === Схемы конфигурации ===
 
@@ -11,7 +10,7 @@ class ConfigValue(BaseModel):
     """Значение конфигурации."""
     value: Any
     source: str = "default"
-    updated_at: Optional[datetime] = None
+    updated_at: datetime | None = None
 
 
 class RiskConfig(BaseModel):
@@ -48,19 +47,19 @@ class BotConfigResponse(BaseModel):
 class TradeResponse(BaseModel):
     """Сделка."""
     id: int
-    symbol: Optional[str] = None
+    symbol: str | None = None
     direction: str
     entry_price: float
-    exit_price: Optional[float] = None
+    exit_price: float | None = None
     amount: float
     pnl: float
     pnl_pct: float
     holding_seconds: int
-    outcome: Optional[str] = None
+    outcome: str | None = None
     is_open: bool = True
-    strategy_id: Optional[int] = None
-    created_at: Optional[datetime] = None
-    closed_at: Optional[datetime] = None
+    strategy_id: int | None = None
+    created_at: datetime | None = None
+    closed_at: datetime | None = None
 
 
 class TradeListResponse(BaseModel):
@@ -74,20 +73,20 @@ class TradeListResponse(BaseModel):
 class OrderResponse(BaseModel):
     """Ордер."""
     id: int
-    symbol: Optional[str] = None
+    symbol: str | None = None
     side: str
     order_type: str
     amount: float
-    price: Optional[float] = None
+    price: float | None = None
     status: str
     filled_amount: float
-    filled_price: Optional[float] = None
+    filled_price: float | None = None
     fee: float
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
-    client_order_id: Optional[str] = None
-    created_at: Optional[datetime] = None
-    closed_at: Optional[datetime] = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    client_order_id: str | None = None
+    created_at: datetime | None = None
+    closed_at: datetime | None = None
 
 
 class OrderListResponse(BaseModel):
@@ -103,12 +102,12 @@ class MLModelResponse(BaseModel):
     id: int
     model_type: str
     version: int
-    model_path: Optional[str] = None
+    model_path: str | None = None
     params: dict
     metrics: dict
     is_active: bool = False
     is_shadow: bool = False
-    created_at: Optional[datetime] = None
+    created_at: datetime | None = None
 
 
 class MLModelListResponse(BaseModel):
@@ -122,7 +121,7 @@ class TelegramChannelResponse(BaseModel):
     """Telegram канал."""
     id: int
     channel_id: str
-    channel_title: Optional[str] = None
+    channel_title: str | None = None
     parser_type: str
     auto_execute: bool = False
     active: bool = True
@@ -134,14 +133,14 @@ class TelegramSignalResponse(BaseModel):
     id: int
     channel_id: int
     raw_message: str
-    parsed_pair: Optional[str] = None
-    parsed_side: Optional[str] = None
-    parsed_entry: Optional[float] = None
-    parsed_sl: Optional[float] = None
-    parsed_tp: Optional[float] = None
-    quality_score: Optional[float] = None
+    parsed_pair: str | None = None
+    parsed_side: str | None = None
+    parsed_entry: float | None = None
+    parsed_sl: float | None = None
+    parsed_tp: float | None = None
+    quality_score: float | None = None
     decision: str
-    created_at: Optional[datetime] = None
+    created_at: datetime | None = None
 
 
 class TelegramSignalListResponse(BaseModel):
@@ -154,7 +153,7 @@ class TelegramSignalListResponse(BaseModel):
 
 class PerformanceSnapshotResponse(BaseModel):
     """Снимок производительности."""
-    time: Optional[datetime] = None
+    time: datetime | None = None
     total_balance: float
     open_pnl: float
     realized_pnl: float
@@ -162,9 +161,9 @@ class PerformanceSnapshotResponse(BaseModel):
     weekly_pnl: float
     num_open_positions: int
     num_trades_today: int
-    max_drawdown: Optional[float] = None
-    sharpe_ratio: Optional[float] = None
-    win_rate: Optional[float] = None
+    max_drawdown: float | None = None
+    sharpe_ratio: float | None = None
+    win_rate: float | None = None
 
 
 class PerformanceResponse(BaseModel):
@@ -181,7 +180,7 @@ class EventResponse(BaseModel):
     source: str
     message: str
     level: str
-    created_at: Optional[datetime] = None
+    created_at: datetime | None = None
 
 
 class EventListResponse(BaseModel):

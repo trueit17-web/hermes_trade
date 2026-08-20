@@ -1,23 +1,21 @@
 """ML компоненты: Feature Store, Trainer, Model Registry, Inference."""
 import logging
-import os
 import pickle
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import lightgbm as lgb
 import numpy as np
 import optuna
 import pandas as pd
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.model_selection import train_test_split
-from sqlalchemy import select, update, func
+from sqlalchemy import func, select, update
 
 from src.config import settings
+from src.db.models import MLFeature, MLModel, Trade
 from src.db.session import get_session
-from src.db.models import MLModel, MLFeature, Strategy, Trade
-from src.utils.logging import logger
 from src.utils.timeutils import utcnow
 
 logger = logging.getLogger(__name__)
@@ -69,7 +67,7 @@ class FeatureStore:
         timeframe: str,
         timestamp: datetime,
         features: dict[str, float],
-        labels: Optional[dict] = None,
+        labels: dict | None = None,
     ):
         """Добавить фичи в онлайн-хранилище и сохранить в БД (идемпотентно по symbol+timeframe+timestamp)."""
         key = f"{symbol}:{timeframe}:{timestamp.isoformat()}"
@@ -106,7 +104,7 @@ class FeatureStore:
         except Exception as e:
             logger.debug(f"Не удалось сохранить фичи в БД: {e}")
 
-    async def get_latest_features(self, symbol: str, timeframe: str = "1h") -> Optional[dict]:
+    async def get_latest_features(self, symbol: str, timeframe: str = "1h") -> dict | None:
         """Получить последние фичи для символа (из онлайн-кэша или БД)."""
         cached = self._online_features.get(f"{symbol}:{timeframe}:latest")
         if cached is not None:
@@ -129,9 +127,9 @@ class FeatureStore:
 
     async def get_features_for_training(
         self,
-        symbol: Optional[str] = None,
+        symbol: str | None = None,
         limit: int = 10000,
-    ) -> Optional[pd.DataFrame]:
+    ) -> pd.DataFrame | None:
         """Получить фичи для обучения из БД."""
         try:
             async with get_session() as session:
@@ -159,7 +157,7 @@ class FeatureStore:
         """Очистить онлайн кэш."""
         self._online_features.clear()
 
-    async def get_training_readiness(self, symbol: Optional[str] = None) -> dict:
+    async def get_training_readiness(self, symbol: str | None = None) -> dict:
         """
         Сколько данных сейчас доступно для обучения и сколько нужно —
         чтобы ответить на вопрос "почему модель не обучилась/не загружена"
@@ -218,18 +216,18 @@ class ModelTrainer:
 
     def __init__(self):
         self.feature_store = FeatureStore()
-        self.last_training_time: Optional[datetime] = None
+        self.last_training_time: datetime | None = None
 
     async def train_direction_classifier(
         self,
-        symbol: Optional[str] = None,
-        training_data: Optional[pd.DataFrame] = None,
-    ) -> Optional[dict]:
+        symbol: str | None = None,
+        training_data: pd.DataFrame | None = None,
+    ) -> dict | None:
         """
         Обучить модель классификации направления.
         Возвращает dict с результатами обучения и метриками.
         """
-        logger.info(f"Начато обучение direction classifier" + (f" для {symbol}" if symbol else ""))
+        logger.info("Начато обучение direction classifier" + (f" для {symbol}" if symbol else ""))
 
         if training_data is None:
             training_data = await self.feature_store.get_features_for_training(symbol)
@@ -297,7 +295,7 @@ class ModelTrainer:
 
         # Метрики
         y_pred = model.predict(X_val)
-        y_proba = model.predict_proba(X_val)
+        model.predict_proba(X_val)
 
         accuracy = accuracy_score(y_val, y_pred)
         precision = precision_score(y_val, y_pred, average="weighted", zero_division=0)
@@ -362,11 +360,11 @@ class ModelTrainer:
 
     async def train_volatility_predictor(
         self,
-        symbol: Optional[str] = None,
-        training_data: Optional[pd.DataFrame] = None,
-    ) -> Optional[dict]:
+        symbol: str | None = None,
+        training_data: pd.DataFrame | None = None,
+    ) -> dict | None:
         """Обучить модель предсказания волатильности."""
-        logger.info(f"Начато обучение volatility predictor" + (f" для {symbol}" if symbol else ""))
+        logger.info("Начато обучение volatility predictor" + (f" для {symbol}" if symbol else ""))
 
         if training_data is None:
             training_data = await self.feature_store.get_features_for_training(symbol)
@@ -511,14 +509,14 @@ class ModelRegistry:
     def __init__(self):
         self._active_models: dict[str, dict] = {}
 
-    async def load_active_model(self, model_type: str) -> Optional[dict]:
+    async def load_active_model(self, model_type: str) -> dict | None:
         """Загрузить активную модель из БД."""
         try:
             async with get_session() as session:
                 from src.db.models import MLModel as M
                 result = await session.execute(
                     select(M)
-                    .where(M.model_type == model_type, M.is_active == True)
+                    .where(M.model_type == model_type, M.is_active == True)  # noqa: E712
                     .order_by(M.version.desc())
                     .limit(1)
                 )
@@ -540,7 +538,7 @@ class ModelRegistry:
             logger.error(f"Ошибка загрузки активной модели {model_type}: {e}")
             return None
 
-    async def get_model_version(self, model_type: str, version: int) -> Optional[dict]:
+    async def get_model_version(self, model_type: str, version: int) -> dict | None:
         """Получить конкретную версию модели."""
         try:
             async with get_session() as session:
@@ -565,7 +563,7 @@ class ModelRegistry:
             logger.error(f"Ошибка получения версии модели {model_type} v{version}: {e}")
             return None
 
-    async def list_models(self, model_type: Optional[str] = None) -> list[dict]:
+    async def list_models(self, model_type: str | None = None) -> list[dict]:
         """Список моделей."""
         try:
             async with get_session() as session:
@@ -616,7 +614,7 @@ class ModelRegistry:
             logger.error(f"Ошибка активации модели {model_type} v{version}: {e}")
             return False
 
-    async def get_active_model(self, model_type: str) -> Optional[dict]:
+    async def get_active_model(self, model_type: str) -> dict | None:
         """Получить активную модель (из кэша или загрузить)."""
         if model_type in self._active_models:
             return self._active_models[model_type]
@@ -646,7 +644,7 @@ class MLInference:
         self,
         features: dict[str, float],
         model_type: str = "direction_classifier",
-    ) -> Optional[dict]:
+    ) -> dict | None:
         """
         Предсказать направление на основе фичей.
         Возвращает {proba_up, proba_down, proba_neutral, feature_importance}
@@ -702,7 +700,7 @@ class MLInference:
     async def predict_volatility(
         self,
         features: dict[str, float],
-    ) -> Optional[float]:
+    ) -> float | None:
         """Предсказать волатильность."""
         model_data = self._models.get("volatility_predictor")
         if model_data is None:

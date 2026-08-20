@@ -1,23 +1,20 @@
 """Unit тесты для backtest engine."""
 import unittest
 from datetime import datetime, timedelta
-from decimal import Decimal
-from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
 
 from src.backtest.engine import (
-    BacktestPosition,
-    BacktestTrade,
-    BacktestResult,
-    BacktestEngine,
     BacktestDataLoader,
+    BacktestEngine,
+    BacktestPosition,
+    BacktestResult,
+    BacktestTrade,
 )
 from src.strategy import (
-    RSIMeanReversionStrategy,
-    EMACrossoverStrategy,
     BollingerBandsStrategy,
+    RSIMeanReversionStrategy,
 )
 
 
@@ -354,7 +351,6 @@ class TestBacktestEngine(unittest.TestCase):
 
     def test_fee_and_slippage(self):
         """Комиссия и slippage."""
-        capital = 10000.0
         price = 50000.0
         amount = 0.01
 
@@ -380,8 +376,8 @@ class TestBacktestDataLoader(unittest.TestCase):
 
     def test_csv_load(self):
         """Загрузка из CSV."""
-        import tempfile
         import os
+        import tempfile
 
         # Создаём временный CSV
         csv_content = """timestamp,open,high,low,close,volume
@@ -409,96 +405,11 @@ class TestBacktestDataLoader(unittest.TestCase):
         self.assertTrue(callable(loader.from_ccxt))
 
 
-class TestDecisionLogger(unittest.TestCase):
-    """Тесты для DecisionLogger."""
-
-    def setUp(self):
-        from src.execution.decision_logger import DecisionLogger
-        self.logger = DecisionLogger()
-
-    def test_log_market_data(self):
-        """Лог market data."""
-        self.logger.start_trade(123)
-        self.logger.log_market_data(
-            symbol="BTC/USDT",
-            timeframe="1h",
-            price=50000.0,
-            features={"rsi_14": 28.5, "ema_20": 49500.0},
-        )
-        self.assertEqual(len(self.logger._steps), 1)
-        self.assertEqual(self.logger._steps[0]["step_type"], "market_data")
-
-    def test_log_strategy_signal(self):
-        """Лог сигнала."""
-        self.logger.start_trade(123)
-        self.logger.log_strategy_signal(
-            strategy_id="rsi_mr",
-            strategy_name="RSI Mean Reversion",
-            signal_side="long",
-            confidence=0.85,
-            entry_price=50000.0,
-            stop_loss=49000.0,
-            take_profit=51000.0,
-            rationale="RSI oversold",
-        )
-        self.assertEqual(len(self.logger._steps), 1)
-        self.assertEqual(self.logger._steps[0]["step_type"], "strategy_signal")
-
-    def test_log_ml_score(self):
-        """Лог ML score."""
-        self.logger.start_trade(123)
-        self.logger.log_ml_score(
-            model_type="direction_classifier",
-            model_version=1,
-            proba_up=0.75,
-            proba_down=0.15,
-            proba_neutral=0.10,
-        )
-        self.assertEqual(len(self.logger._steps), 1)
-        self.assertEqual(self.logger._steps[0]["step_type"], "ml_score")
-
-    def test_log_risk_check_allowed(self):
-        """Лог risk check (допущено)."""
-        self.logger.start_trade(123)
-        self.logger.log_risk_check(
-            decision="allowed",
-            reason="All checks passed",
-            context={"daily_pnl": 50.0, "open_positions": 2},
-        )
-        self.assertEqual(len(self.logger._steps), 1)
-        self.assertEqual(self.logger._steps[0]["step_type"], "risk_check")
-
-    def test_log_risk_check_rejected(self):
-        """Лог risk check (отклонено)."""
-        self.logger.start_trade(123)
-        self.logger.log_risk_check(
-            decision="rejected",
-            reason="Daily loss limit reached",
-            context={"daily_pnl": -500.0},
-        )
-        self.assertEqual(len(self.logger._steps), 1)
-        self.assertEqual(self.logger._steps[0]["details"]["decision"], "rejected")
-
-    def test_log_execution(self):
-        """Лог исполнения."""
-        self.logger.start_trade(123)
-        self.logger.log_execution(
-            order_id="ORD-12345",
-            order_type="market",
-            amount=0.01,
-            price=50000.0,
-            status="filled",
-            fee=5.0,
-        )
-        self.assertEqual(len(self.logger._steps), 1)
-        self.assertEqual(self.logger._steps[0]["step_type"], "execution")
-
-    def test_no_trade_id_log(self):
-        """Лог без trade ID — шаг тихо пропускается (start_trade нигде не вызван по умолчанию)."""
-        with patch("src.execution.decision_logger.logger") as mock_logger:
-            self.logger.log_market_data("BTC/USDT", "1h", 50000.0, {})
-            mock_logger.debug.assert_called()
-            self.assertEqual(len(self.logger._steps), 0)
+# TestDecisionLogger жил здесь и тестировал старый API DecisionLogger
+# (start_trade/_steps), удалённый при переходе на текущую модель
+# begin()/log_step()/attach_to_order()/flush_for_trade() (шаги буферизуются
+# в памяти и пишутся в БД только когда появляется реальный trade_id при
+# закрытии). Актуальные тесты — TestDecisionLogger в tests/test_all.py.
 
 
 if __name__ == "__main__":

@@ -1,14 +1,11 @@
 """Сбор рыночных данных с бирж через ccxt (REST + WebSocket планирование)."""
 import asyncio
 import logging
-from datetime import datetime
-from typing import Any, Optional
 
 import ccxt.async_support as ccxt
 import pandas as pd
 
 from src.config import settings
-from src.utils.logging import log_trade, logger
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +20,7 @@ class MarketDataIngest:
 
     def __init__(self, exchange_id: str = "binance"):
         self.exchange_id = exchange_id.lower()
-        self.exchange: Optional[ccxt.Exchange] = None
+        self.exchange: ccxt.Exchange | None = None
         self.candles_buffer: dict[str, pd.DataFrame] = {}
         self._running = False
 
@@ -63,8 +60,8 @@ class MarketDataIngest:
         symbol: str,
         timeframe: str = "1h",
         limit: int = 500,
-        since: Optional[int] = None,
-    ) -> Optional[pd.DataFrame]:
+        since: int | None = None,
+    ) -> pd.DataFrame | None:
         """
         Загрузить OHLCV свечи из биржи.
         Возвращает DataFrame с индексом timestamp и колонками: open, high, low, close, volume
@@ -106,7 +103,7 @@ class MarketDataIngest:
     async def get_tradable_symbols(
         self,
         quote: str = "USDT",
-        blacklist: Optional[list[str]] = None,
+        blacklist: list[str] | None = None,
         max_symbols: int = 30,
     ) -> list[str]:
         """
@@ -168,7 +165,7 @@ class MarketDataIngest:
                 combined = combined.iloc[-max_rows:]
             self.candles_buffer[symbol] = combined
 
-    def get_latest_candle(self, symbol: str) -> Optional[dict]:
+    def get_latest_candle(self, symbol: str) -> dict | None:
         """Получить последнюю свечу из буфера."""
         if symbol not in self.candles_buffer:
             return None
@@ -185,7 +182,7 @@ class MarketDataIngest:
             "volume": float(latest["volume"]),
         }
 
-    def get_candles_for_symbol(self, symbol: str, limit: Optional[int] = None) -> Optional[pd.DataFrame]:
+    def get_candles_for_symbol(self, symbol: str, limit: int | None = None) -> pd.DataFrame | None:
         """Получить свечи из буфера."""
         if symbol not in self.candles_buffer:
             return None

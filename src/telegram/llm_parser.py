@@ -12,11 +12,10 @@ LLM возвращает строгий JSON через forced tool-call (ник
 from __future__ import annotations
 
 import json
-from typing import Optional
 
 from src.config import settings
-from src.utils.logging import logger
 from src.telegram.channel_monitor import normalize_pair
+from src.utils.logging import logger
 
 _SYSTEM = """You extract crypto trading signals from noisy Telegram messages.
 
@@ -70,7 +69,7 @@ def _get_client():
     return _client
 
 
-async def parse_with_llm(text: str, channel_config: Optional[dict] = None) -> Optional[dict]:
+async def parse_with_llm(text: str, channel_config: dict | None = None) -> dict | None:
     """Распарсить сигнал через LLM. Возвращает тот же формат, что и
     parse_with_regex (pair/side/entry/sl/tp/raw), или None."""
     if not settings.telegram_llm_fallback_enabled or not settings.anthropic_api_key:

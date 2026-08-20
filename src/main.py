@@ -1,39 +1,52 @@
 """CryptoBot Pro — автономный самообучающийся крипто-трейдер бот."""
 import asyncio
-import logging
 import statistics
 import sys
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any, ClassVar
 
 import pandas as pd
 import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from sqlalchemy import select, func
+from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from src.config import settings
-from src.utils.logging import setup_logging, logger
-from src.event_bus import event_bus
-from src.data_ingest.market_data import MarketDataIngest
 from src.data_ingest.coinglass_client import get_coinglass_client
 from src.data_ingest.feature_engine import get_feature_engine
-from src.strategy import strategy_registry
-from src.risk.risk_manager import risk_manager
-from src.risk.protections import protection_manager, GLOBAL_KEY, channel_key, strategy_key
-from src.risk import expectancy_sizing
-from src.execution.executor import execution_engine
+from src.data_ingest.market_data import MarketDataIngest
+from src.db.models import (
+    Exchange,
+    PerformanceSnapshot,
+    Symbol,
+    TelegramChannel,
+    TelegramSignal,
+    Trade,
+)
+from src.db.session import get_session
+from src.event_bus import event_bus
 from src.execution.decision_logger import decision_logger
-from src.ml import model_trainer, model_registry, ml_inference, feature_store
+from src.execution.executor import execution_engine
+from src.ml import feature_store, ml_inference, model_registry, model_trainer
+from src.risk import expectancy_sizing
+from src.risk.protections import (
+    GLOBAL_KEY,
+    channel_key,
+    protection_manager,
+    strategy_key,
+)
+from src.risk.risk_manager import risk_manager
+from src.strategy import strategy_registry
 from src.telegram.channel_monitor import (
-    init_telegram, close_telegram, subscribe_telegram_signal, monitor_channels,
+    close_telegram,
+    init_telegram,
+    monitor_channels,
+    subscribe_telegram_signal,
 )
 from src.telegram.notifier import send_notification
-from src.utils.crypto import generate_encryption_key
+from src.utils.logging import logger, setup_logging
 from src.utils.timeutils import utcnow
-from src.db.session import get_session
-from src.db.models import TelegramChannel, TelegramSignal, Trade, Symbol, Exchange, PerformanceSnapshot
 from src.web.api import app as web_app
 from src.web.settings_store import load_settings_overrides
 
@@ -152,7 +165,7 @@ class TradingBot:
             id="performance_snapshot",
         )
         self.scheduler.start()
-        logger.info(f"✅ Планировщик запущен")
+        logger.info("✅ Планировщик запущен")
         await self._save_performance_snapshot()
 
         # Telegram-уведомления (алерты о сделках/ошибках, без приёма команд)
@@ -241,7 +254,7 @@ class TradingBot:
                     select(Trade)
                     .join(Symbol, Trade.symbol_id == Symbol.id)
                     .join(Exchange, Symbol.exchange_id == Exchange.id)
-                    .where(Exchange.is_paper == settings.is_paper, Trade.is_open == False)
+                    .where(Exchange.is_paper == settings.is_paper, Trade.is_open == False)  # noqa: E712
                 )
                 closed_trades = (await session.execute(base_query)).scalars().all()
 
@@ -337,10 +350,10 @@ class TradingBot:
     async def _update_coinglass(self):
         """Обновление данных из CoinGlass."""
         try:
-            btc_market = await self.cg_client.get_coins_markets(symbol="BTC")
-            funding = await self.cg_client.get_funding_rate_history(symbol="BTC/USDT", limit=50)
-            oi = await self.cg_client.get_open_interest_history(symbol="BTC/USDT", limit=50)
-            fear = await self.cg_client.get_fear_greed_history(limit=10)
+            await self.cg_client.get_coins_markets(symbol="BTC")
+            await self.cg_client.get_funding_rate_history(symbol="BTC/USDT", limit=50)
+            await self.cg_client.get_open_interest_history(symbol="BTC/USDT", limit=50)
+            await self.cg_client.get_fear_greed_history(limit=10)
             logger.debug("CoinGlass данные обновлены")
         except Exception as e:
             logger.debug(f"CoinGlass: {e}")
@@ -385,7 +398,7 @@ class TradingBot:
 
         async with get_session() as session:
             channels = (
-                await session.execute(select(TelegramChannel).where(TelegramChannel.active == True))
+                await session.execute(select(TelegramChannel).where(TelegramChannel.active == True))  # noqa: E712
             ).scalars().all()
             channel_dicts = [
                 {
@@ -439,8 +452,8 @@ class TradingBot:
         pair = signal_event.get("parsed_pair", "")
         side = signal_event.get("parsed_side", "")
         entry = signal_event.get("parsed_entry", 0)
-        sl = signal_event.get("parsed_sl")
-        tp = signal_event.get("parsed_tp")
+        signal_event.get("parsed_sl")
+        signal_event.get("parsed_tp")
 
         if not pair or not side or entry <= 0:
             return
@@ -476,11 +489,11 @@ class TradingBot:
                     decision = "rejected"
                     logger.info(f"🔒 Сигнал по {pair} отклонён (protections): {lock_reason}")
                 else:
-                    logger.info(f"🤖 Автоматическое исполнение")
+                    logger.info("🤖 Автоматическое исполнение")
                     order = await self._execute_telegram_signal(signal_event)
                     decision = "executed" if order else "rejected"
         else:
-            logger.info(f"⏳ Сигнал ожидает подтверждения")
+            logger.info("⏳ Сигнал ожидает подтверждения")
 
         await self._save_telegram_signal(signal_event, quality, decision, order)
 
@@ -673,7 +686,7 @@ class TradingBot:
             except Exception as e:
                 logger.error(f"Ошибка обработки {symbol}: {e}")
 
-    async def _refresh_symbol_candles(self, symbol: str) -> Optional[pd.DataFrame]:
+    async def _refresh_symbol_candles(self, symbol: str) -> pd.DataFrame | None:
         """
         Обновить буфер свечей для пары и вернуть его.
 
@@ -949,7 +962,7 @@ class TradingBot:
             logger.debug(f"Не удалось сохранить ML-обучающий пример для {symbol}: {e}")
 
     @staticmethod
-    def _tp_levels(entry_price: float, tp: Optional[float]) -> tuple:
+    def _tp_levels(entry_price: float, tp: float | None) -> tuple:
         """
         3 уровня частичной фиксации прибыли — линейная интерполяция между
         ценой входа и итоговым TP (TP3): TP1 = 1/3 пути, TP2 = 2/3 пути.
@@ -963,7 +976,7 @@ class TradingBot:
         tp2 = entry_price + (tp - entry_price) * 2 / 3
         return tp1, tp2, tp
 
-    REASON_RU = {
+    REASON_RU: ClassVar[dict[str, str]] = {
         "stop_loss": "Stop Loss",
         "take_profit_1": "Take Profit 1 (50%)",
         "take_profit_2": "Take Profit 2 (25%)",
@@ -1130,7 +1143,7 @@ class TradingBot:
         return not is_partial
 
     async def _link_telegram_signal_trade(
-        self, order_id: Optional[int], trade_id: int, outcome: Optional[str] = None,
+        self, order_id: int | None, trade_id: int, outcome: str | None = None,
     ):
         """
         Проставить executed_trade_id у Telegram-сигнала, чей ордер только что

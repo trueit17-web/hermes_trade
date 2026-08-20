@@ -1,10 +1,19 @@
 """Полная схема базы данных для крипто-трейдер бота."""
 from datetime import datetime
-from typing import Any, Optional
+from typing import Optional
 
 from sqlalchemy import (
-    BigInteger, Boolean, Column, DateTime, DECIMAL, Float, Integer, JSON, String, Text,
-    ForeignKey, Index, UniqueConstraint,
+    DECIMAL,
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -18,8 +27,8 @@ class Exchange(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
-    api_key_enc: Mapped[Optional[str]] = mapped_column(String(512))
-    api_secret_enc: Mapped[Optional[str]] = mapped_column(String(512))
+    api_key_enc: Mapped[str | None] = mapped_column(String(512))
+    api_secret_enc: Mapped[str | None] = mapped_column(String(512))
     is_paper: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -40,8 +49,8 @@ class Symbol(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     base_asset: Mapped[str] = mapped_column(String(20))
     quote_asset: Mapped[str] = mapped_column(String(20))
-    tick_size: Mapped[Optional[float]] = mapped_column(Float)
-    step_size: Mapped[Optional[float]] = mapped_column(Float)
+    tick_size: Mapped[float | None] = mapped_column(Float)
+    step_size: Mapped[float | None] = mapped_column(Float)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     exchange: Mapped["Exchange"] = relationship(back_populates="symbols")
@@ -87,9 +96,9 @@ class Signal(Base):
     symbol_id: Mapped[int] = mapped_column(ForeignKey("symbols.id"))
     side: Mapped[str] = mapped_column(String(10), nullable=False)  # long, short
     confidence: Mapped[float] = mapped_column(Float)
-    entry_price: Mapped[Optional[float]] = mapped_column(DECIMAL)
-    stop_loss: Mapped[Optional[float]] = mapped_column(DECIMAL)
-    take_profit: Mapped[Optional[float]] = mapped_column(DECIMAL)
+    entry_price: Mapped[float | None] = mapped_column(DECIMAL)
+    stop_loss: Mapped[float | None] = mapped_column(DECIMAL)
+    take_profit: Mapped[float | None] = mapped_column(DECIMAL)
     position_size_pct: Mapped[float] = mapped_column(Float)
     timeframe: Mapped[str] = mapped_column(String(10))
     rationale: Mapped[str] = mapped_column(Text)
@@ -107,28 +116,28 @@ class Order(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     exchange_id: Mapped[int] = mapped_column(ForeignKey("exchanges.id"))
     symbol_id: Mapped[int] = mapped_column(ForeignKey("symbols.id"))
-    strategy_id: Mapped[Optional[int]] = mapped_column(ForeignKey("strategies.id"))
-    signal_id: Mapped[Optional[int]] = mapped_column(ForeignKey("signals.id"))
+    strategy_id: Mapped[int | None] = mapped_column(ForeignKey("strategies.id"))
+    signal_id: Mapped[int | None] = mapped_column(ForeignKey("signals.id"))
     side: Mapped[str] = mapped_column(String(10), nullable=False)  # buy, sell
     order_type: Mapped[str] = mapped_column(String(20))  # market, limit, stop_limit
     amount: Mapped[float] = mapped_column(DECIMAL, nullable=False)
-    price: Mapped[Optional[float]] = mapped_column(DECIMAL)
+    price: Mapped[float | None] = mapped_column(DECIMAL)
     status: Mapped[str] = mapped_column(
         String(20), default="open"
     )  # open, filled, partial, cancelled, rejected
     filled_amount: Mapped[float] = mapped_column(DECIMAL, default=0)
-    filled_price: Mapped[Optional[float]] = mapped_column(DECIMAL)
+    filled_price: Mapped[float | None] = mapped_column(DECIMAL)
     fee: Mapped[float] = mapped_column(DECIMAL, default=0)
-    stop_loss: Mapped[Optional[float]] = mapped_column(DECIMAL)
-    take_profit: Mapped[Optional[float]] = mapped_column(DECIMAL)
-    order_id_exchange: Mapped[Optional[str]] = mapped_column(String(100))
-    client_order_id: Mapped[Optional[str]] = mapped_column(String(100))
-    notes: Mapped[Optional[str]] = mapped_column(Text)
+    stop_loss: Mapped[float | None] = mapped_column(DECIMAL)
+    take_profit: Mapped[float | None] = mapped_column(DECIMAL)
+    order_id_exchange: Mapped[str | None] = mapped_column(String(100))
+    client_order_id: Mapped[str | None] = mapped_column(String(100))
+    notes: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=utcnow, onupdate=utcnow
     )
-    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     exchange: Mapped["Exchange"] = relationship(back_populates="orders")
     symbol: Mapped["Symbol"] = relationship(back_populates="orders")
@@ -148,23 +157,23 @@ class Trade(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     symbol_id: Mapped[int] = mapped_column(ForeignKey("symbols.id"))
-    strategy_id: Mapped[Optional[int]] = mapped_column(ForeignKey("strategies.id"))
-    order_open_id: Mapped[Optional[int]] = mapped_column(ForeignKey("orders.id"))
-    order_close_id: Mapped[Optional[int]] = mapped_column(ForeignKey("orders.id"))
+    strategy_id: Mapped[int | None] = mapped_column(ForeignKey("strategies.id"))
+    order_open_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"))
+    order_close_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"))
     direction: Mapped[str] = mapped_column(String(10), nullable=False)  # long, short
     entry_price: Mapped[float] = mapped_column(DECIMAL, nullable=False)
-    exit_price: Mapped[Optional[float]] = mapped_column(DECIMAL)
+    exit_price: Mapped[float | None] = mapped_column(DECIMAL)
     amount: Mapped[float] = mapped_column(DECIMAL, nullable=False)
     pnl: Mapped[float] = mapped_column(DECIMAL, default=0)
     pnl_pct: Mapped[float] = mapped_column(Float)
     holding_seconds: Mapped[int] = mapped_column(Integer, default=0)
-    features_at_open: Mapped[Optional[dict]] = mapped_column(JSON)
-    outcome: Mapped[Optional[str]] = mapped_column(
+    features_at_open: Mapped[dict | None] = mapped_column(JSON)
+    outcome: Mapped[str | None] = mapped_column(
         String(20)
     )  # win, loss, break-even
     is_open: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     symbol: Mapped["Symbol"] = relationship(back_populates="trades")
     strategy: Mapped[Optional["Strategy"]] = relationship(back_populates="trades")
@@ -190,7 +199,7 @@ class Candle(Base):
     low: Mapped[float] = mapped_column(DECIMAL)
     close: Mapped[float] = mapped_column(DECIMAL)
     volume: Mapped[float] = mapped_column(DECIMAL)
-    close_time: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    close_time: Mapped[datetime | None] = mapped_column(DateTime)
 
     symbol: Mapped["Symbol"] = relationship(back_populates="candles")
     exchange: Mapped["Exchange"] = relationship()
@@ -210,7 +219,7 @@ class TelegramChannel(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     channel_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
-    channel_title: Mapped[Optional[str]] = mapped_column(String(200))
+    channel_title: Mapped[str | None] = mapped_column(String(200))
     parser_type: Mapped[str] = mapped_column(
         String(20), default="regex"
     )  # regex, llm
@@ -240,20 +249,20 @@ class TelegramSignal(Base):
     channel_id: Mapped[int] = mapped_column(ForeignKey("telegram_channels.id"))
     raw_message: Mapped[str] = mapped_column(Text, nullable=False)
     message_date: Mapped[datetime] = mapped_column(DateTime)
-    parsed_pair: Mapped[Optional[str]] = mapped_column(String(50))
-    parsed_side: Mapped[Optional[str]] = mapped_column(String(10))
-    parsed_entry: Mapped[Optional[float]] = mapped_column(DECIMAL)
-    parsed_sl: Mapped[Optional[float]] = mapped_column(DECIMAL)
-    parsed_tp: Mapped[Optional[float]] = mapped_column(DECIMAL)
-    quality_score: Mapped[Optional[float]] = mapped_column(Float)
+    parsed_pair: Mapped[str | None] = mapped_column(String(50))
+    parsed_side: Mapped[str | None] = mapped_column(String(10))
+    parsed_entry: Mapped[float | None] = mapped_column(DECIMAL)
+    parsed_sl: Mapped[float | None] = mapped_column(DECIMAL)
+    parsed_tp: Mapped[float | None] = mapped_column(DECIMAL)
+    quality_score: Mapped[float | None] = mapped_column(Float)
     decision: Mapped[str] = mapped_column(
         String(30), default="pending"
     )  # executed, rejected, pending
     # order, открытый по этому сигналу (проставляется сразу при исполнении);
     # executed_trade_id проставляется позже, когда позиция закрывается и
     # известен итоговый исход (нужен для расчёта win rate по каналу).
-    executed_order_id: Mapped[Optional[int]] = mapped_column(ForeignKey("orders.id"))
-    executed_trade_id: Mapped[Optional[int]] = mapped_column(ForeignKey("trades.id"))
+    executed_order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"))
+    executed_trade_id: Mapped[int | None] = mapped_column(ForeignKey("trades.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     channel: Mapped["TelegramChannel"] = relationship(back_populates="signals")
@@ -269,14 +278,14 @@ class MLModel(Base):
     model_type: Mapped[str] = mapped_column(
         String(50), nullable=False
     )  # direction_classifier, volatility, quality_scorer, ensemble_weights
-    strategy_id: Mapped[Optional[int]] = mapped_column(ForeignKey("strategies.id"))
+    strategy_id: Mapped[int | None] = mapped_column(ForeignKey("strategies.id"))
     version: Mapped[int] = mapped_column(Integer, nullable=False)
-    model_path: Mapped[Optional[str]] = mapped_column(String(500))
+    model_path: Mapped[str | None] = mapped_column(String(500))
     params: Mapped[dict] = mapped_column(JSON)
     metrics: Mapped[dict] = mapped_column(JSON)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
     is_shadow: Mapped[bool] = mapped_column(Boolean, default=False)
-    released_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     __table_args__ = (Index("ix_ml_model_active", "model_type", "is_active"),)
@@ -291,10 +300,10 @@ class MLFeature(Base):
     timeframe: Mapped[str] = mapped_column(String(10), nullable=False)
     timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     features: Mapped[dict] = mapped_column(JSON, nullable=False)
-    label_direction: Mapped[Optional[int]] = mapped_column(
+    label_direction: Mapped[int | None] = mapped_column(
         Integer
     )  # -1, 0, +1
-    label_volatility: Mapped[Optional[float]] = mapped_column(Float)
+    label_volatility: Mapped[float | None] = mapped_column(Float)
     source: Mapped[str] = mapped_column(String(20))  # live, backtest
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
@@ -314,7 +323,7 @@ class BotConfig(Base):
     source: Mapped[str] = mapped_column(
         String(20), default="default"
     )  # default, ui, api, ml
-    updated_by: Mapped[Optional[str]] = mapped_column(String(50))
+    updated_by: Mapped[str | None] = mapped_column(String(50))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=utcnow, onupdate=utcnow
     )
@@ -328,7 +337,7 @@ class BotEvent(Base):
     level: Mapped[str] = mapped_column(String(20), nullable=False)  # INFO, WARNING, ERROR
     source: Mapped[str] = mapped_column(String(50), nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
-    details: Mapped[Optional[dict]] = mapped_column(JSON)
+    details: Mapped[dict | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     __table_args__ = (
@@ -350,9 +359,9 @@ class PerformanceSnapshot(Base):
     weekly_pnl: Mapped[float] = mapped_column(DECIMAL, default=0)
     num_open_positions: Mapped[int] = mapped_column(Integer, default=0)
     num_trades_today: Mapped[int] = mapped_column(Integer, default=0)
-    max_drawdown: Mapped[Optional[float]] = mapped_column(Float)
-    sharpe_ratio: Mapped[Optional[float]] = mapped_column(Float)
-    win_rate: Mapped[Optional[float]] = mapped_column(Float)
+    max_drawdown: Mapped[float | None] = mapped_column(Float)
+    sharpe_ratio: Mapped[float | None] = mapped_column(Float)
+    win_rate: Mapped[float | None] = mapped_column(Float)
 
 
 class TradeDecisionLog(Base):
@@ -366,7 +375,7 @@ class TradeDecisionLog(Base):
         String(30), nullable=False
     )  # market_data, strategy_signal, ml_score, risk_check, execution
     description: Mapped[str] = mapped_column(Text, nullable=False)
-    details: Mapped[Optional[dict]] = mapped_column(JSON)
+    details: Mapped[dict | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     __table_args__ = (
