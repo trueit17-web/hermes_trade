@@ -99,7 +99,13 @@ class TradingBot:
         # CoinGlass клиент
         self.cg_client = get_coinglass_client()
 
-        # Market data ingest
+        # Market data ingest — рыночные данные (свечи для индикаторов/сигналов)
+        # всегда берутся с Binance независимо от активной биржи исполнения
+        # (settings.active_exchange): это публичные данные без авторизации,
+        # и у Binance стабильно лучшая ликвидность/качество данных из
+        # поддерживаемых бирж. Ордера при этом уходят на ту биржу, что
+        # выбрана в settings.active_exchange (см. execution_engine.initialize
+        # ниже) — разделение источника цены и места исполнения.
         self.ingest = MarketDataIngest("binance")
         await self.ingest.initialize()
 
@@ -110,8 +116,11 @@ class TradingBot:
         # топ-N по объёму (например, открытая по Telegram-сигналу на альте)
         # осталась бы без обновления цены до следующего планового
         # обновления вселенной (по умолчанию раз в 12 часов).
-        await execution_engine.initialize("binance")
-        logger.info(f"✅ Execution Engine: {'paper' if settings.is_paper else 'real'} режим")
+        await execution_engine.initialize(settings.active_exchange)
+        logger.info(
+            f"✅ Execution Engine: {'paper' if settings.is_paper else 'real'} режим"
+            f"{f' ({settings.active_exchange})' if not settings.is_paper else ''}"
+        )
         self._sync_open_positions_from_execution_engine()
         await risk_manager.restore_daily_pnl_from_db()
 
@@ -383,6 +392,13 @@ class TradingBot:
                 await model_registry.activate_model("direction_classifier", result["version"])
                 if self.ml_inference:
                     self.ml_inference.load_model("direction_classifier", result["model_path"])
+
+            vol_result = await model_trainer.train_volatility_predictor()
+            if vol_result:
+                logger.info(f"✅ Volatility predictor: v{vol_result['version']}")
+                await model_registry.activate_model("volatility_predictor", vol_result["version"])
+                if self.ml_inference:
+                    self.ml_inference.load_model("volatility_predictor", vol_result["model_path"])
         except Exception as e:
             logger.error(f"ML retraining: {e}")
 
@@ -778,12 +794,15 @@ class TradingBot:
         }
 
         # ML inference
+        predicted_volatility = None
         if self.ml_inference:
             ml_result = await self.ml_inference.predict_direction(strategy_data)
             if ml_result:
                 strategy_data["ml_proba_up"] = ml_result.get("proba_up")
                 strategy_data["ml_proba_down"] = ml_result.get("proba_down")
                 strategy_data["ml_proba_neutral"] = ml_result.get("proba_neutral")
+            if settings.volatility_adjustment_enabled:
+                predicted_volatility = await self.ml_inference.predict_volatility(strategy_data)
 
         # Decision logger: новая цепочка решений для этого символа/итерации —
         # шаги ниже накапливаются в памяти и привязываются к ордеру только
@@ -870,9 +889,15 @@ class TradingBot:
                 balance = execution_engine.get_paper_balance()
             else:
                 balance = await execution_engine.get_real_balance() or 0.0
-            size_pct = signal.position_size_pct * mult
-            position_value = balance * (size_pct / 100)
             entry_price = signal.entry_price if signal.entry_price > 0 else close
+
+            vol_size_mult, vol_sltp_mult = self._volatility_multipliers(predicted_volatility)
+            stop_loss, take_profit = self._scale_sl_tp(
+                signal.side, entry_price, signal.stop_loss, signal.take_profit, vol_sltp_mult,
+            )
+
+            size_pct = signal.position_size_pct * mult * vol_size_mult
+            position_value = balance * (size_pct / 100)
             amount = position_value / entry_price if entry_price > 0 else 0
 
             if amount <= 0:
@@ -881,7 +906,7 @@ class TradingBot:
             order_side = "buy" if signal.side == "long" else "sell"
             logger.info(
                 f"📝 Ордер: {order_side.upper()} {amount:.6f} {symbol} @ {entry_price:.2f} | "
-                f"Conf: {signal.confidence:.2f} | SL: {signal.stop_loss} TP: {signal.take_profit}"
+                f"Conf: {signal.confidence:.2f} | SL: {stop_loss} TP: {take_profit}"
             )
 
             decision_logger.log_execution(
@@ -895,8 +920,8 @@ class TradingBot:
                 amount=amount,
                 price=entry_price,
                 order_type="market",
-                stop_loss=signal.stop_loss,
-                take_profit=signal.take_profit,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
                 strategy_id=signal.strategy_id,
                 signal_data={"strategy_id": signal.strategy_id, "confidence": signal.confidence},
             )
@@ -910,8 +935,8 @@ class TradingBot:
                 self.open_positions[symbol] = {
                     "side": signal.side, "entry_price": entry_price,
                     "amount": amount, "strategy_id": signal.strategy_id,
-                    "rationale": signal.rationale, "sl": signal.stop_loss,
-                    "tp": signal.take_profit, "tp_hit_count": 0,
+                    "rationale": signal.rationale, "sl": stop_loss,
+                    "tp": take_profit, "tp_hit_count": 0,
                     "opened_at": utcnow(),
                     "order_id": order.id, "entry_fee": order.fee,
                 }
@@ -1008,6 +1033,60 @@ class TradingBot:
             candidate = current_price * (1 + t)
             if sl is None or candidate < sl:
                 position["sl"] = candidate
+
+    @staticmethod
+    def _volatility_multipliers(predicted_volatility: float | None) -> tuple[float, float]:
+        """
+        (коэффициент размера позиции, коэффициент ширины SL/TP) по
+        предсказанию volatility_predictor. Ожидаемая волатильность выше
+        базовой -> позиция МЕНЬШЕ (защита от шума на резких движениях) и
+        SL/TP ШИРЕ (чтобы не выбивало тем же шумом раньше времени); ниже
+        базовой -> наоборот. Оба коэффициента ограничены сверху/снизу
+        отдельными настройками, чтобы одна аномальная свеча не увеличивала/
+        не уменьшала позицию в разы. Только для сигналов от стратегий —
+        Telegram-сигналы несут собственные уровни от канала.
+        """
+        if not settings.volatility_adjustment_enabled or predicted_volatility is None:
+            return 1.0, 1.0
+
+        baseline = settings.volatility_baseline_pct / 100
+        if baseline <= 0:
+            return 1.0, 1.0
+
+        vol_ratio = abs(predicted_volatility) / baseline
+        if vol_ratio <= 0:
+            size_mult = settings.volatility_size_max_mult
+        else:
+            size_mult = max(
+                settings.volatility_size_min_mult,
+                min(settings.volatility_size_max_mult, 1.0 / vol_ratio),
+            )
+        sltp_mult = max(
+            settings.volatility_sltp_min_mult,
+            min(settings.volatility_sltp_max_mult, vol_ratio),
+        )
+        return size_mult, sltp_mult
+
+    @staticmethod
+    def _scale_sl_tp(
+        side: str, entry_price: float,
+        stop_loss: float | None, take_profit: float | None, sltp_mult: float,
+    ) -> tuple[float | None, float | None]:
+        """Отодвинуть/приблизить SL и TP от entry_price в sltp_mult раз, сохраняя сторону."""
+        if sltp_mult == 1.0 or not entry_price:
+            return stop_loss, take_profit
+
+        new_sl = stop_loss
+        if stop_loss is not None:
+            distance = abs(entry_price - stop_loss) * sltp_mult
+            new_sl = entry_price - distance if side == "long" else entry_price + distance
+
+        new_tp = take_profit
+        if take_profit is not None:
+            distance = abs(take_profit - entry_price) * sltp_mult
+            new_tp = entry_price + distance if side == "long" else entry_price - distance
+
+        return new_sl, new_tp
 
     async def _check_position_exit(self, symbol: str, current_price: float) -> bool:
         """

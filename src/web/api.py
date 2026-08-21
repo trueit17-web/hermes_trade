@@ -816,15 +816,22 @@ async def activate_ml_model(model_type: str, version: int):
 
 @app.post("/ml/retrain")
 async def trigger_retrain():
-    """Запустить переобучение моделей."""
+    """Запустить переобучение моделей (direction_classifier + volatility_predictor)."""
     logger.info("Запуск переобучения ML моделей...")
     result = await model_trainer.train_direction_classifier()
     if result:
         logger.info(f"Direction classifier переобучен: v{result['version']}")
         await model_registry.activate_model("direction_classifier", result["version"])
+
+    vol_result = await model_trainer.train_volatility_predictor()
+    if vol_result:
+        logger.info(f"Volatility predictor переобучен: v{vol_result['version']}")
+        await model_registry.activate_model("volatility_predictor", vol_result["version"])
+
     return {
-        "success": result is not None,
+        "success": result is not None or vol_result is not None,
         "result": result,
+        "volatility_result": vol_result,
     }
 
 

@@ -85,6 +85,18 @@ SETTINGS_SCHEMA: list[dict] = [
      "description": "Сколько комбинаций гиперпараметров перебирает Optuna при тюнинге модели. Больше — точнее, но дольше обучение."},
     {"key": "ml_optuna_min_samples", "label": "Мин. сэмплов для тюнинга гиперпараметров", "group": "ML", "type": "int",
      "description": "Минимум обучающих примеров, при котором вообще запускается подбор гиперпараметров через Optuna (иначе используются значения по умолчанию)."},
+    {"key": "volatility_adjustment_enabled", "label": "Учитывать предсказанную волатильность", "group": "ML", "type": "bool",
+     "description": "Модель volatility_predictor масштабирует размер позиции (меньше при высокой ожидаемой волатильности) и ширину SL/TP (шире при высокой) для сигналов от стратегий. На Telegram-сигналы не влияет — там уровни задаёт канал."},
+    {"key": "volatility_baseline_pct", "label": "Базовая волатильность (%)", "group": "ML", "type": "float",
+     "description": "Ориентир \"обычной\" волатильности, с которым сравнивается предсказание модели, чтобы понять, насколько текущий момент volatильнее/спокойнее нормы."},
+    {"key": "volatility_size_min_mult", "label": "Sizing: мин. коэффициент", "group": "ML", "type": "float",
+     "description": "Нижняя граница масштабирования размера позиции при аномально высокой предсказанной волатильности."},
+    {"key": "volatility_size_max_mult", "label": "Sizing: макс. коэффициент", "group": "ML", "type": "float",
+     "description": "Верхняя граница масштабирования размера позиции при аномально низкой предсказанной волатильности."},
+    {"key": "volatility_sltp_min_mult", "label": "SL/TP: мин. коэффициент ширины", "group": "ML", "type": "float",
+     "description": "Нижняя граница сужения SL/TP при аномально низкой предсказанной волатильности."},
+    {"key": "volatility_sltp_max_mult", "label": "SL/TP: макс. коэффициент ширины", "group": "ML", "type": "float",
+     "description": "Верхняя граница расширения SL/TP при аномально высокой предсказанной волатильности."},
 
     {"key": "paper_slippage_pct", "label": "Paper: слиппедж (%)", "group": "Paper trading", "type": "float",
      "description": "Имитация проскальзывания цены при исполнении paper-ордеров — насколько цена исполнения хуже цены сигнала."},
@@ -121,6 +133,10 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "telegram_chat_id", "label": "Telegram chat id (уведомления)", "group": "Telegram уведомления", "type": "secret",
      "description": "ID чата/пользователя, куда бот отправляет уведомления. Обычно ваш личный chat id."},
 
+    {"key": "active_exchange", "label": "Активная биржа (real-режим)", "group": "Биржи", "type": "select", "options": ["binance", "bybit", "okx"],
+     "description": "На какой бирже исполняются реальные ордера в real-режиме. Требует заполненных ключей этой биржи ниже. Смена применяется сразу, без перезапуска бота."},
+    {"key": "use_exchange_sandbox", "label": "Демо-счёт (sandbox/testnet)", "group": "Биржи", "type": "bool",
+     "description": "Торговать на демо/testnet-счету биржи вместо реальных денег, тем же API-ключом. Рекомендуется держать включённым, пока не проверили бота вживую."},
     {"key": "binance_api_key", "label": "Binance API key", "group": "Биржи", "type": "secret",
      "description": "Ключ API Binance для торговли в real-режиме. Выдавайте права только на торговлю, без вывода средств."},
     {"key": "binance_api_secret", "label": "Binance API secret", "group": "Биржи", "type": "secret",
@@ -129,6 +145,12 @@ SETTINGS_SCHEMA: list[dict] = [
      "description": "Ключ API Bybit для торговли в real-режиме. Выдавайте права только на торговлю, без вывода средств."},
     {"key": "bybit_api_secret", "label": "Bybit API secret", "group": "Биржи", "type": "secret",
      "description": "Секрет API Bybit, в паре с ключом выше."},
+    {"key": "okx_api_key", "label": "OKX API key", "group": "Биржи", "type": "secret",
+     "description": "Ключ API OKX для торговли в real-режиме. Выдавайте права только на торговлю, без вывода средств."},
+    {"key": "okx_api_secret", "label": "OKX API secret", "group": "Биржи", "type": "secret",
+     "description": "Секрет API OKX, в паре с ключом выше."},
+    {"key": "okx_passphrase", "label": "OKX passphrase", "group": "Биржи", "type": "secret",
+     "description": "Passphrase, заданный при создании API-ключа OKX — обязателен для подписи запросов, отдельно от ключа и секрета."},
 ]
 
 _SCHEMA_BY_KEY = {f["key"]: f for f in SETTINGS_SCHEMA}
@@ -244,10 +266,20 @@ async def apply_settings_update(updates: dict[str, Any]) -> dict:
         from src.risk.risk_manager import risk_manager
         risk_manager.configure(risk_changes)
 
-    if "trading_mode" in updated:
+    if "trading_mode" in updated or "active_exchange" in updated or "use_exchange_sandbox" in updated:
         from src.execution.executor import execution_engine
-        if settings.trading_mode == "real" and execution_engine.is_paper:
-            await execution_engine.initialize("binance")
+        if settings.trading_mode == "real":
+            # Три случая требуют (пере)подключения с нуля: первый переход в
+            # real, смена активной биржи, смена sandbox/live при уже
+            # включённом real — во всех трёх старое соединение ccxt уже не
+            # соответствует нужному режиму.
+            if (
+                execution_engine.is_paper
+                or execution_engine.exchange_id != settings.active_exchange
+                or "active_exchange" in updated
+                or "use_exchange_sandbox" in updated
+            ):
+                await execution_engine.initialize(settings.active_exchange)
         elif settings.trading_mode == "paper":
             execution_engine.is_paper = True
 

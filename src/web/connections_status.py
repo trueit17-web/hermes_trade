@@ -18,14 +18,24 @@ async def get_connections_status() -> list[dict]:
         db_status, db_detail = "error", str(e)
     statuses.append({"key": "database", "name": "База данных", "status": db_status, "detail": db_detail})
 
-    # Биржа (исполнение ордеров)
+    # Биржа (исполнение ордеров) — раньше здесь всегда проверялись только
+    # binance_api_key/secret независимо от активной биржи: подключив только
+    # Bybit или OKX, "not_configured" показывался бы и при полностью
+    # заведённых ключах нужной биржи.
     from src.execution.executor import execution_engine
+    _exchange_credentials = {
+        "binance": (settings.binance_api_key, settings.binance_api_secret),
+        "bybit": (settings.bybit_api_key, settings.bybit_api_secret),
+        "okx": (settings.okx_api_key, settings.okx_api_secret),
+    }
+    active_key, active_secret = _exchange_credentials.get(settings.active_exchange, (None, None))
     if execution_engine.exchange is not None:
-        ex_status, ex_detail = "connected", execution_engine.exchange_id or ""
+        sandbox_suffix = " (демо)" if settings.use_exchange_sandbox else ""
+        ex_status, ex_detail = "connected", f"{execution_engine.exchange_id or ''}{sandbox_suffix}"
     elif settings.is_paper:
         ex_status, ex_detail = "paper_mode", "живое подключение не требуется"
-    elif not (settings.binance_api_key and settings.binance_api_secret):
-        ex_status, ex_detail = "not_configured", "API ключи не заданы"
+    elif not (active_key and active_secret):
+        ex_status, ex_detail = "not_configured", f"API ключи {settings.active_exchange} не заданы"
     else:
         ex_status, ex_detail = "error", "инициализация не удалась, см. логи"
     statuses.append({"key": "exchange", "name": "Биржа (исполнение)", "status": ex_status, "detail": ex_detail})

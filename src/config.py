@@ -23,10 +23,22 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # === Биржи ===
+    # Активная биржа для real-режима (paper всегда работает поверх данных
+    # Binance независимо от этого поля — см. main.py: MarketDataIngest).
+    active_exchange: str = "binance"
+    # Демо/testnet-счёт через тот же API вместо реальных денег (ccxt
+    # set_sandbox_mode) — включено по умолчанию, чтобы переключение в
+    # real-режим само по себе не начинало торговать настоящими деньгами.
+    use_exchange_sandbox: bool = True
     binance_api_key: str | None = None
     binance_api_secret: str | None = None
     bybit_api_key: str | None = None
     bybit_api_secret: str | None = None
+    okx_api_key: str | None = None
+    okx_api_secret: str | None = None
+    # OKX, в отличие от Binance/Bybit, требует третий секрет (passphrase,
+    # задаётся при создании API-ключа на бирже) в каждом запросе.
+    okx_passphrase: str | None = None
 
     # === CoinGlass API ===
     coinglass_api_key: str | None = None
@@ -65,6 +77,22 @@ class Settings(BaseSettings):
     # Trailing stop-loss: 0 = выключен. SL подтягивается к текущей цене на
     # trailing_stop_pct и только ужесточается (никогда не откатывается назад).
     trailing_stop_pct: float = 0.0
+
+    # === Volatility adjustment (predicted volatility -> размер позиции и
+    # ширина SL/TP) — только для сигналов от стратегий (strategy_registry);
+    # Telegram-сигналы несут собственные уровни от канала и не трогаются. ===
+    volatility_adjustment_enabled: bool = False
+    # "Типичная" волатильность (%), с которой сравнивается предсказание
+    # volatility_predictor, чтобы получить коэффициент масштабирования.
+    volatility_baseline_pct: float = 2.0
+    # Предсказанная волатильность ВЫШЕ базовой -> позиция МЕНЬШЕ (защита от
+    # шума на резких движениях), диапазон коэффициента ограничен снизу/сверху.
+    volatility_size_min_mult: float = 0.5
+    volatility_size_max_mult: float = 1.5
+    # Предсказанная волатильность ВЫШЕ базовой -> SL/TP ШИРЕ (чтобы не
+    # выбивало шумом раньше времени), диапазон ограничен снизу/сверху.
+    volatility_sltp_min_mult: float = 0.5
+    volatility_sltp_max_mult: float = 2.0
 
     # === Protections (freqtrade-style автопаузы после плохой серии сделок) ===
     protections_enabled: bool = True

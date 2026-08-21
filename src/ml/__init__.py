@@ -419,6 +419,30 @@ class ModelTrainer:
 
         logger.info(f"✅ Volatility predictor обучен: v{version} | MSE={mse:.6f} MAE={mae:.6f}")
 
+        # Регистрация в БД — без этого модель нигде не появляется:
+        # GET /ml/models её не покажет, model_registry.activate_model()
+        # не найдёт ряд для обновления, а MLInference.predict_volatility()
+        # (которая ищет активную модель именно через registry) никогда не
+        # смогла бы её загрузить, даже если обучение прошло успешно.
+        try:
+            async with get_session() as session:
+                model_record = MLModel(
+                    model_type="volatility_predictor",
+                    version=version,
+                    model_path=str(model_path),
+                    params={**best_params, "feature_cols": available_cols},
+                    metrics={
+                        "mse": round(mse, 6), "mae": round(mae, 6),
+                        "train_samples": len(X_train), "val_samples": len(X_val),
+                    },
+                    is_active=True,
+                    released_at=utcnow(),
+                )
+                session.add(model_record)
+                await session.commit()
+        except Exception as e:
+            logger.warning(f"Не удалось зарегистрировать модель в БД: {e}")
+
         return {
             "version": version,
             "model_path": str(model_path),

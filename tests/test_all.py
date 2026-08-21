@@ -1966,9 +1966,9 @@ class TestUpdateTelegramChannel(unittest.IsolatedAsyncioTestCase):
     редактируемыми (раньше можно было только создать/удалить канал целиком)."""
 
     async def test_partial_update_only_changes_given_fields(self):
-        from src.db.session import get_session
         from src.db.models import TelegramChannel
-        from src.web.api import update_telegram_channel, TelegramChannelUpdate
+        from src.db.session import get_session
+        from src.web.api import TelegramChannelUpdate, update_telegram_channel
 
         async with get_session() as session:
             channel = TelegramChannel(
@@ -1999,7 +1999,8 @@ class TestUpdateTelegramChannel(unittest.IsolatedAsyncioTestCase):
 
     async def test_update_unknown_channel_raises_404(self):
         from fastapi import HTTPException
-        from src.web.api import update_telegram_channel, TelegramChannelUpdate
+
+        from src.web.api import TelegramChannelUpdate, update_telegram_channel
 
         with self.assertRaises(HTTPException) as ctx:
             await update_telegram_channel(999999999, TelegramChannelUpdate(quality_threshold=0.9))
@@ -2086,6 +2087,241 @@ class TestGetTradableSymbols(unittest.IsolatedAsyncioTestCase):
             quote="USDT", blacklist=["ETH/USDT"], max_symbols=10,
         )
         self.assertEqual(set(result), {"BTC/USDT"})
+
+
+class TestVolatilityAdjustment(unittest.TestCase):
+    """
+    TradingBot._volatility_multipliers — переводит предсказание
+    volatility_predictor в коэффициенты для размера позиции (обратная
+    связь с волатильностью) и ширины SL/TP (прямая связь), только для
+    сигналов от стратегий. Раньше модель обучалась, но её предсказание
+    нигде не использовалось.
+    """
+
+    def setUp(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        self.TradingBot = main_module.TradingBot
+        self._saved = {
+            k: getattr(settings, k) for k in (
+                "volatility_adjustment_enabled", "volatility_baseline_pct",
+                "volatility_size_min_mult", "volatility_size_max_mult",
+                "volatility_sltp_min_mult", "volatility_sltp_max_mult",
+            )
+        }
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(settings, k, v)
+
+    def test_disabled_returns_neutral_multipliers(self):
+        settings.volatility_adjustment_enabled = False
+        self.assertEqual(self.TradingBot._volatility_multipliers(0.05), (1.0, 1.0))
+
+    def test_none_prediction_returns_neutral(self):
+        settings.volatility_adjustment_enabled = True
+        self.assertEqual(self.TradingBot._volatility_multipliers(None), (1.0, 1.0))
+
+    def test_high_volatility_shrinks_size_and_widens_sltp(self):
+        settings.volatility_adjustment_enabled = True
+        settings.volatility_baseline_pct = 2.0
+        settings.volatility_size_min_mult, settings.volatility_size_max_mult = 0.5, 1.5
+        settings.volatility_sltp_min_mult, settings.volatility_sltp_max_mult = 0.5, 2.0
+        # Предсказано 4% против базовых 2% -> vol_ratio = 2.
+        size_mult, sltp_mult = self.TradingBot._volatility_multipliers(0.04)
+        self.assertAlmostEqual(size_mult, 0.5)
+        self.assertAlmostEqual(sltp_mult, 2.0)
+
+    def test_low_volatility_grows_size_and_narrows_sltp(self):
+        settings.volatility_adjustment_enabled = True
+        settings.volatility_baseline_pct = 2.0
+        settings.volatility_size_min_mult, settings.volatility_size_max_mult = 0.5, 1.5
+        settings.volatility_sltp_min_mult, settings.volatility_sltp_max_mult = 0.5, 2.0
+        # Предсказано 1% против базовых 2% -> vol_ratio = 0.5.
+        size_mult, sltp_mult = self.TradingBot._volatility_multipliers(0.01)
+        self.assertAlmostEqual(size_mult, 1.5)  # 1/0.5=2.0, ограничено максимумом
+        self.assertAlmostEqual(sltp_mult, 0.5)
+
+
+class TestScaleSlTp(unittest.TestCase):
+    """TradingBot._scale_sl_tp — отодвигает/приближает SL и TP от цены входа
+    в заданное число раз, сохраняя сторону сделки."""
+
+    def setUp(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        self.TradingBot = main_module.TradingBot
+
+    def test_no_scaling_is_passthrough(self):
+        self.assertEqual(self.TradingBot._scale_sl_tp("long", 100.0, 95.0, 110.0, 1.0), (95.0, 110.0))
+
+    def test_widens_long_position(self):
+        sl, tp = self.TradingBot._scale_sl_tp("long", 100.0, 95.0, 110.0, 2.0)
+        self.assertAlmostEqual(sl, 90.0)
+        self.assertAlmostEqual(tp, 120.0)
+
+    def test_widens_short_position(self):
+        sl, tp = self.TradingBot._scale_sl_tp("short", 100.0, 105.0, 90.0, 2.0)
+        self.assertAlmostEqual(sl, 110.0)
+        self.assertAlmostEqual(tp, 80.0)
+
+    def test_narrows_position(self):
+        sl, tp = self.TradingBot._scale_sl_tp("long", 100.0, 90.0, 120.0, 0.5)
+        self.assertAlmostEqual(sl, 95.0)
+        self.assertAlmostEqual(tp, 110.0)
+
+    def test_none_values_pass_through(self):
+        sl, tp = self.TradingBot._scale_sl_tp("long", 100.0, None, None, 2.0)
+        self.assertIsNone(sl)
+        self.assertIsNone(tp)
+
+    def test_zero_entry_price_is_noop(self):
+        self.assertEqual(self.TradingBot._scale_sl_tp("long", 0.0, 95.0, 110.0, 2.0), (95.0, 110.0))
+
+
+class TestVolatilityPredictorRegistration(unittest.IsolatedAsyncioTestCase):
+    """
+    train_volatility_predictor раньше не писал ничего в MLModel — модель
+    обучалась и сохранялась на диск, но GET /ml/models её не видел,
+    activate_model() не находил ряд для обновления, а
+    MLInference.predict_volatility() (которая ищет активную модель именно
+    через ModelRegistry) никогда не смогла бы её загрузить.
+    """
+
+    async def test_registers_active_model_row(self):
+        from sqlalchemy import select
+
+        from src.db.models import MLModel
+        from src.db.session import get_session
+        from src.ml import ModelTrainer
+
+        rng = np.random.default_rng(42)
+        n = 150
+        df = pd.DataFrame({
+            "rsi_14": rng.uniform(20, 80, n),
+            "natr_14": rng.uniform(0.5, 5.0, n),
+            "realized_vol_20": rng.uniform(0.01, 0.05, n),
+            "realized_vol_60": rng.uniform(0.01, 0.05, n),
+            "volume_ratio": rng.uniform(0.5, 2.0, n),
+            "atr_14": rng.uniform(10, 500, n),
+            "return_1": rng.normal(0, 0.01, n),
+            "return_3": rng.normal(0, 0.02, n),
+            "label_volatility": rng.uniform(0.01, 0.05, n),
+        })
+
+        trainer = ModelTrainer()
+        result = await trainer.train_volatility_predictor(training_data=df)
+        self.assertIsNotNone(result)
+
+        async with get_session() as session:
+            row = (
+                await session.execute(
+                    select(MLModel).where(
+                        MLModel.model_type == "volatility_predictor",
+                        MLModel.version == result["version"],
+                    )
+                )
+            ).scalar_one_or_none()
+        self.assertIsNotNone(row)
+        self.assertTrue(row.is_active)
+
+
+class TestMultiExchangeCredentials(unittest.IsolatedAsyncioTestCase):
+    """
+    ExecutionEngine.initialize(exchange_id) раньше БЕЗУСЛОВНО брал
+    settings.binance_api_key/secret независимо от exchange_id — реальное
+    подключение к Bybit (или любой другой бирже) шло по Binance-ключам.
+    Плюс новая поддержка OKX (требует passphrase) и демо-режима
+    (ccxt set_sandbox_mode).
+    """
+
+    def setUp(self):
+        self._saved = {
+            k: getattr(settings, k) for k in (
+                "trading_mode", "binance_api_key", "binance_api_secret",
+                "bybit_api_key", "bybit_api_secret",
+                "okx_api_key", "okx_api_secret", "okx_passphrase",
+                "use_exchange_sandbox",
+            )
+        }
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(settings, k, v)
+
+    async def test_bybit_uses_bybit_credentials_not_binance(self):
+        settings.trading_mode = "real"
+        settings.binance_api_key = "WRONG-should-not-be-used"
+        settings.binance_api_secret = "WRONG-should-not-be-used"
+        settings.bybit_api_key = "correct-bybit-key"
+        settings.bybit_api_secret = "correct-bybit-secret"
+        settings.use_exchange_sandbox = True
+
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        mock_exchange = AsyncMock()
+        mock_exchange.fetch_balance = AsyncMock(return_value={})
+        mock_exchange.set_sandbox_mode = MagicMock()  # ccxt: set_sandbox_mode синхронный
+        with patch("src.execution.executor.ccxt.bybit", return_value=mock_exchange) as mock_cls:
+            await engine.initialize("bybit")
+
+        mock_cls.assert_called_once()
+        config = mock_cls.call_args.args[0]
+        self.assertEqual(config["apiKey"], "correct-bybit-key")
+        self.assertEqual(config["secret"], "correct-bybit-secret")
+        mock_exchange.set_sandbox_mode.assert_called_once_with(True)
+        self.assertFalse(engine.is_paper)
+
+    async def test_okx_passes_passphrase_as_password(self):
+        settings.trading_mode = "real"
+        settings.okx_api_key = "okx-key"
+        settings.okx_api_secret = "okx-secret"
+        settings.okx_passphrase = "okx-passphrase"
+        settings.use_exchange_sandbox = True
+
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        mock_exchange = AsyncMock()
+        mock_exchange.fetch_balance = AsyncMock(return_value={})
+        mock_exchange.set_sandbox_mode = MagicMock()
+        with patch("src.execution.executor.ccxt.okx", return_value=mock_exchange) as mock_cls:
+            await engine.initialize("okx")
+
+        config = mock_cls.call_args.args[0]
+        self.assertEqual(config["apiKey"], "okx-key")
+        self.assertEqual(config["secret"], "okx-secret")
+        self.assertEqual(config["password"], "okx-passphrase")
+
+    async def test_okx_missing_passphrase_falls_back_to_paper(self):
+        settings.trading_mode = "real"
+        settings.okx_api_key = "okx-key"
+        settings.okx_api_secret = "okx-secret"
+        settings.okx_passphrase = None
+
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        await engine.initialize("okx")
+
+        self.assertTrue(engine.is_paper)
+
+    async def test_sandbox_disabled_does_not_call_set_sandbox_mode(self):
+        settings.trading_mode = "real"
+        settings.binance_api_key = "key"
+        settings.binance_api_secret = "secret"
+        settings.use_exchange_sandbox = False
+
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        mock_exchange = AsyncMock()
+        mock_exchange.fetch_balance = AsyncMock(return_value={})
+        with patch("src.execution.executor.ccxt.binance", return_value=mock_exchange):
+            await engine.initialize("binance")
+
+        mock_exchange.set_sandbox_mode.assert_not_called()
 
 
 if __name__ == "__main__":

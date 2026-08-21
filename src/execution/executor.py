@@ -55,40 +55,54 @@ class ExecutionEngine:
 
         # Real mode: подключаемся к бирже
         try:
-            api_key = settings.binance_api_key or ""
-            api_secret = settings.binance_api_secret or ""
+            # Раньше здесь БЕЗУСЛОВНО брались settings.binance_api_key/secret
+            # независимо от exchange_id — подключение к Bybit реально шло по
+            # Binance-ключам (или падало в paper, если их не было), а
+            # собственные ключи Bybit нигде не читались вообще.
+            credentials: dict[str, tuple[str | None, str | None, str | None]] = {
+                "binance": (settings.binance_api_key, settings.binance_api_secret, None),
+                "bybit": (settings.bybit_api_key, settings.bybit_api_secret, None),
+                # OKX, в отличие от Binance/Bybit, требует третий секрет
+                # (passphrase) в каждом запросе — ccxt называет его "password".
+                "okx": (settings.okx_api_key, settings.okx_api_secret, settings.okx_passphrase),
+            }
+            api_key, api_secret, passphrase = credentials.get(exchange_id, (None, None, None))
+            missing_passphrase = exchange_id == "okx" and not passphrase
 
-            if not api_key or not api_secret:
-                logger.warning("⚠️ API ключи не указаны, переключаемся в paper режим")
+            if not api_key or not api_secret or missing_passphrase:
+                logger.warning(f"⚠️ API ключи {exchange_id} не указаны, переключаемся в paper режим")
                 self.is_paper = True
                 await self._restore_paper_state_from_db()
                 return
 
-            if exchange_id == "binance":
-                self.exchange = ccxt.binance({
-                    "apiKey": api_key,
-                    "secret": api_secret,
-                    "enableRateLimit": True,
-                    "options": {"defaultType": "spot"},
-                })
-            elif exchange_id == "bybit":
-                self.exchange = ccxt.bybit({
-                    "apiKey": api_key,
-                    "secret": api_secret,
-                    "enableRateLimit": True,
-                    "options": {"defaultType": "spot"},
-                })
-            else:
-                exchange_class = getattr(ccxt, exchange_id, None)
-                if exchange_class:
-                    self.exchange = exchange_class({
-                        "apiKey": api_key,
-                        "secret": api_secret,
-                        "enableRateLimit": True,
-                    })
+            exchange_class = getattr(ccxt, exchange_id, None)
+            if exchange_class is None:
+                logger.error(f"ccxt не поддерживает биржу '{exchange_id}'")
+                self.is_paper = True
+                await self._restore_paper_state_from_db()
+                return
+
+            exchange_config: dict = {
+                "apiKey": api_key,
+                "secret": api_secret,
+                "enableRateLimit": True,
+                "options": {"defaultType": "spot"},
+            }
+            if passphrase:
+                exchange_config["password"] = passphrase
+            self.exchange = exchange_class(exchange_config)
+
+            if settings.use_exchange_sandbox:
+                # Тот же API-ключ, но запросы идут на demo/testnet-счёт биржи
+                # вместо реального — ccxt сам подменяет нужные адреса
+                # (testnet.binance.vision для Binance, demo-режим Bybit/OKX).
+                self.exchange.set_sandbox_mode(True)
 
             await self.exchange.load_markets()
-            logger.info(f"🔗 Execution Engine: подключено к {exchange_id}")
+            logger.info(
+                f"🔗 Execution Engine: подключено к {exchange_id}"
+                f"{' (демо-счёт)' if settings.use_exchange_sandbox else ' (LIVE, реальные средства)'}"
+            )
 
             # Проверка баланса
             try:
