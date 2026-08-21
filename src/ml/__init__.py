@@ -689,18 +689,22 @@ class MLInference:
         feature_cols = model_data.get("feature_cols", [])
 
         # Подготовка признаков
-        X = []
-        for col in feature_cols:
-            val = features.get(col, 0)
-            X.append(val)
+        X = [features.get(col, 0) for col in feature_cols]
 
         if len(X) != len(feature_cols):
             logger.warning(f"Не все признаки предоставлены: {len(X)} vs {len(feature_cols)}")
             return None
 
+        # DataFrame с именами колонок, а не голый список — модель обучалась
+        # на DataFrame (training_data[available_cols]), и без совпадающих
+        # имён колонок sklearn/lightgbm при каждом предсказании пишет в лог
+        # "X does not have valid feature names, but ... was fitted with
+        # feature names" (не ошибка, но шумит в логах на каждой итерации).
+        X_named = pd.DataFrame([X], columns=feature_cols)
+
         # Предсказание
         try:
-            proba = model.predict_proba([X])[0]
+            proba = model.predict_proba(X_named)[0]
             classes = model.classes_
 
             # Составляем результат
@@ -739,13 +743,11 @@ class MLInference:
         model = model_data["model"]
         feature_cols = model_data.get("feature_cols", [])
 
-        X = []
-        for col in feature_cols:
-            val = features.get(col, 0)
-            X.append(val)
+        X = [features.get(col, 0) for col in feature_cols]
+        X_named = pd.DataFrame([X], columns=feature_cols)
 
         try:
-            pred = model.predict([X])[0]
+            pred = model.predict(X_named)[0]
             return float(pred)
         except Exception as e:
             logger.error(f"Ошибка инференса volatility: {e}")

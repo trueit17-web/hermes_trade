@@ -2230,6 +2230,54 @@ class TestVolatilityPredictorRegistration(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(row.is_active)
 
 
+class TestPredictionUsesNamedFeatures(unittest.IsolatedAsyncioTestCase):
+    """
+    predict_direction/predict_volatility передавали в model.predict[_proba]
+    голый список без имён колонок, хотя модель обучалась на DataFrame с
+    именованными колонками — sklearn/lightgbm логировал предупреждение
+    "X does not have valid feature names, but ... was fitted with feature
+    names" на КАЖДОЕ предсказание (то есть на каждую итерацию торгового
+    цикла по каждому символу — не ошибка, но постоянный шум в логах).
+    """
+
+    async def test_predict_volatility_does_not_warn_about_feature_names(self):
+        import warnings
+
+        from src.ml import MLInference, ModelTrainer
+
+        rng = np.random.default_rng(7)
+        n = 150
+        df = pd.DataFrame({
+            "rsi_14": rng.uniform(20, 80, n),
+            "natr_14": rng.uniform(0.5, 5.0, n),
+            "realized_vol_20": rng.uniform(0.01, 0.05, n),
+            "realized_vol_60": rng.uniform(0.01, 0.05, n),
+            "volume_ratio": rng.uniform(0.5, 2.0, n),
+            "atr_14": rng.uniform(10, 500, n),
+            "return_1": rng.normal(0, 0.01, n),
+            "return_3": rng.normal(0, 0.02, n),
+            "label_volatility": rng.uniform(0.01, 0.05, n),
+        })
+        result = await ModelTrainer().train_volatility_predictor(training_data=df)
+        self.assertIsNotNone(result)
+
+        inference = MLInference()
+        inference.load_model("volatility_predictor", result["model_path"])
+
+        features = {
+            "rsi_14": 55.0, "natr_14": 1.5, "realized_vol_20": 0.02,
+            "realized_vol_60": 0.02, "volume_ratio": 1.1, "atr_14": 100.0,
+            "return_1": 0.001, "return_3": 0.002,
+        }
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            pred = await inference.predict_volatility(features)
+
+        self.assertIsInstance(pred, float)
+        feature_name_warnings = [w for w in caught if "feature names" in str(w.message)]
+        self.assertEqual(feature_name_warnings, [], [str(w.message) for w in feature_name_warnings])
+
+
 class TestMultiExchangeCredentials(unittest.IsolatedAsyncioTestCase):
     """
     ExecutionEngine.initialize(exchange_id) раньше БЕЗУСЛОВНО брал
