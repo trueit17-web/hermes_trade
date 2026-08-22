@@ -279,6 +279,15 @@ async def apply_settings_update(updates: dict[str, Any]) -> dict:
                 or "active_exchange" in updated
                 or "use_exchange_sandbox" in updated
             ):
+                # initialize() САМ ПЕРВЫМ ДЕЛОМ проверяет self.is_paper и,
+                # если он всё ещё True, молча остаётся в paper-режиме, даже
+                # не пытаясь подключиться к бирже — is_paper выставляется
+                # только внутри initialize() при неудаче (нет ключей и
+                # т.п.), но никогда не сбрасывается перед вызовом. Без этой
+                # строки переключение в real через дашборд вообще ничего не
+                # делало: настройка менялась, а движок молча оставался в
+                # paper и логировал "Paper Trading режим".
+                execution_engine.is_paper = False
                 await execution_engine.initialize(settings.active_exchange)
         elif settings.trading_mode == "paper":
             execution_engine.is_paper = True

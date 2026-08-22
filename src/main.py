@@ -99,14 +99,15 @@ class TradingBot:
         # CoinGlass клиент
         self.cg_client = get_coinglass_client()
 
-        # Market data ingest — рыночные данные (свечи для индикаторов/сигналов)
-        # всегда берутся с Binance независимо от активной биржи исполнения
-        # (settings.active_exchange): это публичные данные без авторизации,
-        # и у Binance стабильно лучшая ликвидность/качество данных из
-        # поддерживаемых бирж. Ордера при этом уходят на ту биржу, что
-        # выбрана в settings.active_exchange (см. execution_engine.initialize
-        # ниже) — разделение источника цены и места исполнения.
-        self.ingest = MarketDataIngest("binance")
+        # Market data ingest — свечи для индикаторов/сигналов берутся с той
+        # же биржи, что исполняет ордера (settings.active_exchange), а не
+        # всегда с Binance. Раньше эти два источника были разделены (данные
+        # всегда с Binance, ордера — куда выбрано), из-за чего стратегия
+        # считала индикаторы и entry по одной цене, а реальное исполнение
+        # могло быть по заметно другой цене на другой бирже. Публичные
+        # OHLCV/тикеры не требуют авторизации, поэтому переключение биржи
+        # работает без ключей API этой биржи.
+        self.ingest = MarketDataIngest(settings.active_exchange)
         await self.ingest.initialize()
 
         # Execution engine — до расчёта торговой вселенной: _refresh_symbol_universe

@@ -2278,6 +2278,57 @@ class TestPredictionUsesNamedFeatures(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(feature_name_warnings, [], [str(w.message) for w in feature_name_warnings])
 
 
+class TestRealModeSwitchActuallyConnects(unittest.IsolatedAsyncioTestCase):
+    """
+    apply_settings_update() при переключении trading_mode -> "real" вызывал
+    execution_engine.initialize(...), пока execution_engine.is_paper всё
+    ещё оставался True (выставляется один раз при конструировании движка
+    и больше нигде не сбрасывается) — а initialize() САМ ПЕРВЫМ ДЕЛОМ
+    проверяет self.is_paper и, если он ещё True, молча остаётся в paper,
+    даже не пытаясь подключиться к бирже. Переключение в real через
+    дашборд не делало ровным счётом ничего: настройка менялась, а движок
+    молча оставался в paper и логировал "Paper Trading режим".
+    """
+
+    def setUp(self):
+        self._saved = {
+            k: getattr(settings, k) for k in (
+                "trading_mode", "active_exchange", "use_exchange_sandbox",
+                "okx_api_key", "okx_api_secret", "okx_passphrase",
+            )
+        }
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(settings, k, v)
+
+    async def test_switching_to_real_actually_calls_initialize(self):
+        import src.execution.executor as executor_module
+        from src.web.settings_store import apply_settings_update
+
+        settings.trading_mode = "paper"
+        settings.okx_api_key = "okx-key"
+        settings.okx_api_secret = "okx-secret"
+        settings.okx_passphrase = "okx-pass"
+
+        original_engine = executor_module.execution_engine
+        engine = ExecutionEngine()  # is_paper=True, как только что сконструированный
+        executor_module.execution_engine = engine
+        try:
+            mock_exchange = AsyncMock()
+            mock_exchange.fetch_balance = AsyncMock(return_value={})
+            mock_exchange.set_sandbox_mode = MagicMock()
+            with patch("src.execution.executor.ccxt.okx", return_value=mock_exchange):
+                result = await apply_settings_update({
+                    "trading_mode": "real", "active_exchange": "okx",
+                })
+            self.assertEqual(result["errors"], {})
+            self.assertFalse(engine.is_paper)
+            self.assertIsNotNone(engine.exchange)
+        finally:
+            executor_module.execution_engine = original_engine
+
+
 class TestMultiExchangeCredentials(unittest.IsolatedAsyncioTestCase):
     """
     ExecutionEngine.initialize(exchange_id) раньше БЕЗУСЛОВНО брал
