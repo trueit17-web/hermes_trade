@@ -104,6 +104,8 @@ class ExecutionEngine:
                 f"{' (демо-счёт)' if settings.use_exchange_sandbox else ' (LIVE, реальные средства)'}"
             )
 
+            await self._warn_if_okx_trade_permission_missing(exchange_id)
+
             # Проверка баланса
             try:
                 balance = await self.exchange.fetch_balance()
@@ -125,6 +127,31 @@ class ExecutionEngine:
         except Exception as e:
             logger.error(f"Ошибка инициализации биржи {exchange_id}: {e}")
             self.is_paper = True
+
+    async def _warn_if_okx_trade_permission_missing(self, exchange_id: str):
+        """
+        OKX (в отличие от Binance/Bybit) отдаёт список прав, реально выданных
+        API-ключу, прямо в GET /account/config — поле "perm", например
+        "read_only,trade". Раньше отсутствие права "trade" обнаруживалось
+        только когда первый реальный ордер падал с 50123 "API Key does not
+        have trading permission" — иногда через часы после подключения.
+        Проверка read-only, поэтому срабатывает даже если ключу не хватает
+        именно "trade" (сам запрос его не требует).
+        """
+        if exchange_id != "okx":
+            return
+        try:
+            accounts = await self.exchange.fetch_accounts()
+            perm = (accounts[0]["info"].get("perm") or "") if accounts else ""
+            if perm and "trade" not in perm.split(","):
+                logger.warning(
+                    f"⚠️ OKX API-ключ без права 'Trade' (текущие права: {perm}). "
+                    f"Реальные ордера будут отклоняться биржей — включите Trade "
+                    f"permission в OKX API Management "
+                    f"({'Demo Trading' if settings.use_exchange_sandbox else 'обычный'} ключ)."
+                )
+        except Exception as e:
+            logger.debug(f"Не удалось проверить права OKX API-ключа: {e}")
 
     async def _load_open_positions_from_db(
         self, is_paper: bool,

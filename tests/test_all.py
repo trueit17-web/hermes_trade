@@ -2513,5 +2513,70 @@ class TestRealBalanceReseedsRiskState(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.paper_balance, 4987.65)
 
 
+class TestOkxTradePermissionCheck(unittest.IsolatedAsyncioTestCase):
+    """
+    OKX отдаёт реально выданные API-ключу права прямо в GET /account/config
+    (поле "perm", напр. "read_only,trade") — раньше отсутствие права
+    "trade" обнаруживалось только когда первый реальный ордер падал с
+    50123 "API Key does not have trading permission for the Crypto",
+    иногда спустя долгое время после подключения. Это read-only проверка
+    при initialize(), не блокирующая подключение.
+    """
+
+    def setUp(self):
+        self._saved = {
+            k: getattr(settings, k) for k in (
+                "trading_mode", "okx_api_key", "okx_api_secret",
+                "okx_passphrase", "use_exchange_sandbox",
+            )
+        }
+        settings.trading_mode = "real"
+        settings.okx_api_key = "okx-key"
+        settings.okx_api_secret = "okx-secret"
+        settings.okx_passphrase = "okx-pass"
+        settings.use_exchange_sandbox = True
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(settings, k, v)
+
+    async def test_warns_when_trade_permission_missing(self):
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        mock_exchange = AsyncMock()
+        mock_exchange.set_sandbox_mode = MagicMock()
+        mock_exchange.fetch_balance = AsyncMock(return_value={})
+        mock_exchange.fetch_accounts = AsyncMock(return_value=[{"info": {"perm": "read_only"}}])
+        with patch("src.execution.executor.ccxt.okx", return_value=mock_exchange):
+            with self.assertLogs("src.execution.executor", level="WARNING") as logs:
+                await engine.initialize("okx")
+
+        self.assertTrue(any("Trade" in msg for msg in logs.output))
+
+    async def test_no_warning_when_trade_permission_present(self):
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        mock_exchange = AsyncMock()
+        mock_exchange.set_sandbox_mode = MagicMock()
+        mock_exchange.fetch_balance = AsyncMock(return_value={})
+        mock_exchange.fetch_accounts = AsyncMock(return_value=[{"info": {"perm": "read_only,trade"}}])
+        with patch("src.execution.executor.ccxt.okx", return_value=mock_exchange):
+            await engine.initialize("okx")
+
+        self.assertFalse(engine.is_paper)
+
+    async def test_fetch_accounts_failure_does_not_break_initialize(self):
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        mock_exchange = AsyncMock()
+        mock_exchange.set_sandbox_mode = MagicMock()
+        mock_exchange.fetch_balance = AsyncMock(return_value={})
+        mock_exchange.fetch_accounts = AsyncMock(side_effect=Exception("network error"))
+        with patch("src.execution.executor.ccxt.okx", return_value=mock_exchange):
+            await engine.initialize("okx")
+
+        self.assertFalse(engine.is_paper)
+
+
 if __name__ == "__main__":
     unittest.main()
