@@ -2297,10 +2297,14 @@ class TestRealModeSwitchActuallyConnects(unittest.IsolatedAsyncioTestCase):
                 "okx_api_key", "okx_api_secret", "okx_passphrase",
             )
         }
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        self._saved_risk_state = dict(global_risk_manager.state.__dict__)
 
     def tearDown(self):
         for k, v in self._saved.items():
             setattr(settings, k, v)
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        global_risk_manager.state.__dict__.update(self._saved_risk_state)
 
     async def test_switching_to_real_actually_calls_initialize(self):
         import src.execution.executor as executor_module
@@ -2347,10 +2351,14 @@ class TestMultiExchangeCredentials(unittest.IsolatedAsyncioTestCase):
                 "use_exchange_sandbox",
             )
         }
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        self._saved_risk_state = dict(global_risk_manager.state.__dict__)
 
     def tearDown(self):
         for k, v in self._saved.items():
             setattr(settings, k, v)
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        global_risk_manager.state.__dict__.update(self._saved_risk_state)
 
     async def test_bybit_uses_bybit_credentials_not_binance(self):
         settings.trading_mode = "real"
@@ -2421,6 +2429,88 @@ class TestMultiExchangeCredentials(unittest.IsolatedAsyncioTestCase):
             await engine.initialize("binance")
 
         mock_exchange.set_sandbox_mode.assert_not_called()
+
+
+class TestExtractUsdtBalance(unittest.TestCase):
+    """
+    ccxt fetch_balance() кладёт баланс валюты во ВЛОЖЕННЫЙ словарь
+    (balance['free']['USDT'] и/или balance['USDT'] = {'free':,'used':,'total':}),
+    а не как плоское число на верхнем уровне. Старый код фильтровал
+    isinstance(v, (int, float)) по balance.items() верхнего уровня и
+    поэтому всегда получал 0, независимо от реального остатка на счёте.
+    """
+
+    def test_reads_from_free_dict(self):
+        balance = {"free": {"USDT": 4987.65, "BTC": 0.0}, "used": {}, "total": {}}
+        self.assertEqual(ExecutionEngine._extract_usdt_balance(balance), 4987.65)
+
+    def test_falls_back_to_nested_currency_dict(self):
+        balance = {"USDT": {"free": 5000.0, "used": 12.5, "total": 5012.5}}
+        self.assertEqual(ExecutionEngine._extract_usdt_balance(balance), 5000.0)
+
+    def test_missing_usdt_returns_zero(self):
+        balance = {"free": {"BTC": 0.1}, "BTC": {"free": 0.1, "used": 0, "total": 0.1}}
+        self.assertEqual(ExecutionEngine._extract_usdt_balance(balance), 0.0)
+
+    def test_empty_balance_returns_zero(self):
+        self.assertEqual(ExecutionEngine._extract_usdt_balance({}), 0.0)
+
+
+class TestRealBalanceReseedsRiskState(unittest.IsolatedAsyncioTestCase):
+    """
+    RiskState.start_balance был захардкожен на settings.startup_capital_usdt
+    (paper-дефолт, напр. 10000) и никогда не пересчитывался от реального
+    баланса биржи при входе в real-режим — после переключения в real
+    просадка считалась от чужого числа и почти сразу давала ложное
+    срабатывание max_drawdown_pct с автопаузой торговли (в связке с багом
+    _extract_usdt_balance выше — ровно 100% просадки, т.к. баланс к тому
+    же читался как 0).
+    """
+
+    def setUp(self):
+        self._saved = {
+            k: getattr(settings, k) for k in (
+                "trading_mode", "binance_api_key", "binance_api_secret",
+                "use_exchange_sandbox", "risk_max_drawdown_pct",
+            )
+        }
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        self._saved_risk_state = dict(global_risk_manager.state.__dict__)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(settings, k, v)
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        global_risk_manager.state.__dict__.update(self._saved_risk_state)
+
+    async def test_initialize_reseeds_start_balance_from_real_exchange(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+
+        settings.trading_mode = "real"
+        settings.binance_api_key = "key"
+        settings.binance_api_secret = "secret"
+        settings.use_exchange_sandbox = True
+        settings.risk_max_drawdown_pct = 15
+
+        global_risk_manager.state.start_balance = 10000.0
+        global_risk_manager.state.current_balance = 0.0
+        global_risk_manager.state.paused = True  # как после ложной 100%-просадки
+
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        mock_exchange = AsyncMock()
+        mock_exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"USDT": 4987.65}, "USDT": {"free": 4987.65, "used": 0, "total": 4987.65}}
+        )
+        mock_exchange.set_sandbox_mode = MagicMock()
+        with patch("src.execution.executor.ccxt.binance", return_value=mock_exchange):
+            await engine.initialize("binance")
+
+        self.assertEqual(global_risk_manager.state.start_balance, 4987.65)
+        self.assertEqual(global_risk_manager.state.current_balance, 4987.65)
+        self.assertFalse(global_risk_manager.state.paused)
+        self.assertEqual(global_risk_manager.state.total_drawdown_pct, 0.0)
+        self.assertEqual(engine.paper_balance, 4987.65)
 
 
 if __name__ == "__main__":

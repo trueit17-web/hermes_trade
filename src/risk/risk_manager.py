@@ -260,6 +260,29 @@ class RiskManager:
             self.state.paused = False
         logger.warning(f"🔄 Риск-состояние сброшено вместе с paper-аккаунтом: старт={self.state.start_balance:.2f}")
 
+    def reset_for_real_account(self, balance: float):
+        """
+        Пересчитать базу для просадки от реального баланса биржи при входе
+        в real-режим (первое подключение, смена биржи/sandbox). До этого
+        start_balance был захардкожен на settings.startup_capital_usdt
+        (paper-ориентированный дефолт, обычно 10000) и никогда не совпадал
+        с реальным балансом — это гарантированно давало ложную просадку
+        (вплоть до 100%, если баланс к тому же читался как 0) и мгновенную
+        паузу торговли сразу после переключения в real. В отличие от
+        reset_for_new_paper_account, открытые позиции не затрагиваются —
+        реальный аккаунт не "обнуляется", а его состояние просто уже
+        восстановлено отдельно из БД.
+        """
+        self.state.start_balance = balance
+        self.state.current_balance = balance
+        self.state.daily_pnl = 0.0
+        self.state.daily_loss_limit_reached = False
+        self.state.total_drawdown_pct = 0.0
+        self.state.max_drawdown_reached = 0.0
+        if not self.state.kill_switch_active:
+            self.state.paused = False
+        logger.warning(f"🔄 Риск-состояние пересчитано от реального баланса биржи: старт={balance:.2f}")
+
     def get_state(self) -> dict:
         """Получить текущее состояние риска."""
         return {

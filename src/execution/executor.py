@@ -107,12 +107,16 @@ class ExecutionEngine:
             # Проверка баланса
             try:
                 balance = await self.exchange.fetch_balance()
-                total_usdt = sum(
-                    v for k, v in balance.items()
-                    if isinstance(v, (int, float)) and k.endswith("USDT")
-                )
+                total_usdt = self._extract_usdt_balance(balance)
                 self.paper_balance = total_usdt
                 logger.info(f"💰 Баланс USDT: {total_usdt:.2f}")
+                # Без этого start_balance риск-менеджера оставался на
+                # захардкоженном settings.startup_capital_usdt (paper-дефолт)
+                # и не совпадал с реальным балансом — сразу после
+                # переключения в real это давало ложную просадку (иногда
+                # ровно 100%, если баланс к тому же читался как 0 — см.
+                # _extract_usdt_balance) и мгновенную паузу торговли.
+                risk_manager.reset_for_real_account(total_usdt)
             except Exception as e:
                 logger.warning(f"Не удалось получить баланс: {e}")
 
@@ -1015,10 +1019,29 @@ class ExecutionEngine:
             return None
         try:
             balance = await self.exchange.fetch_balance()
-            return sum(v for k, v in balance.items() if isinstance(v, (int, float)) and k.endswith("USDT"))
+            return self._extract_usdt_balance(balance)
         except Exception as e:
             logger.error(f"Ошибка получения баланса: {e}")
             return None
+
+    @staticmethod
+    def _extract_usdt_balance(balance: dict) -> float:
+        """
+        ccxt fetch_balance() кладёт баланс валюты в ВЛОЖЕННЫЙ словарь:
+        balance['free']['USDT'] (плоское число) и/или balance['USDT'] =
+        {'free':, 'used':, 'total':} (сам по себе словарь, а НЕ число).
+        Старый код фильтровал `isinstance(v, (int, float))` по
+        balance.items() верхнего уровня — balance['USDT'] там всегда
+        словарь, значит проверка никогда не проходила, и баланс всегда
+        читался как 0 независимо от биржи и реального остатка на счёте.
+        """
+        free = balance.get("free") or {}
+        value = free.get("USDT")
+        if value is None:
+            usdt = balance.get("USDT")
+            if isinstance(usdt, dict):
+                value = usdt.get("free")
+        return float(value or 0.0)
 
 
 # Глобальный экземпляр
