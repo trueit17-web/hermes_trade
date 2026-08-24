@@ -2372,7 +2372,7 @@ class TestMultiExchangeCredentials(unittest.IsolatedAsyncioTestCase):
         engine.is_paper = False
         mock_exchange = AsyncMock()
         mock_exchange.fetch_balance = AsyncMock(return_value={})
-        mock_exchange.set_sandbox_mode = MagicMock()  # ccxt: set_sandbox_mode синхронный
+        mock_exchange.enable_demo_trading = MagicMock()  # ccxt: синхронный
         with patch("src.execution.executor.ccxt.bybit", return_value=mock_exchange) as mock_cls:
             await engine.initialize("bybit")
 
@@ -2380,7 +2380,11 @@ class TestMultiExchangeCredentials(unittest.IsolatedAsyncioTestCase):
         config = mock_cls.call_args.args[0]
         self.assertEqual(config["apiKey"], "correct-bybit-key")
         self.assertEqual(config["secret"], "correct-bybit-secret")
-        mock_exchange.set_sandbox_mode.assert_called_once_with(True)
+        # Bybit: demo-ключ живёт на api-demo.bybit.com (enable_demo_trading),
+        # а НЕ на testnet.bybit.com (set_sandbox_mode) — это разные песочницы
+        # с разными ключами, см. комментарий в executor.py.
+        mock_exchange.enable_demo_trading.assert_called_once_with(True)
+        mock_exchange.set_sandbox_mode.assert_not_called()
         self.assertFalse(engine.is_paper)
 
     async def test_okx_passes_passphrase_as_password(self):
@@ -2428,6 +2432,22 @@ class TestMultiExchangeCredentials(unittest.IsolatedAsyncioTestCase):
         with patch("src.execution.executor.ccxt.binance", return_value=mock_exchange):
             await engine.initialize("binance")
 
+        mock_exchange.set_sandbox_mode.assert_not_called()
+
+    async def test_bybit_sandbox_disabled_does_not_call_enable_demo_trading(self):
+        settings.trading_mode = "real"
+        settings.bybit_api_key = "key"
+        settings.bybit_api_secret = "secret"
+        settings.use_exchange_sandbox = False
+
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        mock_exchange = AsyncMock()
+        mock_exchange.fetch_balance = AsyncMock(return_value={})
+        with patch("src.execution.executor.ccxt.bybit", return_value=mock_exchange):
+            await engine.initialize("bybit")
+
+        mock_exchange.enable_demo_trading.assert_not_called()
         mock_exchange.set_sandbox_mode.assert_not_called()
 
 

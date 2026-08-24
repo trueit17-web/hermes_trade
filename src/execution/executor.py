@@ -93,10 +93,27 @@ class ExecutionEngine:
             self.exchange = exchange_class(exchange_config)
 
             if settings.use_exchange_sandbox:
-                # Тот же API-ключ, но запросы идут на demo/testnet-счёт биржи
-                # вместо реального — ccxt сам подменяет нужные адреса
-                # (testnet.binance.vision для Binance, demo-режим Bybit/OKX).
-                self.exchange.set_sandbox_mode(True)
+                if exchange_id == "bybit":
+                    # У Bybit это НЕ то же самое, что set_sandbox_mode.
+                    # set_sandbox_mode(True) шлёт запросы на testnet.bybit.com —
+                    # отдельная песочница со своей регистрацией и своими
+                    # ключами. Ключ, который пользователь создаёт как "демо
+                    # счёт" через переключатель Demo Trading в обычном
+                    # live-аккаунте (обычный путь для retail), живёт на
+                    # api-demo.bybit.com и требует отдельного метода
+                    # enable_demo_trading() — иначе тот же самый, реально
+                    # валидный ключ отправлялся на testnet, который его не
+                    # знает, и Bybit отвечал "API key is invalid" (retCode
+                    # 10003). Методы взаимоисключающие: enable_demo_trading()
+                    # падает с NotSupported, если до этого уже включён
+                    # set_sandbox_mode.
+                    self.exchange.enable_demo_trading(True)
+                else:
+                    # Тот же API-ключ, но запросы идут на demo/testnet-счёт
+                    # биржи вместо реального — ccxt сам подменяет нужные
+                    # адреса (testnet.binance.vision для Binance, demo-режим
+                    # OKX).
+                    self.exchange.set_sandbox_mode(True)
 
             await self.exchange.load_markets()
             logger.info(
