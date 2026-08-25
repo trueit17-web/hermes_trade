@@ -885,6 +885,37 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result)
         self.engine.exchange.create_market_sell_order.assert_called_once_with("ARB/USDT", 100.0)
 
+    async def test_close_real_position_logs_available_balance_on_failure(self):
+        """
+        Когда биржа реально отдаёт 0 доступного баланса (позиция уже продана
+        не через бота, запрос ушёл не в тот account type и т.п.) — клэмп
+        (0 < available < amount) не помогает, продажа падает с той же
+        "Insufficient balance". Раньше в этом случае лог ошибки не показывал
+        вообще ничего о том, что сам бот считает доступным по своей
+        проверке — расследовать было нечем, кроме голого текста ошибки
+        биржи.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"1INCH": 0.0}, "1INCH": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        self.engine.exchange.create_market_sell_order = AsyncMock(
+            side_effect=Exception('bybit {"retCode":170131,"retMsg":"Insufficient balance."}')
+        )
+
+        with self.assertLogs("src.execution.executor", level="ERROR") as logs:
+            result = await self.engine.close_real_position(
+                symbol="1INCH/USDT", side="long", entry_price=0.5, amount=100.0,
+                reason="stop_loss", entry_fee=0.1, holding_seconds=60,
+            )
+
+        self.assertIsNone(result)
+        self.engine.exchange.create_market_sell_order.assert_called_once_with("1INCH/USDT", 100.0)
+        self.assertTrue(any("доступно на бирже: 0.0" in msg for msg in logs.output))
+
     async def test_restore_positions_separates_paper_and_real(self):
         """
         Order.exchange_id раньше был общим для paper и real (одно и то же

@@ -974,6 +974,7 @@ class ExecutionEngine:
         # "Insufficient balance", и позиция навсегда зависает открытой,
         # хотя реально продать почти всё, что есть, всё равно можно.
         sell_amount = amount
+        available = None
         try:
             base_currency = symbol.split("/")[0]
             balance = await self.exchange.fetch_balance()
@@ -990,7 +991,18 @@ class ExecutionEngine:
         try:
             order = await self.exchange.create_market_sell_order(symbol, sell_amount)
         except Exception as e:
-            logger.error(f"❌ Не удалось закрыть реальную позицию {symbol}: {e}")
+            # available логируется прямо здесь (а не только по debug выше) —
+            # без этого "Insufficient balance" от биржи ни разу не говорил,
+            # ЧТО именно бот считает доступным по СВОЕЙ проверке: 0 (актив
+            # действительно отсутствует — например уже продан вручную, или
+            # запрос баланса ушёл не в тот account type биржи) — это
+            # принципиально другая причина, чем "чуть меньше из-за
+            # комиссии/округления" (эту вторую подстраховка выше уже решает).
+            logger.error(
+                f"❌ Не удалось закрыть реальную позицию {symbol}: {e} | "
+                f"наш учёт: {amount:.8f}, доступно на бирже: "
+                f"{available if available is not None else 'не удалось проверить'}"
+            )
             return None
 
         order = await self._fetch_confirmed_order(order, symbol)
