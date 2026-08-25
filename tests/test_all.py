@@ -757,6 +757,56 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(result["pnl"], expected_pnl, places=6)
         self.assertNotIn("BTC/USDT", self.engine.real_positions)
 
+    async def test_close_real_position_clamps_to_available_balance(self):
+        """
+        Отслеживаемый объём позиции — оценка (комиссии/округление лота на
+        бирже могут понемногу расходиться с реальным остатком). Раньше
+        close_real_position всегда пытался продать полный отслеживаемый
+        объём — если на бирже реально чуть меньше (частый случай после
+        комиссии, удержанной из base-валюты), ордер падал с "Insufficient
+        balance", и позиция навсегда зависала открытой. Теперь при
+        расхождении продаём фактически доступный остаток.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"ARB": 99.9}, "ARB": {"free": 99.9, "used": 0, "total": 99.9}}
+        )
+        self.engine.exchange.create_market_sell_order.return_value = {
+            "id": "ex-clamp-1", "filled": 99.9, "price": None, "average": 0.5,
+            "fee": {"cost": 0.05, "currency": "USDT"},
+        }
+
+        result = await self.engine.close_real_position(
+            symbol="ARB/USDT", side="long", entry_price=0.5, amount=100.0,
+            reason="stop_loss", entry_fee=0.1, holding_seconds=60,
+        )
+        self.assertIsNotNone(result)
+        self.engine.exchange.create_market_sell_order.assert_called_once_with("ARB/USDT", 99.9)
+
+    async def test_close_real_position_sells_full_amount_when_balance_sufficient(self):
+        """Когда доступного баланса достаточно, объём ордера не подрезается."""
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"ARB": 150.0}, "ARB": {"free": 150.0, "used": 0, "total": 150.0}}
+        )
+        self.engine.exchange.create_market_sell_order.return_value = {
+            "id": "ex-clamp-2", "filled": 100.0, "price": None, "average": 0.5,
+            "fee": {"cost": 0.05, "currency": "USDT"},
+        }
+
+        result = await self.engine.close_real_position(
+            symbol="ARB/USDT", side="long", entry_price=0.5, amount=100.0,
+            reason="stop_loss", entry_fee=0.1, holding_seconds=60,
+        )
+        self.assertIsNotNone(result)
+        self.engine.exchange.create_market_sell_order.assert_called_once_with("ARB/USDT", 100.0)
+
     async def test_restore_positions_separates_paper_and_real(self):
         """
         Order.exchange_id раньше был общим для paper и real (одно и то же

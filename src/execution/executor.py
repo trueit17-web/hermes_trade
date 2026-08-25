@@ -966,8 +966,27 @@ class ExecutionEngine:
             logger.error(f"close_real_position: закрытие {side}-позиции не поддерживается на споте: {symbol}")
             return None
 
+        # Отслеживаемый объём позиции — оценка (комиссии, округление лота
+        # биржей и т.п. могут понемногу расходиться с реальным остатком) —
+        # без подстраховки продажа "полного" объёма падает на бирже с
+        # "Insufficient balance", и позиция навсегда зависает открытой,
+        # хотя реально продать почти всё, что есть, всё равно можно.
+        sell_amount = amount
         try:
-            order = await self.exchange.create_market_sell_order(symbol, amount)
+            base_currency = symbol.split("/")[0]
+            balance = await self.exchange.fetch_balance()
+            available = self._extract_currency_balance(balance, base_currency)
+            if 0 < available < amount:
+                logger.warning(
+                    f"⚠️ Доступный баланс {base_currency} ({available:.8f}) меньше отслеживаемого "
+                    f"объёма позиции {symbol} ({amount:.8f}) — продаём доступный остаток."
+                )
+                sell_amount = available
+        except Exception as e:
+            logger.debug(f"Не удалось сверить доступный баланс перед закрытием {symbol}: {e}")
+
+        try:
+            order = await self.exchange.create_market_sell_order(symbol, sell_amount)
         except Exception as e:
             logger.error(f"❌ Не удалось закрыть реальную позицию {symbol}: {e}")
             return None
@@ -1092,21 +1111,25 @@ class ExecutionEngine:
 
     @staticmethod
     def _extract_usdt_balance(balance: dict) -> float:
+        return ExecutionEngine._extract_currency_balance(balance, "USDT")
+
+    @staticmethod
+    def _extract_currency_balance(balance: dict, currency: str) -> float:
         """
         ccxt fetch_balance() кладёт баланс валюты в ВЛОЖЕННЫЙ словарь:
-        balance['free']['USDT'] (плоское число) и/или balance['USDT'] =
+        balance['free'][currency] (плоское число) и/или balance[currency] =
         {'free':, 'used':, 'total':} (сам по себе словарь, а НЕ число).
         Старый код фильтровал `isinstance(v, (int, float))` по
-        balance.items() верхнего уровня — balance['USDT'] там всегда
+        balance.items() верхнего уровня — balance[currency] там всегда
         словарь, значит проверка никогда не проходила, и баланс всегда
         читался как 0 независимо от биржи и реального остатка на счёте.
         """
         free = balance.get("free") or {}
-        value = free.get("USDT")
+        value = free.get(currency)
         if value is None:
-            usdt = balance.get("USDT")
-            if isinstance(usdt, dict):
-                value = usdt.get("free")
+            entry = balance.get(currency)
+            if isinstance(entry, dict):
+                value = entry.get("free")
         return float(value or 0.0)
 
 
