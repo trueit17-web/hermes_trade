@@ -49,6 +49,7 @@ from src.utils.logging import logger, setup_logging
 from src.utils.timeutils import utcnow
 from src.web.api import app as web_app
 from src.web.settings_store import load_settings_overrides
+from src.web.websocket import setup_websocket_broadcast
 
 
 class TradingBot:
@@ -1277,6 +1278,13 @@ class TradingBot:
 async def main():
     """Точка входа."""
     bot = TradingBot()
+
+    # setup_websocket_broadcast() существовал, но нигде не вызывался —
+    # /ws-эндпоинт принимал подключения, но event_bus ни разу не был
+    # подписан на трансляцию в WebSocket, поэтому дашборд не получал вообще
+    # никаких real-time уведомлений о сделках, пока сам не спрашивал через
+    # обычный REST-поллинг.
+    setup_websocket_broadcast()
 
     # Веб-панель (FastAPI) запускается в этом же процессе, а не отдельным
     # сервисом — она читает состояние напрямую из in-memory синглтонов

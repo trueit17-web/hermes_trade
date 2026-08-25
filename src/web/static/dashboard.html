@@ -259,6 +259,7 @@
     font-size: 11px;
   }
   #lastUpdated { color: var(--text-dim); font-size: 12px; }
+  .ws-indicator { display: flex; align-items: center; gap: 6px; font-size: 12px; }
   .toast {
     position: fixed; bottom: 20px; right: 20px;
     background: var(--panel); border: 1px solid var(--panel-border);
@@ -477,6 +478,10 @@
     <button class="tab-btn" data-tab="settings">Настройки</button>
   </nav>
   <div class="header-actions">
+    <span class="ws-indicator" title="WebSocket real-time соединение">
+      <span id="wsStatusDot" class="conn-dot conn-not_connected"></span>
+      <span id="wsStatusLabel" class="muted">офлайн</span>
+    </span>
     <div id="lastUpdated">—</div>
     <button id="btnLogout" class="btn-logout">Выйти</button>
   </div>
@@ -1680,6 +1685,58 @@ document.getElementById("btnResetPaper").addEventListener("click", async () => {
 });
 
 document.getElementById("btnRefresh").addEventListener("click", refreshAll);
+
+// === WebSocket real-time обновления ===
+// /ws транслирует событие сразу, как только сделка открылась/закрылась —
+// вместо ожидания следующего планового опроса (REFRESH_MS) дашборд узнаёт
+// об этом мгновенно. Поллинг оставлен как есть (баланс/статусы/логи не
+// транслируются событиями) — WebSocket дополняет его, а не заменяет.
+let ws = null;
+let wsReconnectDelay = 1000;
+let wsReconnectTimer = null;
+
+function setWsStatus(state) {
+  const dot = document.getElementById("wsStatusDot");
+  const label = document.getElementById("wsStatusLabel");
+  dot.className = "conn-dot conn-" + state;
+  label.textContent = state === "connected" ? "live" : (state === "error" ? "переподключение…" : "офлайн");
+}
+
+function connectWebSocket() {
+  clearTimeout(wsReconnectTimer);
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${protocol}//${location.host}/ws`);
+
+  ws.onopen = () => {
+    setWsStatus("connected");
+    wsReconnectDelay = 1000;
+  };
+
+  ws.onmessage = (evt) => {
+    let msg;
+    try { msg = JSON.parse(evt.data); } catch (e) { return; }
+    if (msg.type !== "event" || msg.event_type !== "trade_event") return;
+
+    if (msg.is_opening) {
+      showToast(`📈 Открыта позиция ${msg.symbol} ${msg.direction === "long" ? "LONG" : "SHORT"}`);
+    } else {
+      const sign = msg.pnl >= 0 ? "+" : "";
+      showToast(`${msg.pnl >= 0 ? "✅" : "🔻"} ${msg.symbol} закрыта: ${sign}${fmt(msg.pnl)} USDT (${sign}${fmt(msg.pnl_pct, 2)}%)`);
+    }
+    refreshAll();
+  };
+
+  ws.onclose = (evt) => {
+    setWsStatus(evt.code === 4401 ? "not_connected" : "error");
+    if (evt.code === 4401) return;  // сессия истекла — переподключение бессмысленно
+    wsReconnectTimer = setTimeout(connectWebSocket, wsReconnectDelay);
+    wsReconnectDelay = Math.min(wsReconnectDelay * 1.5, 15000);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+connectWebSocket();
 
 refreshAll();
 setInterval(refreshAll, REFRESH_MS);

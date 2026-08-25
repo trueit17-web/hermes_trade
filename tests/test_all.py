@@ -2811,5 +2811,57 @@ class TestOkxTradePermissionCheck(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(engine.is_paper)
 
 
+class TestWebSocketBroadcast(unittest.IsolatedAsyncioTestCase):
+    """
+    broadcast_event() раньше отправлял клиентам только event.payload — у
+    TradeEvent (и других подклассов Event) собственные данные (symbol,
+    pnl, direction, outcome, is_opening...) хранятся в типизированных
+    полях датакласса, а не в payload, который у них всегда None: клиент
+    получал "event_type": "trade_event" без единого реального поля сделки.
+    Отдельно setup_websocket_broadcast() существовал, но нигде не
+    вызывался — event_bus ни разу не подписывался на трансляцию, поэтому
+    вообще ничего не долетало до /ws вне зависимости от первого бага.
+    """
+
+    async def test_broadcast_event_includes_dataclass_fields(self):
+        from src.web.websocket import broadcast_event
+
+        with patch("src.web.websocket.ws_manager") as mock_manager:
+            mock_manager.broadcast = AsyncMock()
+            event = TradeEvent(
+                trade_id=42, symbol="BTC/USDT", direction="long",
+                entry_price=50000.0, exit_price=52000.0, amount=0.1,
+                pnl=200.0, pnl_pct=4.0, outcome="win", is_opening=False,
+            )
+            await broadcast_event(event)
+
+        mock_manager.broadcast.assert_called_once()
+        sent = mock_manager.broadcast.call_args.args[0]
+        self.assertEqual(sent["type"], "event")
+        self.assertEqual(sent["event_type"], "trade_event")
+        self.assertEqual(sent["symbol"], "BTC/USDT")
+        self.assertEqual(sent["pnl"], 200.0)
+        self.assertEqual(sent["outcome"], "win")
+        self.assertFalse(sent["is_opening"])
+
+    async def test_setup_websocket_broadcast_subscribes_to_event_bus(self):
+        from src.web.websocket import setup_websocket_broadcast
+
+        original_subscribers = dict(event_bus._subscribers)
+        try:
+            event_bus._subscribers = {}
+            setup_websocket_broadcast()
+
+            with patch("src.web.websocket.ws_manager") as mock_manager:
+                mock_manager.broadcast = AsyncMock()
+                await event_bus.publish(TradeEvent(symbol="ETH/USDT", is_opening=True))
+
+            mock_manager.broadcast.assert_called_once()
+            sent = mock_manager.broadcast.call_args.args[0]
+            self.assertEqual(sent["symbol"], "ETH/USDT")
+        finally:
+            event_bus._subscribers = original_subscribers
+
+
 if __name__ == "__main__":
     unittest.main()
