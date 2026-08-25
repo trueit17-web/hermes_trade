@@ -1629,6 +1629,83 @@ class TestTradingIterationPerSymbolIsolation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(processed, ["A/USDT", "C/USDT"])
 
 
+class TestTradingIterationPausedStillUpdatesPrices(unittest.IsolatedAsyncioTestCase):
+    """
+    risk_manager.state.paused (пауза по просадке, которая сама себя не
+    снимает — см. RiskManager.on_balance_update) раньше останавливала
+    _trading_iteration() целиком ранним return — цены не обновлялись, SL/TP
+    открытых позиций не проверялись, ордера не закрывались вплоть до
+    /risk/resume или рестарта бота (реконнект к бирже сбрасывает paused
+    через reset_for_real_account). Новые входы уже блокируются отдельно —
+    risk_manager.check_signal() внутри _process_symbol — поэтому пауза не
+    должна останавливать обработку символов целиком, только открытие новых
+    позиций. kill switch — отдельный, более серьёзный стоп, останавливает
+    итерацию полностью, как и раньше.
+    """
+
+    async def test_paused_still_processes_symbols(self):
+        from unittest.mock import AsyncMock
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+
+        bot = main_module.TradingBot()
+        bot.active_symbols = ["A/USDT", "B/USDT"]
+        bot.daily_pnl_reset_date = main_module.utcnow().date()
+        processed = []
+
+        async def fake_process_symbol(symbol):
+            processed.append(symbol)
+
+        bot._process_symbol = fake_process_symbol
+
+        original_risk_manager = main_module.risk_manager
+        original_get_paper_balance = main_module.execution_engine.get_paper_balance
+        try:
+            main_module.risk_manager = AsyncMock()
+            main_module.risk_manager.state.kill_switch_active = False
+            main_module.risk_manager.state.paused = True
+            main_module.execution_engine.get_paper_balance = lambda: 10000.0
+
+            await bot._trading_iteration()
+        finally:
+            main_module.risk_manager = original_risk_manager
+            main_module.execution_engine.get_paper_balance = original_get_paper_balance
+
+        self.assertEqual(processed, ["A/USDT", "B/USDT"])
+
+    async def test_kill_switch_still_stops_iteration_entirely(self):
+        from unittest.mock import AsyncMock
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+
+        bot = main_module.TradingBot()
+        bot.active_symbols = ["A/USDT", "B/USDT"]
+        bot.daily_pnl_reset_date = main_module.utcnow().date()
+        bot._kill_switch_notified = False
+        processed = []
+
+        async def fake_process_symbol(symbol):
+            processed.append(symbol)
+
+        bot._process_symbol = fake_process_symbol
+
+        original_risk_manager = main_module.risk_manager
+        with patch("src.main.send_notification", new=AsyncMock()):
+            try:
+                main_module.risk_manager = AsyncMock()
+                main_module.risk_manager.state.kill_switch_active = True
+
+                await bot._trading_iteration()
+            finally:
+                main_module.risk_manager = original_risk_manager
+
+        self.assertEqual(processed, [])
+
+
 class TestProtections(unittest.IsolatedAsyncioTestCase):
     """
     Protections (перенесено из clonerbot, адаптировано под hermes_trade):

@@ -660,8 +660,16 @@ class TradingBot:
             return
         self._kill_switch_notified = False
 
-        if risk_manager.state.paused:
-            return
+        # risk_manager.state.paused (в отличие от kill switch) НЕ должен
+        # останавливать всю итерацию целиком: check_signal() уже блокирует
+        # НОВЫЕ входы, пока пауза активна (см. RiskManager.can_trade()).
+        # Ранний return здесь заодно останавливал обновление цен и проверку
+        # SL/TP для УЖЕ открытых позиций — после паузы по просадке (которая
+        # сама себя не снимает, см. on_balance_update()) бот выглядел
+        # полностью замороженным (цены не обновляются, ордера не
+        # закрываются) вплоть до ручного /risk/resume или рестарта — при
+        # реконнекте к бирже reset_for_real_account() снимает паузу, из-за
+        # чего казалось, что "обновления происходят только после рестарта".
 
         # Daily PnL reset
         today = utcnow().date()
