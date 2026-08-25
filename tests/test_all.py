@@ -786,6 +786,92 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(paper_positions)
         self.assertNotIn("ETH/USDT", paper_positions)
 
+    async def test_real_buy_with_base_currency_fee_reduces_tracked_amount(self):
+        """
+        На споте комиссия обычно списывается из полученного актива: купили
+        100 1INCH, но комиссия 0.1 1INCH удержана биржей — реально на счету
+        осталось 99.9. Раньше real_positions запоминал полный запрошенный
+        объём без вычета комиссии, и первая же попытка закрыть позицию тем
+        же объёмом падала на бирже с "Insufficient balance".
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "ex-fee-1", "filled": 100.0, "price": None, "average": 0.5,
+            "fee": {"cost": 0.1, "currency": "1INCH"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="1INCH/USDT", side="buy", amount=100.0, price=0.5,
+            order_type="market", stop_loss=0.45, take_profit=0.6,
+        )
+        self.assertIsNotNone(order)
+        self.assertAlmostEqual(self.engine.real_positions["1INCH/USDT"]["amount"], 99.9)
+
+    async def test_real_buy_with_quote_currency_fee_keeps_full_amount(self):
+        """Комиссия в USDT (квота) не уменьшает объём удерживаемого актива."""
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "ex-fee-2", "filled": 100.0, "price": None, "average": 0.5,
+            "fee": {"cost": 0.05, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="QUOTEFEE1/USDT", side="buy", amount=100.0, price=0.5,
+            order_type="market", stop_loss=0.45, take_profit=0.6,
+        )
+        self.assertIsNotNone(order)
+        self.assertAlmostEqual(self.engine.real_positions["QUOTEFEE1/USDT"]["amount"], 100.0)
+
+    async def test_restore_real_position_subtracts_entry_fee(self):
+        """
+        _load_open_positions_from_db(is_paper=False) должен вычитать
+        комиссию покупки из восстановленного объёма при рестарте — та же
+        логика, что и при живом исполнении (см.
+        test_real_buy_with_base_currency_fee_reduces_tracked_amount), иначе
+        баг воспроизводился бы заново после каждого рестарта бота.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "ex-fee-3", "filled": 100.0, "price": None, "average": 0.5,
+            "fee": {"cost": 0.1, "currency": "1INCH"},
+        }
+        order = await self.engine.create_order(
+            symbol="RESTOREFEE1/USDT", side="buy", amount=100.0, price=0.5,
+            order_type="market", stop_loss=0.45, take_profit=0.6,
+        )
+        self.assertIsNotNone(order)
+
+        real_positions, _, _ = await self.engine._load_open_positions_from_db(is_paper=False)
+        self.assertAlmostEqual(real_positions["RESTOREFEE1/USDT"]["amount"], 99.9)
+
+    async def test_restore_paper_position_does_not_subtract_fee(self):
+        """
+        Paper-комиссия условная и списывается только с cash-баланса
+        (paper_balance), а не с количества актива — реконструкция paper-
+        позиций не должна вычитать её из amount, в отличие от real.
+        """
+        settings.trading_mode = "paper"
+        await self.engine.initialize("binance")
+
+        order = await self.engine.create_order(
+            symbol="RESTOREPAPERFEE1/USDT", side="buy", amount=100.0, price=0.5,
+            order_type="market", stop_loss=0.45, take_profit=0.6,
+        )
+        self.assertIsNotNone(order)
+        self.assertGreater(float(order.fee), 0)
+
+        paper_positions, _, _ = await self.engine._load_open_positions_from_db(is_paper=True)
+        self.assertAlmostEqual(paper_positions["RESTOREPAPERFEE1/USDT"]["amount"], 100.0)
+
 
 class TestTelegramSignalParser(unittest.TestCase):
     """Тесты для парсера Telegram сигналов (живой parse_with_regex из channel_monitor —

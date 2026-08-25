@@ -263,6 +263,14 @@ class ExecutionEngine:
             # иначе для частично закрытой позиции она либо задваивалась бы
             # (уже учтена в PnL прошлых частичных закрытий), либо терялась.
             fee = float(o.fee or 0) * (amount / filled_amount) if filled_amount else 0.0
+            # В real-режиме комиссия покупки на споте по умолчанию списывается
+            # из самого купленного актива (в отличие от paper, где комиссия
+            # условная и списывается только с cash-баланса, не уменьшая
+            # количество) — без вычета восстановленный после рестарта остаток
+            # позиции оказывался больше, чем реально лежит на бирже, и первая
+            # же попытка его закрыть падала с "Insufficient balance".
+            if position_side == "long" and not is_paper:
+                amount = max(0.0, amount - fee)
             # cost_basis (спишется с paper_balance ниже) осмыслен только для
             # long — открытие long списывает amount*price+fee с баланса,
             # открытие short маржу не резервирует (см. _execute_paper_order).
@@ -850,7 +858,19 @@ class ExecutionEngine:
             # было ошибкой. Аналогично order["price"] у маркет-ордеров обычно
             # None (заполняется только order["average"]).
             fill_price = order.get("average") or order.get("price") or price
-            fill_fee = (order.get("fee") or {}).get("cost") or 0
+            fee_info = order.get("fee") or {}
+            fill_fee = fee_info.get("cost") or 0
+            filled_amount = order["filled"] or amount
+            # На споте комиссия обычно списывается из полученного актива:
+            # при покупке — из base-валюты (1INCH), а не из USDT. Раньше
+            # позиция запоминалась с "amount" = запрошенный объём, без
+            # вычета комиссии — реально на бирже оставалось на fill_fee
+            # меньше, и попытка закрыть позицию тем же объёмом падала с
+            # "Insufficient balance".
+            net_amount = filled_amount
+            base_currency = symbol.split("/")[0]
+            if side == "buy" and fee_info.get("currency") == base_currency:
+                net_amount = max(0.0, filled_amount - fill_fee)
 
             async with get_session() as session:
                 exchange_id, symbol_id = await self._resolve_symbol_id(session, symbol)
@@ -864,7 +884,7 @@ class ExecutionEngine:
                     amount=amount,
                     price=price,
                     status="filled",
-                    filled_amount=order["filled"] or amount,
+                    filled_amount=filled_amount,
                     filled_price=fill_price,
                     fee=fill_fee,
                     stop_loss=order_data["stop_loss"],
@@ -879,10 +899,12 @@ class ExecutionEngine:
             # Регистрируем открытую реальную позицию так же, как paper —
             # без этого SL/TP по ней никогда не проверялись бы (см.
             # close_real_position / _check_position_exit в main.py), а
-            # закрыть её вручную из дашборда было бы нельзя.
+            # закрыть её вручную из дашборда было бы нельзя. "amount" —
+            # именно net_amount (за вычетом комиссии из base-валюты, если
+            # применимо), т.к. это реально доступный к продаже остаток.
             if side == "buy":
                 self.real_positions[symbol] = {
-                    "amount": amount,
+                    "amount": net_amount,
                     "entry_price": fill_price,
                     "side": "long",
                     "strategy_id": order_data.get("strategy_id"),
