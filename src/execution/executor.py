@@ -1,4 +1,5 @@
 """Execution Engine — отправка ордеров, исполнение, трекинг."""
+import asyncio
 import logging
 import uuid
 
@@ -851,6 +852,7 @@ class ExecutionEngine:
                 logger.error(f"Неизвестный тип ордера: {order_data['type']}")
                 return None
 
+            order = await self._fetch_confirmed_order(order, symbol)
             logger.info(f"✅ Ордер исполнен на бирже: {order['id']} | {side.upper()} {amount:.4f} {symbol}")
 
             # ccxt возвращает order["fee"] как dict {"cost": ..., "currency": ...}
@@ -991,6 +993,7 @@ class ExecutionEngine:
             logger.error(f"❌ Не удалось закрыть реальную позицию {symbol}: {e}")
             return None
 
+        order = await self._fetch_confirmed_order(order, symbol)
         exit_price = order.get("average") or order.get("price") or entry_price
         exit_fee = (order.get("fee") or {}).get("cost") or 0
 
@@ -1131,6 +1134,38 @@ class ExecutionEngine:
             if isinstance(entry, dict):
                 value = entry.get("free")
         return float(value or 0.0)
+
+    async def _fetch_confirmed_order(self, order: dict, symbol: str, attempts: int = 5, delay: float = 0.5) -> dict:
+        """
+        Bybit v5 (и потенциально другие биржи) на СОЗДАНИЕ маркет-ордера
+        возвращает только orderId — цена/объём/комиссия исполнения туда не
+        попадают, т.к. сопоставление на бирже асинхронное и происходит уже
+        ПОСЛЕ ответа на запрос создания. order["average"]/["price"] в таком
+        ответе всегда None — exit_price/fill_price падали на entry_price
+        (комиссия — на 0), из-за чего PnL ЛЮБОЙ закрытой сделки на Bybit
+        получался ровно 0 (или ровно -комиссия, если она всё же попадала).
+        Раз рыночный ордер исполняется почти мгновенно, короткий поллинг
+        fetch_order догоняет реальные данные буквально за один-два тика.
+        """
+        if order.get("average") or order.get("price"):
+            return order
+        order_id = order.get("id")
+        if not order_id:
+            return order
+        for _ in range(attempts):
+            await asyncio.sleep(delay)
+            try:
+                fetched = await self.exchange.fetch_order(order_id, symbol)
+            except Exception as e:
+                logger.debug(f"Не удалось уточнить исполнение ордера {order_id} ({symbol}): {e}")
+                break
+            if fetched.get("average") or fetched.get("price"):
+                return fetched
+        logger.warning(
+            f"⚠️ Не удалось получить цену исполнения ордера {order_id} ({symbol}) — "
+            f"PnL этой сделки будет посчитан по запрошенной цене, а не фактической."
+        )
+        return order
 
 
 # Глобальный экземпляр

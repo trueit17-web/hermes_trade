@@ -731,6 +731,53 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertIn("BTC/USDT", self.engine.real_positions)
         self.assertEqual(self.engine.real_positions["BTC/USDT"]["entry_price"], 50000.0)
 
+    async def test_execute_real_order_polls_fetch_order_when_create_response_is_a_skeleton(self):
+        """
+        Bybit v5 на создание маркет-ордера отдаёт ТОЛЬКО orderId — цена,
+        объём и комиссия исполнения туда не попадают (сопоставление
+        асинхронное). average/price в таком ответе всегда None — без
+        догоняющего fetch_order exit_price/fill_price падал бы на
+        entry_price/запрошенную цену, а комиссия терялась бы — из-за чего
+        PnL ЛЮБОЙ закрытой на Bybit сделки получался ровно 0.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "bybit-order-1", "filled": None, "price": None, "average": None, "fee": None,
+        }
+        self.engine.exchange.fetch_order = AsyncMock(return_value={
+            "id": "bybit-order-1", "filled": 0.2, "price": None, "average": 3000.0,
+            "fee": {"cost": 1.5, "currency": "USDT"},
+        })
+
+        with patch("src.execution.executor.asyncio.sleep", new=AsyncMock()):
+            order = await self.engine.create_order(
+                symbol="ETH/USDT", side="buy", amount=0.2, price=3000.0,
+                order_type="market", stop_loss=2900.0, take_profit=3200.0,
+            )
+
+        self.assertIsNotNone(order)
+        self.engine.exchange.fetch_order.assert_called_once_with("bybit-order-1", "ETH/USDT")
+        self.assertEqual(float(order.filled_price), 3000.0)
+        self.assertEqual(float(order.fee), 1.5)
+        self.assertEqual(self.engine.real_positions["ETH/USDT"]["entry_price"], 3000.0)
+
+    async def test_fetch_confirmed_order_gives_up_after_all_attempts_fail(self):
+        """Если fetch_order так и не вернул цену — используем то, что было (не зависаем/не падаем)."""
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_order = AsyncMock(return_value={
+            "id": "stuck-order", "filled": None, "price": None, "average": None,
+        })
+        skeleton = {"id": "stuck-order", "filled": None, "price": None, "average": None}
+
+        with patch("src.execution.executor.asyncio.sleep", new=AsyncMock()):
+            result = await self.engine._fetch_confirmed_order(skeleton, "BTC/USDT", attempts=2, delay=0.01)
+
+        self.assertEqual(result, skeleton)
+        self.assertEqual(self.engine.exchange.fetch_order.call_count, 2)
+
     async def test_close_real_position_uses_actual_fill_price(self):
         """
         close_real_position должен считать PnL по фактической цене исполнения
@@ -756,6 +803,37 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         expected_pnl = (52000.0 - 50000.0) * 0.1 - 5.0 - 5.2
         self.assertAlmostEqual(result["pnl"], expected_pnl, places=6)
         self.assertNotIn("BTC/USDT", self.engine.real_positions)
+
+    async def test_close_real_position_polls_fetch_order_when_response_is_a_skeleton(self):
+        """
+        Тот же баг "PnL закрытой сделки = 0" на закрывающей стороне: Bybit
+        v5 отдаёт на создание ордера только orderId, без average/price/fee —
+        без догоняющего fetch_order exit_price падал бы на entry_price и
+        PnL получался бы ровно 0 (минус потерянная комиссия) для КАЖДОЙ
+        закрытой на Bybit сделки.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_sell_order.return_value = {
+            "id": "bybit-close-1", "filled": None, "price": None, "average": None, "fee": None,
+        }
+        self.engine.exchange.fetch_order = AsyncMock(return_value={
+            "id": "bybit-close-1", "filled": 0.1, "price": None, "average": 52000.0,
+            "fee": {"cost": 5.2, "currency": "USDT"},
+        })
+
+        with patch("src.execution.executor.asyncio.sleep", new=AsyncMock()):
+            result = await self.engine.close_real_position(
+                symbol="BTC/USDT", side="long", entry_price=50000.0, amount=0.1,
+                reason="take_profit", entry_fee=5.0, holding_seconds=60,
+            )
+
+        self.assertIsNotNone(result)
+        expected_pnl = (52000.0 - 50000.0) * 0.1 - 5.0 - 5.2
+        self.assertAlmostEqual(result["pnl"], expected_pnl, places=6)
+        self.assertNotEqual(result["pnl"], 0)
 
     async def test_close_real_position_clamps_to_available_balance(self):
         """
