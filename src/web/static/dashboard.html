@@ -680,6 +680,7 @@ function showToast(msg, isError = false) {
 async function api(path, opts = {}) {
   const res = await fetch(path, {
     headers: { "Content-Type": "application/json" },
+    cache: "no-store",
     ...opts,
   });
   if (res.status === 401) {

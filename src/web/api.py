@@ -76,7 +76,14 @@ async def auth_middleware(request: Request, call_next):
             return RedirectResponse(url="/login")
         return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
-    return await call_next(request)
+    response = await call_next(request)
+    # Без явного no-store браузер/промежуточный прокси может закэшировать
+    # GET-ответ (напр. /status) по HTTP-эвристике — дашборд тогда выглядит
+    # "обновляется" (fetch успешен, таймстамп в шапке меняется — он чисто
+    # клиентский), но реально показывает одни и те же старые данные снова
+    # и снова, без единой ошибки в консоли.
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 # === WebSocket менеджер для real-time обновлений ===

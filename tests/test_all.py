@@ -1833,6 +1833,51 @@ class TestTradingIterationPausedStillUpdatesPrices(unittest.IsolatedAsyncioTestC
 
         self.assertEqual(processed, [])
 
+    async def test_balance_update_crash_does_not_block_symbol_loop(self):
+        """
+        Обновление баланса/просадки (risk_manager.on_balance_update) идёт
+        ДО цикла по active_symbols и раньше не было защищено — необработанное
+        исключение там (например, повреждённая запись в open_positions)
+        прерывало ВСЮ _trading_iteration() до того, как цикл по символам
+        вообще начинался: цены не обновлялись и SL/TP не проверялись ни для
+        одной позиции, каждую итерацию — тот же эффект "полной заморозки",
+        что и исправленный ранее блокирующий return на паузе.
+        """
+        from unittest.mock import AsyncMock
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+
+        bot = main_module.TradingBot()
+        bot.active_symbols = ["A/USDT", "B/USDT"]
+        bot.daily_pnl_reset_date = main_module.utcnow().date()
+        processed = []
+
+        async def fake_process_symbol(symbol):
+            processed.append(symbol)
+
+        bot._process_symbol = fake_process_symbol
+
+        original_risk_manager = main_module.risk_manager
+        original_get_paper_balance = main_module.execution_engine.get_paper_balance
+        original_trading_mode = settings.trading_mode
+        try:
+            settings.trading_mode = "paper"
+            main_module.risk_manager = AsyncMock()
+            main_module.risk_manager.state.kill_switch_active = False
+            main_module.risk_manager.state.paused = False
+            main_module.risk_manager.on_balance_update = MagicMock(side_effect=RuntimeError("corrupted position"))
+            main_module.execution_engine.get_paper_balance = lambda: 10000.0
+
+            await bot._trading_iteration()
+        finally:
+            main_module.risk_manager = original_risk_manager
+            main_module.execution_engine.get_paper_balance = original_get_paper_balance
+            settings.trading_mode = original_trading_mode
+
+        self.assertEqual(processed, ["A/USDT", "B/USDT"])
+
 
 class TestProtections(unittest.IsolatedAsyncioTestCase):
     """

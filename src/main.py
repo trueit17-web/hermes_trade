@@ -687,13 +687,23 @@ class TradingBot:
         # просто меняют форму: cash -> актив, а не исчезают) выглядело бы
         # как просадка, и бот мог поставить себя на паузу просто за то,
         # что открыл несколько сделок подряд.
-        if settings.is_paper:
-            equity = self._compute_equity(execution_engine.get_paper_balance())
-            risk_manager.on_balance_update(equity)
-        else:
-            real_balance = await execution_engine.get_real_balance()
-            if real_balance is not None:
-                risk_manager.on_balance_update(self._compute_equity(real_balance))
+        # Обёрнуто в try/except: необработанное исключение здесь (например,
+        # повреждённая запись в open_positions) раньше прерывало ВСЮ
+        # _trading_iteration() ДО цикла по символам ниже — цены не
+        # обновлялись и SL/TP не проверялись вообще ни для одной позиции,
+        # каждую итерацию, пока проблема не исчезала сама (или бот не
+        # перезапускался) — тот же эффект "полной заморозки", что и
+        # исправленный ранее блокирующий return на паузе.
+        try:
+            if settings.is_paper:
+                equity = self._compute_equity(execution_engine.get_paper_balance())
+                risk_manager.on_balance_update(equity)
+            else:
+                real_balance = await execution_engine.get_real_balance()
+                if real_balance is not None:
+                    risk_manager.on_balance_update(self._compute_equity(real_balance))
+        except Exception as e:
+            logger.error(f"Ошибка обновления баланса/просадки: {e}")
 
         # Раньше цикл ничем не был защищён — необработанное исключение
         # (сетевой сбой при запросе свечей, ошибка стратегии, что угодно)
