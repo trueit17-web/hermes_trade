@@ -778,6 +778,109 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, skeleton)
         self.assertEqual(self.engine.exchange.fetch_order.call_count, 2)
 
+    async def test_execute_real_order_rejects_unconfirmed_fill(self):
+        """
+        Bybit может вернуть orderId даже для ордера, который на самом деле
+        НЕ исполнился (отклонён движком сопоставления) — сам факт ответа
+        без исключения не значит, что сделка реально произошла. Раньше
+        бот всё равно регистрировал позицию — реального актива на бирже
+        не было (ни самого баланса, ни истории операций), а закрыть такую
+        фантомную позицию было невозможно ("Insufficient balance" на
+        каждой попытке, бесконечно).
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "phantom-order-1", "filled": None, "price": None, "average": None, "fee": None,
+        }
+        self.engine.exchange.fetch_order = AsyncMock(return_value={
+            "id": "phantom-order-1", "filled": None, "price": None, "average": None,
+            "status": "rejected",
+        })
+
+        with patch("src.execution.executor.asyncio.sleep", new=AsyncMock()):
+            order = await self.engine.create_order(
+                symbol="PHANTOM1/USDT", side="buy", amount=100.0, price=0.5,
+                order_type="market", stop_loss=0.45, take_profit=0.6,
+            )
+
+        self.assertIsNone(order)
+        self.assertNotIn("PHANTOM1/USDT", self.engine.real_positions)
+
+    async def test_close_real_position_rejects_unconfirmed_fill(self):
+        """Симметричный случай на закрытии: неподтверждённое исполнение не засчитывается как закрытие."""
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"PHANTOM2": 100.0}, "PHANTOM2": {"free": 100.0, "used": 0, "total": 100.0}}
+        )
+        self.engine.exchange.create_market_sell_order.return_value = {
+            "id": "phantom-close-1", "filled": None, "price": None, "average": None, "fee": None,
+        }
+        self.engine.exchange.fetch_order = AsyncMock(return_value={
+            "id": "phantom-close-1", "filled": None, "price": None, "average": None,
+        })
+
+        with patch("src.execution.executor.asyncio.sleep", new=AsyncMock()):
+            result = await self.engine.close_real_position(
+                symbol="PHANTOM2/USDT", side="long", entry_price=0.5, amount=100.0,
+                reason="stop_loss", entry_fee=0.1, holding_seconds=60,
+            )
+
+        self.assertIsNone(result)
+
+    async def test_close_real_position_reconciles_phantom_when_exchange_confirms_zero_balance(self):
+        """
+        Когда И наша предварительная проверка баланса, И сама попытка
+        продажи независимо согласны, что на бирже 0 актива — это почти
+        наверняка фантомная позиция (открывающий BUY на самом деле не
+        исполнился). Позиция должна сняться с учёта, а не зависать в
+        вечных повторных попытках продать то, чего никогда не было —
+        исходный открывающий ордер помечается rejected, чтобы реконструкция
+        при рестарте не воссоздала фантом заново.
+        """
+        from src.db.models import Order
+        from src.db.session import get_session
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "recon-open-1", "filled": 100.0, "price": None, "average": 0.5,
+            "fee": {"cost": 0.05, "currency": "USDT"},
+        }
+        opening_order = await self.engine.create_order(
+            symbol="RECONCILE1/USDT", side="buy", amount=100.0, price=0.5,
+            order_type="market", stop_loss=0.45, take_profit=0.6,
+        )
+        self.assertIsNotNone(opening_order)
+        self.assertIn("RECONCILE1/USDT", self.engine.real_positions)
+
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"RECONCILE1": 0.0}, "RECONCILE1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        self.engine.exchange.create_market_sell_order = AsyncMock(
+            side_effect=Exception('bybit {"retCode":170131,"retMsg":"Insufficient balance."}')
+        )
+
+        result = await self.engine.close_real_position(
+            symbol="RECONCILE1/USDT", side="long", entry_price=0.5, amount=100.0,
+            reason="stop_loss", entry_fee=0.05, holding_seconds=60,
+            order_open_id=opening_order.id,
+        )
+
+        self.assertIsNone(result)
+        self.assertNotIn("RECONCILE1/USDT", self.engine.real_positions)
+
+        async with get_session() as session:
+            refreshed = await session.get(Order, opening_order.id)
+            self.assertEqual(refreshed.status, "rejected")
+
     async def test_close_real_position_uses_actual_fill_price(self):
         """
         close_real_position должен считать PnL по фактической цене исполнения
@@ -1630,6 +1733,93 @@ class TestTradesGrouping(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(row["amount"], 10.0)
         self.assertEqual(row["holding_seconds"], 180)
 
+    async def test_list_trades_uses_opening_order_time_and_exchange_order_id(self):
+        """
+        Тот же баг, что и в GET /trades/{id}/detail (см. TestTradeDetail):
+        created_at в списке сделок должен быть временем реального открытия
+        позиции (created_at открывающего Order), а не моментом вставки
+        строки Trade в БД (который совпадает с closed_at). Плюс проверка
+        ID открывающего/закрывающего ордера с биржи.
+        """
+        from src.execution.executor import ExecutionEngine
+        from src.web.api import list_trades
+        from src.db.session import get_session
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "real"
+        engine.is_paper = False
+        engine.exchange_id = "bybit"
+        engine.exchange = AsyncMock()
+        engine.exchange.create_market_buy_order.return_value = {
+            "id": "list-open-ex-1", "filled": 10.0, "price": None, "average": 200.0,
+            "fee": {"cost": 0.5, "currency": "USDT"},
+        }
+
+        symbol = "TRADESLISTEX1/USDT"
+        order = await engine.create_order(
+            symbol=symbol, side="buy", amount=10.0, price=200.0, order_type="market",
+        )
+        self.assertIsNotNone(order)
+
+        async with get_session() as session:
+            refreshed_order = await session.get(type(order), order.id)
+            expected_opened_at = refreshed_order.created_at.isoformat() + "Z"
+
+        engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"TRADESLISTEX1": 10.0}, "TRADESLISTEX1": {"free": 10.0, "used": 0, "total": 10.0}}
+        )
+        engine.exchange.create_market_sell_order.return_value = {
+            "id": "list-close-ex-1", "filled": 10.0, "price": None, "average": 220.0,
+            "fee": {"cost": 0.5, "currency": "USDT"},
+        }
+        result = await engine.close_real_position(
+            symbol=symbol, side="long", entry_price=200.0, amount=10.0,
+            reason="take_profit_3", entry_fee=0.5, holding_seconds=60, order_open_id=order.id,
+        )
+        self.assertIsNotNone(result)
+
+        listed = await list_trades(limit=200, offset=0)
+        row = next(t for t in listed["trades"] if t["symbol"] == symbol)
+        self.assertEqual(row["created_at"], expected_opened_at)
+        self.assertEqual(row["order_id_exchange_open"], "list-open-ex-1")
+        self.assertEqual(row["order_id_exchange_close"], "list-close-ex-1")
+
+
+class TestStatusExposesExchangeOrderId(unittest.IsolatedAsyncioTestCase):
+    """GET /status должен показывать ID открывающего ордера с биржи для
+    каждой открытой реальной позиции — раньше в ответе был только
+    внутренний DB id ордера, недоступный для сверки с самой биржей."""
+
+    async def test_open_real_position_includes_order_id_exchange(self):
+        from src.execution.executor import ExecutionEngine
+        from src.web.api import get_status
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "real"
+        engine.is_paper = False
+        engine.exchange_id = "bybit"
+        engine.exchange = AsyncMock()
+        engine.exchange.create_market_buy_order.return_value = {
+            "id": "status-open-ex-1", "filled": 10.0, "price": None, "average": 300.0,
+            "fee": {"cost": 0.5, "currency": "USDT"},
+        }
+
+        symbol = "STATUSEX1/USDT"
+        order = await engine.create_order(
+            symbol=symbol, side="buy", amount=10.0, price=300.0, order_type="market",
+        )
+        self.assertIsNotNone(order)
+
+        # api.py импортирует execution_engine на уровне модуля (`from
+        # src.execution.executor import execution_engine`) — это отдельная
+        # привязка имени, переприсваивание src.execution.executor.execution_engine
+        # её не затронуло бы; подменяем именно ссылку внутри api.py.
+        with patch("src.web.api.execution_engine", engine):
+            status = await get_status()
+
+        self.assertIn(symbol, status["paper_positions"])
+        self.assertEqual(status["paper_positions"][symbol]["order_id_exchange"], "status-open-ex-1")
+
 
 class TestTradeDetail(unittest.IsolatedAsyncioTestCase):
     """
@@ -1691,6 +1881,59 @@ class TestTradeDetail(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as ctx:
             await get_trade_detail(999999999)
         self.assertEqual(ctx.exception.status_code, 404)
+
+    async def test_detail_uses_opening_order_time_and_exchange_order_ids(self):
+        """
+        Trade.created_at — момент вставки строки Trade в БД, а Trade
+        создаётся только при ЗАКРЫТИИ позиции — то есть почти совпадает
+        с closed_at, и "Открыта"/"Закрыта" в дашборде показывали одно и
+        то же время. Настоящее время открытия — created_at связанного
+        открывающего Order. Заодно проверяем ID ордеров с биржи (открытие
+        и закрытие) — должны браться из реальных данных ордеров, а не
+        придумываться.
+        """
+        from src.execution.executor import ExecutionEngine
+        from src.web.api import get_trade_detail
+        from src.db.session import get_session
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "real"
+        engine.is_paper = False
+        engine.exchange_id = "bybit"
+        engine.exchange = AsyncMock()
+        engine.exchange.create_market_buy_order.return_value = {
+            "id": "detail-open-ex-1", "filled": 10.0, "price": None, "average": 100.0,
+            "fee": {"cost": 0.5, "currency": "USDT"},
+        }
+
+        symbol = "TRADEDETAILEX1/USDT"
+        order = await engine.create_order(
+            symbol=symbol, side="buy", amount=10.0, price=100.0, order_type="market",
+        )
+        self.assertIsNotNone(order)
+
+        async with get_session() as session:
+            refreshed_order = await session.get(type(order), order.id)
+            expected_opened_at = refreshed_order.created_at.isoformat() + "Z"
+
+        engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"TRADEDETAILEX1": 10.0}, "TRADEDETAILEX1": {"free": 10.0, "used": 0, "total": 10.0}}
+        )
+        engine.exchange.create_market_sell_order.return_value = {
+            "id": "detail-close-ex-1", "filled": 10.0, "price": None, "average": 110.0,
+            "fee": {"cost": 0.5, "currency": "USDT"},
+        }
+        result = await engine.close_real_position(
+            symbol=symbol, side="long", entry_price=100.0, amount=10.0,
+            reason="take_profit_3", entry_fee=0.5, holding_seconds=60, order_open_id=order.id,
+        )
+        self.assertIsNotNone(result)
+
+        detail = await get_trade_detail(result["trade_id"])
+        self.assertEqual(detail["created_at"], expected_opened_at)
+        self.assertEqual(detail["order_id_exchange_open"], "detail-open-ex-1")
+        self.assertEqual(len(detail["legs"]), 1)
+        self.assertEqual(detail["legs"][0]["order_id_exchange_close"], "detail-close-ex-1")
 
 
 class TestClosePositionAtomicity(unittest.IsolatedAsyncioTestCase):

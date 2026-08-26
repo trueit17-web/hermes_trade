@@ -314,9 +314,20 @@ async def get_status():
     # попросту невидимы в дашборде.
     open_positions = execution_engine.get_open_positions()
     if open_positions:
+        order_ids = [pos["order_id"] for pos in open_positions.values() if pos.get("order_id")]
+        exchange_ids_by_order: dict[int, str | None] = {}
+        if order_ids:
+            async with get_session() as session:
+                rows = (
+                    await session.execute(
+                        select(Order.id, Order.order_id_exchange).where(Order.id.in_(order_ids))
+                    )
+                ).all()
+                exchange_ids_by_order = dict(rows)
         for symbol, pos in open_positions.items():
             pos["source"] = _position_source_label(pos.get("strategy_id"))
             pos["current_price"] = execution_engine.last_prices.get(symbol)
+            pos["order_id_exchange"] = exchange_ids_by_order.get(pos.get("order_id"))
 
     balance = (
         execution_engine.get_paper_balance()
@@ -577,7 +588,10 @@ async def list_trades(limit: int = 100, offset: int = 0):
         raw_trades = (
             await session.execute(
                 select(Trade)
-                .options(selectinload(Trade.symbol), selectinload(Trade.strategy))
+                .options(
+                    selectinload(Trade.symbol), selectinload(Trade.strategy),
+                    selectinload(Trade.order_open), selectinload(Trade.order_close),
+                )
                 .order_by(Trade.closed_at.desc(), Trade.created_at.desc())
                 .limit((limit + offset) * 3 + 50)
             )
@@ -602,6 +616,13 @@ async def list_trades(limit: int = 100, offset: int = 0):
             )
             pnl_pct = (total_pnl / (entry_price * total_amount) * 100) if entry_price and total_amount else 0.0
             outcome = "win" if total_pnl > 0 else ("loss" if total_pnl < 0 else "break-even")
+            # Trade.created_at — это момент вставки строки Trade в БД, а
+            # Trade создаётся только при ЗАКРЫТИИ позиции (в
+            # close_paper_position/close_real_position) — то есть почти
+            # совпадает с closed_at. Настоящее время открытия — это
+            # created_at связанного открывающего Order, который создаётся
+            # в момент реального входа в позицию.
+            opened_at = first.order_open.created_at if first.order_open else first.created_at
             aggregated.append({
                 "id": last.id,
                 "symbol_id": last.symbol_id,
@@ -617,7 +638,9 @@ async def list_trades(limit: int = 100, offset: int = 0):
                 "is_open": last.is_open,
                 "parts": len(group),
                 "source": _position_source_label(last.strategy.name if last.strategy else None),
-                "created_at": first.created_at.isoformat() + "Z" if first.created_at else None,
+                "order_id_exchange_open": first.order_open.order_id_exchange if first.order_open else None,
+                "order_id_exchange_close": last.order_close.order_id_exchange if last.order_close else None,
+                "created_at": opened_at.isoformat() + "Z" if opened_at else None,
                 "closed_at": last.closed_at.isoformat() + "Z" if last.closed_at else None,
                 "_sort_key": (last.closed_at or last.created_at).isoformat() + "Z",
             })
@@ -650,7 +673,10 @@ async def get_trade_detail(trade_id: int):
         trade = (
             await session.execute(
                 select(Trade)
-                .options(selectinload(Trade.symbol), selectinload(Trade.strategy))
+                .options(
+                    selectinload(Trade.symbol), selectinload(Trade.strategy),
+                    selectinload(Trade.order_open),
+                )
                 .where(Trade.id == trade_id)
             )
         ).scalar_one_or_none()
@@ -661,6 +687,7 @@ async def get_trade_detail(trade_id: int):
             group = (
                 await session.execute(
                     select(Trade)
+                    .options(selectinload(Trade.order_close))
                     .where(Trade.order_open_id == trade.order_open_id)
                     .order_by(Trade.closed_at.asc(), Trade.created_at.asc())
                 )
@@ -680,6 +707,11 @@ async def get_trade_detail(trade_id: int):
         total_amount = sum(float(t.amount) for t in group)
         total_pnl = sum(float(t.pnl) for t in group)
         entry_price = float(group[0].entry_price)
+        # Trade.created_at — момент вставки строки Trade в БД (при
+        # ЗАКРЫТИИ позиции), а не настоящее время открытия — см. тот же
+        # комментарий в GET /trades. Настоящее время входа — created_at
+        # связанного открывающего Order.
+        opened_at = trade.order_open.created_at if trade.order_open else group[0].created_at
 
         return {
             "trade_id": trade_id,
@@ -692,7 +724,8 @@ async def get_trade_detail(trade_id: int):
             "pnl_pct": (total_pnl / (entry_price * total_amount) * 100) if entry_price and total_amount else 0.0,
             "outcome": trade.outcome,
             "is_open": trade.is_open,
-            "created_at": group[0].created_at.isoformat() + "Z" if group[0].created_at else None,
+            "order_id_exchange_open": trade.order_open.order_id_exchange if trade.order_open else None,
+            "created_at": opened_at.isoformat() + "Z" if opened_at else None,
             "closed_at": trade.closed_at.isoformat() + "Z" if trade.closed_at else None,
             "legs": [
                 {
@@ -703,6 +736,7 @@ async def get_trade_detail(trade_id: int):
                     "pnl_pct": t.pnl_pct,
                     "outcome": t.outcome,
                     "holding_seconds": t.holding_seconds,
+                    "order_id_exchange_close": t.order_close.order_id_exchange if t.order_close else None,
                     "closed_at": t.closed_at.isoformat() + "Z" if t.closed_at else None,
                 }
                 for t in group

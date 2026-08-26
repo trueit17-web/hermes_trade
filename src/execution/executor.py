@@ -853,6 +853,21 @@ class ExecutionEngine:
                 return None
 
             order = await self._fetch_confirmed_order(order, symbol)
+            # Bybit возвращает orderId даже для ордера, который потом не
+            # исполнился (например, отклонён движком сопоставления) —
+            # получение orderId без исключения НЕ значит, что сделка реально
+            # произошла на бирже. Раньше это не проверялось: бот регистрировал
+            # позицию и списывал "комиссию" для ордера, которого по факту
+            # никогда не было — ни самого актива, ни истории операций по нему
+            # на бирже, а закрыть такую фантомную позицию невозможно
+            # (продавать нечего, "Insufficient balance" на каждой попытке).
+            if not (order.get("filled") or 0) > 0:
+                logger.error(
+                    f"❌ Ордер {order.get('id')} ({symbol}) не подтверждён как реально "
+                    f"исполненный на бирже (filled={order.get('filled')!r}) — позиция НЕ "
+                    f"регистрируется, данные должны быть идентичны бирже."
+                )
+                return None
             logger.info(f"✅ Ордер исполнен на бирже: {order['id']} | {side.upper()} {amount:.4f} {symbol}")
 
             # ccxt возвращает order["fee"] как dict {"cost": ..., "currency": ...}
@@ -1003,9 +1018,25 @@ class ExecutionEngine:
                 f"наш учёт: {amount:.8f}, доступно на бирже: "
                 f"{available if available is not None else 'не удалось проверить'}"
             )
+            if available == 0:
+                # Наша ПРЕДварительная проверка (строкой выше) уже сказала
+                # "доступно 0", и сама биржа ТОЖЕ отказала — оба независимых
+                # сигнала совпадают, значит актива для этой позиции реально
+                # нет. Обычно это фантомная позиция: открывающий BUY-ордер
+                # вернул orderId, но на самом деле не исполнился (см. проверку
+                # в _execute_real_order) — бесконечные повторные попытки
+                # продать то, чего никогда не было, ничего не изменят.
+                await self._reconcile_phantom_position(symbol, order_open_id)
             return None
 
         order = await self._fetch_confirmed_order(order, symbol)
+        if not (order.get("filled") or 0) > 0:
+            logger.error(
+                f"❌ Закрывающий ордер {order.get('id')} ({symbol}) не подтверждён как "
+                f"реально исполненный на бирже (filled={order.get('filled')!r}) — закрытие "
+                f"НЕ засчитывается, данные должны быть идентичны бирже."
+            )
+            return None
         exit_price = order.get("average") or order.get("price") or entry_price
         exit_fee = (order.get("fee") or {}).get("cost") or 0
 
@@ -1100,6 +1131,37 @@ class ExecutionEngine:
         await event_bus.publish(trade_event)
 
         return {"pnl": pnl, "pnl_pct": pnl_pct, "outcome": outcome, "trade_id": trade_id}
+
+    async def _reconcile_phantom_position(self, symbol: str, order_open_id: int | None):
+        """
+        Снять с учёта позицию, для которой на бирже реально нет актива —
+        и наша предварительная проверка баланса, и сама попытка продажи
+        независимо согласны, что доступно 0. Обычно причина в том, что
+        открывающий BUY-ордер вернул orderId, но так и не исполнился на
+        бирже (Bybit не гарантирует исполнение самим фактом ответа на
+        создание ордера — см. проверку в _execute_real_order/
+        close_real_position), а старый код регистрировал позицию без
+        проверки реального исполнения.
+
+        Помечаем исходный открывающий Order как rejected (а не оставляем
+        "filled") — без этого при следующем рестарте бота позиция
+        реконструировалась бы из БД заново (реконструкция берёт только
+        Order.status == "filled", см. _load_open_positions_from_db), и
+        зависание повторилось бы. Не создаём фиктивную закрывающую Trade —
+        реальной сделки никогда не было.
+        """
+        self.real_positions.pop(symbol, None)
+        if order_open_id is not None:
+            async with get_session() as session:
+                await session.execute(
+                    update(Order).where(Order.id == order_open_id).values(status="rejected")
+                )
+                await session.commit()
+        logger.warning(
+            f"⚠️ Позиция {symbol} снята с учёта: на бирже нет соответствующего актива "
+            f"(0 доступного баланса, подтверждено дважды) — исходный открывающий ордер "
+            f"помечен как rejected, реального открытия на бирже не было."
+        )
 
     def can_execute(self) -> bool:
         """Можно ли исполнить ордер?"""
