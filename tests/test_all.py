@@ -3260,5 +3260,144 @@ class TestWebSocketBroadcast(unittest.IsolatedAsyncioTestCase):
             event_bus._subscribers = original_subscribers
 
 
+class TestManualTrading(unittest.IsolatedAsyncioTestCase):
+    """
+    Вкладка 'Ручная торговля': POST /manual/order открывает сделку через
+    тот же execution_engine.create_order(), что и стратегии/Telegram, с
+    strategy_id="manual" — и регистрирует её в основном торговом цикле
+    (src.main.current_bot), иначе SL/TP такой позиции никогда бы не
+    проверялись. POST /positions/{symbol}/edit меняет SL/TP на лету.
+    """
+
+    def setUp(self):
+        import src.main as main_module
+        import src.web.api as api_module
+        from fastapi import HTTPException
+
+        self.main_module = main_module
+        self.api_module = api_module
+        self.HTTPException = HTTPException
+        self._saved_trading_mode = settings.trading_mode
+        self._saved_current_bot = main_module.current_bot
+        self._saved_engine = api_module.execution_engine
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+        self.main_module.current_bot = self._saved_current_bot
+        self.api_module.execution_engine = self._saved_engine
+
+    async def _install_engine_and_bot(self, exchange_id="binance", is_paper=True):
+        from src.execution.executor import ExecutionEngine
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "paper" if is_paper else "real"
+        engine.is_paper = is_paper
+        engine.exchange_id = exchange_id
+        self.api_module.execution_engine = engine
+
+        bot = self.main_module.TradingBot()
+        bot.ingest = AsyncMock()
+        bot.ingest.fetch_ohlcv = AsyncMock(return_value=None)
+        self.main_module.current_bot = bot
+        return engine, bot
+
+    async def test_create_manual_order_paper_registers_in_bot_and_engine(self):
+        engine, bot = await self._install_engine_and_bot(is_paper=True)
+
+        result = await self.api_module.create_manual_order(self.api_module.ManualOrderCreate(
+            symbol="MANUALPAPER1/USDT", side="buy", order_type="market",
+            amount=2.0, price=100.0, stop_loss=90.0, take_profit=120.0,
+        ))
+        self.assertTrue(result["success"])
+        self.assertIn("MANUALPAPER1/USDT", engine.paper_positions)
+        self.assertIn("MANUALPAPER1/USDT", bot.open_positions)
+        self.assertEqual(bot.open_positions["MANUALPAPER1/USDT"]["strategy_id"], "manual")
+        self.assertEqual(bot.open_positions["MANUALPAPER1/USDT"]["sl"], 90.0)
+        self.assertEqual(bot.open_positions["MANUALPAPER1/USDT"]["tp"], 120.0)
+        self.assertIn("MANUALPAPER1/USDT", bot.active_symbols)
+
+    async def test_create_manual_order_computes_amount_from_usdt(self):
+        await self._install_engine_and_bot(is_paper=True)
+
+        result = await self.api_module.create_manual_order(self.api_module.ManualOrderCreate(
+            symbol="MANUALPAPER2/USDT", side="buy", order_type="limit",
+            amount_usdt=500.0, price=50.0,
+        ))
+        self.assertTrue(result["success"])
+        self.assertAlmostEqual(result["amount"], 10.0)
+
+    async def test_create_manual_order_rejects_short_on_real_mode(self):
+        await self._install_engine_and_bot(exchange_id="bybit", is_paper=False)
+
+        with self.assertRaises(self.HTTPException) as ctx:
+            await self.api_module.create_manual_order(self.api_module.ManualOrderCreate(
+                symbol="MANUALREAL1/USDT", side="sell", amount=1.0, price=100.0,
+            ))
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    async def test_create_manual_order_rejects_duplicate_position(self):
+        await self._install_engine_and_bot(is_paper=True)
+
+        await self.api_module.create_manual_order(self.api_module.ManualOrderCreate(
+            symbol="MANUALDUP1/USDT", side="buy", amount=1.0, price=100.0,
+        ))
+        with self.assertRaises(self.HTTPException) as ctx:
+            await self.api_module.create_manual_order(self.api_module.ManualOrderCreate(
+                symbol="MANUALDUP1/USDT", side="buy", amount=1.0, price=100.0,
+            ))
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    async def test_edit_position_updates_engine_and_bot_state(self):
+        engine, bot = await self._install_engine_and_bot(is_paper=True)
+
+        await self.api_module.create_manual_order(self.api_module.ManualOrderCreate(
+            symbol="MANUALEDIT1/USDT", side="buy", amount=1.0, price=100.0,
+            stop_loss=90.0, take_profit=110.0,
+        ))
+
+        result = await self.api_module.edit_position(
+            self.api_module.PositionEditRequest(symbol="MANUALEDIT1/USDT", stop_loss=95.0)
+        )
+        self.assertEqual(result["stop_loss"], 95.0)
+        self.assertEqual(result["take_profit"], 110.0, "take_profit не был передан — не должен измениться")
+        self.assertEqual(engine.paper_positions["MANUALEDIT1/USDT"]["stop_loss"], 95.0)
+        self.assertEqual(bot.open_positions["MANUALEDIT1/USDT"]["sl"], 95.0)
+
+        cleared = await self.api_module.edit_position(
+            self.api_module.PositionEditRequest(symbol="MANUALEDIT1/USDT", clear_take_profit=True)
+        )
+        self.assertIsNone(cleared["take_profit"])
+        self.assertIsNone(bot.open_positions["MANUALEDIT1/USDT"]["tp"])
+
+    async def test_edit_position_unknown_symbol_404(self):
+        await self._install_engine_and_bot(is_paper=True)
+        with self.assertRaises(self.HTTPException) as ctx:
+            await self.api_module.edit_position(
+                self.api_module.PositionEditRequest(symbol="NOPOSITION1/USDT", stop_loss=1.0)
+            )
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    async def test_list_trades_filters_by_strategy_id(self):
+        engine, bot = await self._install_engine_and_bot(is_paper=True)
+
+        order = await self.api_module.create_manual_order(self.api_module.ManualOrderCreate(
+            symbol="MANUALLIST1/USDT", side="buy", amount=1.0, price=100.0,
+        ))
+        del bot.open_positions["MANUALLIST1/USDT"]
+        await engine.close_paper_position(
+            symbol="MANUALLIST1/USDT", side="long", entry_price=100.0, amount=1.0,
+            exit_price=110.0, reason="manual", entry_fee=0.1, holding_seconds=30,
+            order_open_id=order["order_id"], strategy_id="manual",
+        )
+
+        result = await self.api_module.list_trades(limit=200, offset=0, strategy_id="manual")
+        symbols = {t["symbol"] for t in result["trades"]}
+        self.assertIn("MANUALLIST1/USDT", symbols)
+
+        result_other = await self.api_module.list_trades(limit=200, offset=0, strategy_id="telegram_signal")
+        symbols_other = {t["symbol"] for t in result_other["trades"]}
+        self.assertNotIn("MANUALLIST1/USDT", symbols_other)
+
+
 if __name__ == "__main__":
     unittest.main()

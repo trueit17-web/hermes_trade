@@ -131,6 +131,25 @@
   }
   .add-channel-form input[type="text"] { min-width: 180px; }
   .add-channel-form input[type="number"] { width: 90px; }
+  .add-channel-form select {
+    font: inherit;
+    background: var(--bg);
+    border: 1px solid var(--panel-border);
+    color: var(--text);
+    padding: 8px 10px;
+    border-radius: 8px;
+  }
+  .add-channel-form .field-hint { flex-basis: 100%; margin: -4px 0 0; }
+  .inline-edit-input {
+    font: inherit;
+    background: var(--bg);
+    border: 1px solid var(--panel-border);
+    color: var(--text);
+    padding: 4px 6px;
+    border-radius: 6px;
+    width: 90px;
+  }
+  .row-actions { display: flex; gap: 6px; align-items: center; white-space: nowrap; }
   .checkbox-label {
     display: flex;
     align-items: center;
@@ -475,6 +494,7 @@
   </h1>
   <nav class="tabs">
     <button class="tab-btn active" data-tab="dashboard">Дашборд</button>
+    <button class="tab-btn" data-tab="manual">Ручная торговля</button>
     <button class="tab-btn" data-tab="settings">Настройки</button>
   </nav>
   <div class="header-actions">
@@ -633,6 +653,57 @@
     </div>
 
   </div>
+</div>
+
+<div id="tabManual" class="tab-panel" style="display:none">
+
+  <section>
+    <h2>Открыть сделку вручную</h2>
+    <form id="manualOrderForm" class="add-channel-form">
+      <input type="text" id="manualSymbolInput" placeholder="Символ, напр. BTC/USDT" required>
+      <select id="manualSideInput">
+        <option value="buy">Long (buy)</option>
+        <option value="sell">Short (sell) — только paper</option>
+      </select>
+      <select id="manualOrderTypeInput">
+        <option value="market">Market</option>
+        <option value="limit">Limit</option>
+      </select>
+      <input type="number" id="manualAmountUsdtInput" placeholder="Сумма, USDT" min="0" step="any">
+      <input type="number" id="manualAmountInput" placeholder="Объём в монете (опц.)" min="0" step="any">
+      <input type="number" id="manualPriceInput" placeholder="Цена (для Limit / расчёта из USDT)" min="0" step="any">
+      <input type="number" id="manualSlInput" placeholder="Stop Loss" min="0" step="any">
+      <input type="number" id="manualTpInput" placeholder="Take Profit" min="0" step="any">
+      <button type="submit" class="btn-primary">+ Открыть сделку</button>
+      <p class="muted field-hint">
+        Укажите либо «Объём в монете», либо «Сумма в USDT» (тогда объём считается по указанной цене
+        или по последней известной боту цене символа). Для Limit-ордера цена обязательна.
+        На реальном споте открывается только Long — шорт доступен лишь в paper-режиме.
+      </p>
+    </form>
+  </section>
+
+  <section>
+    <h2>Открытые ручные позиции</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Символ</th><th>Сторона</th><th>Кол-во</th><th>Цена входа</th><th>Текущая цена</th><th>Stop Loss</th><th>Take Profit</th><th>PnL</th><th>ID ордера</th><th></th></tr></thead>
+        <tbody id="manualPositionsBody"><tr class="empty-row"><td colspan="10">Загрузка…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>История ручных сделок</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Символ</th><th>Сторона</th><th>Вход</th><th>Выход</th><th>PnL</th><th>Итог</th><th>В сделке</th><th>Открыта</th><th>Закрыта</th><th>ID ордера</th></tr></thead>
+        <tbody id="manualTradesBody"><tr class="empty-row"><td colspan="10">Загрузка…</td></tr></tbody>
+      </table>
+    </div>
+    <div class="pagination" id="manualTradesPagination"></div>
+  </section>
+
 </div>
 
 </main>
@@ -815,6 +886,199 @@ function renderPositions(status) {
     });
   });
 }
+
+// Открытые вручную позиции — то же status.paper_positions, что и обычная
+// таблица позиций, просто отфильтрованное по strategy_id === "manual", с
+// добавленным инлайн-редактированием SL/TP (POST /positions/{symbol}/edit).
+function renderManualPositions(status) {
+  const body = document.getElementById("manualPositionsBody");
+  const positions = status.paper_positions || {};
+  const rows = Object.entries(positions).filter(([, pos]) => pos.strategy_id === "manual");
+  if (!rows.length) {
+    body.innerHTML = `<tr class="empty-row"><td colspan="10">Нет открытых вручную позиций</td></tr>`;
+    return;
+  }
+  body.innerHTML = rows.map(([symbol, pos]) => {
+    const cur = pos.current_price;
+    let pnlHtml = "—";
+    if (cur !== null && cur !== undefined && pos.entry_price) {
+      const dir = pos.side === "short" ? -1 : 1;
+      const pnlPct = dir * (cur - pos.entry_price) / pos.entry_price * 100;
+      pnlHtml = `<span class="${pnlPct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${pnlPct >= 0 ? "+" : ""}${fmt(pnlPct, 2)}%</span>`;
+    }
+    return `
+    <tr>
+      <td>${symbol}</td>
+      <td class="side-${pos.side === 'long' ? 'long' : 'short'}">${(pos.side || '').toUpperCase()}</td>
+      <td>${fmt(pos.amount, 6)}</td>
+      <td>${fmtPrice(pos.entry_price)}</td>
+      <td>${cur !== null && cur !== undefined ? fmtPrice(cur) : "—"}</td>
+      <td><input type="number" class="inline-edit-input" data-sl-input="${symbol}" value="${pos.stop_loss ?? ''}" step="any" placeholder="—"></td>
+      <td><input type="number" class="inline-edit-input" data-tp-input="${symbol}" value="${pos.take_profit ?? ''}" step="any" placeholder="—"></td>
+      <td>${pnlHtml}</td>
+      <td class="muted">${pos.order_id_exchange ? escapeHtml(pos.order_id_exchange) : "—"}</td>
+      <td class="row-actions">
+        <button class="btn-ghost" data-save-sltp="${symbol}" title="Сохранить SL/TP">💾</button>
+        <button class="btn-icon-danger" data-close-position="${symbol}" title="Закрыть по рынку">✕</button>
+      </td>
+    </tr>
+  `;
+  }).join("");
+
+  body.querySelectorAll("[data-save-sltp]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const symbol = btn.dataset.saveSltp;
+      const slInput = body.querySelector(`[data-sl-input="${symbol}"]`);
+      const tpInput = body.querySelector(`[data-tp-input="${symbol}"]`);
+      const slVal = slInput.value.trim();
+      const tpVal = tpInput.value.trim();
+      btn.disabled = true;
+      try {
+        await api("/positions/edit", {
+          method: "POST",
+          body: JSON.stringify({
+            symbol,
+            stop_loss: slVal === "" ? null : parseFloat(slVal),
+            take_profit: tpVal === "" ? null : parseFloat(tpVal),
+            clear_stop_loss: slVal === "",
+            clear_take_profit: tpVal === "",
+          }),
+        });
+        showToast(`${symbol}: SL/TP обновлены`);
+        await refreshAll();
+      } catch (err) {
+        showToast(`Ошибка: ${err.message}`, true);
+        btn.disabled = false;
+      }
+    });
+  });
+
+  body.querySelectorAll("[data-close-position]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const symbol = btn.dataset.closePosition;
+      if (!confirm(`Закрыть позицию ${symbol} по текущей рыночной цене?`)) return;
+      btn.disabled = true;
+      try {
+        const result = await api("/positions/close", {
+          method: "POST",
+          body: JSON.stringify({ symbol }),
+        });
+        showToast(`${symbol} закрыта: ${result.pnl >= 0 ? "+" : ""}${fmt(result.pnl)} USDT (${fmt(result.pnl_pct, 2)}%)`);
+        await refreshAll();
+      } catch (err) {
+        showToast(`Ошибка: ${err.message}`, true);
+        btn.disabled = false;
+      }
+    });
+  });
+}
+
+const MANUAL_TRADES_PAGE_SIZE = 10;
+let manualTradesPage = 0;
+
+// Отдельная (не разворачиваемая) история именно ручных сделок — своя
+// пагинация и свой запрос (GET /trades?strategy_id=manual), т.к. ручные
+// сделки могут быть разбросаны по страницам общей истории.
+async function renderManualTrades() {
+  const body = document.getElementById("manualTradesBody");
+  const pagination = document.getElementById("manualTradesPagination");
+  try {
+    const offset = manualTradesPage * MANUAL_TRADES_PAGE_SIZE;
+    const data = await api(`/trades?strategy_id=manual&limit=${MANUAL_TRADES_PAGE_SIZE}&offset=${offset}`);
+    const trades = data.trades || [];
+    const total = data.total || 0;
+
+    if (!total) {
+      body.innerHTML = `<tr class="empty-row"><td colspan="10">Ручных сделок пока нет</td></tr>`;
+      pagination.innerHTML = "";
+      return;
+    }
+
+    const lastPage = Math.max(0, Math.ceil(total / MANUAL_TRADES_PAGE_SIZE) - 1);
+    if (manualTradesPage > lastPage) {
+      manualTradesPage = lastPage;
+      return renderManualTrades();
+    }
+
+    body.innerHTML = trades.map(t => {
+      const orderId = t.order_id_exchange_open || t.order_id_exchange_close;
+      return `
+      <tr>
+        <td>${t.symbol || ("#" + t.symbol_id)}</td>
+        <td class="side-${t.direction === 'long' ? 'long' : 'short'}">${(t.direction || '').toUpperCase()}</td>
+        <td>${fmtPrice(t.entry_price)}</td>
+        <td>${t.exit_price !== null ? fmtPrice(t.exit_price) : "—"}</td>
+        <td class="${t.pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${t.pnl >= 0 ? "+" : ""}${fmt(t.pnl)} (${fmt(t.pnl_pct, 2)}%)</td>
+        <td>${t.outcome || (t.is_open ? "открыта" : "—")}</td>
+        <td class="muted">${fmtDuration(t.holding_seconds)}</td>
+        <td class="muted">${t.created_at ? new Date(t.created_at).toLocaleString("ru-RU") : "—"}</td>
+        <td class="muted">${t.closed_at ? new Date(t.closed_at).toLocaleString("ru-RU") : "—"}</td>
+        <td class="muted">${orderId ? escapeHtml(orderId) : "—"}</td>
+      </tr>
+    `;
+    }).join("");
+
+    const pageCount = lastPage + 1;
+    pagination.innerHTML = `
+      <button class="btn-ghost" id="manualTradesPrevBtn" ${manualTradesPage === 0 ? "disabled" : ""}>← Назад</button>
+      <span>Страница ${manualTradesPage + 1} из ${pageCount} (всего: ${total})</span>
+      <button class="btn-ghost" id="manualTradesNextBtn" ${manualTradesPage >= lastPage ? "disabled" : ""}>Вперёд →</button>
+    `;
+    document.getElementById("manualTradesPrevBtn").addEventListener("click", () => {
+      if (manualTradesPage > 0) { manualTradesPage--; renderManualTrades(); }
+    });
+    document.getElementById("manualTradesNextBtn").addEventListener("click", () => {
+      if (manualTradesPage < lastPage) { manualTradesPage++; renderManualTrades(); }
+    });
+  } catch (err) {
+    body.innerHTML = `<tr class="empty-row"><td colspan="10">Ошибка загрузки: ${err.message}</td></tr>`;
+  }
+}
+
+document.getElementById("manualOrderForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const symbol = document.getElementById("manualSymbolInput").value.trim().toUpperCase();
+  const side = document.getElementById("manualSideInput").value;
+  const orderType = document.getElementById("manualOrderTypeInput").value;
+  const amountVal = document.getElementById("manualAmountInput").value.trim();
+  const amountUsdtVal = document.getElementById("manualAmountUsdtInput").value.trim();
+  const priceVal = document.getElementById("manualPriceInput").value.trim();
+  const slVal = document.getElementById("manualSlInput").value.trim();
+  const tpVal = document.getElementById("manualTpInput").value.trim();
+
+  if (!amountVal && !amountUsdtVal) {
+    showToast("Укажите объём в монете или сумму в USDT", true);
+    return;
+  }
+  if (orderType === "limit" && !priceVal) {
+    showToast("Для лимитного ордера укажите цену", true);
+    return;
+  }
+
+  const payload = {
+    symbol, side, order_type: orderType,
+    amount: amountVal ? parseFloat(amountVal) : null,
+    amount_usdt: amountUsdtVal ? parseFloat(amountUsdtVal) : null,
+    price: priceVal ? parseFloat(priceVal) : null,
+    stop_loss: slVal ? parseFloat(slVal) : null,
+    take_profit: tpVal ? parseFloat(tpVal) : null,
+  };
+
+  const submitBtn = e.target.querySelector('button[type="submit"]');
+  submitBtn.disabled = true;
+  try {
+    const result = await api("/manual/order", { method: "POST", body: JSON.stringify(payload) });
+    showToast(`✅ ${symbol}: открыта сделка ${side === "buy" ? "LONG" : "SHORT"} по ${fmtPrice(result.price)}`);
+    e.target.reset();
+    document.getElementById("manualOrderTypeInput").value = "market";
+    document.getElementById("manualSideInput").value = "buy";
+    await refreshAll();
+  } catch (err) {
+    showToast(`Ошибка: ${err.message}`, true);
+  } finally {
+    submitBtn.disabled = false;
+  }
+});
 
 async function renderStrategies() {
   const body = document.getElementById("strategiesBody");
@@ -1363,11 +1627,16 @@ function switchTab(tab) {
   currentTab = tab;
   document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
   document.getElementById("tabDashboard").style.display = tab === "dashboard" ? "" : "none";
+  document.getElementById("tabManual").style.display = tab === "manual" ? "" : "none";
   document.getElementById("tabSettings").style.display = tab === "settings" ? "" : "none";
   if (tab === "settings") {
     loadSettings();
     loadConnections();
     loadModuleList().then(loadLogs);
+  }
+  if (tab === "manual") {
+    if (lastStatus) renderManualPositions(lastStatus);
+    renderManualTrades();
   }
 }
 
@@ -1715,12 +1984,14 @@ async function refreshAll() {
     lastStatus = status;
     renderHeader(status);
     renderPositions(status);
+    renderManualPositions(status);
     const trades = await renderTrades();
     renderStats(status, trades || []);
     await renderStrategies();
     await renderMlModels();
     await renderTelegram();
     await renderProtections();
+    if (currentTab === "manual") await renderManualTrades();
     document.getElementById("lastUpdated").textContent =
       "Обновлено: " + new Date().toLocaleTimeString("ru-RU");
   } catch (err) {

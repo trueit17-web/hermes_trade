@@ -219,6 +219,32 @@ class PositionCloseRequest(BaseModel):
     symbol: str
 
 
+class ManualOrderCreate(BaseModel):
+    """Запрос на открытие сделки вручную со вкладки 'Ручная торговля'."""
+    symbol: str
+    side: str  # "buy" (long) или "sell" (short, только в paper-режиме)
+    order_type: str = "market"  # "market" или "limit"
+    amount: float | None = None  # объём напрямую в базовой валюте
+    amount_usdt: float | None = None  # альтернатива amount — сумма в USDT
+    price: float | None = None  # обязателен для limit; для market — референсная цена, если amount_usdt
+    stop_loss: float | None = None
+    take_profit: float | None = None
+
+
+class PositionEditRequest(BaseModel):
+    """
+    Изменение SL/TP уже открытой позиции. Незаданные поля не меняются.
+    symbol — в теле запроса, а не в пути (как и в PositionCloseRequest),
+    т.к. символы содержат "/" (напр. "BTC/USDT"), который ломает
+    сопоставление пути {symbol} по умолчанию в FastAPI/Starlette.
+    """
+    symbol: str
+    stop_loss: float | None = Field(default=None)
+    take_profit: float | None = Field(default=None)
+    clear_stop_loss: bool = False
+    clear_take_profit: bool = False
+
+
 # === API эндпоинты ===
 
 @app.get("/")
@@ -237,6 +263,8 @@ def _position_source_label(strategy_id: str | None) -> str:
         return "—"
     if strategy_id == "telegram_signal":
         return "📲 Telegram"
+    if strategy_id == "manual":
+        return "🖐 Ручная"
     strategy = strategy_registry.get(strategy_id)
     return strategy.name if strategy else strategy_id
 
@@ -463,6 +491,137 @@ async def close_position_manually(request: PositionCloseRequest):
     return {"success": True, **result}
 
 
+@app.post("/manual/order")
+async def create_manual_order(request: ManualOrderCreate):
+    """
+    Открыть сделку вручную со вкладки 'Ручная торговля'. Использует тот же
+    execution_engine.create_order(), что и стратегии/Telegram-сигналы, с
+    strategy_id="manual" — данные ордера (цена, комиссия, ID на бирже)
+    заполняются исключительно из реального ответа биржи (или paper-
+    симуляции), как и для любого другого источника сигналов.
+    """
+    symbol = request.symbol.strip().upper()
+    side = request.side.strip().lower()
+    if side not in ("buy", "sell"):
+        raise HTTPException(status_code=400, detail="side должен быть 'buy' или 'sell'")
+    if not settings.is_paper and side == "sell":
+        raise HTTPException(
+            status_code=400,
+            detail="На реальном споте нет встроенного шорта — открыть можно только long (buy)",
+        )
+    order_type = request.order_type.strip().lower()
+    if order_type not in ("market", "limit"):
+        raise HTTPException(status_code=400, detail="order_type должен быть 'market' или 'limit'")
+    if order_type == "limit" and not request.price:
+        raise HTTPException(status_code=400, detail="Для лимитного ордера нужна цена (price)")
+
+    existing = execution_engine.get_open_positions().get(symbol)
+    if existing:
+        raise HTTPException(status_code=400, detail=f"По {symbol} уже есть открытая позиция")
+
+    if request.amount:
+        amount = request.amount
+    elif request.amount_usdt:
+        ref_price = request.price or execution_engine.last_prices.get(symbol)
+        if not ref_price:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Текущая цена {symbol} ещё не известна боту — укажите amount "
+                    f"(объём напрямую) или price (для расчёта из amount_usdt)"
+                ),
+            )
+        amount = request.amount_usdt / ref_price
+    else:
+        raise HTTPException(status_code=400, detail="Укажите amount или amount_usdt")
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Объём сделки должен быть положительным")
+
+    order = await execution_engine.create_order(
+        symbol=symbol, side=side, amount=amount, price=request.price,
+        order_type=order_type, stop_loss=request.stop_loss, take_profit=request.take_profit,
+        strategy_id="manual",
+    )
+    if order is None:
+        raise HTTPException(status_code=500, detail="Не удалось создать ордер — см. логи")
+
+    logger.info(
+        f"🖐 Ручной ордер: {side.upper()} {amount:.6f} {symbol} @ {order.filled_price} | "
+        f"SL={request.stop_loss} TP={request.take_profit} | ID={order.client_order_id}"
+    )
+
+    # Без этого позиция была бы видна только в execution_engine (баланс,
+    # /status), а основной торговый цикл узнал бы о ней только на
+    # следующем плановом обновлении торговой вселенной — SL/TP не
+    # проверялись бы и цена не обновлялась бы до тех пор.
+    import src.main as main_module
+    if main_module.current_bot is not None:
+        await main_module.current_bot.register_manual_position(
+            symbol=symbol, side="long" if side == "buy" else "short",
+            entry_price=float(order.filled_price), amount=float(order.filled_amount),
+            order_id=order.id, entry_fee=float(order.fee),
+            stop_loss=request.stop_loss, take_profit=request.take_profit,
+        )
+    else:
+        logger.warning(
+            f"⚠️ Ручная позиция {symbol} создана, но бот ещё не готов (current_bot=None) — "
+            f"SL/TP начнут проверяться после завершения инициализации бота."
+        )
+
+    return {
+        "success": True,
+        "order_id": order.id,
+        "order_id_exchange": order.order_id_exchange,
+        "symbol": symbol,
+        "amount": float(order.filled_amount),
+        "price": float(order.filled_price),
+    }
+
+
+@app.post("/positions/edit")
+async def edit_position(request: PositionEditRequest):
+    """
+    Изменить Stop Loss / Take Profit уже открытой позиции (любого
+    источника, не только ручных сделок). Обновляет и execution_engine
+    (paper_positions/real_positions — источник для /status), и открытые
+    позиции основного торгового цикла (main.current_bot.open_positions —
+    именно их читает _check_position_exit при проверке SL/TP), иначе
+    изменение подействовало бы только на дашборд, но не на сам бот.
+    """
+    symbol = request.symbol
+    tracked = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
+    position = tracked.get(symbol)
+    if position is None:
+        raise HTTPException(status_code=404, detail=f"Открытая позиция {symbol} не найдена")
+
+    updates = request.model_dump(exclude_unset=True)
+    new_sl = position.get("stop_loss")
+    new_tp = position.get("take_profit")
+    if request.clear_stop_loss:
+        new_sl = None
+    elif "stop_loss" in updates:
+        new_sl = request.stop_loss
+    if request.clear_take_profit:
+        new_tp = None
+    elif "take_profit" in updates:
+        new_tp = request.take_profit
+
+    position["stop_loss"] = new_sl
+    position["take_profit"] = new_tp
+
+    import src.main as main_module
+    bot_position = (
+        main_module.current_bot.open_positions.get(symbol)
+        if main_module.current_bot is not None else None
+    )
+    if bot_position is not None:
+        bot_position["sl"] = new_sl
+        bot_position["tp"] = new_tp
+
+    logger.info(f"✏️ SL/TP {symbol} изменены вручную: SL={new_sl} TP={new_tp}")
+    return {"success": True, "symbol": symbol, "stop_loss": new_sl, "take_profit": new_tp}
+
+
 @app.get("/risk/state")
 async def get_risk_state():
     """Текущее состояние риска."""
@@ -576,26 +735,35 @@ async def update_strategy(strategy_id: str, request: StrategyUpdateRequest):
 
 
 @app.get("/trades")
-async def list_trades(limit: int = 100, offset: int = 0):
+async def list_trades(limit: int = 100, offset: int = 0, strategy_id: str | None = None):
     """
     Список сделок, сгруппированных по позиции (order_open_id): частичные
     закрытия одной позиции по уровням TP1/TP2/TP3 показываются одной
     строкой с суммарными объёмом/PnL, а не как отдельные сделки.
+
+    strategy_id — опциональный фильтр по строковому идентификатору
+    источника (напр. "manual" для вкладки "Ручная торговля",
+    "telegram_signal" для Telegram-сигналов) — сверяется с именем
+    связанной Strategy, под которым его создаёт
+    ExecutionEngine._resolve_strategy_id().
     """
     async with get_session() as session:
         # Берём сырые Trade-строки с запасом, чтобы после группировки (до
         # 3 частей на позицию) точно хватило на limit+offset готовых строк.
-        raw_trades = (
-            await session.execute(
-                select(Trade)
-                .options(
-                    selectinload(Trade.symbol), selectinload(Trade.strategy),
-                    selectinload(Trade.order_open), selectinload(Trade.order_close),
-                )
-                .order_by(Trade.closed_at.desc(), Trade.created_at.desc())
-                .limit((limit + offset) * 3 + 50)
+        query = (
+            select(Trade)
+            .options(
+                selectinload(Trade.symbol), selectinload(Trade.strategy),
+                selectinload(Trade.order_open), selectinload(Trade.order_close),
             )
-        ).scalars().all()
+            .order_by(Trade.closed_at.desc(), Trade.created_at.desc())
+            .limit((limit + offset) * 3 + 50)
+        )
+        if strategy_id:
+            query = query.join(StrategyModel, Trade.strategy_id == StrategyModel.id).where(
+                StrategyModel.name == strategy_id
+            )
+        raw_trades = (await session.execute(query)).scalars().all()
 
         groups: dict = {}
         for t in raw_trades:

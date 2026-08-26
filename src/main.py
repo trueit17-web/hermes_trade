@@ -51,6 +51,15 @@ from src.web.api import app as web_app
 from src.web.settings_store import load_settings_overrides
 from src.web.websocket import setup_websocket_broadcast
 
+# Ссылка на единственный работающий экземпляр бота — нужна веб-панели
+# (src/web/api.py), чтобы вручную открытая через дашборд позиция сразу же
+# попадала в основной торговый цикл (open_positions/active_symbols), а не
+# ждала следующего перезапуска. main.py импортирует src.web.api (для
+# web_app), поэтому обратный импорт (from src.main import current_bot) в
+# api.py должен быть ленивым — внутри функции, а не на уровне модуля,
+# иначе получится циклический импорт при старте процесса.
+current_bot: "TradingBot | None" = None
+
 
 class TradingBot:
     """Основной класс торгового бота."""
@@ -606,6 +615,34 @@ class TradingBot:
                 self.active_symbols.append(symbol)
                 await self._refresh_symbol_candles(symbol)
         return order
+
+    async def register_manual_position(
+        self, symbol: str, side: str, entry_price: float, amount: float,
+        order_id: int, entry_fee: float,
+        stop_loss: float | None, take_profit: float | None,
+    ):
+        """
+        Зарегистрировать вручную открытую через дашборд (POST /manual/order)
+        позицию в основном цикле — без этого _check_position_exit никогда бы
+        её не увидел (open_positions пуст для неё), SL/TP не проверялись бы,
+        а её символ не попал бы в active_symbols, и цена не обновлялась бы.
+        Та же регистрация, что и в _on_telegram_signal выше, но вызывается
+        снаружи основного цикла — из src/web/api.py через src.main.current_bot,
+        сразу после исполнения ордера на бирже/в paper-режиме.
+        """
+        self.open_positions[symbol] = {
+            "side": side, "entry_price": entry_price,
+            "amount": amount, "strategy_id": "manual",
+            "rationale": "Ручная сделка", "sl": stop_loss, "tp": take_profit,
+            "tp_hit_count": 0,
+            "opened_at": utcnow(),
+            "order_id": order_id, "entry_fee": entry_fee,
+        }
+        risk_manager.on_position_added(symbol, 0.0)
+
+        if symbol not in self.active_symbols:
+            self.active_symbols.append(symbol)
+            await self._refresh_symbol_candles(symbol)
 
     async def run(self):
         """Основной цикл торговли."""
@@ -1287,7 +1324,9 @@ class TradingBot:
 
 async def main():
     """Точка входа."""
+    global current_bot
     bot = TradingBot()
+    current_bot = bot
 
     # setup_websocket_broadcast() существовал, но нигде не вызывался —
     # /ws-эндпоинт принимал подключения, но event_bus ни разу не был
