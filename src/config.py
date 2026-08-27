@@ -139,10 +139,14 @@ class Settings(BaseSettings):
     telegram_signals_auto_execute: bool = False
     telegram_signals_quality_threshold: float = 0.5
     # LLM-фолбэк парсинга: когда регулярки не смогли распознать сообщение,
-    # пробуем через Anthropic API (перенос из clonerbot: parser/llm_parser.py).
+    # пробуем через Anthropic API (перенос из clonerbot: parser/llm_parser.py),
+    # а если он не настроен/не смог — через Gemini API (второй уровень,
+    # бесплатный по тарифу вариант, см. src/telegram/gemini_parser.py).
     telegram_llm_fallback_enabled: bool = False
     anthropic_api_key: str | None = None
     anthropic_model: str = "claude-haiku-4-5-20251001"
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-2.0-flash"
 
     # === Веб сервер ===
     web_host: str = "0.0.0.0"
