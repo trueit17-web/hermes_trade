@@ -124,23 +124,46 @@ class ExecutionEngine:
 
             await self._warn_if_okx_trade_permission_missing(exchange_id)
 
+            # Восстанавливаем позиции ДО расчёта базы для просадки — иначе
+            # (см. ниже) на счету с уже открытыми real-позициями базой для
+            # drawdown становился один только свободный кэш.
+            await self._restore_real_positions_from_db()
+
             # Проверка баланса
             try:
                 balance = await self.exchange.fetch_balance()
                 total_usdt = self._extract_usdt_balance(balance)
                 self.paper_balance = total_usdt
-                logger.info(f"💰 Баланс USDT: {total_usdt:.2f}")
+                logger.info(f"💰 Свободный баланс USDT: {total_usdt:.2f}")
                 # Без этого start_balance риск-менеджера оставался на
                 # захардкоженном settings.startup_capital_usdt (paper-дефолт)
                 # и не совпадал с реальным балансом — сразу после
                 # переключения в real это давало ложную просадку (иногда
                 # ровно 100%, если баланс к тому же читался как 0 — см.
                 # _extract_usdt_balance) и мгновенную паузу торговли.
-                risk_manager.reset_for_real_account(total_usdt)
+                #
+                # total_usdt — это ТОЛЬКО свободный (неинвестированный) кэш с
+                # биржи. Если на счету уже есть открытые real-позиции (обычный
+                # случай при каждом рестарте процесса, не только "первое
+                # подключение"), это давало обратный перекос: start_balance
+                # считался от голого кэша (например $12.79), а
+                # _compute_equity() дальше в main.py каждую итерацию считает
+                # cash + стоимость позиций (например $7156) — сравнение
+                # несопоставимых величин превращало "просадку" в дашборде в
+                # гигантский фиктивный "профит" вида -55830%. База для
+                # просадки должна быть той же величиной, что и текущий equity:
+                # кэш + стоимость уже восстановленных позиций по цене входа
+                # (текущая рыночная цена ещё не известна на этом шаге —
+                # entry_price здесь так же консервативен, как fallback в
+                # main.py._compute_equity).
+                positions_value = sum(
+                    pos["amount"] * pos["entry_price"]
+                    for pos in self.real_positions.values()
+                    if pos.get("side") == "long"
+                )
+                risk_manager.reset_for_real_account(total_usdt + positions_value)
             except Exception as e:
                 logger.warning(f"Не удалось получить баланс: {e}")
-
-            await self._restore_real_positions_from_db()
 
         except Exception as e:
             logger.error(f"Ошибка инициализации биржи {exchange_id}: {e}")

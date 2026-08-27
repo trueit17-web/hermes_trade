@@ -3401,11 +3401,113 @@ class TestRealBalanceReseedsRiskState(unittest.IsolatedAsyncioTestCase):
         with patch("src.execution.executor.ccxt.binance", return_value=mock_exchange):
             await engine.initialize("binance")
 
-        self.assertEqual(global_risk_manager.state.start_balance, 4987.65)
-        self.assertEqual(global_risk_manager.state.current_balance, 4987.65)
+        # Тестовая БД общая на сессию — другие тесты могут оставлять свои
+        # незакрытые real-позиции для биржи "binance" (не относится к делу
+        # здесь: они не куплены по этому fetch_balance и не влияют на смысл
+        # проверки). start_balance честно учитывает стоимость ЛЮБЫХ
+        # восстановленных позиций (см. test_initialize_baseline_includes_
+        # preexisting_real_positions рядом), поэтому ожидание считаем от
+        # того же restored-состояния, а не от жёстко зашитого числа —
+        # без открытых позиций оно совпадёт с голым кэшем 4987.65.
+        expected_positions_value = sum(
+            pos["amount"] * pos["entry_price"]
+            for pos in engine.real_positions.values() if pos.get("side") == "long"
+        )
+        expected_baseline = 4987.65 + expected_positions_value
+
+        self.assertAlmostEqual(global_risk_manager.state.start_balance, expected_baseline)
+        self.assertAlmostEqual(global_risk_manager.state.current_balance, expected_baseline)
         self.assertFalse(global_risk_manager.state.paused)
         self.assertEqual(global_risk_manager.state.total_drawdown_pct, 0.0)
         self.assertEqual(engine.paper_balance, 4987.65)
+
+    async def test_initialize_baseline_includes_preexisting_real_positions(self):
+        """
+        total_usdt из fetch_balance() — это ТОЛЬКО свободный (неинвестированный)
+        кэш на бирже. Если на счету уже есть открытые real-позиции (обычный
+        случай при КАЖДОМ рестарте процесса, а не только при первом
+        подключении), старый код всё равно брал за базу для просадки один
+        голый кэш — а _compute_equity() в main.py дальше на каждой итерации
+        считает cash + стоимость позиций. Несопоставимые базы для
+        start_balance и current_balance превращали "просадку" в дашборде в
+        гигантский фиктивный "профит" (реальный инцидент: свободный кэш
+        $12.79, equity с учётом позиций — $7156, просадка показывала
+        -55830%). База для просадки должна включать стоимость уже открытых
+        позиций по цене входа — так же, как их посчитал бы _compute_equity.
+        """
+        from sqlalchemy import select, update
+        from src.db.session import get_session
+        from src.db.models import Order, Symbol, Exchange
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+
+        async with get_session() as session:
+            real_ex = (
+                await session.execute(select(Exchange).where(Exchange.name == "binance", Exchange.is_paper == False))
+            ).scalar_one_or_none()
+            if real_ex is None:
+                real_ex = Exchange(name="binance", is_paper=False)
+                session.add(real_ex)
+                await session.flush()
+            sym = Symbol(exchange_id=real_ex.id, symbol="BASELINE1/USDT", base_asset="BASELINE1", quote_asset="USDT")
+            session.add(sym)
+            await session.flush()
+            order = Order(
+                exchange_id=real_ex.id, symbol_id=sym.id, side="buy", order_type="market",
+                amount=100.0, price=39.5, status="filled", filled_amount=100.0, filled_price=39.5, fee=0.0,
+            )
+            session.add(order)
+            await session.commit()
+            order_id = order.id
+
+        settings.trading_mode = "real"
+        settings.binance_api_key = "key"
+        settings.binance_api_secret = "secret"
+        settings.use_exchange_sandbox = True
+
+        try:
+            engine = ExecutionEngine()
+            engine.is_paper = False
+            mock_exchange = AsyncMock()
+            mock_exchange.fetch_balance = AsyncMock(
+                return_value={"free": {"USDT": 12.79}, "USDT": {"free": 12.79, "used": 0, "total": 12.79}}
+            )
+            mock_exchange.set_sandbox_mode = MagicMock()
+            with patch("src.execution.executor.ccxt.binance", return_value=mock_exchange):
+                await engine.initialize("binance")
+
+            self.assertIn("BASELINE1/USDT", engine.real_positions)
+            our_position = engine.real_positions["BASELINE1/USDT"]
+            self.assertAlmostEqual(our_position["amount"] * our_position["entry_price"], 3950.0)
+
+            # Тестовая БД общая на сессию — у других тестов в этом файле могли
+            # остаться свои незакрытые real-позиции (не относится к делу здесь),
+            # поэтому ожидаемое значение считаем от того же restored-состояния,
+            # а не от жёстко зашитого числа: главное утверждение теста — что
+            # start_balance учитывает ВСЕ восстановленные позиции, а не только
+            # свободный кэш.
+            expected_positions_value = sum(
+                pos["amount"] * pos["entry_price"]
+                for pos in engine.real_positions.values() if pos.get("side") == "long"
+            )
+            expected_baseline = 12.79 + expected_positions_value
+            self.assertAlmostEqual(global_risk_manager.state.start_balance, expected_baseline)
+            self.assertAlmostEqual(global_risk_manager.state.current_balance, expected_baseline)
+            self.assertEqual(global_risk_manager.state.total_drawdown_pct, 0.0)
+            # Ключевая регрессия: раньше start_balance был бы равен голому кэшу
+            # (12.79), полностью игнорируя стоимость уже открытых позиций.
+            self.assertGreater(global_risk_manager.state.start_balance, 12.79 + 3950.0 - 1.0)
+        finally:
+            # Тестовая БД общая на сессию — не оставляем открытую позицию,
+            # иначе она "просочится" в другие тесты этого класса/файла,
+            # которые тоже восстанавливают real-позиции из БД (проверено:
+            # без этой очистки следующий по алфавиту тест в этом же классе
+            # получал заниженный ожидаемый start_balance, т.к. видел и эту
+            # позицию тоже).
+            async with get_session() as session:
+                await session.execute(
+                    update(Order).where(Order.id == order_id).values(status="rejected")
+                )
+                await session.commit()
 
 
 class TestOkxTradePermissionCheck(unittest.IsolatedAsyncioTestCase):
