@@ -1337,7 +1337,27 @@ class ExecutionEngine:
         exit_filled_amount = order["filled"] or amount
         exit_fee, exit_fee_currency = self._resolve_fee(order.get("fee"), exit_filled_amount, exit_price, "sell", symbol)
 
-        pnl = (exit_price - entry_price) * amount - entry_fee - exit_fee
+        # Комиссия ОТКРЫТИЯ на споте обычно удерживается в BASE-валюте
+        # (полученный актив) — например 105.4915 TAC, а не в USDT. PnL ниже
+        # считается в QUOTE-валюте (USDT): вычитать base-валютную комиссию
+        # как есть означало бы принять "105.4915 TAC" за "105.4915 USDT" —
+        # искажение на порядки. Переводим её в USDT-эквивалент по цене
+        # входа, если знаем (из fee_currency открывающего Order), что она
+        # была в base-валюте; иначе (уже в quote или неизвестно) — как есть.
+        entry_fee_quote = entry_fee
+        base_currency = symbol.split("/")[0]
+        if order_open_id is not None:
+            try:
+                async with get_session() as session:
+                    opening_order = (
+                        await session.execute(select(Order).where(Order.id == order_open_id))
+                    ).scalar_one_or_none()
+                if opening_order is not None and opening_order.fee_currency == base_currency:
+                    entry_fee_quote = entry_fee * entry_price
+            except Exception as e:
+                logger.debug(f"Не удалось определить валюту комиссии открытия для {symbol}: {e}")
+
+        pnl = (exit_price - entry_price) * amount - entry_fee_quote - exit_fee
         pnl_pct = (pnl / (entry_price * amount) * 100) if entry_price and amount else 0.0
         outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "break-even")
 

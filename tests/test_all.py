@@ -584,6 +584,10 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         сверкой по балансу (см. предыдущий тест) exit_price откатился бы на
         entry_price — сверка по балансу подтверждает только ОБЪЁМ, не цену —
         и PnL показывал бы ровно 0.00 независимо от факта на бирже.
+
+        Комиссия открытия здесь в BASE-валюте (0.034458 LINK) — PnL должен
+        учитывать её в USDT-эквиваленте по цене входа (0.034458 * 11.729),
+        а не вычитать "0.034458" напрямую как будто это уже доллары.
         """
         settings.trading_mode = "real"
         self.engine.is_paper = False
@@ -624,8 +628,8 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIsNotNone(result)
-        self.assertGreater(result["pnl"], 1.0, "реально прибыльная сделка не должна показывать PnL≈0")
-        self.assertAlmostEqual(result["pnl"], 1.178057752, places=4)
+        self.assertGreater(result["pnl"], 0.5, "реально прибыльная сделка не должна показывать PnL≈0")
+        self.assertAlmostEqual(result["pnl"], 0.8083578700000205, places=4)
 
     async def test_execute_real_order_stores_exchange_trade_id_not_internal_order_id(self):
         """
@@ -824,6 +828,57 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         fee, currency = self.engine._resolve_fee({"cost": 3.5, "currency": "USDT"}, 1000.0, 2.0, "sell", "RESOLVEFEE1/USDT")
         self.assertEqual(fee, 3.5)
         self.assertEqual(currency, "USDT")
+
+    async def test_close_real_position_converts_base_currency_entry_fee_to_quote(self):
+        """
+        Комиссия ОТКРЫТИЯ в BASE-валюте (например TAC при покупке TAC/USDT)
+        должна учитываться в PnL в USDT-эквиваленте по цене входа, а не
+        вычитаться как есть — иначе "105.4915 TAC" считалась бы как
+        "105.4915 USDT", искажая PnL на порядки. Комиссия в QUOTE-валюте
+        (уже USDT) не должна конвертироваться повторно.
+        """
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Order, Trade
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"FEECONV1": 0.0}, "FEECONV1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        # Комиссия открытия — 10 FEECONV1 (base-валюта), т.е. эквивалент
+        # 10 * 2.0 = 20 USDT по цене входа.
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "feeconv-open-1", "filled": 1000.0, "average": 2.0, "price": None,
+            "fee": {"cost": 10.0, "currency": "FEECONV1"},
+        }
+        self.engine.exchange.fetch_order_trades = AsyncMock(return_value=None)
+        opening_order = await self.engine.create_order(
+            symbol="FEECONV1/USDT", side="buy", amount=1000.0, price=2.0, order_type="market",
+        )
+        self.assertIsNotNone(opening_order)
+        entry_amount = self.engine.real_positions["FEECONV1/USDT"]["amount"]
+
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"FEECONV1": entry_amount},
+            "FEECONV1": {"free": entry_amount, "used": 0, "total": entry_amount},
+        })
+        self.engine.exchange.create_market_sell_order.return_value = {
+            "id": "feeconv-close-1", "filled": entry_amount, "average": 2.0, "price": None,
+            "fee": {"cost": 0.5, "currency": "USDT"},
+        }
+
+        result = await self.engine.close_real_position(
+            symbol="FEECONV1/USDT", side="long", entry_price=2.0, amount=entry_amount,
+            reason="stop_loss", entry_fee=10.0, holding_seconds=60, order_open_id=opening_order.id,
+        )
+        self.assertIsNotNone(result)
+        # Цена входа == цена выхода (2.0), т.е. весь PnL — это (-1) * учтённая
+        # комиссия открытия в USDT-эквиваленте (-10 * 2.0 = -20, а не -10) и
+        # комиссия закрытия (уже в USDT, без конвертации): -20 - 0.5 = -20.5.
+        self.assertAlmostEqual(result["pnl"], -20.5, places=4)
 
     async def test_paper_mode_initialization(self):
         """Инициализация в paper режиме восстанавливает баланс/позиции из БД."""
