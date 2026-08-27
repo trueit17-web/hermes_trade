@@ -477,6 +477,80 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "open")
         self.assertEqual(self.engine.exchange.fetch_order.call_count, 3)
 
+    async def test_execute_real_order_confirms_via_balance_diff_when_status_never_confirms(self):
+        """
+        Реальный инцидент (демо-счёт Bybit, RLUSD/USDT, USDC/USDT,
+        BTC/USDT): биржа реально исполняла ордер (видно в истории сделок
+        самой биржи), но fetch_order по его ID стабильно не показывал
+        filled ни разу — даже после расширенного окна поллинга. Без
+        второго способа подтверждения _execute_real_order слепо считал
+        такой ордер проваленным и НЕ регистрировал позицию, хотя деньги
+        были реально потрачены на бирже. Сверка баланса базовой валюты
+        до/после (независимая от статуса самого ордера) должна поймать
+        этот случай.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(side_effect=[
+            {"free": {"BALDIFF1": 0.0}, "BALDIFF1": {"free": 0.0, "used": 0, "total": 0.0}},
+            {"free": {"BALDIFF1": 2011.85}, "BALDIFF1": {"free": 2011.85, "used": 0, "total": 2011.85}},
+        ])
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "never-confirms-buy-1", "filled": None, "average": None, "price": None,
+        }
+        self.engine.exchange.fetch_order = AsyncMock(return_value={
+            "id": "never-confirms-buy-1", "filled": None, "average": None, "price": None, "status": "open",
+        })
+
+        with patch("src.execution.executor.asyncio.sleep", new=AsyncMock()):
+            order = await self.engine.create_order(
+                symbol="BALDIFF1/USDT", side="buy", amount=2011.85, price=1.0003, order_type="market",
+            )
+
+        self.assertIsNotNone(order)
+        self.assertIn("BALDIFF1/USDT", self.engine.real_positions)
+        self.assertAlmostEqual(self.engine.real_positions["BALDIFF1/USDT"]["amount"], 2011.85)
+
+    async def test_close_real_position_confirms_via_balance_diff_when_status_never_confirms(self):
+        """Симметричный случай на закрытии — см. тест выше на открытии."""
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"BALDIFFCLOSE1": 0.0}, "BALDIFFCLOSE1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "baldiffclose-open-1", "filled": 100.0, "price": None, "average": 0.5,
+            "fee": {"cost": 0.05, "currency": "USDT"},
+        }
+        opening_order = await self.engine.create_order(
+            symbol="BALDIFFCLOSE1/USDT", side="buy", amount=100.0, price=0.5, order_type="market",
+        )
+        self.assertIsNotNone(opening_order)
+
+        self.engine.exchange.fetch_balance = AsyncMock(side_effect=[
+            {"free": {"BALDIFFCLOSE1": 100.0}, "BALDIFFCLOSE1": {"free": 100.0, "used": 0, "total": 100.0}},
+            {"free": {"BALDIFFCLOSE1": 0.0}, "BALDIFFCLOSE1": {"free": 0.0, "used": 0, "total": 0.0}},
+        ])
+        self.engine.exchange.create_market_sell_order.return_value = {
+            "id": "never-confirms-sell-1", "filled": None, "average": None, "price": None,
+        }
+        self.engine.exchange.fetch_order = AsyncMock(return_value={
+            "id": "never-confirms-sell-1", "filled": None, "average": None, "price": None, "status": "open",
+        })
+
+        with patch("src.execution.executor.asyncio.sleep", new=AsyncMock()):
+            result = await self.engine.close_real_position(
+                symbol="BALDIFFCLOSE1/USDT", side="long", entry_price=0.5, amount=100.0,
+                reason="stop_loss", entry_fee=0.05, holding_seconds=60, order_open_id=opening_order.id,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertNotIn("BALDIFFCLOSE1/USDT", self.engine.real_positions)
+
     async def test_paper_mode_initialization(self):
         """Инициализация в paper режиме восстанавливает баланс/позиции из БД."""
         settings.trading_mode = "paper"
