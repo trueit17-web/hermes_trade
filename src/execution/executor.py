@@ -911,6 +911,66 @@ class ExecutionEngine:
             logger.debug(f"Не удалось проверить минимальные лимиты биржи для {symbol}: {e}")
         return None
 
+    async def _fetch_fill_details_via_trades(self, order_id: str | None, symbol: str) -> dict | None:
+        """
+        Точные детали исполнения (средняя цена, объём, комиссия) через
+        историю СДЕЛОК биржи — нужно, когда fetch_order() статус ордера так
+        и не подтвердил filled (см. _fetch_confirmed_order/
+        _confirm_fill_via_balance). Реальный инцидент: на демо-счету Bybit
+        ордер был полностью исполнен (в истории сделок биржи сразу видна
+        "Заповнена ціна"/цена и комиссия по факту), но fetch_order по его ID
+        ни разу не показал average/price — _confirm_fill_via_balance в этом
+        случае подтверждал только ОБЪЁМ (по изменению баланса), а цену брал
+        из запрошенной/entry_price как заглушку — PnL любой такой сделки
+        считался от несовпадающих цен открытия/закрытия и получался
+        околонулевым независимо от реального результата на бирже.
+
+        Пробуем сначала fetch_order_trades (сделки именно этого ордера,
+        точнее всего), затем fetch_my_trades с фильтром по order_id — как
+        и в других необязательных сверках с биржей в этом классе, любая
+        неожиданность (биржа не поддерживает метод, сеть, неожиданный
+        формат ответа) просто означает "детали недоступны этим способом",
+        а не падение всего исполнения ордера.
+        """
+        if not order_id:
+            return None
+        try:
+            trades = None
+            try:
+                trades = await self.exchange.fetch_order_trades(order_id, symbol)
+            except Exception:
+                trades = None
+            if not trades:
+                recent = await self.exchange.fetch_my_trades(symbol, limit=10)
+                trades = [t for t in (recent or []) if t.get("order") == order_id]
+            if not trades:
+                return None
+
+            total_amount = sum(float(t.get("amount") or 0) for t in trades)
+            if total_amount <= 0:
+                return None
+            total_cost = sum(
+                float(t["cost"]) if t.get("cost") is not None else float(t.get("amount") or 0) * float(t.get("price") or 0)
+                for t in trades
+            )
+            average = total_cost / total_amount
+            if not average:
+                return None
+
+            fee_cost = 0.0
+            fee_currency = None
+            for t in trades:
+                fee = t.get("fee") or {}
+                cost = fee.get("cost")
+                if cost:
+                    fee_cost += float(cost)
+                    fee_currency = fee_currency or fee.get("currency")
+
+            return {"amount": total_amount, "average": average, "fee": {"cost": fee_cost, "currency": fee_currency}}
+        except Exception as e:
+            logger.debug(f"Не удалось получить детали исполнения через историю сделок {order_id} ({symbol}): {e}")
+            return None
+
     async def _confirm_fill_via_balance(
         self, symbol: str, side: str, balance_before: float, expected_amount: float,
     ) -> float | None:
@@ -992,24 +1052,42 @@ class ExecutionEngine:
             # на бирже, а закрыть такую фантомную позицию невозможно
             # (продавать нечего, "Insufficient balance" на каждой попытке).
             if not (order.get("filled") or 0) > 0:
-                confirmed_amount = (
-                    await self._confirm_fill_via_balance(symbol, side, balance_before, amount)
-                    if balance_before is not None else None
-                )
-                if confirmed_amount is None:
-                    logger.error(
-                        f"❌ Ордер {order.get('id')} ({symbol}) не подтверждён как реально "
-                        f"исполненный на бирже (filled={order.get('filled')!r}) — позиция НЕ "
-                        f"регистрируется, данные должны быть идентичны бирже."
+                # Сначала пробуем ТОЧНЫЕ данные через историю сделок биржи
+                # (реальная цена и комиссия исполнения) — только если их нет,
+                # откатываемся к грубому подтверждению по изменению баланса
+                # (объём есть, а цена/комиссия — оценка по запрошенной цене,
+                # без этого PnL такой сделки считался бы от несовпадающих
+                # цен и получался околонулевым независимо от факта на бирже).
+                trade_fill = await self._fetch_fill_details_via_trades(order.get("id"), symbol)
+                if trade_fill:
+                    logger.warning(
+                        f"⚠️ Ордер {order.get('id')} ({symbol}) подтверждён по истории сделок биржи "
+                        f"(цена={trade_fill['average']:.8f}, объём={trade_fill['amount']:.8f}) — "
+                        f"fetch_order так и не показал filled/average/price."
                     )
-                    return None
-                logger.warning(
-                    f"⚠️ Ордер {order.get('id')} ({symbol}) подтверждён по изменению баланса на "
-                    f"бирже ({confirmed_amount:.8f} {symbol.split('/')[0]}), хотя fetch_order так и "
-                    f"не показал filled — используем это значение вместо статуса ордера."
-                )
-                order = dict(order)
-                order["filled"] = confirmed_amount
+                    order = dict(order)
+                    order["filled"] = trade_fill["amount"]
+                    order["average"] = trade_fill["average"]
+                    order["fee"] = trade_fill["fee"]
+                else:
+                    confirmed_amount = (
+                        await self._confirm_fill_via_balance(symbol, side, balance_before, amount)
+                        if balance_before is not None else None
+                    )
+                    if confirmed_amount is None:
+                        logger.error(
+                            f"❌ Ордер {order.get('id')} ({symbol}) не подтверждён как реально "
+                            f"исполненный на бирже (filled={order.get('filled')!r}) — позиция НЕ "
+                            f"регистрируется, данные должны быть идентичны бирже."
+                        )
+                        return None
+                    logger.warning(
+                        f"⚠️ Ордер {order.get('id')} ({symbol}) подтверждён по изменению баланса на "
+                        f"бирже ({confirmed_amount:.8f} {symbol.split('/')[0]}), хотя fetch_order так и "
+                        f"не показал filled — цена исполнения оценивается по запрошенной, не биржевой."
+                    )
+                    order = dict(order)
+                    order["filled"] = confirmed_amount
             logger.info(f"✅ Ордер исполнен на бирже: {order['id']} | {side.upper()} {amount:.4f} {symbol}")
 
             # ccxt возвращает order["fee"] как dict {"cost": ..., "currency": ...}
@@ -1182,28 +1260,45 @@ class ExecutionEngine:
 
         order = await self._fetch_confirmed_order(order, symbol)
         if not (order.get("filled") or 0) > 0:
-            # Второй, независимый от статуса ордера способ подтверждения —
-            # тот же, что и при открытии (см. _confirm_fill_via_balance):
-            # available уже снят с биржи чуть выше (до отправки sell), так
-            # что здесь не нужен ещё один запрос баланса "до".
-            confirmed_amount = (
-                await self._confirm_fill_via_balance(symbol, "sell", available, sell_amount)
-                if available is not None else None
-            )
-            if confirmed_amount is None:
-                logger.error(
-                    f"❌ Закрывающий ордер {order.get('id')} ({symbol}) не подтверждён как "
-                    f"реально исполненный на бирже (filled={order.get('filled')!r}) — закрытие "
-                    f"НЕ засчитывается, данные должны быть идентичны бирже."
+            # Сначала пробуем ТОЧНЫЕ данные через историю сделок биржи (см.
+            # тот же приоритет при открытии в _execute_real_order) — иначе
+            # exit_price ниже откатился бы на entry_price (единственный
+            # доступный fallback без average/price), и PnL закрытия
+            # получался бы околонулевым независимо от реального результата.
+            trade_fill = await self._fetch_fill_details_via_trades(order.get("id"), symbol)
+            if trade_fill:
+                logger.warning(
+                    f"⚠️ Закрывающий ордер {order.get('id')} ({symbol}) подтверждён по истории "
+                    f"сделок биржи (цена={trade_fill['average']:.8f}, объём={trade_fill['amount']:.8f})."
                 )
-                return None
-            logger.warning(
-                f"⚠️ Закрывающий ордер {order.get('id')} ({symbol}) подтверждён по изменению "
-                f"баланса на бирже ({confirmed_amount:.8f} {symbol.split('/')[0]}), хотя "
-                f"fetch_order так и не показал filled."
-            )
-            order = dict(order)
-            order["filled"] = confirmed_amount
+                order = dict(order)
+                order["filled"] = trade_fill["amount"]
+                order["average"] = trade_fill["average"]
+                order["fee"] = trade_fill["fee"]
+            else:
+                # Второй, независимый от статуса ордера способ подтверждения —
+                # тот же, что и при открытии (см. _confirm_fill_via_balance):
+                # available уже снят с биржи чуть выше (до отправки sell), так
+                # что здесь не нужен ещё один запрос баланса "до".
+                confirmed_amount = (
+                    await self._confirm_fill_via_balance(symbol, "sell", available, sell_amount)
+                    if available is not None else None
+                )
+                if confirmed_amount is None:
+                    logger.error(
+                        f"❌ Закрывающий ордер {order.get('id')} ({symbol}) не подтверждён как "
+                        f"реально исполненный на бирже (filled={order.get('filled')!r}) — закрытие "
+                        f"НЕ засчитывается, данные должны быть идентичны бирже."
+                    )
+                    return None
+                logger.warning(
+                    f"⚠️ Закрывающий ордер {order.get('id')} ({symbol}) подтверждён по изменению "
+                    f"баланса на бирже ({confirmed_amount:.8f} {symbol.split('/')[0]}), хотя "
+                    f"fetch_order так и не показал filled — цена исполнения оценивается по цене "
+                    f"открытия, не биржевой."
+                )
+                order = dict(order)
+                order["filled"] = confirmed_amount
         exit_price = order.get("average") or order.get("price") or entry_price
         exit_fee = (order.get("fee") or {}).get("cost") or 0
 

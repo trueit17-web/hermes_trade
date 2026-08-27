@@ -843,13 +843,43 @@ async def get_trade_detail(trade_id: int):
                 select(Trade)
                 .options(
                     selectinload(Trade.symbol), selectinload(Trade.strategy),
-                    selectinload(Trade.order_open),
+                    selectinload(Trade.order_open), selectinload(Trade.order_close),
                 )
                 .where(Trade.id == trade_id)
             )
         ).scalar_one_or_none()
         if trade is None:
             raise HTTPException(status_code=404, detail="Сделка не найдена")
+
+        def _order_card(o):
+            """
+            Все доступные поля ордера/транзакции с биржи — для карточки
+            "открывающий/закрывающий ордер" в развёрнутой сделке на
+            дашборде. filled_price/filled_amount — то, что реально
+            произошло на бирже (после сегодняшнего фикса подтверждения
+            через историю сделок — реальная цена и комиссия, а не
+            запрошенная цена/0 как раньше); price/amount — то, что было
+            запрошено ботом.
+            """
+            if o is None:
+                return None
+            return {
+                "id": o.id,
+                "order_id_exchange": o.order_id_exchange,
+                "client_order_id": o.client_order_id,
+                "side": o.side,
+                "order_type": o.order_type,
+                "status": o.status,
+                "amount_requested": float(o.amount) if o.amount is not None else None,
+                "price_requested": float(o.price) if o.price is not None else None,
+                "filled_amount": float(o.filled_amount) if o.filled_amount is not None else None,
+                "filled_price": float(o.filled_price) if o.filled_price is not None else None,
+                "fee": float(o.fee) if o.fee is not None else None,
+                "stop_loss": float(o.stop_loss) if o.stop_loss is not None else None,
+                "take_profit": float(o.take_profit) if o.take_profit is not None else None,
+                "notes": o.notes,
+                "created_at": o.created_at.isoformat() + "Z" if o.created_at else None,
+            }
 
         if trade.order_open_id is not None:
             group = (
@@ -895,6 +925,7 @@ async def get_trade_detail(trade_id: int):
             "order_id_exchange_open": trade.order_open.order_id_exchange if trade.order_open else None,
             "created_at": opened_at.isoformat() + "Z" if opened_at else None,
             "closed_at": trade.closed_at.isoformat() + "Z" if trade.closed_at else None,
+            "opening_order": _order_card(trade.order_open),
             "legs": [
                 {
                     "id": t.id,
@@ -906,6 +937,7 @@ async def get_trade_detail(trade_id: int):
                     "holding_seconds": t.holding_seconds,
                     "order_id_exchange_close": t.order_close.order_id_exchange if t.order_close else None,
                     "closed_at": t.closed_at.isoformat() + "Z" if t.closed_at else None,
+                    "closing_order": _order_card(t.order_close),
                 }
                 for t in group
             ],

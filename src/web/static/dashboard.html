@@ -260,6 +260,50 @@
     gap: 10px 16px;
     font-size: 13px;
   }
+  .order-cards-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    margin-bottom: 14px;
+  }
+  .order-cards-row:last-child { margin-bottom: 0; }
+  @media (max-width: 640px) { .order-cards-row { grid-template-columns: 1fr; } }
+  .order-card {
+    background: rgba(255,255,255,.03);
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    padding: 12px 14px;
+  }
+  .order-card h5 {
+    margin: 0 0 8px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--text-dim);
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .order-card .order-card-kv {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 4px 10px;
+    font-size: 12.5px;
+  }
+  .order-card .order-card-kv dt { color: var(--text-dim); white-space: nowrap; }
+  .order-card .order-card-kv dd { margin: 0; text-align: right; }
+  .pnl-breakdown {
+    margin-top: 4px;
+    padding-top: 10px;
+    border-top: 1px dashed var(--panel-border);
+    font-size: 12.5px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 4px;
+    align-items: baseline;
+  }
+  .pnl-breakdown .op { color: var(--text-dim); }
   .decision-log { display: flex; flex-direction: column; gap: 4px; }
   .decision-log-step {
     display: flex;
@@ -1254,7 +1298,71 @@ function restoreExpandedTrade(row) {
   }
 }
 
+function orderCardHtml(o, title) {
+  if (!o) {
+    return `<div class="order-card"><h5>${title}</h5><div class="muted">Данные ордера недоступны</div></div>`;
+  }
+  const rows = [
+    ["ID (внутр. / биржа)", `${o.id}${o.order_id_exchange ? " / " + escapeHtml(o.order_id_exchange) : ""}`],
+    ["Client order ID", o.client_order_id ? escapeHtml(o.client_order_id) : "—"],
+    ["Сторона / тип", `${(o.side || "—").toUpperCase()} / ${o.order_type || "—"}`],
+    ["Статус", o.status || "—"],
+    ["Объём запрошен", o.amount_requested !== null ? fmt(o.amount_requested, 6) : "—"],
+    ["Объём исполнен", o.filled_amount !== null ? fmt(o.filled_amount, 6) : "—"],
+    ["Цена запрошена", o.price_requested !== null ? fmtPrice(o.price_requested) : "—"],
+    ["Цена исполнения", o.filled_price !== null ? fmtPrice(o.filled_price) : "—"],
+    ["Комиссия", o.fee !== null ? fmt(o.fee, 6) : "—"],
+  ];
+  if (o.stop_loss !== null || o.take_profit !== null) {
+    rows.push(["Stop Loss", o.stop_loss !== null ? fmtPrice(o.stop_loss) : "—"]);
+    rows.push(["Take Profit", o.take_profit !== null ? fmtPrice(o.take_profit) : "—"]);
+  }
+  rows.push(["Время", o.created_at ? new Date(o.created_at).toLocaleString("ru-RU") : "—"]);
+  if (o.notes) rows.push(["Заметка", escapeHtml(o.notes)]);
+
+  return `
+    <div class="order-card">
+      <h5>${title}</h5>
+      <dl class="order-card-kv">
+        ${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}
+      </dl>
+    </div>
+  `;
+}
+
+function orderCardsRowHtml(openingOrder, leg, label) {
+  const openPrice = openingOrder ? openingOrder.filled_price : null;
+  const closePrice = leg.closing_order ? leg.closing_order.filled_price : leg.exit_price;
+  const openFee = openingOrder && openingOrder.fee !== null ? openingOrder.fee : 0;
+  const closeFee = leg.closing_order && leg.closing_order.fee !== null ? leg.closing_order.fee : 0;
+  const breakdown = (openPrice != null && closePrice != null && leg.amount != null)
+    ? `
+      <div class="pnl-breakdown">
+        <span>(${fmtPrice(closePrice)} <span class="op">&minus;</span> ${fmtPrice(openPrice)}) <span class="op">&times;</span> ${fmt(leg.amount, 6)}
+        <span class="op">&minus;</span> ${fmt(openFee, 6)} <span class="op">&minus;</span> ${fmt(closeFee, 6)}
+        <span class="op">=</span> <strong class="${leg.pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${leg.pnl >= 0 ? "+" : ""}${fmt(leg.pnl)} USDT</strong></span>
+      </div>
+    `
+    : "";
+  return `
+    <div class="trade-detail-block">
+      ${label ? `<h4>${label}</h4>` : ""}
+      <div class="order-cards-row">
+        ${orderCardHtml(openingOrder, "Открывающий ордер")}
+        ${orderCardHtml(leg.closing_order, "Закрывающий ордер")}
+      </div>
+      ${breakdown}
+    </div>
+  `;
+}
+
 function renderTradeDetail(d) {
+  const ordersHtml = d.legs && d.legs.length
+    ? d.legs.map((leg, i) => orderCardsRowHtml(
+        d.opening_order, leg, d.legs.length > 1 ? `Ордера — частичное закрытие #${i + 1}` : "Ордера"
+      )).join("")
+    : orderCardsRowHtml(d.opening_order, {}, "Ордера");
+
   const legsHtml = d.legs && d.legs.length > 1 ? `
     <div class="trade-detail-block">
       <h4>Частичные закрытия (${d.legs.length})</h4>
@@ -1314,6 +1422,7 @@ function renderTradeDetail(d) {
           <div><span class="muted">ID открывающего ордера</span><br>${d.order_id_exchange_open ? escapeHtml(d.order_id_exchange_open) : "—"}</div>
         </div>
       </div>
+      ${ordersHtml}
       ${legsHtml}
       ${logHtml}
     </div>

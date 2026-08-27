@@ -551,6 +551,75 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result)
         self.assertNotIn("BALDIFFCLOSE1/USDT", self.engine.real_positions)
 
+    async def test_fetch_fill_details_via_trades_returns_weighted_average_and_fee(self):
+        """
+        Юнит-тест самого хелпера: несколько частичных сделок по одному
+        ордеру должны сворачиваться в средневзвешенную цену и суммарную
+        комиссию, а не просто в цену первой сделки.
+        """
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_order_trades = AsyncMock(return_value=[
+            {"amount": 10.0, "price": 100.0, "cost": 1000.0, "fee": {"cost": 0.1, "currency": "USDT"}},
+            {"amount": 5.0, "price": 102.0, "cost": 510.0, "fee": {"cost": 0.05, "currency": "USDT"}},
+        ])
+        result = await self.engine._fetch_fill_details_via_trades("some-order-1", "TESTTRADES1/USDT")
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result["amount"], 15.0)
+        self.assertAlmostEqual(result["average"], 1510.0 / 15.0)
+        self.assertAlmostEqual(result["fee"]["cost"], 0.15)
+        self.assertEqual(result["fee"]["currency"], "USDT")
+
+    async def test_close_real_position_computes_correct_pnl_via_trade_history_price(self):
+        """
+        Реальный сценарий пользователя (LINK/USDT, демо-счёт Bybit): куплено
+        34.458 LINK по 11.729, продано 34.423 LINK по 11.776 — реально
+        прибыльная сделка на бирже. Без приоритета истории сделок над
+        сверкой по балансу (см. предыдущий тест) exit_price откатился бы на
+        entry_price — сверка по балансу подтверждает только ОБЪЁМ, не цену —
+        и PnL показывал бы ровно 0.00 независимо от факта на бирже.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"LINKPNL1": 0.0}, "LINKPNL1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "linkpnl-open-1", "filled": 34.458, "average": 11.729, "price": None,
+            "fee": {"cost": 0.034458, "currency": "LINKPNL1"},
+        }
+        opening_order = await self.engine.create_order(
+            symbol="LINKPNL1/USDT", side="buy", amount=34.458, price=11.729, order_type="market",
+        )
+        self.assertIsNotNone(opening_order)
+        entry_amount = self.engine.real_positions["LINKPNL1/USDT"]["amount"]
+
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"LINKPNL1": entry_amount},
+            "LINKPNL1": {"free": entry_amount, "used": 0, "total": entry_amount},
+        })
+        self.engine.exchange.create_market_sell_order.return_value = {
+            "id": "linkpnl-close-1", "filled": None, "average": None, "price": None,
+        }
+        self.engine.exchange.fetch_order = AsyncMock(return_value={
+            "id": "linkpnl-close-1", "filled": None, "average": None, "price": None, "status": "open",
+        })
+        self.engine.exchange.fetch_order_trades = AsyncMock(return_value=[
+            {"amount": 34.423, "price": 11.776, "cost": 34.423 * 11.776,
+             "fee": {"cost": 0.405365248, "currency": "USDT"}},
+        ])
+
+        with patch("src.execution.executor.asyncio.sleep", new=AsyncMock()):
+            result = await self.engine.close_real_position(
+                symbol="LINKPNL1/USDT", side="long", entry_price=11.729, amount=34.423,
+                reason="stop_loss", entry_fee=0.034458, holding_seconds=1900, order_open_id=opening_order.id,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertGreater(result["pnl"], 1.0, "реально прибыльная сделка не должна показывать PnL≈0")
+        self.assertAlmostEqual(result["pnl"], 1.178057752, places=4)
+
     async def test_paper_mode_initialization(self):
         """Инициализация в paper режиме восстанавливает баланс/позиции из БД."""
         settings.trading_mode = "paper"
