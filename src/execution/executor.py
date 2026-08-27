@@ -1242,6 +1242,14 @@ class ExecutionEngine:
                     update(Order).where(Order.id == order_open_id).values(status="rejected")
                 )
                 await session.commit()
+        # Без этого risk_manager.state.open_positions_count навсегда
+        # оставался бы завышенным после каждой реконсиляции (эта функция —
+        # единственное место, где позиция снимается с учёта в обход обычных
+        # путей закрытия — /positions/close и SL/TP в _check_position_exit,
+        # которые сами вызывают on_position_closed) — искусственно
+        # ограничивая число новых сделок через check_max_positions(), пока
+        # число открытых позиций фактически меньше лимита.
+        risk_manager.on_position_closed(symbol)
         logger.warning(
             f"⚠️ Позиция {symbol} снята с учёта: закрыть её обычной продажей на бирже "
             f"невозможно (нет актива или его остаток ниже минимального торгуемого объёма) "

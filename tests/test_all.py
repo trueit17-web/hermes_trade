@@ -1035,6 +1035,52 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
             refreshed = await session.get(Order, dust_order.id)
             self.assertEqual(refreshed.status, "rejected")
 
+    async def test_reconcile_phantom_position_also_clears_risk_manager_count(self):
+        """
+        _reconcile_phantom_position() снимает позицию с учёта в
+        execution_engine.real_positions, но раньше не уведомляла об этом
+        risk_manager — risk_manager.state.open_positions_count оставался
+        завышенным навсегда (единственные места, вызывающие
+        on_position_closed — POST /positions/close и обычное закрытие по
+        SL/TP в _check_position_exit — про реконсиляцию не знают). Живой
+        симптом в проде: символ числился в risk_state.open_positions, но
+        отсутствовал среди реально отслеживаемых позиций — искусственно
+        занижая доступное число новых сделок относительно
+        max_open_positions.
+        """
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "riskcount-open-1", "filled": 100.0, "price": None, "average": 0.5,
+            "fee": {"cost": 0.05, "currency": "USDT"},
+        }
+        opening_order = await self.engine.create_order(
+            symbol="RISKCOUNT1/USDT", side="buy", amount=100.0, price=0.5, order_type="market",
+        )
+        self.assertIsNotNone(opening_order)
+        # Симулируем то, что в реальном цикле делает main.py после открытия.
+        global_risk_manager.on_position_added("RISKCOUNT1/USDT", 5.0)
+        self.assertIn("RISKCOUNT1/USDT", global_risk_manager.state.open_positions)
+
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"RISKCOUNT1": 0.0}, "RISKCOUNT1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        self.engine.exchange.create_market_sell_order = AsyncMock(
+            side_effect=Exception('bybit {"retCode":170131,"retMsg":"Insufficient balance."}')
+        )
+
+        result = await self.engine.close_real_position(
+            symbol="RISKCOUNT1/USDT", side="long", entry_price=0.5, amount=100.0,
+            reason="stop_loss", entry_fee=0.05, holding_seconds=60, order_open_id=opening_order.id,
+        )
+
+        self.assertIsNone(result)
+        self.assertNotIn("RISKCOUNT1/USDT", global_risk_manager.state.open_positions)
+
     async def test_close_real_position_uses_actual_fill_price(self):
         """
         close_real_position должен считать PnL по фактической цене исполнения
