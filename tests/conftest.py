@@ -1,6 +1,7 @@
 """Общие фикстуры для тестов: изолированная тестовая БД."""
 import asyncio
 import os
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -24,3 +25,18 @@ def _test_database():
 
     if os.path.exists(TEST_DB_PATH):
         os.remove(TEST_DB_PATH)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_polling_delay():
+    """
+    ExecutionEngine поллит биржу с реальными паузами (_fetch_confirmed_order,
+    _fetch_fill_details_via_trades) — без этого автопатча каждый тест,
+    который не оборачивает вызов в `patch(asyncio.sleep)` вручную, реально
+    ждал бы секунды на каждый create_order()/close_real_position(), и суммарно
+    раздувал бы прогон всего файла тестов с секунд до минут. Патчим глобально
+    для всех тестов, а не точечно в каждом — новые тесты/код с поллингом не
+    должны каждый раз добавлять свой locals patch, чтобы остаться быстрыми.
+    """
+    with patch("src.execution.executor.asyncio.sleep", new=AsyncMock()):
+        yield

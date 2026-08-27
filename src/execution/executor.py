@@ -911,7 +911,9 @@ class ExecutionEngine:
             logger.debug(f"Не удалось проверить минимальные лимиты биржи для {symbol}: {e}")
         return None
 
-    async def _fetch_fill_details_via_trades(self, order_id: str | None, symbol: str) -> dict | None:
+    async def _fetch_fill_details_via_trades(
+        self, order_id: str | None, symbol: str, attempts: int = 4, delay: float = 1.0,
+    ) -> dict | None:
         """
         Точные детали исполнения (средняя цена, объём, комиссия) через
         историю СДЕЛОК биржи — нужно, когда fetch_order() статус ордера так
@@ -926,14 +928,29 @@ class ExecutionEngine:
         околонулевым независимо от реального результата на бирже.
 
         Пробуем сначала fetch_order_trades (сделки именно этого ордера,
-        точнее всего), затем fetch_my_trades с фильтром по order_id — как
-        и в других необязательных сверках с биржей в этом классе, любая
-        неожиданность (биржа не поддерживает метод, сеть, неожиданный
-        формат ответа) просто означает "детали недоступны этим способом",
-        а не падение всего исполнения ордера.
+        точнее всего), затем fetch_my_trades с фильтром по order_id. РЕАЛЬНЫЙ
+        инцидент (прод, реальный счёт Bybit, SUI/USDT, LINK/USDT, LIT/USDT):
+        история сделок биржи иногда ещё не готова к моменту, когда истекло
+        окно поллинга fetch_order (~6с) — единственная попытка сразу же
+        падала в грубый fallback по балансу (цена/комиссия — оценка, а не
+        реальные с биржи). Повторяем несколько раз с паузой — история сделок
+        обычно догоняет статус ордера буквально на пару секунд позже. Как и в
+        других необязательных сверках с биржей в этом классе, любая
+        неожиданность (биржа не поддерживает метод, сеть, неожиданный формат
+        ответа) просто означает "детали недоступны этим способом", а не
+        падение всего исполнения ордера.
         """
         if not order_id:
             return None
+        for attempt in range(attempts):
+            result = await self._fetch_fill_details_via_trades_once(order_id, symbol)
+            if result is not None:
+                return result
+            if attempt < attempts - 1:
+                await asyncio.sleep(delay)
+        return None
+
+    async def _fetch_fill_details_via_trades_once(self, order_id: str, symbol: str) -> dict | None:
         try:
             trades = None
             try:
