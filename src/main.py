@@ -676,9 +676,24 @@ class TradingBot:
         не полная стоимость позиции. Пока текущая цена символа ещё не
         известна (последняя итерация), используем entry_price — консервативно
         (без искусственной прибыли/убытка), а не 0.
+
+        self.open_positions — вторичный кэш execution_engine.paper_positions/
+        real_positions, синхронизируется лениво (см. _check_position_exit:
+        "символа нет в tracked — удалить из open_positions"), а не сразу в
+        момент закрытия/реконсиляции. Если пропустить эту проверку здесь,
+        позиция, которую execution_engine уже снял с учёта (закрытие в обход
+        основного цикла, реконсиляция фантомной/пыльной позиции при
+        расхождении с реальным остатком на бирже), ещё минимум одну итерацию
+        продолжала бы искажать equity её (часто уже некорректным) amount —
+        именно так раздутый объём одной такой позиции (AVAX/USDT: учтено
+        416.5, на бирже 0.00046) превращал "Просадку" в дашборде в
+        бессмысленные "-220110,7%".
         """
+        tracked = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
         equity = cash_balance
         for symbol, pos in self.open_positions.items():
+            if symbol not in tracked:
+                continue
             price = self.last_prices.get(symbol)
             if price is None:
                 price = pos["entry_price"]
@@ -736,7 +751,14 @@ class TradingBot:
                 equity = self._compute_equity(execution_engine.get_paper_balance())
                 risk_manager.on_balance_update(equity)
             else:
-                real_balance = await execution_engine.get_real_balance()
+                # reconcile_real_positions() (а не просто get_real_balance())
+                # — попутно с получением баланса сверяет ВСЕ отслеживаемые
+                # реальные позиции с фактическими остатками на бирже и снимает
+                # с учёта те, что уже нельзя закрыть обычной продажей, ДО
+                # расчёта equity — иначе испорченная позиция (расхождение с
+                # биржей) могла искажать equity/просадку неограниченно долго,
+                # ожидая срабатывания SL/TP (см. AVAX/USDT-инцидент).
+                real_balance = await execution_engine.reconcile_real_positions()
                 if real_balance is not None:
                     risk_manager.on_balance_update(self._compute_equity(real_balance))
         except Exception as e:

@@ -931,6 +931,110 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
             refreshed = await session.get(Order, opening_order.id)
             self.assertEqual(refreshed.status, "rejected")
 
+    async def test_execute_real_order_skips_below_exchange_minimum_cost(self):
+        """
+        Реальный сценарий: DATA/USDT, retCode 170140 "Order value exceeded
+        lower limit" — рассчитанный от текущего (малого) баланса объём
+        оказался ниже минимальной стоимости ордера на бирже. Такой ордер не
+        должен даже отправляться на биржу (и падать оттуда ERROR'ом,
+        выглядящим как поломка) — если markets[symbol].limits.cost.min
+        известен, проверяем ДО отправки и просто пропускаем сигнал.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.markets = {
+            "DATA1/USDT": {"limits": {"amount": {"min": 1.0}, "cost": {"min": 5.0}}}
+        }
+
+        # amount=1.5 * price=0.05 = 0.075 USDT — заметно ниже cost.min=5.0
+        order = await self.engine.create_order(
+            symbol="DATA1/USDT", side="buy", amount=1.5, price=0.05, order_type="market",
+        )
+
+        self.assertIsNone(order)
+        self.engine.exchange.create_market_buy_order.assert_not_called()
+        self.assertNotIn("DATA1/USDT", self.engine.real_positions)
+
+    async def test_execute_real_order_ignores_unusable_markets_metadata(self):
+        """
+        Если exchange.markets отсутствует/не словарь (как в большинстве
+        существующих тестов с AsyncMock()-биржей без явного .markets) —
+        проверка минимумов не должна ломать обычную отправку ордера.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "mm-open-1", "filled": 10.0, "price": None, "average": 0.5,
+            "fee": {"cost": 0.05, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="MARKETSMOCK1/USDT", side="buy", amount=10.0, price=0.5, order_type="market",
+        )
+
+        self.assertIsNotNone(order)
+        self.engine.exchange.create_market_buy_order.assert_called_once()
+
+    async def test_reconcile_real_positions_purges_dust_and_returns_balance(self):
+        """
+        reconcile_real_positions() — ПРОАКТИВНАЯ сверка (раньше сверка
+        происходила только реактивно, в момент попытки закрыть позицию —
+        см. close_real_position — то есть только когда сработает SL/TP; если
+        цена никогда до них не доходила, испорченная позиция могла висеть
+        неограниченно долго, искажая equity/просадку каждую итерацию).
+        Один fetch_balance() должен: (1) снять с учёта позицию, для которой
+        реальный остаток ниже торгуемого минимума, (2) НЕ трогать позицию с
+        достаточным остатком, (3) вернуть актуальный USDT-баланс из того же
+        запроса.
+        """
+        from src.db.models import Order
+        from src.db.session import get_session
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.markets = {
+            "RECONDUST1/USDT": {"limits": {"amount": {"min": 0.001}}},
+        }
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "recondust-open-1", "filled": 416.0, "price": None, "average": 0.5,
+            "fee": {"cost": 0.05, "currency": "USDT"},
+        }
+        dust_order = await self.engine.create_order(
+            symbol="RECONDUST1/USDT", side="buy", amount=416.0, price=0.5, order_type="market",
+        )
+        self.assertIsNotNone(dust_order)
+
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "reconok-open-1", "filled": 10.0, "price": None, "average": 1.0,
+            "fee": {"cost": 0.05, "currency": "USDT"},
+        }
+        ok_order = await self.engine.create_order(
+            symbol="RECONOK1/USDT", side="buy", amount=10.0, price=1.0, order_type="market",
+        )
+        self.assertIsNotNone(ok_order)
+
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 123.45, "RECONDUST1": 0.00046, "RECONOK1": 10.0},
+            "RECONDUST1": {"free": 0.00046, "used": 0, "total": 0.00046},
+            "RECONOK1": {"free": 10.0, "used": 0, "total": 10.0},
+        })
+
+        balance = await self.engine.reconcile_real_positions()
+
+        self.assertAlmostEqual(balance, 123.45)
+        self.assertNotIn("RECONDUST1/USDT", self.engine.real_positions)
+        self.assertIn("RECONOK1/USDT", self.engine.real_positions)
+
+        async with get_session() as session:
+            refreshed = await session.get(Order, dust_order.id)
+            self.assertEqual(refreshed.status, "rejected")
+
     async def test_close_real_position_uses_actual_fill_price(self):
         """
         close_real_position должен считать PnL по фактической цене исполнения
@@ -2032,6 +2136,71 @@ class TestClosePositionAtomicity(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNotNone(result)
         self.assertNotIn(symbol, engine.paper_positions)
+
+
+class TestComputeEquitySkipsUntrackedPositions(unittest.IsolatedAsyncioTestCase):
+    """
+    self.open_positions (TradingBot) — вторичный кэш execution_engine
+    .paper_positions/real_positions, синхронизируется лениво (см.
+    _check_position_exit). Если позицию уже сняли с учёта в execution_engine
+    (закрытие в обход основного цикла, реконсиляция фантомной/пыльной
+    позиции), но self.open_positions ещё не подчищен, _compute_equity не
+    должен продолжать считать её объём в equity — иначе именно так раздутый
+    amount одной такой позиции (AVAX/USDT: учтено 416.5, на бирже 0.00046)
+    превращал "Просадку" в дашборде в бессмысленные "-220110,7%".
+    """
+
+    def test_untracked_position_excluded_from_equity(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+
+        bot = main_module.TradingBot()
+        original_trading_mode = settings.trading_mode
+        original_paper_positions = dict(main_module.execution_engine.paper_positions)
+        try:
+            settings.trading_mode = "paper"
+            # execution_engine больше не знает об этой позиции (снята с
+            # учёта), но open_positions ещё её содержит с раздутым amount.
+            main_module.execution_engine.paper_positions = {}
+            bot.open_positions = {
+                "GHOST/USDT": {"side": "long", "entry_price": 0.5, "amount": 416.5},
+            }
+            bot.last_prices = {"GHOST/USDT": 0.5}
+
+            equity = bot._compute_equity(100.0)
+        finally:
+            settings.trading_mode = original_trading_mode
+            main_module.execution_engine.paper_positions = original_paper_positions
+
+        self.assertEqual(equity, 100.0, "untracked position's amount must not inflate equity")
+
+    def test_tracked_position_still_counted_in_equity(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+
+        bot = main_module.TradingBot()
+        original_trading_mode = settings.trading_mode
+        original_paper_positions = dict(main_module.execution_engine.paper_positions)
+        try:
+            settings.trading_mode = "paper"
+            main_module.execution_engine.paper_positions = {
+                "REAL/USDT": {"amount": 2.0, "entry_price": 10.0},
+            }
+            bot.open_positions = {
+                "REAL/USDT": {"side": "long", "entry_price": 10.0, "amount": 2.0},
+            }
+            bot.last_prices = {"REAL/USDT": 12.0}
+
+            equity = bot._compute_equity(100.0)
+        finally:
+            settings.trading_mode = original_trading_mode
+            main_module.execution_engine.paper_positions = original_paper_positions
+
+        self.assertAlmostEqual(equity, 100.0 + 2.0 * 12.0)
 
 
 class TestTradingIterationPerSymbolIsolation(unittest.IsolatedAsyncioTestCase):

@@ -830,12 +830,78 @@ class ExecutionEngine:
 
         return {"pnl": pnl, "pnl_pct": pnl_pct, "outcome": outcome, "trade_id": trade_id}
 
+    def _market_limits(self, symbol: str) -> dict | None:
+        """
+        market["limits"] для symbol, если оно есть и имеет ожидаемую форму
+        словаря — иначе None. Общий защитный доступ для
+        _below_exchange_minimum/reconcile_real_positions: структура
+        markets[symbol] не гарантирована (разные биржи, тестовые mock-объекты
+        без выставленного .markets), а падать из-за необязательной проверки
+        не должны ни отправка ордера, ни сверка позиций.
+        """
+        try:
+            markets = self.exchange.markets if self.exchange else None
+            if not isinstance(markets, dict):
+                return None
+            market = markets.get(symbol)
+            if not isinstance(market, dict):
+                return None
+            limits = market.get("limits")
+            return limits if isinstance(limits, dict) else None
+        except Exception:
+            return None
+
+    def _market_min_amount(self, symbol: str) -> float | None:
+        limits = self._market_limits(symbol)
+        if not limits:
+            return None
+        amount_limits = limits.get("amount")
+        min_amount = amount_limits.get("min") if isinstance(amount_limits, dict) else None
+        return min_amount if isinstance(min_amount, (int, float)) else None
+
+    def _below_exchange_minimum(self, symbol: str, amount: float, price: float | None) -> str | None:
+        """
+        Проверить объём/стоимость ордера ПРОТИВ биржевых лимитов пары ДО
+        отправки запроса — иначе биржа отклоняет ордер (напр. Bybit
+        retCode 170140 "Order value exceeded lower limit"), это летит в
+        логи как ERROR, будто сломался код, а на деле объём просто
+        занижен: посчитанного от текущего доступного баланса (size_pct%
+        от него) размера позиции не хватает даже на минимальный
+        допустимый на бирже ордер по этой паре — сигнал безопасно
+        пропускается, ошибка это ожидаемая при малом остатке средств.
+
+        Это вспомогательная, необязательная проверка: структура markets[symbol]
+        не гарантирована (разные биржи, неполные тестовые/тестовые-mock
+        объекты) — при любой неожиданности просто не блокируем ордер,
+        оставляя решение самой бирже, как и раньше.
+        """
+        try:
+            min_amount = self._market_min_amount(symbol)
+            if isinstance(min_amount, (int, float)) and amount < min_amount:
+                return f"объём {amount:.8f} {symbol.split('/')[0]} меньше минимального ({min_amount})"
+            limits = self._market_limits(symbol) or {}
+            cost_limits = limits.get("cost")
+            min_cost = cost_limits.get("min") if isinstance(cost_limits, dict) else None
+            if isinstance(min_cost, (int, float)) and price and amount * price < min_cost:
+                return f"стоимость ордера {amount * price:.4f} USDT меньше минимальной по паре ({min_cost} USDT)"
+        except Exception as e:
+            logger.debug(f"Не удалось проверить минимальные лимиты биржи для {symbol}: {e}")
+        return None
+
     async def _execute_real_order(self, order_data: dict) -> Order | None:
         """Реальный ордер через биржу."""
         symbol = order_data["symbol"]
         side = order_data["side"]
         amount = order_data["amount"]
         price = order_data["price"]
+
+        below_min = self._below_exchange_minimum(symbol, amount, price)
+        if below_min:
+            logger.warning(
+                f"⚠️ Реальный ордер {symbol} пропущен: {below_min} — доступного баланса "
+                f"недостаточно для минимального размера ордера по этой паре."
+            )
+            return None
 
         try:
             if order_data["type"] == "market":
@@ -1205,6 +1271,57 @@ class ExecutionEngine:
         except Exception as e:
             logger.error(f"Ошибка получения баланса: {e}")
             return None
+
+    async def reconcile_real_positions(self) -> float | None:
+        """
+        Сверить ВСЕ отслеживаемые реальные позиции с фактическими остатками
+        на бирже одним вызовом fetch_balance() и снять с учёта те, которые
+        обычной продажей закрыть уже невозможно (актива нет вообще или его
+        остаток ниже минимального торгуемого объёма пары) — ДО того, как
+        расхождение попадёт в _compute_equity()/просадку в main.py.
+
+        До этого сверка была чисто РЕАКТИВНОЙ: она случалась только в
+        момент попытки закрыть позицию (close_real_position), то есть
+        только когда сработает SL/TP. Если цена никогда не доходила до
+        SL/TP, испорченная позиция (раздутый/не совпадающий с биржей
+        amount) могла висеть в real_positions неограниченно долго, каждую
+        итерацию искажая equity — так разово раздутый объём AVAX/USDT
+        (учтено 416.5, на бирже 0.00046) превратил "Просадку" в дашборде в
+        "-220110,7%".
+
+        Возвращает актуальный свободный баланс USDT из ТОГО ЖЕ запроса —
+        вызывающий код (main.py, расчёт equity) должен использовать именно
+        его вместо отдельного get_real_balance(), чтобы не делать два
+        одинаковых запроса к бирже за одну итерацию.
+        """
+        if not self.exchange:
+            return None
+        try:
+            balance = await self.exchange.fetch_balance()
+        except Exception as e:
+            logger.error(f"Ошибка получения баланса: {e}")
+            return None
+
+        for symbol, pos in list(self.real_positions.items()):
+            tracked_amount = pos.get("amount") or 0
+            if tracked_amount <= 0:
+                continue
+            base_currency = symbol.split("/")[0]
+            available = self._extract_currency_balance(balance, base_currency)
+            if available >= tracked_amount:
+                continue
+            min_amount = self._market_min_amount(symbol)
+            unsellable = available == 0 or (min_amount is not None and available < min_amount)
+            if not unsellable:
+                continue
+            logger.warning(
+                f"⚠️ Периодическая сверка позиций: {symbol} — учтено {tracked_amount:.8f}, "
+                f"на бирже доступно {available:.8f} (продать невозможно) — расхождение поймано "
+                f"до попытки закрытия, чтобы не портить equity/просадку."
+            )
+            await self._reconcile_phantom_position(symbol, pos.get("order_id"))
+
+        return self._extract_usdt_balance(balance)
 
     @staticmethod
     def _extract_usdt_balance(balance: dict) -> float:
