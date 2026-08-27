@@ -128,6 +128,7 @@ class Order(Base):
     filled_amount: Mapped[float] = mapped_column(DECIMAL, default=0)
     filled_price: Mapped[float | None] = mapped_column(DECIMAL)
     fee: Mapped[float] = mapped_column(DECIMAL, default=0)
+    fee_currency: Mapped[str | None] = mapped_column(String(20))
     stop_loss: Mapped[float | None] = mapped_column(DECIMAL)
     take_profit: Mapped[float | None] = mapped_column(DECIMAL)
     order_id_exchange: Mapped[str | None] = mapped_column(String(100))

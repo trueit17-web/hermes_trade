@@ -1314,7 +1314,7 @@ function orderCardHtml(o, title) {
     ["Объём исполнен", o.filled_amount !== null ? fmt(o.filled_amount, 6) : "—"],
     ["Цена запрошена", o.price_requested !== null ? fmtPrice(o.price_requested) : "—"],
     ["Цена исполнения", o.filled_price !== null ? fmtPrice(o.filled_price) : "—"],
-    ["Комиссия", o.fee !== null ? fmt(o.fee, 6) : "—"],
+    ["Комиссия", o.fee !== null ? `${fmt(o.fee, 6)}${o.fee_currency ? " " + escapeHtml(o.fee_currency) : ""}` : "—"],
   ];
   if (o.stop_loss !== null || o.take_profit !== null) {
     rows.push(["Stop Loss", o.stop_loss !== null ? fmtPrice(o.stop_loss) : "—"]);

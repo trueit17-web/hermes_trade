@@ -511,7 +511,14 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(order)
         self.assertIn("BALDIFF1/USDT", self.engine.real_positions)
-        self.assertAlmostEqual(self.engine.real_positions["BALDIFF1/USDT"]["amount"], 2011.85)
+        # Ни fetch_order, ни история сделок не дали комиссию — она
+        # рассчитывается по стандартной ставке (см. _resolve_fee) и
+        # вычитается из объёма позиции (комиссия в base-валюте при покупке),
+        # поэтому реально доступный остаток чуть меньше исполненного объёма.
+        expected_fee = 2011.85 * 1.0003 * (settings.paper_fee_pct / 100)
+        self.assertAlmostEqual(
+            self.engine.real_positions["BALDIFF1/USDT"]["amount"], 2011.85 - expected_fee,
+        )
 
     async def test_close_real_position_confirms_via_balance_diff_when_status_never_confirms(self):
         """Симметричный случай на закрытии — см. тест выше на открытии."""
@@ -710,6 +717,113 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
                 await session.execute(select(Order).where(Order.id == trade.order_close_id))
             ).scalar_one()
         self.assertEqual(close_order.order_id_exchange, "35242741")
+
+    async def test_execute_real_order_prefers_trade_history_fee_over_order_response(self):
+        """
+        Реальный инцидент (демо-счёт Bybit, TAC/USDT): комиссия покупки на
+        бирже — 105.4915 TAC, но order["fee"] из create_market_buy_order
+        может быть неполным/нулевым на момент снимка (Bybit v5 иногда
+        подтверждает объём/статус раньше, чем комиссию) — приоритет должен
+        быть у истории сделок биржи (fetch_order_trades), а не у уже как бы
+        подтверждённого order["fee"].
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"TACFEE1": 0.0}, "TACFEE1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "tacfee-open-1", "filled": 10000.0, "average": 0.01, "price": None,
+            "fee": {"cost": 0, "currency": None},
+        }
+        self.engine.exchange.fetch_order_trades = AsyncMock(return_value=[
+            {"id": "56173056", "amount": 10000.0, "price": 0.01, "cost": 100.0,
+             "fee": {"cost": 105.4915, "currency": "TACFEE1"}},
+        ])
+
+        order = await self.engine.create_order(
+            symbol="TACFEE1/USDT", side="buy", amount=10000.0, price=0.01, order_type="market",
+        )
+        self.assertIsNotNone(order)
+        self.assertAlmostEqual(float(order.fee), 105.4915)
+        self.assertEqual(order.fee_currency, "TACFEE1")
+        self.assertEqual(order.order_id_exchange, "56173056")
+
+    async def test_close_real_position_prefers_trade_history_fee_over_order_response(self):
+        """Симметричный случай на закрытии — комиссия продажи в USDT (как в примере пользователя)."""
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Order, Trade
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"TACFEECLOSE1": 0.0}, "TACFEECLOSE1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "tacfeeclose-open-1", "filled": 10000.0, "average": 0.01, "price": None,
+            "fee": {"cost": 1.0, "currency": "TACFEECLOSE1"},
+        }
+        self.engine.exchange.fetch_order_trades = AsyncMock(return_value=None)
+        self.engine.exchange.fetch_my_trades = AsyncMock(return_value=None)
+        opening_order = await self.engine.create_order(
+            symbol="TACFEECLOSE1/USDT", side="buy", amount=10000.0, price=0.01, order_type="market",
+        )
+        self.assertIsNotNone(opening_order)
+        entry_amount = self.engine.real_positions["TACFEECLOSE1/USDT"]["amount"]
+
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"TACFEECLOSE1": entry_amount},
+            "TACFEECLOSE1": {"free": entry_amount, "used": 0, "total": entry_amount},
+        })
+        self.engine.exchange.create_market_sell_order.return_value = {
+            "id": "tacfeeclose-close-1", "filled": entry_amount, "average": 0.0105, "price": None,
+            "fee": {"cost": 0, "currency": None},
+        }
+        self.engine.exchange.fetch_order_trades = AsyncMock(return_value=[
+            {"id": "35242741", "amount": entry_amount, "price": 0.0105, "cost": entry_amount * 0.0105,
+             "fee": {"cost": 0.2950808, "currency": "USDT"}},
+        ])
+
+        result = await self.engine.close_real_position(
+            symbol="TACFEECLOSE1/USDT", side="long", entry_price=0.01, amount=entry_amount,
+            reason="stop_loss", entry_fee=1.0, holding_seconds=60, order_open_id=opening_order.id,
+        )
+        self.assertIsNotNone(result)
+
+        async with get_session() as session:
+            trade = (
+                await session.execute(select(Trade).where(Trade.id == result["trade_id"]))
+            ).scalar_one()
+            close_order = (
+                await session.execute(select(Order).where(Order.id == trade.order_close_id))
+            ).scalar_one()
+        self.assertAlmostEqual(float(close_order.fee), 0.2950808)
+        self.assertEqual(close_order.fee_currency, "USDT")
+        self.assertEqual(close_order.order_id_exchange, "35242741")
+
+    async def test_resolve_fee_calculates_estimate_when_exchange_data_unavailable(self):
+        """
+        Если ни order["fee"], ни история сделок не дали реальную комиссию —
+        нужно посчитать её по стандартной ставке spot-таксы, а не оставлять
+        0 (иначе PnL завышался бы на величину реальной, но неучтённой
+        комиссии биржи).
+        """
+        fee, currency = self.engine._resolve_fee(None, 1000.0, 2.0, "buy", "RESOLVEFEE1/USDT")
+        self.assertAlmostEqual(fee, 1000.0 * 2.0 * (settings.paper_fee_pct / 100))
+        self.assertEqual(currency, "RESOLVEFEE1")
+
+        fee, currency = self.engine._resolve_fee({"cost": 0, "currency": "USDT"}, 1000.0, 2.0, "sell", "RESOLVEFEE1/USDT")
+        self.assertAlmostEqual(fee, 1000.0 * 2.0 * (settings.paper_fee_pct / 100))
+        self.assertEqual(currency, "USDT")
+
+        fee, currency = self.engine._resolve_fee({"cost": 3.5, "currency": "USDT"}, 1000.0, 2.0, "sell", "RESOLVEFEE1/USDT")
+        self.assertEqual(fee, 3.5)
+        self.assertEqual(currency, "USDT")
 
     async def test_paper_mode_initialization(self):
         """Инициализация в paper режиме восстанавливает баланс/позиции из БД."""

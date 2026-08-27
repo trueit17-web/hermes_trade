@@ -875,6 +875,7 @@ async def get_trade_detail(trade_id: int):
                 "filled_amount": float(o.filled_amount) if o.filled_amount is not None else None,
                 "filled_price": float(o.filled_price) if o.filled_price is not None else None,
                 "fee": float(o.fee) if o.fee is not None else None,
+                "fee_currency": o.fee_currency,
                 "stop_loss": float(o.stop_loss) if o.stop_loss is not None else None,
                 "take_profit": float(o.take_profit) if o.take_profit is not None else None,
                 "notes": o.notes,
