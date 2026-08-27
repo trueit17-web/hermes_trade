@@ -881,6 +881,56 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
             refreshed = await session.get(Order, opening_order.id)
             self.assertEqual(refreshed.status, "rejected")
 
+    async def test_close_real_position_reconciles_phantom_when_remaining_dust_below_minimum(self):
+        """
+        Второй вариант того же класса бага: доступный остаток положительный
+        (не 0), но настолько мал, что биржа отклоняет продажу как ниже
+        минимального торгуемого объёма ("precision"/"minimum" в тексте
+        ошибки, как реально было у AVAX/USDT: наш учёт 416.54, доступно
+        0.00046). Продать такую пыль невозможно в принципе — повторные
+        попытки не помогут, позиция должна сняться с учёта так же, как и
+        при available == 0.
+        """
+        from src.db.models import Order
+        from src.db.session import get_session
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "dust-open-1", "filled": 100.0, "price": None, "average": 0.5,
+            "fee": {"cost": 0.05, "currency": "USDT"},
+        }
+        opening_order = await self.engine.create_order(
+            symbol="DUST1/USDT", side="buy", amount=100.0, price=0.5,
+            order_type="market", stop_loss=0.45, take_profit=0.6,
+        )
+        self.assertIsNotNone(opening_order)
+        self.assertIn("DUST1/USDT", self.engine.real_positions)
+
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"DUST1": 0.0001}, "DUST1": {"free": 0.0001, "used": 0, "total": 0.0001}}
+        )
+        self.engine.exchange.create_market_sell_order = AsyncMock(
+            side_effect=Exception(
+                "bybit amount of DUST1/USDT must be greater than minimum amount precision of 0.001"
+            )
+        )
+
+        result = await self.engine.close_real_position(
+            symbol="DUST1/USDT", side="long", entry_price=0.5, amount=100.0,
+            reason="stop_loss", entry_fee=0.05, holding_seconds=60,
+            order_open_id=opening_order.id,
+        )
+
+        self.assertIsNone(result)
+        self.assertNotIn("DUST1/USDT", self.engine.real_positions)
+
+        async with get_session() as session:
+            refreshed = await session.get(Order, opening_order.id)
+            self.assertEqual(refreshed.status, "rejected")
+
     async def test_close_real_position_uses_actual_fill_price(self):
         """
         close_real_position должен считать PnL по фактической цене исполнения
