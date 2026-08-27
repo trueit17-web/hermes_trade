@@ -609,6 +609,12 @@ async def edit_position(request: PositionEditRequest):
     position["stop_loss"] = new_sl
     position["take_profit"] = new_tp
 
+    if not settings.is_paper:
+        # Ручное изменение SL должно сразу отражаться и на бирже — иначе
+        # выставленный ранее условный ордер продолжил бы защищать позицию
+        # по старой, уже неактуальной цене.
+        await execution_engine.sync_stop_loss_order(symbol, position.get("amount") or 0, new_sl)
+
     import src.main as main_module
     bot_position = (
         main_module.current_bot.open_positions.get(symbol)

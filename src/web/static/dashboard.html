@@ -895,6 +895,15 @@ function renderPositions(status) {
       pnlHtml = `<span class="${pnlPct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${pnlPct >= 0 ? "+" : ""}${fmt(pnlPct, 2)}%</span>`;
     }
     const tradeValue = pos.entry_price ? pos.amount * pos.entry_price : null;
+    // В real-режиме SL дублируется отдельным условным ордером на самой
+    // бирже (см. sync_stop_loss_order) — защита не зависит от того, жив ли
+    // процесс бота. 🛡️ — ордер на бирже подтверждён, ⚠️ — биржа его
+    // отклонила/ещё не выставлен, позиция под защитой только внутреннего
+    // поллинга цены. В paper-режиме такого ордера в принципе нет — иконку
+    // не показываем, это не сбой.
+    const slBadge = !status.is_paper && pos.stop_loss
+      ? (pos.sl_order_id ? ` <span title="SL выставлен на бирже">🛡️</span>` : ` <span title="SL НЕ подтверждён биржей — защита только внутри бота">⚠️</span>`)
+      : "";
     return `
     <tr>
       <td>${symbol}</td>
@@ -902,7 +911,7 @@ function renderPositions(status) {
       <td>${fmt(pos.amount, 6)}</td>
       <td>${fmtPrice(pos.entry_price)}</td>
       <td>${cur !== null && cur !== undefined ? fmtPrice(cur) : "—"}</td>
-      <td class="muted">${pos.stop_loss ? fmtPrice(pos.stop_loss) : "—"}</td>
+      <td class="muted">${pos.stop_loss ? fmtPrice(pos.stop_loss) : "—"}${slBadge}</td>
       <td class="muted">${pos.take_profit ? fmtPrice(pos.take_profit) : "—"}</td>
       <td>${tradeValue !== null ? "$" + fmt(tradeValue) : "—"}</td>
       <td>${pnlHtml}</td>
@@ -952,6 +961,9 @@ function renderManualPositions(status) {
       const pnlPct = dir * (cur - pos.entry_price) / pos.entry_price * 100;
       pnlHtml = `<span class="${pnlPct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${pnlPct >= 0 ? "+" : ""}${fmt(pnlPct, 2)}%</span>`;
     }
+    const slBadge = !status.is_paper && pos.stop_loss
+      ? (pos.sl_order_id ? ` <span title="SL выставлен на бирже">🛡️</span>` : ` <span title="SL НЕ подтверждён биржей — защита только внутри бота">⚠️</span>`)
+      : "";
     return `
     <tr>
       <td>${symbol}</td>
@@ -959,7 +971,7 @@ function renderManualPositions(status) {
       <td>${fmt(pos.amount, 6)}</td>
       <td>${fmtPrice(pos.entry_price)}</td>
       <td>${cur !== null && cur !== undefined ? fmtPrice(cur) : "—"}</td>
-      <td><input type="number" class="inline-edit-input" data-sl-input="${symbol}" value="${pos.stop_loss ?? ''}" step="any" placeholder="—"></td>
+      <td><input type="number" class="inline-edit-input" data-sl-input="${symbol}" value="${pos.stop_loss ?? ''}" step="any" placeholder="—">${slBadge}</td>
       <td><input type="number" class="inline-edit-input" data-tp-input="${symbol}" value="${pos.take_profit ?? ''}" step="any" placeholder="—"></td>
       <td>${pnlHtml}</td>
       <td class="muted">${pos.order_id_exchange ? escapeHtml(pos.order_id_exchange) : "—"}</td>

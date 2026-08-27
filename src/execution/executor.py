@@ -128,6 +128,7 @@ class ExecutionEngine:
             # (см. ниже) на счету с уже открытыми real-позициями базой для
             # drawdown становился один только свободный кэш.
             await self._restore_real_positions_from_db()
+            await self._rearm_stop_loss_orders_after_restart()
 
             # Проверка баланса
             try:
@@ -381,6 +382,30 @@ class ExecutionEngine:
             )
         else:
             logger.info("Открытых реальных позиций в БД нет")
+
+    async def _rearm_stop_loss_orders_after_restart(self):
+        """
+        После рестарта процесса связь real_positions[symbol]["sl_order_id"] с
+        уже выставленным на бирже условным SL-ордером теряется — БД хранит
+        только сам stop_loss (цену в Order.stop_loss), а не ID биржевого
+        ордера. Чтобы не накапливать дубликаты условных ордеров при каждом
+        рестарте, сначала отменяем ВСЕ незакрытые условные ('tpslOrder')
+        ордера по символу, затем ставим один новый под актуальный
+        остаток/цену. Best-effort, как и вся остальная работа с биржевыми
+        SL-ордерами в этом классе — сбой здесь не должен мешать запуску.
+        """
+        for symbol, pos in list(self.real_positions.items()):
+            stop_loss = pos.get("stop_loss")
+            amount = pos.get("amount") or 0
+            if not stop_loss or amount <= 0:
+                continue
+            try:
+                open_orders = await self.exchange.fetch_open_orders(symbol, params={"orderFilter": "tpslOrder"})
+                for o in (open_orders or []):
+                    await self._cancel_order_safe(symbol, o.get("id"))
+            except Exception as e:
+                logger.debug(f"Не удалось получить список условных ордеров {symbol} перед переустановкой SL: {e}")
+            await self.sync_stop_loss_order(symbol, amount, stop_loss)
 
     async def reset_paper_account(self) -> dict:
         """
@@ -1022,6 +1047,74 @@ class ExecutionEngine:
         estimated = filled_amount * fill_price * (settings.paper_fee_pct / 100)
         return estimated, (base_currency if side == "buy" else quote_currency)
 
+    async def _place_stop_loss_order(self, symbol: str, amount: float, stop_loss_price: float) -> str | None:
+        """
+        Разместить биржевой стоп-ордер (Bybit spot: условный 'tpslOrder' —
+        рыночная продажа по достижении stop_loss_price), чтобы защита
+        позиции не зависела от того, жив ли процесс бота и успевает ли
+        внутренний поллинг цены (_check_position_exit в main.py) её
+        отследить. Тейк-профиты (TP1/TP2/TP3) сознательно остаются только
+        во внутренней логике: у Bybit spot нет родного OCO-механизма
+        частичного выхода по нескольким уровням, один статичный биржевой
+        TP-ордер такому сценарию не соответствует, а SL — соответствует
+        (единственный уровень, который в момент установки актуален всегда).
+
+        ВАЖНО: Bybit spot НЕ поддерживает stopLoss/takeProfit, прикреплённые
+        к самому маркет-ордеру (ccxt бросает InvalidOrder) — это ОТДЕЛЬНЫЙ
+        условный ордер, размещаемый уже после того, как позиция открыта.
+
+        Best-effort: любая ошибка (биржа отклонила триггер-цену, не
+        поддерживается для этой пары и т.п.) не должна блокировать саму
+        позицию — просто логируем и остаёмся под защитой одной внутренней
+        проверки, как было раньше.
+        """
+        if amount <= 0 or not stop_loss_price:
+            return None
+        try:
+            order = await self.exchange.create_market_sell_order(
+                symbol, amount, params={"stopLossPrice": stop_loss_price},
+            )
+            order_id = order.get("id") if order else None
+            if order_id:
+                logger.info(
+                    f"🛡️ Биржевой SL выставлен: {symbol} sell {amount:.8f} @ триггер "
+                    f"{stop_loss_price} (ордер {order_id})"
+                )
+            return order_id
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Не удалось выставить биржевой SL для {symbol} (триггер {stop_loss_price}): {e} "
+                f"— позиция защищена только внутренним поллингом цены."
+            )
+            return None
+
+    async def _cancel_order_safe(self, symbol: str, order_id: str | None) -> None:
+        """Best-effort отмена ордера — он мог уже исполниться или быть отменённым, это не ошибка."""
+        if not order_id:
+            return
+        try:
+            await self.exchange.cancel_order(order_id, symbol)
+        except Exception as e:
+            logger.debug(f"Не удалось отменить ордер {order_id} ({symbol}) — возможно, уже неактивен: {e}")
+
+    async def sync_stop_loss_order(self, symbol: str, amount: float, stop_loss_price: float | None) -> None:
+        """
+        Пересоздать биржевой SL-ордер под текущий остаток/цену позиции —
+        нужно после частичного закрытия (TP1/TP2 уменьшают объём) и после
+        переноса SL в безубыток (см. _check_position_exit в main.py):
+        старый биржевой ордер продавал бы либо неверный объём, либо по
+        неверной, уже неактуальной цене. Отменяет прежний отслеживаемый
+        SL-ордер (если был) и, если задан stop_loss_price и остаток > 0,
+        ставит новый.
+        """
+        pos = self.real_positions.get(symbol)
+        if pos is None:
+            return
+        await self._cancel_order_safe(symbol, pos.get("sl_order_id"))
+        pos["sl_order_id"] = None
+        if stop_loss_price and amount > 0:
+            pos["sl_order_id"] = await self._place_stop_loss_order(symbol, amount, stop_loss_price)
+
     async def _confirm_fill_via_balance(
         self, symbol: str, side: str, balance_before: float, expected_amount: float,
     ) -> float | None:
@@ -1204,7 +1297,10 @@ class ExecutionEngine:
                     "order_id": order_id,
                     "entry_fee": fill_fee,
                     "opened_at": utcnow(),
+                    "sl_order_id": None,
                 }
+                if order_data.get("stop_loss"):
+                    await self.sync_stop_loss_order(symbol, net_amount, order_data["stop_loss"])
 
             trade_event = TradeEvent(
                 type="trade_event",
@@ -1256,6 +1352,14 @@ class ExecutionEngine:
         if side != "long":
             logger.error(f"close_real_position: закрытие {side}-позиции не поддерживается на споте: {symbol}")
             return None
+
+        # Отменяем биржевой SL-ордер (если был) ДО собственной продажи —
+        # иначе он остаётся висеть параллельно с этим закрытием (не важно,
+        # по какой причине оно происходит — TP, ручное закрытие или сам же
+        # SL) и может конфликтовать за один и тот же остаток базовой валюты.
+        tracked_pos = self.real_positions.get(symbol)
+        if tracked_pos is not None:
+            await self._cancel_order_safe(symbol, tracked_pos.get("sl_order_id"))
 
         # Отслеживаемый объём позиции — оценка (комиссии, округление лота
         # биржей и т.п. могут понемногу расходиться с реальным остатком) —
@@ -1582,6 +1686,12 @@ class ExecutionEngine:
             unsellable = available == 0 or (min_amount is not None and available < min_amount)
             if not unsellable:
                 continue
+            # Прежде чем списывать позицию как фантомную (без PnL), проверяем:
+            # не сработал ли на бирже наш собственный SL-ордер сам по себе,
+            # без участия бота (см. _finalize_externally_closed_position) —
+            # тогда это реальное закрытие с реальным PnL, а не мусор.
+            if await self._finalize_externally_closed_position(symbol, pos):
+                continue
             logger.warning(
                 f"⚠️ Периодическая сверка позиций: {symbol} — учтено {tracked_amount:.8f}, "
                 f"на бирже доступно {available:.8f} (продать невозможно) — расхождение поймано "
@@ -1590,6 +1700,127 @@ class ExecutionEngine:
             await self._reconcile_phantom_position(symbol, pos.get("order_id"))
 
         return self._extract_usdt_balance(balance)
+
+    async def _finalize_externally_closed_position(self, symbol: str, pos: dict) -> bool:
+        """
+        Позиция пропала с баланса биржи (available ~0 при периодической
+        сверке reconcile_real_positions), и на неё был выставлен биржевой
+        SL-ордер (см. sync_stop_loss_order) — скорее всего, именно он
+        сработал сам по себе, без участия бота (например, между итерациями
+        основного цикла или пока процесс был недоступен). В отличие от
+        _reconcile_phantom_position (для позиций, реальное исполнение
+        которых объяснить нечем — фантом/пыль), здесь есть конкретный
+        биржевой ордер, который можно проверить: если он реально исполнился,
+        закрытие записывается с настоящими ценой/комиссией/PnL — как обычное
+        закрытие, а не молча теряется из статистики и risk_manager.daily_pnl.
+
+        Возвращает True, если закрытие удалось финализировать (тогда
+        _reconcile_phantom_position для этого символа вызывать уже не надо).
+        """
+        sl_order_id = pos.get("sl_order_id")
+        if not sl_order_id:
+            return False
+        try:
+            order = await self.exchange.fetch_order(sl_order_id, symbol)
+        except Exception as e:
+            logger.debug(f"Не удалось проверить биржевой SL-ордер {sl_order_id} ({symbol}): {e}")
+            return False
+        status = str(order.get("status") or "").lower()
+        if status not in ("closed", "filled"):
+            return False
+
+        entry_price = pos.get("entry_price") or 0
+        entry_fee = pos.get("entry_fee") or 0
+        amount = float(order.get("filled") or pos.get("amount") or 0)
+        if amount <= 0:
+            return False
+
+        trade_fill = await self._fetch_fill_details_via_trades(str(sl_order_id), symbol)
+        if trade_fill:
+            exit_price = trade_fill["average"]
+            amount = trade_fill["amount"]
+            exit_fee = trade_fill["fee"].get("cost") or 0
+        else:
+            exit_price = order.get("average") or order.get("price")
+            if not exit_price:
+                return False
+            exit_fee, _ = self._resolve_fee(order.get("fee"), amount, exit_price, "sell", symbol)
+
+        pnl = (exit_price - entry_price) * amount - entry_fee - exit_fee
+        pnl_pct = (pnl / (entry_price * amount) * 100) if entry_price and amount else 0.0
+        outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "break-even")
+        opened_at = pos.get("opened_at")
+        holding_seconds = int((utcnow() - opened_at).total_seconds()) if opened_at else 0
+        order_open_id = pos.get("order_id")
+
+        self.real_positions.pop(symbol, None)
+
+        async with get_session() as session:
+            exchange_id, symbol_id = await self._resolve_symbol_id(session, symbol)
+            strategy_db_id = await self._resolve_strategy_id(session, pos.get("strategy_id"))
+            close_order = Order(
+                exchange_id=exchange_id,
+                symbol_id=symbol_id,
+                strategy_id=strategy_db_id,
+                side="sell",
+                order_type="market",
+                amount=amount,
+                price=exit_price,
+                status="filled",
+                filled_amount=amount,
+                filled_price=exit_price,
+                fee=exit_fee,
+                order_id_exchange=str(sl_order_id),
+                client_order_id=str(uuid.uuid4())[:12],
+                notes="Real close (stop_loss, exchange-triggered)",
+            )
+            session.add(close_order)
+            await session.flush()
+
+            trade = Trade(
+                symbol_id=symbol_id,
+                strategy_id=strategy_db_id,
+                order_open_id=order_open_id,
+                order_close_id=close_order.id,
+                direction="long",
+                entry_price=entry_price,
+                exit_price=exit_price,
+                amount=amount,
+                pnl=pnl,
+                pnl_pct=pnl_pct,
+                holding_seconds=holding_seconds,
+                outcome=outcome,
+                is_open=False,
+                closed_at=utcnow(),
+            )
+            session.add(trade)
+            await session.commit()
+            trade_id = trade.id
+
+        risk_manager.on_trade_closed(pnl)
+        risk_manager.on_position_closed(symbol)
+        logger.warning(
+            f"🛡️ Биржевой SL сработал сам по себе (вне цикла бота): {symbol} | "
+            f"PnL: {pnl:+.2f} ({pnl_pct:+.2f}%) | ордер {sl_order_id}"
+        )
+
+        trade_event = TradeEvent(
+            type="trade_event",
+            trade_id=trade_id,
+            symbol=symbol,
+            direction="long",
+            entry_price=entry_price,
+            exit_price=exit_price,
+            amount=amount,
+            pnl=pnl,
+            pnl_pct=pnl_pct,
+            holding_seconds=holding_seconds,
+            outcome=outcome,
+            is_opening=False,
+            timestamp=utcnow_timestamp(),
+        )
+        await event_bus.publish(trade_event)
+        return True
 
     @staticmethod
     def _extract_usdt_balance(balance: dict) -> float:

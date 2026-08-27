@@ -1262,6 +1262,12 @@ class TradingBot:
                 # Безубыток: после первой частичной фиксации прибыли остаток
                 # позиции больше не может уйти в минус относительно входа.
                 position["sl"] = position["entry_price"]
+            if not settings.is_paper:
+                # Биржевой SL-ордер (см. close_real_position — старый уже
+                # отменён им) продавал бы неверный объём и/или устаревшую
+                # цену после частичного закрытия/переноса в безубыток —
+                # переставляем под новый остаток позиции.
+                await execution_engine.sync_stop_loss_order(symbol, position["amount"], position["sl"])
         else:
             del self.open_positions[symbol]
             risk_manager.on_position_closed(symbol)

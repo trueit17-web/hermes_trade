@@ -880,6 +880,149 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         # комиссия закрытия (уже в USDT, без конвертации): -20 - 0.5 = -20.5.
         self.assertAlmostEqual(result["pnl"], -20.5, places=4)
 
+    async def test_execute_real_order_places_exchange_stop_loss_when_set(self):
+        """
+        SL должен уходить на биржу отдельным условным ордером сразу после
+        открытия реальной позиции (Bybit spot не поддерживает stopLoss,
+        прикреплённый к самому маркет-ордеру, — только отдельный условный
+        ордер с 'stopLossPrice') — иначе защита позиции существует только
+        пока жив процесс бота и успевает внутренний поллинг цены.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"SLPLACE1": 0.0}, "SLPLACE1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "slplace-open-1", "filled": 100.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.02, "currency": "USDT"},
+        }
+        self.engine.exchange.fetch_order_trades = AsyncMock(return_value=None)
+        self.engine.exchange.fetch_my_trades = AsyncMock(return_value=None)
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "slplace-sl-order-1"}
+
+        order = await self.engine.create_order(
+            symbol="SLPLACE1/USDT", side="buy", amount=100.0, price=2.0, order_type="market",
+            stop_loss=1.8,
+        )
+        self.assertIsNotNone(order)
+        self.engine.exchange.create_market_sell_order.assert_called_once_with(
+            "SLPLACE1/USDT", 100.0, params={"stopLossPrice": 1.8},
+        )
+        self.assertEqual(self.engine.real_positions["SLPLACE1/USDT"]["sl_order_id"], "slplace-sl-order-1")
+
+    async def test_execute_real_order_survives_stop_loss_placement_rejection(self):
+        """
+        Биржа может отклонить условный SL-ордер (например, триггер-цена
+        невалидна) — это НЕ должно блокировать саму позицию, она просто
+        остаётся под защитой только внутреннего поллинга цены, как раньше.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"SLREJECT1": 0.0}, "SLREJECT1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "slreject-open-1", "filled": 100.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.02, "currency": "USDT"},
+        }
+        self.engine.exchange.fetch_order_trades = AsyncMock(return_value=None)
+        self.engine.exchange.fetch_my_trades = AsyncMock(return_value=None)
+        self.engine.exchange.create_market_sell_order = AsyncMock(
+            side_effect=Exception('bybit {"retCode":10001,"retMsg":"Invalid trigger price"}')
+        )
+
+        order = await self.engine.create_order(
+            symbol="SLREJECT1/USDT", side="buy", amount=100.0, price=2.0, order_type="market",
+            stop_loss=1.8,
+        )
+        self.assertIsNotNone(order)
+        self.assertIn("SLREJECT1/USDT", self.engine.real_positions)
+        self.assertIsNone(self.engine.real_positions["SLREJECT1/USDT"]["sl_order_id"])
+
+    async def test_close_real_position_cancels_tracked_stop_loss_order(self):
+        """
+        Закрытие (по любой причине — TP, ручное закрытие) должно отменять
+        ранее выставленный биржевой SL-ордер ДО собственной продажи —
+        иначе он остаётся висеть параллельно и может конфликтовать за тот
+        же остаток базовой валюты.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.real_positions["SLCANCEL1/USDT"] = {
+            "amount": 100.0, "entry_price": 2.0, "side": "long",
+            "sl_order_id": "sl-order-to-cancel-1",
+        }
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"SLCANCEL1": 100.0}, "SLCANCEL1": {"free": 100.0, "used": 0, "total": 100.0}}
+        )
+        self.engine.exchange.create_market_sell_order.return_value = {
+            "id": "slcancel-close-1", "filled": 100.0, "average": 2.1, "price": None,
+            "fee": {"cost": 0.05, "currency": "USDT"},
+        }
+
+        result = await self.engine.close_real_position(
+            symbol="SLCANCEL1/USDT", side="long", entry_price=2.0, amount=100.0,
+            reason="take_profit_3", entry_fee=0.02, holding_seconds=60,
+        )
+        self.assertIsNotNone(result)
+        self.engine.exchange.cancel_order.assert_called_once_with("sl-order-to-cancel-1", "SLCANCEL1/USDT")
+
+    async def test_reconcile_real_positions_finalizes_externally_triggered_stop_loss(self):
+        """
+        Если позиция пропала с баланса биржи (available ~0) и на неё был
+        выставлен биржевой SL-ордер, который сам сработал (без участия
+        бота — например, между итерациями цикла), периодическая сверка
+        должна записать это как обычное закрытие с реальным PnL, а не
+        молча списать позицию как фантомную (без PnL, как для настоящих
+        фантомов/пыли).
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.real_positions["SLFIRED1/USDT"] = {
+            "amount": 100.0, "entry_price": 2.0, "side": "long",
+            "strategy_id": None, "entry_fee": 0.02, "order_id": None,
+            "opened_at": datetime.now(), "sl_order_id": "sl-order-fired-1",
+        }
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"SLFIRED1": 0.0}, "SLFIRED1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        self.engine.exchange.fetch_order = AsyncMock(
+            return_value={"id": "sl-order-fired-1", "status": "closed", "filled": 100.0, "average": 1.8}
+        )
+        self.engine.exchange.fetch_order_trades = AsyncMock(return_value=[
+            {"id": "exec-1", "amount": 100.0, "price": 1.8, "cost": 180.0,
+             "fee": {"cost": 0.18, "currency": "USDT"}},
+        ])
+
+        await self.engine.reconcile_real_positions()
+
+        self.assertNotIn("SLFIRED1/USDT", self.engine.real_positions)
+        from sqlalchemy import select, desc
+        from src.db.session import get_session
+        from src.db.models import Trade, Symbol
+        async with get_session() as session:
+            symbol_row = (
+                await session.execute(select(Symbol).where(Symbol.symbol == "SLFIRED1/USDT"))
+            ).scalar_one()
+            trade = (
+                await session.execute(
+                    select(Trade).where(Trade.symbol_id == symbol_row.id).order_by(desc(Trade.id))
+                )
+            ).scalars().first()
+        self.assertIsNotNone(trade)
+        # (1.8 - 2.0) * 100 - entry_fee(0.02) - exit_fee(0.18) = -20.2
+        self.assertAlmostEqual(float(trade.pnl), -20.2, places=4)
+        self.assertFalse(trade.is_open)
+
     async def test_paper_mode_initialization(self):
         """Инициализация в paper режиме восстанавливает баланс/позиции из БД."""
         settings.trading_mode = "paper"
@@ -4177,6 +4320,33 @@ class TestManualTrading(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(cleared["take_profit"])
         self.assertIsNone(bot.open_positions["MANUALEDIT1/USDT"]["tp"])
+
+    async def test_edit_position_resyncs_exchange_stop_loss_in_real_mode(self):
+        """
+        Ручное изменение SL из дашборда (POST /positions/edit) должно сразу
+        переставлять биржевой SL-ордер под новую цену в real-режиме —
+        иначе выставленный ранее условный ордер продолжил бы защищать
+        позицию по старой, уже неактуальной цене.
+        """
+        engine, bot = await self._install_engine_and_bot(exchange_id="bybit", is_paper=False)
+        engine.exchange = AsyncMock()
+        engine.exchange.create_market_sell_order.return_value = {"id": "resync-sl-order-2"}
+        engine.real_positions["MANUALEDITREAL1/USDT"] = {
+            "amount": 10.0, "entry_price": 100.0, "side": "long",
+            "stop_loss": 90.0, "take_profit": 110.0, "strategy_id": "manual",
+            "sl_order_id": "resync-sl-order-1",
+        }
+        bot.open_positions["MANUALEDITREAL1/USDT"] = {"sl": 90.0, "tp": 110.0}
+
+        result = await self.api_module.edit_position(
+            self.api_module.PositionEditRequest(symbol="MANUALEDITREAL1/USDT", stop_loss=95.0)
+        )
+        self.assertEqual(result["stop_loss"], 95.0)
+        engine.exchange.cancel_order.assert_called_once_with("resync-sl-order-1", "MANUALEDITREAL1/USDT")
+        engine.exchange.create_market_sell_order.assert_called_once_with(
+            "MANUALEDITREAL1/USDT", 10.0, params={"stopLossPrice": 95.0},
+        )
+        self.assertEqual(engine.real_positions["MANUALEDITREAL1/USDT"]["sl_order_id"], "resync-sl-order-2")
 
     async def test_edit_position_unknown_symbol_404(self):
         await self._install_engine_and_bot(is_paper=True)
