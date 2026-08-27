@@ -1804,6 +1804,41 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.engine.exchange.create_market_sell_order.assert_called_once_with("1INCH/USDT", 100.0)
         self.assertTrue(any("доступно на бирже: 0.0" in msg for msg in logs.output))
 
+    async def test_close_real_position_reconciles_when_order_value_below_lower_limit(self):
+        """
+        Реальный инцидент (прод, реальный счёт Bybit, SUI/USDT): доступного
+        объёма было БОЛЬШЕ отслеживаемого (available > amount — старая
+        проверка available < amount вообще не срабатывала), но биржа всё
+        равно отклоняла продажу с retCode 170140 "Order value exceeded
+        lower limit" — стоимость позиции в USDT ниже минимальной для пары.
+        Без отдельного распознавания этого случая бот пытался закрыть её
+        снова каждую итерацию бесконечно (наблюдалось ~26 минут подряд).
+        Продать такую позицию одним ордером в принципе невозможно (дробить
+        её на более мелкие ордера — только уменьшает стоимость каждого), и
+        сверка должна снять её с учёта так же, как классическую "пыль".
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"LOWERLIMIT1": 0.39879}, "LOWERLIMIT1": {"free": 0.39879, "used": 0, "total": 0.39879}}
+        )
+        self.engine.exchange.create_market_sell_order = AsyncMock(
+            side_effect=Exception(
+                'bybit {"retCode":170140,"retMsg":"Order value exceeded lower limit.",'
+                '"result":{},"retExtInfo":{},"time":1787843738428}'
+            )
+        )
+
+        result = await self.engine.close_real_position(
+            symbol="LOWERLIMIT1/USDT", side="long", entry_price=0.7664, amount=0.39339472,
+            reason="stop_loss", entry_fee=0.001, holding_seconds=60, order_open_id=None,
+        )
+
+        self.assertIsNone(result)
+        self.assertNotIn("LOWERLIMIT1/USDT", self.engine.real_positions)
+
     async def test_restore_positions_separates_paper_and_real(self):
         """
         Order.exchange_id раньше был общим для paper и real (одно и то же

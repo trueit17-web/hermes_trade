@@ -1396,22 +1396,30 @@ class ExecutionEngine:
                 f"наш учёт: {amount:.8f}, доступно на бирже: "
                 f"{available if available is not None else 'не удалось проверить'}"
             )
-            # Помимо available == 0 (актива нет вообще), есть второй случай
-            # той же природы: доступный остаток положительный, но настолько
-            # мал, что сама биржа отклоняет ЛЮБОЙ ордер на его продажу как
-            # ниже минимального торгуемого объёма (ccxt/биржа сообщают об
-            # этом словами "precision"/"minimum" в тексте ошибки — например
-            # "amount ... must be greater than minimum amount precision of
-            # 0.001"). Продать такую пыль в принципе невозможно, поэтому
+            # Помимо available == 0 (актива нет вообще), есть ещё два случая
+            # той же природы — продать позицию в принципе невозможно, и
             # бесконечный повтор попытки (как раньше было с available == 0)
-            # ничего не изменит — учитываем оба сигнала так же, как
-            # оригинальный phantom-кейс: наша проверка (available < amount,
-            # см. выше) + отказ самой биржи по независимой причине.
+            # ничего не изменит:
+            # 1) доступный остаток положительный, но настолько мал, что
+            #    биржа отклоняет ЛЮБОЙ ордер на его продажу как ниже
+            #    минимального торгуемого ОБЪЁМА (ccxt/биржа сообщают об этом
+            #    словами "precision"/"minimum" в тексте ошибки — например
+            #    "amount ... must be greater than minimum amount precision
+            #    of 0.001").
+            # 2) объёма достаточно (available >= amount), но его СТОИМОСТЬ в
+            #    quote-валюте (amount * текущая цена) ниже минимальной для
+            #    пары — Bybit отвечает retCode 170140 "Order value exceeded
+            #    lower limit" (реальный инцидент: SUI/USDT, ~26 минут подряд
+            #    одна и та же ошибка каждые ~70с, available > amount, так что
+            #    условие (1) не срабатывало вообще). В отличие от (1), эта
+            #    проверка НЕ требует available < amount — деление позиции на
+            #    более мелкие ордера её не решает, наоборот, ещё уменьшает
+            #    стоимость каждого.
             unsellable_dust = available == 0 or (
                 available is not None
                 and available < amount
                 and any(kw in str(e).lower() for kw in ("precision", "minimum"))
-            )
+            ) or "lower limit" in str(e).lower()
             if unsellable_dust:
                 await self._reconcile_phantom_position(symbol, order_open_id)
             return None
