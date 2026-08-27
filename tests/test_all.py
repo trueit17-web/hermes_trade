@@ -620,6 +620,97 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(result["pnl"], 1.0, "реально прибыльная сделка не должна показывать PnL≈0")
         self.assertAlmostEqual(result["pnl"], 1.178057752, places=4)
 
+    async def test_execute_real_order_stores_exchange_trade_id_not_internal_order_id(self):
+        """
+        На бирже "ID ордера" в истории сделок — это короткий ID сделки
+        (execId, ~8 символов), а не длинный внутренний order["id"], который
+        нигде в интерфейсе биржи не показывается. order_id_exchange должен
+        хранить ID сделки, даже когда fetch_order уже подтвердил filled сам
+        по себе (без похода в _fetch_fill_details_via_trades по цене/объёму).
+        """
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Order
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"TRADEID1": 0.0}, "TRADEID1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "1234567890123456789-very-long-internal-order-id",
+            "filled": 10.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+        self.engine.exchange.fetch_order_trades = AsyncMock(return_value=[
+            {"id": "56173056", "amount": 10.0, "price": 2.0, "cost": 20.0,
+             "fee": {"cost": 0.01, "currency": "USDT"}},
+        ])
+
+        order = await self.engine.create_order(
+            symbol="TRADEID1/USDT", side="buy", amount=10.0, price=2.0, order_type="market",
+        )
+        self.assertIsNotNone(order)
+
+        async with get_session() as session:
+            db_order = (
+                await session.execute(select(Order).where(Order.id == order.id))
+            ).scalar_one()
+        self.assertEqual(db_order.order_id_exchange, "56173056")
+
+    async def test_close_real_position_stores_exchange_trade_id_not_internal_order_id(self):
+        """Симметричный случай на закрытии — см. тест выше на открытии."""
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Order, Trade
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"TRADEIDCLOSE1": 0.0}, "TRADEIDCLOSE1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "open-long-internal-id", "filled": 10.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+        self.engine.exchange.fetch_order_trades = AsyncMock(return_value=None)
+        opening_order = await self.engine.create_order(
+            symbol="TRADEIDCLOSE1/USDT", side="buy", amount=10.0, price=2.0, order_type="market",
+        )
+        self.assertIsNotNone(opening_order)
+
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"TRADEIDCLOSE1": 10.0},
+            "TRADEIDCLOSE1": {"free": 10.0, "used": 0, "total": 10.0},
+        })
+        self.engine.exchange.create_market_sell_order.return_value = {
+            "id": "close-long-internal-id-much-longer-than-8-chars", "filled": 10.0, "average": 2.5, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+        self.engine.exchange.fetch_order_trades = AsyncMock(return_value=[
+            {"id": "35242741", "amount": 10.0, "price": 2.5, "cost": 25.0,
+             "fee": {"cost": 0.01, "currency": "USDT"}},
+        ])
+
+        result = await self.engine.close_real_position(
+            symbol="TRADEIDCLOSE1/USDT", side="long", entry_price=2.0, amount=10.0,
+            reason="stop_loss", entry_fee=0.01, holding_seconds=60, order_open_id=opening_order.id,
+        )
+        self.assertIsNotNone(result)
+
+        async with get_session() as session:
+            trade = (
+                await session.execute(select(Trade).where(Trade.id == result["trade_id"]))
+            ).scalar_one()
+            close_order = (
+                await session.execute(select(Order).where(Order.id == trade.order_close_id))
+            ).scalar_one()
+        self.assertEqual(close_order.order_id_exchange, "35242741")
+
     async def test_paper_mode_initialization(self):
         """Инициализация в paper режиме восстанавливает баланс/позиции из БД."""
         settings.trading_mode = "paper"

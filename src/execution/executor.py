@@ -966,7 +966,18 @@ class ExecutionEngine:
                     fee_cost += float(cost)
                     fee_currency = fee_currency or fee.get("currency")
 
-            return {"amount": total_amount, "average": average, "fee": {"cost": fee_cost, "currency": fee_currency}}
+            # ID сделки(-ок) на бирже (execId/trade id) — короче и это именно
+            # то, что видно как "ID ордера"/"ID транзакції" в истории сделок
+            # на самой бирже; parent-ордер (order["id"]) — отдельный,
+            # значительно более длинный технический ID, который в интерфейсе
+            # биржи нигде не показывается.
+            trade_ids = [str(t["id"]) for t in trades if t.get("id")]
+
+            return {
+                "amount": total_amount, "average": average,
+                "fee": {"cost": fee_cost, "currency": fee_currency},
+                "trade_ids": trade_ids,
+            }
         except Exception as e:
             logger.debug(f"Не удалось получить детали исполнения через историю сделок {order_id} ({symbol}): {e}")
             return None
@@ -1051,6 +1062,7 @@ class ExecutionEngine:
             # никогда не было — ни самого актива, ни истории операций по нему
             # на бирже, а закрыть такую фантомную позицию невозможно
             # (продавать нечего, "Insufficient balance" на каждой попытке).
+            trade_ids: list[str] | None = None
             if not (order.get("filled") or 0) > 0:
                 # Сначала пробуем ТОЧНЫЕ данные через историю сделок биржи
                 # (реальная цена и комиссия исполнения) — только если их нет,
@@ -1069,6 +1081,7 @@ class ExecutionEngine:
                     order["filled"] = trade_fill["amount"]
                     order["average"] = trade_fill["average"]
                     order["fee"] = trade_fill["fee"]
+                    trade_ids = trade_fill.get("trade_ids")
                 else:
                     confirmed_amount = (
                         await self._confirm_fill_via_balance(symbol, side, balance_before, amount)
@@ -1088,6 +1101,15 @@ class ExecutionEngine:
                     )
                     order = dict(order)
                     order["filled"] = confirmed_amount
+            else:
+                # filled уже подтверждён через fetch_order (цена/объём верные) —
+                # отдельно запрашиваем ID сделки(-ок) на бирже только для
+                # отображения в дашборде: на самой бирже "ID ордера" в истории
+                # сделок — это короткий ID сделки (~8 символов), а не длинный
+                # внутренний order["id"], который нигде в UI биржи не виден.
+                trade_fill = await self._fetch_fill_details_via_trades(order.get("id"), symbol)
+                if trade_fill:
+                    trade_ids = trade_fill.get("trade_ids")
             logger.info(f"✅ Ордер исполнен на бирже: {order['id']} | {side.upper()} {amount:.4f} {symbol}")
 
             # ccxt возвращает order["fee"] как dict {"cost": ..., "currency": ...}
@@ -1126,7 +1148,7 @@ class ExecutionEngine:
                     fee=fill_fee,
                     stop_loss=order_data["stop_loss"],
                     take_profit=order_data["take_profit"],
-                    order_id_exchange=order["id"],
+                    order_id_exchange=",".join(trade_ids) if trade_ids else order["id"],
                     client_order_id=order_data["client_order_id"],
                 )
                 session.add(order_obj)
@@ -1259,6 +1281,7 @@ class ExecutionEngine:
             return None
 
         order = await self._fetch_confirmed_order(order, symbol)
+        trade_ids: list[str] | None = None
         if not (order.get("filled") or 0) > 0:
             # Сначала пробуем ТОЧНЫЕ данные через историю сделок биржи (см.
             # тот же приоритет при открытии в _execute_real_order) — иначе
@@ -1275,6 +1298,7 @@ class ExecutionEngine:
                 order["filled"] = trade_fill["amount"]
                 order["average"] = trade_fill["average"]
                 order["fee"] = trade_fill["fee"]
+                trade_ids = trade_fill.get("trade_ids")
             else:
                 # Второй, независимый от статуса ордера способ подтверждения —
                 # тот же, что и при открытии (см. _confirm_fill_via_balance):
@@ -1299,6 +1323,13 @@ class ExecutionEngine:
                 )
                 order = dict(order)
                 order["filled"] = confirmed_amount
+        else:
+            # filled уже подтверждён через fetch_order — отдельно запрашиваем
+            # ID сделки(-ок) на бирже только для отображения (см. тот же
+            # комментарий в _execute_real_order).
+            trade_fill = await self._fetch_fill_details_via_trades(order.get("id"), symbol)
+            if trade_fill:
+                trade_ids = trade_fill.get("trade_ids")
         exit_price = order.get("average") or order.get("price") or entry_price
         exit_fee = (order.get("fee") or {}).get("cost") or 0
 
@@ -1343,7 +1374,7 @@ class ExecutionEngine:
                 filled_amount=order["filled"] or amount,
                 filled_price=exit_price,
                 fee=exit_fee,
-                order_id_exchange=order["id"],
+                order_id_exchange=",".join(trade_ids) if trade_ids else order["id"],
                 client_order_id=str(uuid.uuid4())[:12],
                 notes=f"Real close ({reason})",
             )

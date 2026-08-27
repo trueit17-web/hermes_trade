@@ -190,6 +190,8 @@
 
   .side-long { color: var(--green); font-weight: 600; }
   .side-short { color: var(--red); font-weight: 600; }
+  .side-buy { color: var(--green); font-weight: 700; }
+  .side-sell { color: var(--red); font-weight: 700; }
   .pnl-pos { color: var(--green); }
   .pnl-neg { color: var(--red); }
 
@@ -1302,10 +1304,11 @@ function orderCardHtml(o, title) {
   if (!o) {
     return `<div class="order-card"><h5>${title}</h5><div class="muted">Данные ордера недоступны</div></div>`;
   }
+  const sideClass = o.side === "sell" ? "side-sell" : "side-buy";
   const rows = [
-    ["ID (внутр. / биржа)", `${o.id}${o.order_id_exchange ? " / " + escapeHtml(o.order_id_exchange) : ""}`],
+    ["ID транзакции", o.order_id_exchange ? escapeHtml(o.order_id_exchange) : "—"],
     ["Client order ID", o.client_order_id ? escapeHtml(o.client_order_id) : "—"],
-    ["Сторона / тип", `${(o.side || "—").toUpperCase()} / ${o.order_type || "—"}`],
+    ["Сторона / тип", `<span class="${sideClass}">${(o.side || "—").toUpperCase()}</span> / ${o.order_type || "—"}`],
     ["Статус", o.status || "—"],
     ["Объём запрошен", o.amount_requested !== null ? fmt(o.amount_requested, 6) : "—"],
     ["Объём исполнен", o.filled_amount !== null ? fmt(o.filled_amount, 6) : "—"],
@@ -1404,6 +1407,8 @@ function renderTradeDetail(d) {
   ` : `<div class="muted" style="padding:4px 0">Журнал решений пуст</div>`;
 
   const tradeValue = d.amount && d.entry_price ? d.amount * d.entry_price : null;
+  const lastLeg = d.legs && d.legs.length ? d.legs[d.legs.length - 1] : null;
+  const exitPrice = lastLeg && lastLeg.exit_price !== null ? lastLeg.exit_price : null;
   return `
     <div class="trade-detail">
       <div class="trade-detail-block">
@@ -1412,7 +1417,7 @@ function renderTradeDetail(d) {
           <div><span class="muted">Символ</span><br>${d.symbol || "—"}</div>
           <div><span class="muted">Сторона</span><br>${(d.direction || "").toUpperCase()}</div>
           <div><span class="muted">Источник</span><br>${d.source || "—"}</div>
-          <div><span class="muted">Цена входа</span><br>${fmtPrice(d.entry_price)}</div>
+          <div><span class="muted">Цена входа / выхода</span><br>${fmtPrice(d.entry_price)} / ${exitPrice !== null ? fmtPrice(exitPrice) : "—"}</div>
           <div><span class="muted">Объём</span><br>${fmt(d.amount, 6)}</div>
           <div><span class="muted">Сумма сделки</span><br>${tradeValue !== null ? "$" + fmt(tradeValue) : "—"}</div>
           <div><span class="muted">PnL</span><br><span class="${d.pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${d.pnl >= 0 ? "+" : ""}${fmt(d.pnl)} (${fmt(d.pnl_pct, 2)}%)</span></div>
@@ -1670,7 +1675,7 @@ function renderChannelSignalsTable(signals) {
         <tbody>
           ${signals.map(s => {
             const order = s.order
-              ? `${s.order.side.toUpperCase()} ${fmt(s.order.amount, 6)} @ ${fmtPrice(s.order.filled_price ?? s.order.price)} <span class="muted">(${s.order.status})</span>`
+              ? `<span class="${s.order.side === 'sell' ? 'side-sell' : 'side-buy'}">${s.order.side.toUpperCase()}</span> ${fmt(s.order.amount, 6)} @ ${fmtPrice(s.order.filled_price ?? s.order.price)} <span class="muted">(${s.order.status})</span>`
               : "—";
             let outcome = "—";
             if (s.trade) {
