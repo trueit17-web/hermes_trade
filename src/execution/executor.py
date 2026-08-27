@@ -1377,7 +1377,9 @@ class ExecutionEngine:
                 value = entry.get("free")
         return float(value or 0.0)
 
-    async def _fetch_confirmed_order(self, order: dict, symbol: str, attempts: int = 5, delay: float = 0.5) -> dict:
+    async def _fetch_confirmed_order(
+        self, order: dict, symbol: str, attempts: int = 8, delay: float = 0.75,
+    ) -> dict:
         """
         Bybit v5 (и потенциально другие биржи) на СОЗДАНИЕ маркет-ордера
         возвращает только orderId — цена/объём/комиссия исполнения туда не
@@ -1388,12 +1390,32 @@ class ExecutionEngine:
         получался ровно 0 (или ровно -комиссия, если она всё же попадала).
         Раз рыночный ордер исполняется почти мгновенно, короткий поллинг
         fetch_order догоняет реальные данные буквально за один-два тика.
+
+        Реальный инцидент (RLUSD/USDT на демо-счёте Bybit): ~50 подряд
+        реальных покупок за час, каждая меньше предыдущей — ордер реально
+        исполнялся на бирже (подтверждено историей сделок биржи), но эта
+        функция каждый раз считала его неподтверждённым, вызывающий код
+        (_execute_real_order) трактовал это как провал и НЕ регистрировал
+        позицию — на следующей итерации стратегия видела символ "свободным"
+        и открывала его заново на то, что осталось от баланса. Причина:
+        условие выхода из цикла проверяло только average/price, хотя
+        решение о провале в вызывающем коде принимается по полю filled —
+        ответ fetch_order мог уже содержать реальный filled без ещё
+        подтянувшихся average/price, и такой промежуточный снимок никогда
+        не возвращался: цикл впустую доходил до конца попыток и откатывался
+        к исходному, заведомо неактуальному ответу СОЗДАНИЯ ордера
+        (filled там всегда None/0 — см. выше). Теперь: (1) выходим раньше и
+        по filled тоже, не только по average/price; (2) если так и не
+        дождались ни одного из трёх — возвращаем ПОСЛЕДНИЙ полученный от
+        биржи снимок, а не исходный ответ создания ордера, который точно
+        устарел.
         """
-        if order.get("average") or order.get("price"):
+        if order.get("average") or order.get("price") or (order.get("filled") or 0) > 0:
             return order
         order_id = order.get("id")
         if not order_id:
             return order
+        latest = order
         for _ in range(attempts):
             await asyncio.sleep(delay)
             try:
@@ -1401,13 +1423,14 @@ class ExecutionEngine:
             except Exception as e:
                 logger.debug(f"Не удалось уточнить исполнение ордера {order_id} ({symbol}): {e}")
                 break
-            if fetched.get("average") or fetched.get("price"):
+            latest = fetched
+            if fetched.get("average") or fetched.get("price") or (fetched.get("filled") or 0) > 0:
                 return fetched
         logger.warning(
-            f"⚠️ Не удалось получить цену исполнения ордера {order_id} ({symbol}) — "
-            f"PnL этой сделки будет посчитан по запрошенной цене, а не фактической."
+            f"⚠️ Не удалось дождаться подтверждения исполнения ордера {order_id} ({symbol}) "
+            f"за {attempts * delay:.1f}с — используем последний полученный от биржи снимок."
         )
-        return order
+        return latest
 
 
 # Глобальный экземпляр

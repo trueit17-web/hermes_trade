@@ -438,6 +438,45 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.engine.close()
 
+    async def test_fetch_confirmed_order_exits_early_on_filled_without_average_price(self):
+        """
+        Реальный инцидент (RLUSD/USDT, демо-счёт Bybit): ответ fetch_order
+        мог уже содержать реальный filled без ещё подтянувшихся
+        average/price — раньше условие выхода из цикла проверяло только
+        average/price, поэтому такой снимок игнорировался, цикл впустую
+        доходил до конца попыток и вызывающий код (_execute_real_order)
+        считал ордер неисполненным, хотя биржа его уже реально исполнила.
+        """
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_order = AsyncMock(
+            return_value={"id": "early-filled-1", "filled": 1.03, "average": None, "price": None}
+        )
+        with patch("src.execution.executor.asyncio.sleep", new=AsyncMock()):
+            result = await self.engine._fetch_confirmed_order(
+                {"id": "early-filled-1", "filled": None, "average": None, "price": None},
+                "RLUSD/USDT",
+            )
+        self.assertEqual(result["filled"], 1.03)
+        self.engine.exchange.fetch_order.assert_called_once()
+
+    async def test_fetch_confirmed_order_returns_latest_snapshot_not_stale_original(self):
+        """
+        Если ни за одну попытку ни average/price, ни filled так и не
+        появились — нужно вернуть ПОСЛЕДНИЙ полученный от биржи снимок
+        (пусть и неполный), а не исходный ответ СОЗДАНИЯ ордера, который
+        точно устарел (в нём filled всегда None/0 по конструкции Bybit v5).
+        """
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_order = AsyncMock(
+            return_value={"id": "never-confirms-1", "filled": None, "average": None, "price": None, "status": "open"}
+        )
+        original = {"id": "never-confirms-1", "filled": None, "average": None, "price": None}
+        with patch("src.execution.executor.asyncio.sleep", new=AsyncMock()):
+            result = await self.engine._fetch_confirmed_order(original, "RLUSD/USDT", attempts=3, delay=0.01)
+        self.assertIsNot(result, original)
+        self.assertEqual(result["status"], "open")
+        self.assertEqual(self.engine.exchange.fetch_order.call_count, 3)
+
     async def test_paper_mode_initialization(self):
         """Инициализация в paper режиме восстанавливает баланс/позиции из БД."""
         settings.trading_mode = "paper"
