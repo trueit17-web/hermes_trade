@@ -3678,6 +3678,78 @@ class TestScaleSlTp(unittest.TestCase):
         self.assertEqual(self.TradingBot._scale_sl_tp("long", 0.0, 95.0, 110.0, 2.0), (95.0, 110.0))
 
 
+class TestAtrSlTp(unittest.TestCase):
+    """
+    TradingBot._atr_sl_tp — ATR-адаптивный SL/TP (метод 1 из запроса
+    пользователя): SL = ATR(14) × множитель, TP = SL × R:R, где R:R зависит
+    от типа стратегии (трендовая/контртрендовая). Выключено по умолчанию.
+    """
+
+    def setUp(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        self.TradingBot = main_module.TradingBot
+        self._saved = {
+            k: getattr(settings, k) for k in (
+                "atr_sltp_enabled", "atr_sl_multiplier", "atr_tp_rr_trend", "atr_tp_rr_countertrend",
+            )
+        }
+        settings.atr_sltp_enabled = True
+        settings.atr_sl_multiplier = 1.8
+        settings.atr_tp_rr_trend = 3.0
+        settings.atr_tp_rr_countertrend = 2.0
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(settings, k, v)
+
+    def test_disabled_returns_none(self):
+        settings.atr_sltp_enabled = False
+        sl, tp = self.TradingBot._atr_sl_tp("ema_cross", "long", 100.0, 5.0)
+        self.assertIsNone(sl)
+        self.assertIsNone(tp)
+
+    def test_missing_atr_returns_none(self):
+        sl, tp = self.TradingBot._atr_sl_tp("ema_cross", "long", 100.0, None)
+        self.assertIsNone(sl)
+        self.assertIsNone(tp)
+
+    def test_nan_atr_returns_none(self):
+        """
+        pandas .get() на ещё не прогретом буфере свечей отдаёт NaN, а не
+        None — NaN truthy в Python и не ловится ни "not atr", ни "atr <= 0",
+        поэтому нужна отдельная проверка math.isnan (иначе NaN попал бы в
+        SL/TP реального ордера).
+        """
+        sl, tp = self.TradingBot._atr_sl_tp("ema_cross", "long", 100.0, float("nan"))
+        self.assertIsNone(sl)
+        self.assertIsNone(tp)
+
+    def test_trend_strategy_uses_trend_rr_long(self):
+        """BTC/USD пример из запроса пользователя: ATR=1200, множитель 1.8 -> SL=2160, R:R=3 -> TP=6480."""
+        sl, tp = self.TradingBot._atr_sl_tp("ema_cross", "long", 50000.0, 1200.0)
+        self.assertAlmostEqual(sl, 50000.0 - 2160.0)
+        self.assertAlmostEqual(tp, 50000.0 + 6480.0)
+
+    def test_trend_strategy_uses_trend_rr_short(self):
+        sl, tp = self.TradingBot._atr_sl_tp("ml_classifier", "short", 50000.0, 1200.0)
+        self.assertAlmostEqual(sl, 50000.0 + 2160.0)
+        self.assertAlmostEqual(tp, 50000.0 - 6480.0)
+
+    def test_countertrend_strategy_uses_narrower_rr(self):
+        sl, tp = self.TradingBot._atr_sl_tp("rsi_mr", "long", 100.0, 2.0)
+        sl_distance = 2.0 * 1.8
+        self.assertAlmostEqual(sl, 100.0 - sl_distance)
+        self.assertAlmostEqual(tp, 100.0 + sl_distance * 2.0)
+
+    def test_ensemble_voter_classified_as_trend(self):
+        sl, tp = self.TradingBot._atr_sl_tp("ensemble_voter", "long", 100.0, 2.0)
+        sl_distance = 2.0 * 1.8
+        self.assertAlmostEqual(tp, 100.0 + sl_distance * 3.0)
+
+
 class TestVolatilityPredictorRegistration(unittest.IsolatedAsyncioTestCase):
     """
     train_volatility_predictor раньше не писал ничего в MLModel — модель

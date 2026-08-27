@@ -1,5 +1,6 @@
 """CryptoBot Pro — автономный самообучающийся крипто-трейдер бот."""
 import asyncio
+import math
 import statistics
 import sys
 from datetime import datetime, timedelta
@@ -971,8 +972,13 @@ class TradingBot:
             entry_price = signal.entry_price if signal.entry_price > 0 else close
 
             vol_size_mult, vol_sltp_mult = self._volatility_multipliers(predicted_volatility)
+            atr_sl, atr_tp = self._atr_sl_tp(
+                signal.strategy_id, signal.side, entry_price, strategy_data.get("atr_14"),
+            )
+            base_sl = atr_sl if atr_sl is not None else signal.stop_loss
+            base_tp = atr_tp if atr_tp is not None else signal.take_profit
             stop_loss, take_profit = self._scale_sl_tp(
-                signal.side, entry_price, signal.stop_loss, signal.take_profit, vol_sltp_mult,
+                signal.side, entry_price, base_sl, base_tp, vol_sltp_mult,
             )
 
             size_pct = signal.position_size_pct * mult * vol_size_mult
@@ -1145,6 +1151,55 @@ class TradingBot:
             min(settings.volatility_sltp_max_mult, vol_ratio),
         )
         return size_mult, sltp_mult
+
+    # Трендовые стратегии (сигнал следует за направлением движения — ждём
+    # продолжения, ставим TP дальше) против контртрендовых/mean-reversion
+    # (играем на откате — вероятность большого хода ниже, TP ближе). Влияет
+    # только на R:R для ATR-адаптивного TP (см. _atr_sl_tp) — со стратегией
+    # ensemble_voter обычно голосует несколько источников сразу, что ближе
+    # по духу к подтверждённому трендовому сигналу.
+    ATR_TREND_STRATEGY_IDS: ClassVar[frozenset[str]] = frozenset({"ema_cross", "ml_classifier", "ensemble_voter"})
+
+    @staticmethod
+    def _atr_sl_tp(
+        strategy_id: str, side: str, entry_price: float, atr: float | None,
+    ) -> tuple[float | None, float | None]:
+        """
+        ATR-адаптивный SL/TP: ATR(14) — объективная мера "среднего" движения
+        рынка за последние 14 свечей, в отличие от фиксированного % (2%/4%
+        по умолчанию у всех стратегий), одинакового и в затишье, и в шторм.
+
+        SL = ATR × atr_sl_multiplier (типично 1.5–2.0 — консервативно,
+        перекрывает нормальный шум; 0.8–1.2 — агрессивно, для частых
+        внутридневных сделок). TP = SL × R:R, где R:R зависит от типа
+        стратегии — шире для трендовых (см. ATR_TREND_STRATEGY_IDS), уже
+        для контртрендовых. Оба множителя настраиваются в дашборде.
+
+        Выключено по умолчанию (settings.atr_sltp_enabled) и не подменяет
+        уровни Telegram-сигналов (там свои, от канала) — только сигналы от
+        strategy_registry. Возвращает (None, None), если фича выключена,
+        ATR недоступен (например, буфер свечей ещё не прогрелся) или
+        entry_price некорректен — тогда вызывающий код использует
+        собственные %-ные уровни стратегии как раньше.
+        """
+        # "not atr"/"atr <= 0" НЕ ловят NaN (буфер свечей ещё не прогрелся до
+        # 14 периодов ATR) — NaN в Python truthy и не сравнивается через <=,
+        # поэтому явная проверка через math.isnan обязательна: без неё в SL/TP
+        # ордера мог бы уйти NaN.
+        if (
+            not settings.atr_sltp_enabled or not atr or math.isnan(atr) or atr <= 0
+            or not entry_price
+        ):
+            return None, None
+        sl_distance = atr * settings.atr_sl_multiplier
+        rr = (
+            settings.atr_tp_rr_trend if strategy_id in TradingBot.ATR_TREND_STRATEGY_IDS
+            else settings.atr_tp_rr_countertrend
+        )
+        tp_distance = sl_distance * rr
+        if side == "long":
+            return entry_price - sl_distance, entry_price + tp_distance
+        return entry_price + sl_distance, entry_price - tp_distance
 
     @staticmethod
     def _scale_sl_tp(

@@ -78,6 +78,21 @@ class Settings(BaseSettings):
     # trailing_stop_pct и только ужесточается (никогда не откатывается назад).
     trailing_stop_pct: float = 0.0
 
+    # === ATR-адаптивный SL/TP (только для сигналов от стратегий —
+    # Telegram-сигналы несут собственные уровни от канала и не трогаются).
+    # SL = ATR(14) * atr_sl_multiplier; TP = SL * R:R (R:R зависит от типа
+    # стратегии — трендовые шире, контртрендовые уже, см. main.py
+    # ATR_TREND_STRATEGY_IDS). Выключено по умолчанию — включается осознанно
+    # из дашборда, как и volatility_adjustment_enabled ниже; при включении
+    # ATR-уровни заменяют фиксированный %-ный SL/TP стратегии ДО того, как
+    # к ним применится масштабирование по предсказанной волатильности
+    # (volatility_adjustment_enabled) — эти два механизма совместимы и не
+    # дублируют друг друга: ATR даёт базовую ширину, volatility её донастраивает. ===
+    atr_sltp_enabled: bool = False
+    atr_sl_multiplier: float = 1.8
+    atr_tp_rr_trend: float = 3.0
+    atr_tp_rr_countertrend: float = 2.0
+
     # === Volatility adjustment (predicted volatility -> размер позиции и
     # ширина SL/TP) — только для сигналов от стратегий (strategy_registry);
     # Telegram-сигналы несут собственные уровни от канала и не трогаются. ===
