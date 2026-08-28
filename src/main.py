@@ -1,6 +1,7 @@
 """CryptoBot Pro — автономный самообучающийся крипто-трейдер бот."""
 import asyncio
 import math
+import signal
 import statistics
 import sys
 from datetime import datetime, timedelta
@@ -1414,6 +1415,29 @@ class TradingBot:
         logger.info("✅ Очистка завершена")
 
 
+async def _run_until_shutdown(bot_task: asyncio.Task, server_task: asyncio.Task, web_server) -> None:
+    """
+    Дождаться завершения основного цикла бота и веб-сервера, что бы ни
+    случилось раньше (штатный сигнал остановки отменяет bot_task — см.
+    _request_shutdown в main() — либо одна из задач сама упала). Не
+    полагаемся на то, что отмена await asyncio.gather(...) сама дождётся
+    детей (в разных версиях asyncio это ведёт себя неоднозначно) — вместо
+    этого явно ждём, при необходимости довозбуждаем отмену/should_exit
+    оставшейся задаче и гарантированно дожидаемся обеих через gather с
+    return_exceptions=True, прежде чем вернуть управление наружу (только
+    тогда TradingBot.run() успевает дойти до своего _cleanup()).
+    """
+    await asyncio.wait({bot_task, server_task}, return_when=asyncio.FIRST_COMPLETED)
+    if not bot_task.done():
+        bot_task.cancel()
+    if not server_task.done():
+        web_server.should_exit = True
+    results = await asyncio.gather(bot_task, server_task, return_exceptions=True)
+    for result in results:
+        if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
+            logger.error(f"Ошибка при остановке: {result}")
+
+
 async def main():
     """Точка входа."""
     global current_bot
@@ -1438,14 +1462,33 @@ async def main():
         log_level=settings.log_level.lower(),
     )
     web_server = uvicorn.Server(web_config)
-    web_server.install_signal_handlers = lambda: None  # управление сигналами — у asyncio.run()
+    web_server.install_signal_handlers = lambda: None  # управление сигналами — вручную, ниже
+
+    bot_task = asyncio.create_task(bot.run())
+    server_task = asyncio.create_task(web_server.serve())
+
+    # SIGTERM — то, чем docker/docker-compose штатно останавливает контейнер
+    # (docker stop, пересоздание образа при "docker compose up -d") — по
+    # умолчанию у него ВООБЩЕ нет обработчика ни в Python, ни в asyncio (в
+    # отличие от SIGINT, который asyncio.run() сам превращает в
+    # KeyboardInterrupt): процесс убивался ОС мгновенно, ни разу не долетая
+    # до _cleanup() — отсюда "Unclosed client session"/"Unclosed connector"
+    # от aiohttp при каждом рестарте контейнера, даже после того как
+    # _cleanup() научили закрывать соединение с биржей (сам _cleanup()
+    # попросту не успевал вызваться). run() ловит CancelledError в своём
+    # цикле и сам доходит до _cleanup() перед завершением (см.
+    # TradingBot.run() выше) — _run_until_shutdown() дожидается этого явно.
+    def _request_shutdown(sig_name: str):
+        logger.info(f"📥 Получен {sig_name} — начинаю graceful shutdown")
+        web_server.should_exit = True
+        bot_task.cancel()
+
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, _request_shutdown, "SIGTERM")
+    loop.add_signal_handler(signal.SIGINT, _request_shutdown, "SIGINT")
 
     try:
-        await asyncio.gather(bot.run(), web_server.serve())
-    except KeyboardInterrupt:
-        logger.info("📥 SIGINT — shutdown")
-        await bot._cleanup()
-        sys.exit(0)
+        await _run_until_shutdown(bot_task, server_task, web_server)
     except Exception as e:
         logger.critical(f"Критическая ошибка: {e}")
         import traceback

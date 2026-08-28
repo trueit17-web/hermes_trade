@@ -3365,6 +3365,76 @@ class TestCleanupClosesExchangeConnection(unittest.IsolatedAsyncioTestCase):
         close_mock.assert_awaited_once()
 
 
+class TestGracefulShutdownWaitsForCleanup(unittest.IsolatedAsyncioTestCase):
+    """
+    SIGTERM (то, чем docker/docker-compose штатно останавливает контейнер)
+    раньше не имел вообще никакого обработчика — процесс убивался ОС
+    мгновенно, ни разу не долетая до TradingBot._cleanup() (см.
+    TestCleanupClosesExchangeConnection выше — сам _cleanup() уже был
+    исправлен, но это не помогало, если его никогда не вызывали). Теперь
+    main() отменяет bot_task вручную по сигналу и явно дожидается, пока
+    run() дойдёт до своего _cleanup() — _run_until_shutdown() и есть эта
+    логика ожидания, вынесенная отдельно, чтобы проверить её без реального
+    uvicorn/сигналов ОС.
+    """
+
+    async def test_cancelling_bot_task_waits_for_its_cleanup_before_returning(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+
+        # Тесты этого файла глобально патчат asyncio.sleep на AsyncMock (см.
+        # conftest._no_real_polling_delay) — он резолвится без реальной
+        # приостановки, поэтому "while: await asyncio.sleep(...)" здесь
+        # превратился бы в бесконечный busy-loop, ни разу не отдающий
+        # управление планировщику. asyncio.Event — обычная примитива
+        # синхронизации, этим патчем не затронута.
+        cleanup_marker = {"ran": False}
+        started = asyncio.Event()
+
+        async def fake_bot_run():
+            started.set()
+            try:
+                await asyncio.Event().wait()  # никогда не установится сам — только через cancel()
+            except asyncio.CancelledError:
+                # Мимикрирует TradingBot.run(): ловит отмену внутри себя,
+                # "делает cleanup" и возвращается нормально, не перевызывая
+                # исключение — то же поведение, что и у настоящего run().
+                cleanup_marker["ran"] = True
+                return
+
+        class FakeWebServer:
+            def __init__(self):
+                self._exit_event = asyncio.Event()
+
+            @property
+            def should_exit(self):
+                return self._exit_event.is_set()
+
+            @should_exit.setter
+            def should_exit(self, value):
+                if value:
+                    self._exit_event.set()
+
+            async def serve(self):
+                await self._exit_event.wait()
+
+        fake_server = FakeWebServer()
+        bot_task = asyncio.create_task(fake_bot_run())
+        server_task = asyncio.create_task(fake_server.serve())
+
+        await started.wait()  # дать bot_task реально стартовать
+        bot_task.cancel()  # то же самое, что делает _request_shutdown() по сигналу
+
+        await main_module._run_until_shutdown(bot_task, server_task, fake_server)
+
+        self.assertTrue(cleanup_marker["ran"], "bot_task должен успеть дойти до своего cleanup")
+        self.assertTrue(fake_server.should_exit, "should_exit должен быть выставлен серверу")
+        self.assertTrue(bot_task.done())
+        self.assertTrue(server_task.done())
+
+
 class TestTradingIterationPerSymbolIsolation(unittest.IsolatedAsyncioTestCase):
     """
     The for-symbol loop in _trading_iteration had no per-symbol exception
