@@ -1972,6 +1972,79 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(paper_positions)
         self.assertNotIn("ETH/USDT", paper_positions)
 
+    async def test_execute_real_order_rejects_sell_side_short_open(self):
+        """
+        Реальный инцидент (прод, реальный счёт Bybit, ENA/USDT,
+        bb_strategy): сигнал side="short" дошёл до _execute_real_order и
+        создал market SELL, который реально ИСПОЛНИЛСЯ на бирже (аккаунт
+        держал ENA не через этого бота) — распродав реальный актив и
+        оставив в БД "осиротевший" sell-ордер, который на каждом рестарте
+        реконструировался как незакрываемая "short-позиция" (close_real_position
+        принципиально отклоняет side != long). На споте нет встроенного
+        шорта — _execute_real_order должен отклонять side="sell" СРАЗУ, не
+        доходя до биржи вообще.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+
+        order = await self.engine.create_order(
+            symbol="ENASHORT1/USDT", side="sell", amount=1000.0, price=0.15, order_type="market",
+        )
+        self.assertIsNone(order)
+        self.engine.exchange.create_market_sell_order.assert_not_called()
+        self.assertNotIn("ENASHORT1/USDT", self.engine.real_positions)
+
+    async def test_restore_real_positions_skips_orphaned_short_order(self):
+        """
+        Уже существующий в БД "осиротевший" real short-ордер (от бага до
+        добавления защиты выше) не должен реконструироваться как открытая
+        позиция при каждом рестарте — закрыть его всё равно принципиально
+        невозможно (close_real_position отклоняет side != long), только
+        засоряет логи той же неустранимой ошибкой на каждой попытке.
+        """
+        from src.db.session import get_session
+        from src.db.models import Order
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        async with get_session() as session:
+            exchange_id, symbol_id = await self.engine._resolve_symbol_id(session, "ORPHANSHORT1/USDT")
+            orphan = Order(
+                exchange_id=exchange_id, symbol_id=symbol_id,
+                side="sell", order_type="market", amount=1000.0, price=0.15,
+                status="filled", filled_amount=1000.0, filled_price=0.15,
+                fee=0.01, order_id_exchange="orphan-short-1", client_order_id="orphanshort1",
+            )
+            session.add(orphan)
+            await session.commit()
+
+        real_positions, _, _ = await self.engine._load_open_positions_from_db(is_paper=False)
+        self.assertIsNotNone(real_positions)
+        self.assertNotIn("ORPHANSHORT1/USDT", real_positions)
+
+        # Paper-режим по-прежнему поддерживает шорт (только real сломан) —
+        # тот же самый sell-ордер, но под paper-биржей, должен по-прежнему
+        # восстанавливаться как открытая short-позиция.
+        self.engine.is_paper = True
+        async with get_session() as session:
+            exchange_id, symbol_id = await self.engine._resolve_symbol_id(session, "ORPHANSHORT1/USDT")
+            paper_short = Order(
+                exchange_id=exchange_id, symbol_id=symbol_id,
+                side="sell", order_type="market", amount=1000.0, price=0.15,
+                status="filled", filled_amount=1000.0, filled_price=0.15,
+                fee=0.01, order_id_exchange=None, client_order_id="paperorphanshort1",
+            )
+            session.add(paper_short)
+            await session.commit()
+
+        paper_positions, _, _ = await self.engine._load_open_positions_from_db(is_paper=True)
+        self.assertIsNotNone(paper_positions)
+        self.assertIn("ORPHANSHORT1/USDT", paper_positions)
+        self.assertEqual(paper_positions["ORPHANSHORT1/USDT"]["side"], "short")
+
     async def test_real_buy_with_base_currency_fee_reduces_tracked_amount(self):
         """
         На споте комиссия обычно списывается из полученного актива: купили
