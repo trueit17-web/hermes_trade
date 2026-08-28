@@ -4079,6 +4079,46 @@ class TestTrailingStop(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("NOSUCHPOS/USDT", bot.open_positions)
 
 
+class TestTpLevels(unittest.TestCase):
+    """
+    _tp_levels: для сделок из Telegram-канала — 3 уровня частичной фиксации
+    (TP1/TP2/TP3); для остальных источников (стратегии) — временно только
+    одинарный TP (TP1=TP2=None, TP3=финальный уровень).
+    """
+
+    def _tp_levels(self, entry_price, tp, strategy_id=None):
+        import src.main as main_module
+        return main_module.TradingBot._tp_levels(entry_price, tp, strategy_id)
+
+    def test_telegram_signal_splits_into_three_levels(self):
+        tp1, tp2, tp3 = self._tp_levels(100.0, 130.0, "telegram_signal")
+        self.assertAlmostEqual(tp1, 110.0)
+        self.assertAlmostEqual(tp2, 120.0)
+        self.assertAlmostEqual(tp3, 130.0)
+
+    def test_strategy_signal_uses_single_tp(self):
+        tp1, tp2, tp3 = self._tp_levels(100.0, 130.0, "ensemble_voter")
+        self.assertIsNone(tp1)
+        self.assertIsNone(tp2)
+        self.assertEqual(tp3, 130.0)
+
+    def test_no_strategy_id_defaults_to_single_tp(self):
+        tp1, tp2, tp3 = self._tp_levels(100.0, 130.0, None)
+        self.assertIsNone(tp1)
+        self.assertIsNone(tp2)
+        self.assertEqual(tp3, 130.0)
+
+    def test_no_tp_returns_all_none_regardless_of_source(self):
+        self.assertEqual(self._tp_levels(100.0, None, "telegram_signal"), (None, None, None))
+        self.assertEqual(self._tp_levels(100.0, None, "ensemble_voter"), (None, None, None))
+
+    def test_short_side_symmetric_for_telegram_signal(self):
+        tp1, tp2, tp3 = self._tp_levels(100.0, 70.0, "telegram_signal")
+        self.assertAlmostEqual(tp1, 90.0)
+        self.assertAlmostEqual(tp2, 80.0)
+        self.assertAlmostEqual(tp3, 70.0)
+
+
 class TestExpectancySizing(unittest.IsolatedAsyncioTestCase):
     """
     Expectancy-based sizing (портировано из clonerbot: scoring/channel_scorer.py):

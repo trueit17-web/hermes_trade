@@ -276,6 +276,7 @@
     margin-bottom: 14px;
   }
   .order-cards-row:last-child { margin-bottom: 0; }
+  .order-cards-row--single { grid-template-columns: 1fr; }
   @media (max-width: 640px) { .order-cards-row { grid-template-columns: 1fr; } }
   .order-card {
     background: rgba(255,255,255,.03);
@@ -1425,7 +1426,7 @@ function orderCardHtml(o, title) {
   `;
 }
 
-function orderCardsRowHtml(openingOrder, leg, label) {
+function orderCardsRowHtml(openingOrder, leg, label, showOpeningCard = true) {
   const openPrice = openingOrder ? openingOrder.filled_price : null;
   const closePrice = leg.closing_order ? leg.closing_order.filled_price : leg.exit_price;
   const openFee = openingOrder && openingOrder.fee !== null ? openingOrder.fee : 0;
@@ -1442,8 +1443,8 @@ function orderCardsRowHtml(openingOrder, leg, label) {
   return `
     <div class="trade-detail-block">
       ${label ? `<h4>${label}</h4>` : ""}
-      <div class="order-cards-row">
-        ${orderCardHtml(openingOrder, "Открывающий ордер")}
+      <div class="order-cards-row${showOpeningCard ? "" : " order-cards-row--single"}">
+        ${showOpeningCard ? orderCardHtml(openingOrder, "Открывающий ордер") : ""}
         ${orderCardHtml(leg.closing_order, "Закрывающий ордер")}
       </div>
       ${breakdown}
@@ -1452,9 +1453,13 @@ function orderCardsRowHtml(openingOrder, leg, label) {
 }
 
 function renderTradeDetail(d) {
+  // Все "ноги" в d.legs делят один и тот же открывающий ордер (группа
+  // собрана на бэкенде по order_open_id) — карточку открывающего ордера
+  // показываем только у первой ноги, чтобы не дублировать её на каждом
+  // частичном закрытии TP1/TP2/TP3.
   const ordersHtml = d.legs && d.legs.length
     ? d.legs.map((leg, i) => orderCardsRowHtml(
-        d.opening_order, leg, d.legs.length > 1 ? `Ордера — частичное закрытие #${i + 1}` : "Ордера"
+        d.opening_order, leg, d.legs.length > 1 ? `Ордера — частичное закрытие #${i + 1}` : "Ордера", i === 0
       )).join("")
     : orderCardsRowHtml(d.opening_order, {}, "Ордера");
 

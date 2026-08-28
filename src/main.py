@@ -1075,16 +1075,23 @@ class TradingBot:
             logger.debug(f"Не удалось сохранить ML-обучающий пример для {symbol}: {e}")
 
     @staticmethod
-    def _tp_levels(entry_price: float, tp: float | None) -> tuple:
+    def _tp_levels(entry_price: float, tp: float | None, strategy_id: str | None = None) -> tuple:
         """
         3 уровня частичной фиксации прибыли — линейная интерполяция между
         ценой входа и итоговым TP (TP3): TP1 = 1/3 пути, TP2 = 2/3 пути.
         Формула симметрична для long и short (tp > entry для long,
         tp < entry для short — интерполяция работает в обе стороны).
         Возвращает (None, None, None), если TP не задан.
+
+        Для сделок НЕ от Telegram-канала (strategy_id != "telegram_signal")
+        временно используется только одинарный TP (TP1=TP2=None, TP3=tp) —
+        позиция закрывается целиком по единственному уровню, без частичных
+        фиксаций.
         """
         if not tp:
             return None, None, None
+        if strategy_id != "telegram_signal":
+            return None, None, tp
         tp1 = entry_price + (tp - entry_price) / 3
         tp2 = entry_price + (tp - entry_price) * 2 / 3
         return tp1, tp2, tp
@@ -1249,7 +1256,7 @@ class TradingBot:
         side = position["side"]
         sl = position.get("sl")
         tp_hit_count = position.get("tp_hit_count", 0)
-        tp1, tp2, tp3 = self._tp_levels(position["entry_price"], position.get("tp"))
+        tp1, tp2, tp3 = self._tp_levels(position["entry_price"], position.get("tp"), position.get("strategy_id"))
 
         reason = None
         if side == "long":
