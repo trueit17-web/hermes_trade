@@ -829,6 +829,15 @@ function escapeHtml(s) {
   return div.innerHTML;
 }
 
+// На бирже ID сделки в истории показывается коротким (~8 символов) — тот
+// же формат в дашборде, а не длинный технический ID. order_id_exchange
+// иногда содержит несколько ID через запятую (частичные исполнения) —
+// усекаем каждый по отдельности, сохраняя разделитель.
+function fmtOrderId(id) {
+  if (!id) return null;
+  return String(id).split(",").map(part => part.length > 8 ? part.slice(-8) : part).join(", ");
+}
+
 function renderHeader(status) {
   const badges = document.getElementById("headerBadges");
   const modeClass = status.is_paper ? "badge-mode-paper" : "badge-mode-real";
@@ -916,7 +925,7 @@ function renderPositions(status) {
       <td>${tradeValue !== null ? "$" + fmt(tradeValue) : "—"}</td>
       <td>${pnlHtml}</td>
       <td class="muted">${pos.source || "—"}</td>
-      <td class="muted">${pos.order_id_exchange ? escapeHtml(pos.order_id_exchange) : "—"}</td>
+      <td class="muted">${pos.order_id_exchange ? escapeHtml(fmtOrderId(pos.order_id_exchange)) : "—"}</td>
       <td><button class="btn-icon-danger" data-close-position="${symbol}" title="Закрыть по рынку">✕</button></td>
     </tr>
   `;
@@ -974,7 +983,7 @@ function renderManualPositions(status) {
       <td><input type="number" class="inline-edit-input" data-sl-input="${symbol}" value="${pos.stop_loss ?? ''}" step="any" placeholder="—">${slBadge}</td>
       <td><input type="number" class="inline-edit-input" data-tp-input="${symbol}" value="${pos.take_profit ?? ''}" step="any" placeholder="—"></td>
       <td>${pnlHtml}</td>
-      <td class="muted">${pos.order_id_exchange ? escapeHtml(pos.order_id_exchange) : "—"}</td>
+      <td class="muted">${pos.order_id_exchange ? escapeHtml(fmtOrderId(pos.order_id_exchange)) : "—"}</td>
       <td class="row-actions">
         <button class="btn-ghost" data-save-sltp="${symbol}" title="Сохранить SL/TP">💾</button>
         <button class="btn-icon-danger" data-close-position="${symbol}" title="Закрыть по рынку">✕</button>
@@ -1059,7 +1068,7 @@ async function renderManualTrades() {
     }
 
     body.innerHTML = trades.map(t => {
-      const orderId = t.order_id_exchange_open || t.order_id_exchange_close;
+      const orderId = fmtOrderId(t.order_id_exchange_open || t.order_id_exchange_close);
       return `
       <tr>
         <td>${t.symbol || ("#" + t.symbol_id)}</td>
@@ -1215,7 +1224,7 @@ async function renderTrades() {
 
     body.innerHTML = trades.map(t => {
       const tradeValue = t.amount && t.entry_price ? t.amount * t.entry_price : null;
-      const orderId = t.order_id_exchange_open || t.order_id_exchange_close;
+      const orderId = fmtOrderId(t.order_id_exchange_open || t.order_id_exchange_close);
       return `
       <tr class="trade-row" data-trade-id="${t.id}" title="Показать подробности сделки">
         <td><span class="expand-arrow">▸</span>${t.symbol || ("#" + t.symbol_id)}</td>
@@ -1318,7 +1327,7 @@ function orderCardHtml(o, title) {
   }
   const sideClass = o.side === "sell" ? "side-sell" : "side-buy";
   const rows = [
-    ["ID транзакции", o.order_id_exchange ? escapeHtml(o.order_id_exchange) : "—"],
+    ["ID транзакции", o.order_id_exchange ? escapeHtml(fmtOrderId(o.order_id_exchange)) : "—"],
     ["Client order ID", o.client_order_id ? escapeHtml(o.client_order_id) : "—"],
     ["Сторона / тип", `<span class="${sideClass}">${(o.side || "—").toUpperCase()}</span> / ${o.order_type || "—"}`],
     ["Статус", o.status || "—"],
@@ -1394,7 +1403,7 @@ function renderTradeDetail(d) {
                 <td>${leg.outcome || "—"}</td>
                 <td class="muted">${fmtDuration(leg.holding_seconds)}</td>
                 <td class="muted">${leg.closed_at ? new Date(leg.closed_at).toLocaleString("ru-RU") : "—"}</td>
-                <td class="muted">${leg.order_id_exchange_close ? escapeHtml(leg.order_id_exchange_close) : "—"}</td>
+                <td class="muted">${leg.order_id_exchange_close ? escapeHtml(fmtOrderId(leg.order_id_exchange_close)) : "—"}</td>
               </tr>
             `).join("")}
           </tbody>
@@ -1436,7 +1445,7 @@ function renderTradeDetail(d) {
           <div><span class="muted">Итог</span><br>${d.outcome || (d.is_open ? "открыта" : "—")}</div>
           <div><span class="muted">Открыта</span><br>${d.created_at ? new Date(d.created_at).toLocaleString("ru-RU") : "—"}</div>
           <div><span class="muted">Закрыта</span><br>${d.closed_at ? new Date(d.closed_at).toLocaleString("ru-RU") : "—"}</div>
-          <div><span class="muted">ID открывающего ордера</span><br>${d.order_id_exchange_open ? escapeHtml(d.order_id_exchange_open) : "—"}</div>
+          <div><span class="muted">ID открывающего ордера</span><br>${d.order_id_exchange_open ? escapeHtml(fmtOrderId(d.order_id_exchange_open)) : "—"}</div>
         </div>
       </div>
       ${ordersHtml}

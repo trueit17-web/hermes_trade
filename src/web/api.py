@@ -132,9 +132,18 @@ async def websocket_endpoint(websocket: WebSocket):
     await ws_manager.connect(websocket)
     try:
         while True:
-            # Ждём сообщение от клиента (опционально)
-            data = await websocket.receive_text()
-            logger.debug(f"WebSocket сообщение: {data}")
+            # receive_text() без таймаута ждёт сообщение от клиента
+            # неограниченно — фронтенд ничего не шлёт (только слушает
+            # broadcast), поэтому соединение простаивало полностью в обе
+            # стороны, и обратные прокси/браузер тихо рвали "неактивный"
+            # WebSocket через некоторое время (клиентский реконнект после
+            # этого работал, но с задержкой и разрывом live-обновлений).
+            # Периодический ping от сервера держит соединение активным.
+            try:
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=25.0)
+                logger.debug(f"WebSocket сообщение: {data}")
+            except TimeoutError:
+                await websocket.send_json({"type": "ping"})
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket)
         logger.info("WebSocket клиент отключился")

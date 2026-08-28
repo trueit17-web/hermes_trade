@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import uuid
+from datetime import UTC
 
 import ccxt.async_support as ccxt
 from sqlalchemy import delete, func, select, update
@@ -1694,11 +1695,22 @@ class ExecutionEngine:
             unsellable = available == 0 or (min_amount is not None and available < min_amount)
             if not unsellable:
                 continue
-            # Прежде чем списывать позицию как фантомную (без PnL), проверяем:
-            # не сработал ли на бирже наш собственный SL-ордер сам по себе,
-            # без участия бота (см. _finalize_externally_closed_position) —
-            # тогда это реальное закрытие с реальным PnL, а не мусор.
+            # Прежде чем списывать позицию как фантомную (без PnL), проверяем
+            # ДВА способа объяснить исчезновение реальным закрытием на бирже
+            # (а не багом/пылью) — по возрастающей специфичности:
+            # 1) свой же биржевой SL-ордер сработал сам по себе, без участия
+            #    бота (см. sync_stop_loss_order) — знаем точный order id;
+            # 2) более общий случай — позиции без выставленного SL-ордера
+            #    (SL не настроен, отклонён биржей, или закрыто вручную/через
+            #    TP на самой бирже) — ищем недавнюю продажу в истории сделок
+            #    биржи по объёму (см. _finalize_via_recent_trade_history).
+            # Оба варианта пишут закрытие с настоящими ценой/комиссией/PnL —
+            # без них любое закрытие в обход обычного цикла бота (в т.ч.
+            # ручное на бирже) молча терялось бы из истории сделок навсегда,
+            # а не появлялось бы даже после рестарта.
             if await self._finalize_externally_closed_position(symbol, pos):
+                continue
+            if await self._finalize_via_recent_trade_history(symbol, pos):
                 continue
             logger.warning(
                 f"⚠️ Периодическая сверка позиций: {symbol} — учтено {tracked_amount:.8f}, "
@@ -1737,8 +1749,6 @@ class ExecutionEngine:
         if status not in ("closed", "filled"):
             return False
 
-        entry_price = pos.get("entry_price") or 0
-        entry_fee = pos.get("entry_fee") or 0
         amount = float(order.get("filled") or pos.get("amount") or 0)
         if amount <= 0:
             return False
@@ -1754,6 +1764,110 @@ class ExecutionEngine:
                 return False
             exit_fee, _ = self._resolve_fee(order.get("fee"), amount, exit_price, "sell", symbol)
 
+        await self._record_external_close(
+            symbol, pos, exit_price=exit_price, amount=amount, exit_fee=exit_fee,
+            order_id_exchange=str(sl_order_id),
+            log_note=f"🛡️ Биржевой SL сработал сам по себе (вне цикла бота): {symbol}",
+        )
+        return True
+
+    async def _finalize_via_recent_trade_history(self, symbol: str, pos: dict) -> bool:
+        """
+        Общий случай (в отличие от _finalize_externally_closed_position выше,
+        здесь НЕТ известного order id для точной проверки): позиция пропала
+        с баланса биржи, но у неё либо не было выставленного биржевого
+        SL-ордера (SL не задан, отклонён биржей — см. _place_stop_loss_order),
+        либо закрытие произошло другим способом — вручную на самой бирже
+        или через биржевой TP. Ищем недавнюю ПРОДАЖУ в истории сделок биржи
+        по этому символу и сверяем её объём с тем, что мы отслеживаем.
+
+        ВАЖНО: аккаунт биржи может использоваться не только этим ботом
+        (например, параллельно работающим независимым ботом на том же
+        символе) — доверять чужой сделке с совпадающим объёмом по чистой
+        случайности опасно (реальные деньги, неверно приписанный PnL хуже,
+        чем отсутствие записи). Поэтому принимаем совпадение, только если:
+        (1) сделка произошла ПОСЛЕ открытия нашей позиции, и
+        (2) суммарный объём недавних продаж отличается от нашего
+        отслеживаемого объёма не более чем на 15% — иначе (в т.ч. если
+        историю сделок вообще не удалось получить) не гадаем и оставляем
+        обычный фолбэк на _reconcile_phantom_position (без PnL, но без
+        риска приписать чужую сделку).
+        """
+        tracked_amount = pos.get("amount") or 0
+        opened_at = pos.get("opened_at")
+        if tracked_amount <= 0 or not opened_at:
+            return False
+        # Как и другие необязательные сверки с биржей в этом классе (см.
+        # _fetch_fill_details_via_trades) — вся функция под одним широким
+        # try/except: непредвиденный формат ответа биржи/мока (например,
+        # fetch_my_trades не поддерживается или неитерируемый результат)
+        # должен просто означать "сверить не удалось", а не ронять весь
+        # reconcile_real_positions.
+        try:
+            recent = await self.exchange.fetch_my_trades(symbol, limit=20)
+            if not recent:
+                return False
+
+            # opened_at — наивный datetime в UTC (см. utcnow); .timestamp()
+            # на наивном datetime трактует его как ЛОКАЛЬНОЕ время, а не
+            # UTC, и даёт неверный epoch вне контейнеров с TZ=UTC — сначала
+            # явно проставляем tzinfo=UTC, как и utcnow_timestamp.
+            opened_at_ts = opened_at.replace(tzinfo=UTC).timestamp() * 1000
+            sells = [
+                t for t in recent
+                if str(t.get("side", "")).lower() == "sell" and (t.get("timestamp") or 0) >= opened_at_ts
+            ]
+            if not sells:
+                return False
+
+            total_amount = sum(float(t.get("amount") or 0) for t in sells)
+            if total_amount <= 0:
+                return False
+            if abs(total_amount - tracked_amount) / tracked_amount > 0.15:
+                logger.debug(
+                    f"Сверка {symbol}: недавние продажи ({total_amount:.8f}) слишком расходятся с "
+                    f"отслеживаемым объёмом ({tracked_amount:.8f}) — не гадаем, чей это ордер."
+                )
+                return False
+        except Exception as e:
+            logger.debug(f"Не удалось сверить закрытие {symbol} по истории сделок: {e}")
+            return False
+
+        total_cost = sum(
+            float(t["cost"]) if t.get("cost") is not None else float(t.get("amount") or 0) * float(t.get("price") or 0)
+            for t in sells
+        )
+        exit_price = total_cost / total_amount if total_amount else 0
+        if not exit_price:
+            return False
+        exit_fee = 0.0
+        for t in sells:
+            fee = t.get("fee") or {}
+            cost = fee.get("cost")
+            if cost:
+                exit_fee += float(cost)
+        trade_ids = [str(t["id"]) for t in sells if t.get("id")]
+
+        await self._record_external_close(
+            symbol, pos, exit_price=exit_price, amount=total_amount, exit_fee=exit_fee,
+            order_id_exchange=",".join(trade_ids) if trade_ids else None,
+            log_note=f"🔍 Позиция закрыта вне цикла бота (найдено по истории сделок биржи): {symbol}",
+        )
+        return True
+
+    async def _record_external_close(
+        self, symbol: str, pos: dict, *, exit_price: float, amount: float, exit_fee: float,
+        order_id_exchange: str | None, log_note: str,
+    ) -> None:
+        """
+        Общий хвост записи закрытия, обнаруженного вне обычного цикла бота
+        (см. _finalize_externally_closed_position и
+        _finalize_via_recent_trade_history) — та же запись Order+Trade и
+        публикация TradeEvent, что и у close_real_position, но без попытки
+        продать (это уже произошло на бирже без нас).
+        """
+        entry_price = pos.get("entry_price") or 0
+        entry_fee = pos.get("entry_fee") or 0
         pnl = (exit_price - entry_price) * amount - entry_fee - exit_fee
         pnl_pct = (pnl / (entry_price * amount) * 100) if entry_price and amount else 0.0
         outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "break-even")
@@ -1778,9 +1892,9 @@ class ExecutionEngine:
                 filled_amount=amount,
                 filled_price=exit_price,
                 fee=exit_fee,
-                order_id_exchange=str(sl_order_id),
+                order_id_exchange=order_id_exchange,
                 client_order_id=str(uuid.uuid4())[:12],
-                notes="Real close (stop_loss, exchange-triggered)",
+                notes="Real close (exchange-triggered, outside bot cycle)",
             )
             session.add(close_order)
             await session.flush()
@@ -1807,10 +1921,7 @@ class ExecutionEngine:
 
         risk_manager.on_trade_closed(pnl)
         risk_manager.on_position_closed(symbol)
-        logger.warning(
-            f"🛡️ Биржевой SL сработал сам по себе (вне цикла бота): {symbol} | "
-            f"PnL: {pnl:+.2f} ({pnl_pct:+.2f}%) | ордер {sl_order_id}"
-        )
+        logger.warning(f"{log_note} | PnL: {pnl:+.2f} ({pnl_pct:+.2f}%)")
 
         trade_event = TradeEvent(
             type="trade_event",
@@ -1828,7 +1939,6 @@ class ExecutionEngine:
             timestamp=utcnow_timestamp(),
         )
         await event_bus.publish(trade_event)
-        return True
 
     @staticmethod
     def _extract_usdt_balance(balance: dict) -> float:

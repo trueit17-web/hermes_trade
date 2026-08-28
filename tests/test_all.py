@@ -1,7 +1,7 @@
 """Тесты для крипто-трейдер бота."""
 import asyncio
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, AsyncMock, PropertyMock, patch
 
 import numpy as np
@@ -1022,6 +1022,110 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         # (1.8 - 2.0) * 100 - entry_fee(0.02) - exit_fee(0.18) = -20.2
         self.assertAlmostEqual(float(trade.pnl), -20.2, places=4)
         self.assertFalse(trade.is_open)
+
+    async def test_reconcile_real_positions_finds_close_via_trade_history_without_sl_order(self):
+        """
+        Позиция без выставленного биржевого SL-ордера (например, SL не был
+        задан) пропала с баланса биржи — закрыта либо вручную на самой
+        бирже, либо через биржевой TP. Без известного order id единственный
+        способ восстановить реальные данные — история сделок биржи: если
+        найденная недавняя продажа по объёму совпадает с отслеживаемой
+        позицией, закрытие должно записаться с реальными ценой/PnL, а не
+        потеряться как фантомная позиция без PnL.
+        """
+        from sqlalchemy import select, desc
+        from src.db.session import get_session
+        from src.db.models import Trade, Symbol, Order
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        opened_at = datetime.now() - timedelta(hours=1)
+        self.engine.real_positions["TRHIST1/USDT"] = {
+            "amount": 100.0, "entry_price": 2.0, "side": "long",
+            "strategy_id": None, "entry_fee": 0.02, "order_id": None,
+            "opened_at": opened_at, "sl_order_id": None,
+        }
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"TRHIST1": 0.0}, "TRHIST1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        recent_ts_ms = int((opened_at + timedelta(minutes=30)).timestamp() * 1000)
+        self.engine.exchange.fetch_my_trades = AsyncMock(return_value=[
+            {"id": "closed-manually-1", "side": "sell", "amount": 100.0, "price": 2.1,
+             "cost": 210.0, "timestamp": recent_ts_ms, "fee": {"cost": 0.05, "currency": "USDT"}},
+        ])
+
+        await self.engine.reconcile_real_positions()
+
+        self.assertNotIn("TRHIST1/USDT", self.engine.real_positions)
+        async with get_session() as session:
+            symbol_row = (
+                await session.execute(select(Symbol).where(Symbol.symbol == "TRHIST1/USDT"))
+            ).scalar_one()
+            trade = (
+                await session.execute(
+                    select(Trade).where(Trade.symbol_id == symbol_row.id).order_by(desc(Trade.id))
+                )
+            ).scalars().first()
+            close_order = (
+                await session.execute(select(Order).where(Order.id == trade.order_close_id))
+            ).scalar_one()
+        self.assertIsNotNone(trade)
+        # (2.1 - 2.0) * 100 - entry_fee(0.02) - exit_fee(0.05) = 9.93
+        self.assertAlmostEqual(float(trade.pnl), 9.93, places=4)
+        self.assertFalse(trade.is_open)
+        self.assertEqual(close_order.order_id_exchange, "closed-manually-1")
+
+    async def test_reconcile_real_positions_does_not_misattribute_unrelated_trade(self):
+        """
+        Если недавние продажи по символу сильно расходятся по объёму с
+        отслеживаемой позицией (например, аккаунт биржи используется не
+        только этим ботом — см. docstring _finalize_via_recent_trade_history),
+        подставлять чужую сделку нельзя — реальные деньги, неверно
+        приписанный PnL хуже отсутствия записи. Должен сработать привычный
+        фолбэк на _reconcile_phantom_position (без PnL, но и без риска).
+        """
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Trade, Symbol
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        opened_at = datetime.now() - timedelta(hours=1)
+        self.engine.real_positions["TRMISMATCH1/USDT"] = {
+            "amount": 100.0, "entry_price": 2.0, "side": "long",
+            "strategy_id": None, "entry_fee": 0.02, "order_id": None,
+            "opened_at": opened_at, "sl_order_id": None,
+        }
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"TRMISMATCH1": 0.0}, "TRMISMATCH1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        recent_ts_ms = int((opened_at + timedelta(minutes=30)).timestamp() * 1000)
+        # Совсем другой объём (5.0 против отслеживаемых 100.0) — похоже на
+        # сделку постороннего процесса на том же аккаунте, а не на закрытие
+        # именно этой позиции.
+        self.engine.exchange.fetch_my_trades = AsyncMock(return_value=[
+            {"id": "unrelated-1", "side": "sell", "amount": 5.0, "price": 2.1,
+             "cost": 10.5, "timestamp": recent_ts_ms, "fee": {"cost": 0.01, "currency": "USDT"}},
+        ])
+
+        await self.engine.reconcile_real_positions()
+
+        self.assertNotIn("TRMISMATCH1/USDT", self.engine.real_positions)
+        # Фолбэк на _reconcile_phantom_position не создаёт Trade-запись —
+        # никакого PnL для этой позиции быть не должно (в отличие от
+        # предыдущего теста, где совпадение по объёму принимается).
+        async with get_session() as session:
+            symbol_row = (
+                await session.execute(select(Symbol).where(Symbol.symbol == "TRMISMATCH1/USDT"))
+            ).scalar_one_or_none()
+            trade = (
+                await session.execute(select(Trade).where(Trade.symbol_id == symbol_row.id))
+            ).scalars().first() if symbol_row else None
+        self.assertIsNone(trade)
 
     async def test_paper_mode_initialization(self):
         """Инициализация в paper режиме восстанавливает баланс/позиции из БД."""
@@ -4461,6 +4565,40 @@ class TestWebSocketBroadcast(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sent["symbol"], "ETH/USDT")
         finally:
             event_bus._subscribers = original_subscribers
+
+    async def test_websocket_sends_keepalive_ping_on_idle_timeout(self):
+        """
+        Реальный инцидент: фронтенд ничего не шлёт на /ws (только слушает
+        broadcast), поэтому receive_text() без таймаута ждал неограниченно —
+        соединение простаивало в обе стороны, и обратные прокси/браузер
+        тихо рвали "неактивный" WebSocket через некоторое время. Сервер
+        теперь должен сам отправлять ping при таймауте ожидания.
+        """
+        import src.web.api as api_module
+        from fastapi import WebSocketDisconnect
+
+        mock_ws = AsyncMock()
+        mock_ws.cookies = {api_module.auth.SESSION_COOKIE_NAME: "valid-token"}
+        mock_ws.receive_text = AsyncMock(
+            side_effect=[TimeoutError(), WebSocketDisconnect()]
+        )
+
+        with patch.object(api_module.auth, "verify_session", return_value=True):
+            await api_module.websocket_endpoint(mock_ws)
+
+        mock_ws.send_json.assert_any_call({"type": "ping"})
+
+    async def test_websocket_rejects_unauthenticated(self):
+        import src.web.api as api_module
+
+        mock_ws = AsyncMock()
+        mock_ws.cookies = {}
+
+        with patch.object(api_module.auth, "verify_session", return_value=False):
+            await api_module.websocket_endpoint(mock_ws)
+
+        mock_ws.close.assert_called_once_with(code=4401)
+        mock_ws.accept.assert_not_called()
 
 
 class TestManualTrading(unittest.IsolatedAsyncioTestCase):
