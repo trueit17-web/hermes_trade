@@ -285,6 +285,7 @@ class RiskManager:
 
     def get_state(self) -> dict:
         """Получить текущее состояние риска."""
+        self.state.check_cooldown()
         return {
             "daily_loss_limit": self.profile.daily_loss_limit_usd,
             "daily_pnl": self.state.daily_pnl,
@@ -312,7 +313,16 @@ class RiskManager:
             return False
         if self.state.daily_loss_limit_reached:
             return False
-        if self.state.cooldown_active:
+        # check_cooldown() пересчитывает флаг по прошедшему времени, а не
+        # голое чтение state.cooldown_active — record_trade_time() только
+        # ВКЛЮЧАЕТ его после закрытия (в т.ч. частичного, TP1/TP2), но
+        # выключить обратно по истечении cooldown_seconds могла только
+        # check_cooldown(), которая раньше нигде не вызывалась — после
+        # первого же закрытия за время работы процесса флаг оставался True
+        # навсегда, блокируя вообще все новые входы до рестарта, независимо
+        # от значения cooldown_seconds (поэтому его изменение в настройках
+        # не имело вообще никакого эффекта).
+        if self.state.check_cooldown():
             return False
         return not self.state.check_max_positions()
 

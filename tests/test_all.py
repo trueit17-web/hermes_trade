@@ -262,6 +262,41 @@ class TestRiskManager(unittest.IsolatedAsyncioTestCase):
         self.risk.on_trade_closed(-600.0)
         self.assertTrue(self.risk.state.daily_loss_limit_reached)
 
+    async def test_cannot_trade_immediately_after_trade_closed(self):
+        """Сразу после закрытия сделки (в т.ч. частичного TP) кулдаун активен."""
+        self.risk.on_trade_closed(10.0)
+        self.assertFalse(self.risk.can_trade())
+
+    async def test_can_trade_again_after_cooldown_elapses(self):
+        """
+        Кулдаун должен автоматически сниматься по истечении cooldown_seconds,
+        а не оставаться активным до рестарта процесса. can_trade() раньше
+        читал голый state.cooldown_active — его выключало только
+        check_cooldown() по прошедшему времени, но эта проверка нигде не
+        вызывалась, поэтому после первого же закрытия сделки за время
+        работы процесса кулдаун блокировал вообще все новые входы навсегда,
+        независимо от значения risk_cooldown_seconds.
+        """
+        from src.utils.timeutils import utcnow
+        self.risk.profile.cooldown_seconds = 5
+        self.risk.state.cooldown_seconds = 5
+        self.risk.on_trade_closed(10.0)
+        self.assertFalse(self.risk.can_trade())
+
+        self.risk.state.last_trade_time = utcnow() - timedelta(seconds=6)
+        self.assertTrue(self.risk.can_trade())
+
+    async def test_changing_cooldown_seconds_takes_effect_on_active_cooldown(self):
+        """Уменьшение cooldown_seconds в настройках должно сократить уже идущий кулдаун."""
+        self.risk.profile.cooldown_seconds = 300
+        self.risk.state.cooldown_seconds = 300
+        self.risk.on_trade_closed(10.0)
+        self.assertFalse(self.risk.can_trade())
+
+        self.risk.configure({"cooldown_seconds": 1})
+        self.risk.state.last_trade_time -= timedelta(seconds=2)
+        self.assertTrue(self.risk.can_trade())
+
 
 class TestRSIMeanReversionStrategy(unittest.TestCase):
     """Тесты для RSI стратегии."""
