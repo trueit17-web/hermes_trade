@@ -547,13 +547,11 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(order)
         self.assertIn("BALDIFF1/USDT", self.engine.real_positions)
         # Ни fetch_order, ни история сделок не дали комиссию — она
-        # рассчитывается по стандартной ставке (см. _resolve_fee) и
-        # вычитается из объёма позиции (комиссия в base-валюте при покупке),
-        # поэтому реально доступный остаток чуть меньше исполненного объёма.
-        expected_fee = 2011.85 * 1.0003 * (settings.paper_fee_pct / 100)
-        self.assertAlmostEqual(
-            self.engine.real_positions["BALDIFF1/USDT"]["amount"], 2011.85 - expected_fee,
-        )
+        # рассчитывается по стандартной ставке (см. _resolve_fee), но её
+        # валюта в этом расчётном случае всегда quote (см.
+        # test_resolve_fee_calculates_estimate_when_exchange_data_unavailable) —
+        # объём позиции не уменьшается.
+        self.assertAlmostEqual(self.engine.real_positions["BALDIFF1/USDT"]["amount"], 2011.85)
 
     async def test_close_real_position_confirms_via_balance_diff_when_status_never_confirms(self):
         """Симметричный случай на закрытии — см. тест выше на открытии."""
@@ -850,11 +848,16 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         Если ни order["fee"], ни история сделок не дали реальную комиссию —
         нужно посчитать её по стандартной ставке spot-таксы, а не оставлять
         0 (иначе PnL завышался бы на величину реальной, но неучтённой
-        комиссии биржи).
+        комиссии биржи). Валюта оценки — всегда quote (даже для buy):
+        estimated = filled_amount(base) × fill_price(quote/base) × pct —
+        число в quote-валюте по построению формулы, независимо от side.
+        Реальный инцидент: HYPE/USDT — оценка в USDT была помечена как
+        "в HYPE", close_real_position домножила её на entry_price ЕЩЁ РАЗ
+        при конвертации, и прибыльный Take Profit 1 показал PnL -13.47.
         """
         fee, currency = self.engine._resolve_fee(None, 1000.0, 2.0, "buy", "RESOLVEFEE1/USDT")
         self.assertAlmostEqual(fee, 1000.0 * 2.0 * (settings.paper_fee_pct / 100))
-        self.assertEqual(currency, "RESOLVEFEE1")
+        self.assertEqual(currency, "USDT")
 
         fee, currency = self.engine._resolve_fee({"cost": 0, "currency": "USDT"}, 1000.0, 2.0, "sell", "RESOLVEFEE1/USDT")
         self.assertAlmostEqual(fee, 1000.0 * 2.0 * (settings.paper_fee_pct / 100))
@@ -863,6 +866,57 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         fee, currency = self.engine._resolve_fee({"cost": 3.5, "currency": "USDT"}, 1000.0, 2.0, "sell", "RESOLVEFEE1/USDT")
         self.assertEqual(fee, 3.5)
         self.assertEqual(currency, "USDT")
+
+    async def test_close_real_position_profitable_tp_stays_profitable_when_fee_estimated(self):
+        """
+        Реальный инцидент: HYPE/USDT, buy без реальных данных о комиссии от
+        биржи (fetch_order_trades/order["fee"] недоступны) — оценочная
+        комиссия _resolve_fee (всегда в quote-валюте, см. тест выше) раньше
+        помечалась как base для покупки. close_real_position конвертирует
+        комиссию открытия в USDT-эквивалент, ТОЛЬКО если её валюта — base
+        (opening_order.fee_currency == base_currency) — при неверной метке
+        уже quote-валютное число домножалось на entry_price ЕЩЁ РАЗ, и
+        реально прибыльное частичное закрытие (цена выросла с 83.12 до
+        84.22) показывало PnL -13.47 вместо примерно +2.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"HYPEPNL1": 0.0}, "HYPEPNL1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "hypepnl-open-1", "filled": 4.506489, "average": 83.12, "price": None,
+            "fee": {"cost": 0, "currency": None},
+        }
+        self.engine.exchange.fetch_order_trades = AsyncMock(return_value=None)
+        self.engine.exchange.fetch_my_trades = AsyncMock(return_value=None)
+        opening_order = await self.engine.create_order(
+            symbol="HYPEPNL1/USDT", side="buy", amount=4.506489, price=83.12, order_type="market",
+        )
+        self.assertIsNotNone(opening_order)
+        self.assertEqual(opening_order.fee_currency, "USDT")
+        full_amount = self.engine.real_positions["HYPEPNL1/USDT"]["amount"]
+        entry_fee_total = float(opening_order.fee)
+        close_amount = full_amount * 0.5
+
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"HYPEPNL1": close_amount},
+            "HYPEPNL1": {"free": close_amount, "used": 0, "total": close_amount},
+        })
+        self.engine.exchange.create_market_sell_order.return_value = {
+            "id": "hypepnl-close-1", "filled": close_amount, "average": 84.22, "price": None,
+            "fee": {"cost": close_amount * 84.22 * (settings.paper_fee_pct / 100), "currency": "USDT"},
+        }
+
+        result = await self.engine.close_real_position(
+            symbol="HYPEPNL1/USDT", side="long", entry_price=83.12, amount=close_amount,
+            reason="take_profit_1", entry_fee=entry_fee_total * 0.5, holding_seconds=11488,
+            order_open_id=opening_order.id,
+        )
+        self.assertIsNotNone(result)
+        self.assertGreater(result["pnl"], 0, "цена выросла с 83.12 до 84.22 — закрытие должно быть в плюсе")
 
     async def test_close_real_position_converts_base_currency_entry_fee_to_quote(self):
         """

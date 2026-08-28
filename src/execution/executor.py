@@ -1063,18 +1063,27 @@ class ExecutionEngine:
         cost), считаем по стандартной ставке spot-таксы (то же приближение,
         что и paper_fee_pct в paper-режиме) вместо того, чтобы оставлять 0 —
         иначе PnL был бы завышен на величину реальной, но неучтённой
-        комиссии биржи. Валюта комиссии в этом расчётном случае — не
-        подтверждённый факт, а стандартное для спота допущение: при покупке
-        комиссия обычно удерживается из полученного actива (base), при
-        продаже — из полученной quote-валюты.
+        комиссии биржи.
+
+        Валюта РАСЧЁТНОЙ оценки — всегда quote, а не "base для покупки,
+        quote для продажи" (как для настоящей комиссии с биржи, где такое
+        допущение имеет смысл): estimated = filled_amount(base) ×
+        fill_price(quote/base) × pct — это ЧИСЛО в quote-валюте по
+        построению формулы, независимо от side. Реальный инцидент:
+        HYPE/USDT, buy — оценочная комиссия 0.37 USDT была помечена как
+        "0.37 HYPE" (~31 USDT по факту), из-за чего close_real_position
+        (конвертирует комиссию открытия в USDT-эквивалент, ТОЛЬКО если её
+        валюта — base) домножила и без того неверно про-labeled число ЕЩЁ
+        РАЗ на entry_price — реально прибыльный Take Profit 1 показал PnL
+        -13.47 вместо примерно +2.
         """
         fee_info = fee_info or {}
         cost = fee_info.get("cost")
         if cost:
             return float(cost), fee_info.get("currency")
-        base_currency, quote_currency = symbol.split("/")
+        _, quote_currency = symbol.split("/")
         estimated = filled_amount * fill_price * (settings.paper_fee_pct / 100)
-        return estimated, (base_currency if side == "buy" else quote_currency)
+        return estimated, quote_currency
 
     async def _place_stop_loss_order(self, symbol: str, amount: float, stop_loss_price: float) -> str | None:
         """
