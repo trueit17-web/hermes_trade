@@ -3880,6 +3880,62 @@ class TestChannelQualitySettings(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(auto_execute, settings.telegram_signals_auto_execute)
 
 
+class TestTelegramAutoExecuteIgnoresProtections(unittest.IsolatedAsyncioTestCase):
+    """
+    Автоисполнение сигнала включённого канала — явное доверие каналу по
+    запросу пользователя, поэтому Protections-блокировки (кулдаун канала
+    после закрытия сделки, StoplossGuard, LosingStreak) не должны его
+    останавливать, в отличие от стратегийного пути. Kill switch/пауза
+    (execution_engine.can_execute(), общий аварийный стоп) по-прежнему
+    применяются — это не тестируется здесь напрямую (сигнал просто
+    доходит до _execute_telegram_signal, тот сам упирается в can_execute()
+    внутри create_order при необходимости).
+    """
+
+    async def test_auto_execute_runs_despite_active_protections_lock(self):
+        from unittest.mock import AsyncMock, patch
+
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+
+        from src.db.session import get_session
+        from src.db.models import TelegramChannel
+        from src.risk.protections import GLOBAL_KEY, channel_key, protection_manager
+
+        channel_id = "@autoexec_ignore_protections_unittest"
+        async with get_session() as session:
+            channel = TelegramChannel(
+                channel_id=channel_id, channel_title="X",
+                quality_threshold=0.0, auto_execute=True, active=True,
+            )
+            session.add(channel)
+            await session.commit()
+            db_id = channel.id
+
+        # Активная блокировка и по каналу, и глобальная (StoplossGuard) —
+        # обе должны быть проигнорированы для автоисполнения.
+        await protection_manager.locks.add(channel_key(channel_id), 5, "test lock")
+        await protection_manager.locks.add(GLOBAL_KEY, 5, "stoploss guard test")
+
+        bot = main_module.TradingBot()
+        bot._telegram_channel_db_ids = {channel_id: db_id}
+        bot.open_positions = {}
+
+        fake_order = MagicMock(id=1)
+        with patch.object(bot, "_execute_telegram_signal", new=AsyncMock(return_value=fake_order)) as exec_mock:
+            await bot._on_telegram_signal({
+                "channel_id": channel_id,
+                "parsed_pair": "BTC/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 50000.0,
+                "raw_message": "test",
+            })
+
+        exec_mock.assert_awaited_once()
+
+
 class TestUpdateTelegramChannel(unittest.IsolatedAsyncioTestCase):
     """PATCH /telegram/channels/{id} — делает настройки существующего канала
     редактируемыми (раньше можно было только создать/удалить канал целиком)."""

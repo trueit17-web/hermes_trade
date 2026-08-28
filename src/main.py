@@ -510,16 +510,18 @@ class TradingBot:
                 decision = "rejected"
                 logger.info(f"🚫 Сигнал по {pair} отклонён: уже есть открытая позиция")
             else:
-                lock_reason = await protection_manager.locked_reason(
-                    [GLOBAL_KEY, channel_key(channel_id)]
-                )
-                if lock_reason:
-                    decision = "rejected"
-                    logger.info(f"🔒 Сигнал по {pair} отклонён (protections): {lock_reason}")
-                else:
-                    logger.info("🤖 Автоматическое исполнение")
-                    order = await self._execute_telegram_signal(signal_event)
-                    decision = "executed" if order else "rejected"
+                # Protections (кулдаун источника после закрытия, StoplossGuard,
+                # LosingStreak) сюда намеренно НЕ применяются: по явному
+                # запросу автоисполнение канала должно срабатывать
+                # безусловно, пока оно включено — это осознанное решение
+                # доверять сигналам канала, а не автоматическая защита от
+                # серии убытков внутри самого бота. Kill switch и ручная
+                # пауза (execution_engine.can_execute(), проверяется внутри
+                # create_order) по-прежнему останавливают и эту сделку —
+                # это отдельный, более общий аварийный стоп всей торговли.
+                logger.info("🤖 Автоматическое исполнение")
+                order = await self._execute_telegram_signal(signal_event)
+                decision = "executed" if order else "rejected"
         else:
             logger.info("⏳ Сигнал ожидает подтверждения")
 

@@ -1537,6 +1537,12 @@ document.getElementById("btnToggleMlModels").addEventListener("click", () => {
   btn.textContent = isHidden ? "Скрыть список моделей" : "Выбрать модель";
 });
 
+// Аналогично expandedTrades выше — renderTelegram() перестраивает всю
+// таблицу каналов на каждый REFRESH_MS, без этой карты развёрнутая
+// история сигналов сворачивалась бы сама по себе при любом плановом
+// обновлении, а не только по клику на своей же строке.
+const expandedChannels = new Map();
+
 async function renderTelegram() {
   const body = document.getElementById("telegramBody");
   try {
@@ -1605,6 +1611,10 @@ async function renderTelegram() {
         if (e.target.closest("[data-delete-channel]") || e.target.closest(".channel-editable")) return;
         toggleChannelSignals(row);
       });
+      const id = row.dataset.channelId;
+      if (expandedChannels.has(id)) {
+        restoreExpandedChannel(row);
+      }
     });
 
     body.querySelectorAll(".channel-threshold-input").forEach(input => {
@@ -1659,9 +1669,11 @@ async function toggleChannelSignals(row) {
   if (isOpen) {
     detailsRow.style.display = "none";
     arrow.textContent = "▸";
+    expandedChannels.delete(id);
     return;
   }
 
+  expandedChannels.set(id, null);
   detailsRow.style.display = "";
   arrow.textContent = "▾";
   const cell = detailsRow.querySelector("td");
@@ -1670,10 +1682,31 @@ async function toggleChannelSignals(row) {
   cell.innerHTML = `<div class="muted" style="padding:10px 16px">Загрузка…</div>`;
   try {
     const data = await api(`/telegram/signals?channel_id=${id}&limit=50`);
-    cell.innerHTML = renderChannelSignalsTable(data.signals || []);
+    const html = renderChannelSignalsTable(data.signals || []);
+    cell.innerHTML = html;
     cell.dataset.loaded = "1";
+    if (expandedChannels.has(id)) expandedChannels.set(id, html);
   } catch (err) {
     cell.innerHTML = `<div class="muted" style="padding:10px 16px">Ошибка загрузки: ${err.message}</div>`;
+  }
+}
+
+// Восстановить визуально развёрнутое состояние строки канала после того,
+// как renderTelegram() перестроил всю таблицу заново по таймеру — без
+// этого история сигналов сворачивалась бы сама, будто пользователь кликнул
+// по строке, хотя он мог смотреть в это время именно на неё.
+function restoreExpandedChannel(row) {
+  const id = row.dataset.channelId;
+  const detailsRow = document.querySelector(`tr[data-channel-signals="${id}"]`);
+  const arrow = row.querySelector(".expand-arrow");
+  if (!detailsRow) return;
+  detailsRow.style.display = "";
+  arrow.textContent = "▾";
+  const cachedHtml = expandedChannels.get(id);
+  if (cachedHtml) {
+    const cell = detailsRow.querySelector("td");
+    cell.innerHTML = cachedHtml;
+    cell.dataset.loaded = "1";
   }
 }
 
