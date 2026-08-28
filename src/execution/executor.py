@@ -1524,21 +1524,24 @@ class ExecutionEngine:
             #    минимального торгуемого ОБЪЁМА (ccxt/биржа сообщают об этом
             #    словами "precision"/"minimum" в тексте ошибки — например
             #    "amount ... must be greater than minimum amount precision
-            #    of 0.001").
+            #    of 0.001"). Реальный инцидент: USDC/USDT, наш учёт всего
+            #    0.00717323 при доступных на бирже 14092.25 — available
+            #    здесь заведомо НЕ меньше amount (сам отслеживаемый объём —
+            #    пыль, а не нехватка баланса), поэтому проверка НЕ требует
+            #    available < amount: продать меньше минимального объёма
+            #    нельзя вне зависимости от того, сколько ещё есть на бирже.
             # 2) объёма достаточно (available >= amount), но его СТОИМОСТЬ в
             #    quote-валюте (amount * текущая цена) ниже минимальной для
             #    пары — Bybit отвечает retCode 170140 "Order value exceeded
             #    lower limit" (реальный инцидент: SUI/USDT, ~26 минут подряд
-            #    одна и та же ошибка каждые ~70с, available > amount, так что
-            #    условие (1) не срабатывало вообще). В отличие от (1), эта
-            #    проверка НЕ требует available < amount — деление позиции на
-            #    более мелкие ордера её не решает, наоборот, ещё уменьшает
+            #    одна и та же ошибка каждые ~70с). Деление позиции на более
+            #    мелкие ордера её не решает, наоборот, ещё уменьшает
             #    стоимость каждого.
-            unsellable_dust = available == 0 or (
-                available is not None
-                and available < amount
-                and any(kw in str(e).lower() for kw in ("precision", "minimum"))
-            ) or "lower limit" in str(e).lower()
+            unsellable_dust = (
+                available == 0
+                or any(kw in str(e).lower() for kw in ("precision", "minimum"))
+                or "lower limit" in str(e).lower()
+            )
             if unsellable_dust:
                 await self._reconcile_phantom_position(symbol, order_open_id)
             return None
