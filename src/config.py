@@ -146,7 +146,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = None
     anthropic_model: str = "claude-haiku-4-5-20251001"
     gemini_api_key: str | None = None
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-3.6-flash"
 
     # === Веб сервер ===
     web_host: str = "0.0.0.0"

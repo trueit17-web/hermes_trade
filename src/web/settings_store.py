@@ -132,7 +132,7 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "gemini_api_key", "label": "Gemini API key", "group": "Telegram сигналы", "type": "secret",
      "description": "Ключ Google Gemini API — второй, резервный вариант LLM-фолбэка (пробуется, если Anthropic не настроен или не смог разобрать сообщение). Бесплатный тариф Gemini обычно достаточен для этой задачи."},
     {"key": "gemini_model", "label": "Gemini модель", "group": "Telegram сигналы", "type": "str",
-     "description": "Идентификатор модели Gemini, используемой для разбора сигналов (например gemini-2.0-flash)."},
+     "description": "Идентификатор модели Gemini, используемой для разбора сигналов (например gemini-3.6-flash)."},
     {"key": "telegram_api_id", "label": "Telegram API ID", "group": "Telegram сигналы", "type": "secret",
      "description": "API ID приложения Telegram (my.telegram.org) — нужен для чтения сообщений из каналов-сигналов."},
     {"key": "telegram_api_hash", "label": "Telegram API hash", "group": "Telegram сигналы", "type": "secret",
