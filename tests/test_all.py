@@ -913,6 +913,50 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.engine.real_positions["SLPLACE1/USDT"]["sl_order_id"], "slplace-sl-order-1")
 
+    async def test_place_stop_loss_order_clamps_to_available_balance(self):
+        """
+        Отслеживаемый объём позиции мог разойтись с реальным остатком на
+        бирже (комиссии/округление лота, накопленные за частичные закрытия
+        или рестарты — реальный инцидент: LINK/USDT после 3 частичных TP,
+        XAUT/USDT со старой комиссией — бот пытался выставить SL на весь
+        расчётный объём и биржа отклоняла его целиком с "Insufficient
+        balance", оставляя позицию вовсе без биржевой защиты). SL должен
+        выставляться на фактически доступный остаток, а не на устаревший.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"SLCLAMP1": 90.0}, "SLCLAMP1": {"free": 90.0, "used": 0, "total": 90.0}}
+        )
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "slclamp-sl-order-1"}
+
+        order_id = await self.engine._place_stop_loss_order("SLCLAMP1/USDT", 100.0, 1.8)
+
+        self.assertEqual(order_id, "slclamp-sl-order-1")
+        self.engine.exchange.create_market_sell_order.assert_called_once_with(
+            "SLCLAMP1/USDT", 90.0, params={"stopLossPrice": 1.8},
+        )
+
+    async def test_place_stop_loss_order_uses_full_amount_when_balance_sufficient(self):
+        """Обычный случай (без дрейфа) не должен ничего урезать."""
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"SLFULL1": 100.0}, "SLFULL1": {"free": 100.0, "used": 0, "total": 100.0}}
+        )
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "slfull-sl-order-1"}
+
+        order_id = await self.engine._place_stop_loss_order("SLFULL1/USDT", 100.0, 1.8)
+
+        self.assertEqual(order_id, "slfull-sl-order-1")
+        self.engine.exchange.create_market_sell_order.assert_called_once_with(
+            "SLFULL1/USDT", 100.0, params={"stopLossPrice": 1.8},
+        )
+
     async def test_execute_real_order_survives_stop_loss_placement_rejection(self):
         """
         Биржа может отклонить условный SL-ордер (например, триггер-цена

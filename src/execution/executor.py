@@ -1089,6 +1089,26 @@ class ExecutionEngine:
         """
         if amount <= 0 or not stop_loss_price:
             return None
+        # Отслеживаемый объём позиции мог немного разойтись с реальным
+        # остатком на бирже — та же причина, что и в close_real_position
+        # (комиссии, округление лота, накопленный дрейф за несколько
+        # частичных закрытий или рестартов процесса): условный SL-ордер на
+        # биржевой остаток, а не на устаревший расчётный объём — иначе
+        # биржа отклоняет ЕГО ЦЕЛИКОМ с "Insufficient balance", и позиция
+        # остаётся вовсе без биржевой защиты (реальный инцидент: XAUT/USDT,
+        # LINK/USDT после нескольких частичных TP).
+        try:
+            base_currency = symbol.split("/")[0]
+            balance = await self.exchange.fetch_balance()
+            available = self._extract_currency_balance(balance, base_currency)
+            if 0 < available < amount:
+                logger.debug(
+                    f"SL {symbol}: доступно {available:.8f} {base_currency} < отслеживаемого "
+                    f"{amount:.8f} — выставляем на доступный остаток."
+                )
+                amount = available
+        except Exception as e:
+            logger.debug(f"Не удалось сверить баланс перед выставлением SL {symbol}: {e}")
         try:
             order = await self.exchange.create_market_sell_order(
                 symbol, amount, params={"stopLossPrice": stop_loss_price},
