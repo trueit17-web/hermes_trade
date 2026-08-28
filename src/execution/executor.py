@@ -966,7 +966,7 @@ class ExecutionEngine:
         return None
 
     async def _fetch_fill_details_via_trades(
-        self, order_id: str | None, symbol: str, attempts: int = 4, delay: float = 1.0,
+        self, order_id: str | None, symbol: str, attempts: int = 6, delay: float = 1.5,
     ) -> dict | None:
         """
         Точные детали исполнения (средняя цена, объём, комиссия) через
@@ -1055,33 +1055,52 @@ class ExecutionEngine:
 
     def _resolve_fee(
         self, fee_info: dict | None, filled_amount: float, fill_price: float, side: str, symbol: str,
+        amount_requested: float | None = None,
     ) -> tuple[float, str | None]:
         """
         Комиссию исполнения нужно брать РЕАЛЬНУЮ с биржи (order["fee"] или
-        сумма комиссий из истории сделок — см. _fetch_fill_details_via_trades)
-        — если её не удалось получить НИОТКУДА (ни один из источников не дал
-        cost), считаем по стандартной ставке spot-таксы (то же приближение,
-        что и paper_fee_pct в paper-режиме) вместо того, чтобы оставлять 0 —
-        иначе PnL был бы завышен на величину реальной, но неучтённой
-        комиссии биржи.
+        сумма комиссий из истории сделок — см. _fetch_fill_details_via_trades,
+        которая уже сама повторяет запрос несколько раз с паузой, если
+        биржа не успела отдать комиссию сразу) — если её не удалось
+        получить НИОТКУДА (ни один из источников не дал cost даже после
+        повторов), не оставляем 0 (иначе PnL был бы завышен на величину
+        реальной, но неучтённой комиссии биржи), а пробуем по убыванию
+        точности:
 
-        Валюта РАСЧЁТНОЙ оценки — всегда quote, а не "base для покупки,
-        quote для продажи" (как для настоящей комиссии с биржи, где такое
-        допущение имеет смысл): estimated = filled_amount(base) ×
-        fill_price(quote/base) × pct — это ЧИСЛО в quote-валюте по
-        построению формулы, независимо от side. Реальный инцидент:
-        HYPE/USDT, buy — оценочная комиссия 0.37 USDT была помечена как
-        "0.37 HYPE" (~31 USDT по факту), из-за чего close_real_position
-        (конвертирует комиссию открытия в USDT-эквивалент, ТОЛЬКО если её
-        валюта — base) домножила и без того неверно про-labeled число ЕЩЁ
-        РАЗ на entry_price — реально прибыльный Take Profit 1 показал PnL
-        -13.47 вместо примерно +2.
+        1) Разница между запрошенным и фактически исполненным объёмом (в
+           base-валюте) — на споте комиссия покупки часто списывается
+           биржей из самого актива ДО того, как объём попадает в
+           order["filled"]/историю сделок, так что эта разница и есть
+           фактическая комиссия, точнее стандартной ставки ниже. Валиден,
+           только если запрошено СТРОГО больше исполненного — иначе (объём
+           совпал или исполнилось больше, к комиссии отношения не имеющая
+           ситуация) сигнала нет.
+        2) Стандартная ставка spot-таксы (то же приближение, что и
+           paper_fee_pct в paper-режиме). Валюта ЭТОЙ оценки — всегда
+           quote, а не "base для покупки, quote для продажи" (как для
+           настоящей комиссии с биржи, где такое допущение имеет смысл):
+           estimated = filled_amount(base) × fill_price(quote/base) × pct —
+           это ЧИСЛО в quote-валюте по построению формулы, независимо от
+           side. Реальный инцидент: HYPE/USDT, buy — оценочная комиссия
+           0.37 USDT была помечена как "0.37 HYPE" (~31 USDT по факту), из-
+           за чего close_real_position (конвертирует комиссию открытия в
+           USDT-эквивалент, ТОЛЬКО если её валюта — base) домножила и без
+           того неверно про-labeled число ЕЩЁ РАЗ на entry_price — реально
+           прибыльный Take Profit 1 показал PnL -13.47 вместо примерно +2.
         """
         fee_info = fee_info or {}
         cost = fee_info.get("cost")
         if cost:
             return float(cost), fee_info.get("currency")
-        _, quote_currency = symbol.split("/")
+        base_currency, quote_currency = symbol.split("/")
+        # Только для buy: комиссия покупки на споте обычно списывается из
+        # base-валюты (полученного актива) ДО того, как объём попадает в
+        # order["filled"]. Для sell это допущение неверно — там комиссия
+        # обычно из quote (полученной от продажи), а не из проданного
+        # base-объёма, так что разница запрошенного/исполненного там —
+        # просто округление лота, не комиссия.
+        if side == "buy" and amount_requested is not None and amount_requested > filled_amount:
+            return amount_requested - filled_amount, base_currency
         estimated = filled_amount * fill_price * (settings.paper_fee_pct / 100)
         return estimated, quote_currency
 
@@ -1324,7 +1343,9 @@ class ExecutionEngine:
             # None (заполняется только order["average"]).
             fill_price = order.get("average") or order.get("price") or price
             filled_amount = order["filled"] or amount
-            fill_fee, fee_currency = self._resolve_fee(order.get("fee"), filled_amount, fill_price, side, symbol)
+            fill_fee, fee_currency = self._resolve_fee(
+                order.get("fee"), filled_amount, fill_price, side, symbol, amount_requested=amount,
+            )
             fee_info = {"cost": fill_fee, "currency": fee_currency}
             # На споте комиссия обычно списывается из полученного актива:
             # при покупке — из base-валюты (1INCH), а не из USDT. Раньше
@@ -1562,7 +1583,9 @@ class ExecutionEngine:
             order["filled"] = confirmed_amount
         exit_price = order.get("average") or order.get("price") or entry_price
         exit_filled_amount = order["filled"] or amount
-        exit_fee, exit_fee_currency = self._resolve_fee(order.get("fee"), exit_filled_amount, exit_price, "sell", symbol)
+        exit_fee, exit_fee_currency = self._resolve_fee(
+            order.get("fee"), exit_filled_amount, exit_price, "sell", symbol, amount_requested=sell_amount,
+        )
 
         # Комиссия ОТКРЫТИЯ на споте обычно удерживается в BASE-валюте
         # (полученный актив) — например 105.4915 TAC, а не в USDT. PnL ниже

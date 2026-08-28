@@ -867,6 +867,40 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fee, 3.5)
         self.assertEqual(currency, "USDT")
 
+    async def test_resolve_fee_uses_requested_vs_filled_diff_for_buy_when_available(self):
+        """
+        На споте комиссия покупки часто списывается биржей из самого
+        актива ДО того, как объём попадает в order["filled"] — разница
+        между запрошенным и фактически исполненным объёмом (в base-валюте)
+        точнее стандартной ставки, когда её можно посчитать (запрошено
+        строго больше исполненного).
+        """
+        fee, currency = self.engine._resolve_fee(
+            None, 998.5, 2.0, "buy", "RESOLVEFEE2/USDT", amount_requested=1000.0,
+        )
+        self.assertAlmostEqual(fee, 1.5)
+        self.assertEqual(currency, "RESOLVEFEE2")
+
+    async def test_resolve_fee_ignores_diff_for_sell_side(self):
+        """
+        Для sell комиссия обычно из quote (полученной от продажи), а не из
+        проданного base-объёма — разница запрошенного/исполненного там не
+        комиссия, а округление лота. Должен остаться процентный фолбэк.
+        """
+        fee, currency = self.engine._resolve_fee(
+            None, 998.5, 2.0, "sell", "RESOLVEFEE3/USDT", amount_requested=1000.0,
+        )
+        self.assertAlmostEqual(fee, 998.5 * 2.0 * (settings.paper_fee_pct / 100))
+        self.assertEqual(currency, "USDT")
+
+    async def test_resolve_fee_falls_back_to_percentage_when_filled_exceeds_requested(self):
+        """Исполнено не меньше запрошенного — разница не сигнал о комиссии, используем ставку."""
+        fee, currency = self.engine._resolve_fee(
+            None, 1000.0, 2.0, "buy", "RESOLVEFEE4/USDT", amount_requested=1000.0,
+        )
+        self.assertAlmostEqual(fee, 1000.0 * 2.0 * (settings.paper_fee_pct / 100))
+        self.assertEqual(currency, "USDT")
+
     async def test_close_real_position_profitable_tp_stays_profitable_when_fee_estimated(self):
         """
         Реальный инцидент: HYPE/USDT, buy без реальных данных о комиссии от

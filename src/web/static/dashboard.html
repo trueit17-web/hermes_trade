@@ -287,6 +287,15 @@
     align-items: baseline;
     gap: 8px;
   }
+  .order-card-side {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+    font-size: 13px;
+    text-transform: none;
+    letter-spacing: normal;
+    flex-shrink: 0;
+  }
   .order-card .order-card-kv {
     display: grid;
     grid-template-columns: auto 1fr;
@@ -1329,32 +1338,46 @@ function restoreExpandedTrade(row) {
   }
 }
 
+// Запрошено == исполнено -> обе зелёные (совпало, как и должно быть).
+// Запрошено != исполнено -> красным только МЕНЬШЕЕ из двух значений
+// (второе остаётся обычным цветом) — исполнение хуже запрошенного.
+function comparedPairHtml(requested, filled, fmtFn) {
+  if (requested === null && filled === null) return "—";
+  const reqText = requested !== null ? fmtFn(requested) : "—";
+  const filledText = filled !== null ? fmtFn(filled) : "—";
+  if (requested === null || filled === null) return `${reqText} / ${filledText}`;
+  if (requested === filled) {
+    return `<span class="pnl-pos">${reqText}</span> / <span class="pnl-pos">${filledText}</span>`;
+  }
+  const reqHtml = requested < filled ? `<span class="pnl-neg">${reqText}</span>` : reqText;
+  const filledHtml = filled < requested ? `<span class="pnl-neg">${filledText}</span>` : filledText;
+  return `${reqHtml} / ${filledHtml}`;
+}
+
 function orderCardHtml(o, title) {
   if (!o) {
     return `<div class="order-card"><h5>${title}</h5><div class="muted">Данные ордера недоступны</div></div>`;
   }
-  const sideClass = o.side === "sell" ? "side-sell" : "side-buy";
+  const sideArrow = o.side === "sell"
+    ? `<span class="side-sell" title="SELL">&#9660;</span>`
+    : `<span class="side-buy" title="BUY">&#9650;</span>`;
+  const idSuffix = o.order_id_exchange
+    ? ` <span class="muted">(ID: ${escapeHtml(fmtOrderId(o.order_id_exchange))})</span>` : "";
   const rows = [
-    ["ID транзакции", o.order_id_exchange ? escapeHtml(fmtOrderId(o.order_id_exchange)) : "—"],
-    ["Client order ID", o.client_order_id ? escapeHtml(o.client_order_id) : "—"],
-    ["Сторона / тип", `<span class="${sideClass}">${(o.side || "—").toUpperCase()}</span> / ${o.order_type || "—"}`],
     ["Статус", o.status || "—"],
-    ["Объём запрошен", o.amount_requested !== null ? fmt(o.amount_requested, 6) : "—"],
-    ["Объём исполнен", o.filled_amount !== null ? fmt(o.filled_amount, 6) : "—"],
-    ["Цена запрошена", o.price_requested !== null ? fmtPrice(o.price_requested) : "—"],
-    ["Цена исполнения", o.filled_price !== null ? fmtPrice(o.filled_price) : "—"],
+    ["Объём (запрош. / исполн.)", comparedPairHtml(o.amount_requested, o.filled_amount, n => fmt(n, 6))],
+    ["Цена (запрош. / исполн.)", comparedPairHtml(o.price_requested, o.filled_price, fmtPrice)],
     ["Комиссия", o.fee !== null ? `${fmt(o.fee, 6)}${o.fee_currency ? " " + escapeHtml(o.fee_currency) : ""}` : "—"],
   ];
   if (o.stop_loss !== null || o.take_profit !== null) {
-    rows.push(["Stop Loss", o.stop_loss !== null ? fmtPrice(o.stop_loss) : "—"]);
-    rows.push(["Take Profit", o.take_profit !== null ? fmtPrice(o.take_profit) : "—"]);
+    rows.push(["SL / TP", `${o.stop_loss !== null ? fmtPrice(o.stop_loss) : "—"} / ${o.take_profit !== null ? fmtPrice(o.take_profit) : "—"}`]);
   }
   rows.push(["Время", o.created_at ? new Date(o.created_at).toLocaleString("ru-RU") : "—"]);
   if (o.notes) rows.push(["Заметка", escapeHtml(o.notes)]);
 
   return `
     <div class="order-card">
-      <h5>${title}</h5>
+      <h5>${title}<span class="order-card-side">${sideArrow}${idSuffix}</span></h5>
       <dl class="order-card-kv">
         ${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}
       </dl>
