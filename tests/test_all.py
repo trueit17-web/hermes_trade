@@ -3269,6 +3269,30 @@ class TestComputeEquitySkipsUntrackedPositions(unittest.IsolatedAsyncioTestCase)
         self.assertAlmostEqual(equity, 100.0 + 2.0 * 12.0)
 
 
+class TestCleanupClosesExchangeConnection(unittest.IsolatedAsyncioTestCase):
+    """
+    _cleanup() закрывал ingest/cg_client/scheduler/telegram, но никогда не
+    вызывал execution_engine.close() — ccxt-биржа держит собственную aiohttp
+    ClientSession, которая при каждом рестарте/остановке процесса оставалась
+    незакрытой (aiohttp сам логировал это как ERROR "Unclosed client
+    session" / "Unclosed connector" уже после выхода из event loop).
+    """
+
+    async def test_cleanup_calls_execution_engine_close(self):
+        from unittest.mock import AsyncMock, patch
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+
+        bot = main_module.TradingBot()
+        with patch.object(main_module.execution_engine, "close", new=AsyncMock()) as close_mock, \
+                patch.object(main_module, "close_telegram", new=AsyncMock()):
+            await bot._cleanup()
+
+        close_mock.assert_awaited_once()
+
+
 class TestTradingIterationPerSymbolIsolation(unittest.IsolatedAsyncioTestCase):
     """
     The for-symbol loop in _trading_iteration had no per-symbol exception

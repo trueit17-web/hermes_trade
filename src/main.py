@@ -1401,6 +1401,13 @@ class TradingBot:
             await self.cg_client.close()
         if self.scheduler:
             self.scheduler.shutdown()
+        # execution_engine держит ccxt-биржу с собственной aiohttp
+        # ClientSession — без явного close() при каждом рестарте/остановке
+        # процесса эта сессия и её TCP-коннектор оставались незакрытыми
+        # (aiohttp сам логировал это как ERROR "Unclosed client session" /
+        # "Unclosed connector" уже после выхода из event loop, когда закрыть
+        # их штатно было поздно).
+        await execution_engine.close()
         await close_telegram()
         logger.info("✅ Очистка завершена")
 
