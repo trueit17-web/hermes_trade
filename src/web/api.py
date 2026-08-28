@@ -971,6 +971,22 @@ async def get_trade_detail(trade_id: int):
         }
 
 
+@app.post("/trades/{trade_id}/recalculate")
+async def recalculate_trade(trade_id: int):
+    """
+    Перезапросить у биржи реальные цену/объём/комиссию для ордеров этой
+    (уже закрытой) сделки и пересчитать PnL — ручной способ подтянуть
+    точные данные постфактум, если изначально они были записаны по оценке
+    (см. ExecutionEngine.recalculate_closed_trade). Только для real-режима.
+    """
+    if settings.is_paper:
+        raise HTTPException(status_code=400, detail="Доступно только в real-режиме — в paper реальных данных с биржи нет")
+    result = await execution_engine.recalculate_closed_trade(trade_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Сделка не найдена или у неё нет обоих ордеров")
+    return result
+
+
 @app.get("/trades/{trade_id}/decision-log")
 async def get_trade_decision_log(trade_id: int):
     """Получить decision log для сделки (почему сделка была открыта/закрыта)."""

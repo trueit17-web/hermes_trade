@@ -256,6 +256,13 @@
     letter-spacing: .05em;
     color: var(--text-dim);
   }
+  .trade-detail-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .trade-detail-header h4 { margin: 0; }
   .trade-detail-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
@@ -1310,6 +1317,10 @@ async function toggleTradeDetail(row) {
   const cell = detailsRow.querySelector("td");
   if (cell.dataset.loaded) return;
 
+  await loadTradeDetailInto(cell, id);
+}
+
+async function loadTradeDetailInto(cell, id) {
   cell.innerHTML = `<div class="muted" style="padding:10px 16px">Загрузка…</div>`;
   try {
     const detail = await api(`/trades/${id}/detail`);
@@ -1317,9 +1328,34 @@ async function toggleTradeDetail(row) {
     cell.innerHTML = html;
     cell.dataset.loaded = "1";
     if (expandedTrades.has(id)) expandedTrades.set(id, html);
+    wireTradeDetailButtons(cell, id);
   } catch (err) {
     cell.innerHTML = `<div class="muted" style="padding:10px 16px">Ошибка загрузки: ${err.message}</div>`;
   }
+}
+
+function wireTradeDetailButtons(cell, id) {
+  const btn = cell.querySelector("#btnRecalcTrade");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    btn.textContent = "Пересчитываю…";
+    try {
+      const result = await api(`/trades/${id}/recalculate`, { method: "POST" });
+      if (result.updated) {
+        showToast(`Сделка пересчитана: PnL ${result.pnl >= 0 ? "+" : ""}${fmt(result.pnl)} (${fmt(result.pnl_pct, 2)}%)`);
+      } else {
+        showToast("Биржа не вернула ничего нового по этой сделке", true);
+      }
+      delete cell.dataset.loaded;
+      await loadTradeDetailInto(cell, id);
+      await renderTrades();
+    } catch (err) {
+      showToast(`Ошибка: ${err.message}`, true);
+      btn.disabled = false;
+      btn.textContent = "🔄 Пересчитать по бирже";
+    }
+  });
 }
 
 // Восстановить визуально развёрнутое состояние строки после того, как
@@ -1338,6 +1374,7 @@ function restoreExpandedTrade(row) {
     const cell = detailsRow.querySelector("td");
     cell.innerHTML = cachedHtml;
     cell.dataset.loaded = "1";
+    wireTradeDetailButtons(cell, id);
   }
 }
 
@@ -1464,10 +1501,19 @@ function renderTradeDetail(d) {
   const tradeValue = d.amount && d.entry_price ? d.amount * d.entry_price : null;
   const lastLeg = d.legs && d.legs.length ? d.legs[d.legs.length - 1] : null;
   const exitPrice = lastLeg && lastLeg.exit_price !== null ? lastLeg.exit_price : null;
+  // Пересчёт по бирже имеет смысл только для закрытой real-сделки, у
+  // которой есть настоящий ID ордера открытия для запроса к бирже — paper
+  // (order_id_exchange всегда пуст) и открытые позиции сюда не попадают.
+  const canRecalculate = !d.is_open && d.order_id_exchange_open;
+  const recalcBtn = canRecalculate
+    ? `<button type="button" class="btn-ghost" id="btnRecalcTrade">🔄 Пересчитать по бирже</button>` : "";
   return `
     <div class="trade-detail">
       <div class="trade-detail-block">
-        <h4>Сделка</h4>
+        <div class="trade-detail-header">
+          <h4>Сделка</h4>
+          ${recalcBtn}
+        </div>
         <div class="trade-detail-grid">
           <div><span class="muted">Символ</span><br>${d.symbol || "—"}</div>
           <div><span class="muted">Сторона</span><br>${(d.direction || "").toUpperCase()}</div>

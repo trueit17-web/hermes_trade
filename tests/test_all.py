@@ -3316,6 +3316,145 @@ class TestTradeDetail(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail["legs"][0]["order_id_exchange_close"], "detail-close-ex-1")
 
 
+class TestRecalculateClosedTrade(unittest.IsolatedAsyncioTestCase):
+    """
+    ExecutionEngine.recalculate_closed_trade — ручной способ подтянуть
+    точные цену/объём/комиссию с биржи постфактум для уже закрытой сделки,
+    изначально записанной по оценке (биржа не успела вовремя отдать
+    комиссию/цену), не дожидаясь следующего похожего инцидента.
+    """
+
+    async def test_returns_none_in_paper_mode(self):
+        from src.execution.executor import ExecutionEngine
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "paper"
+        await engine.initialize("binance")
+
+        result = await engine.recalculate_closed_trade(1)
+        self.assertIsNone(result)
+
+    async def test_returns_none_for_unknown_trade(self):
+        from src.execution.executor import ExecutionEngine
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "real"
+        engine.is_paper = False
+        engine.exchange_id = "bybit"
+        engine.exchange = AsyncMock()
+
+        result = await engine.recalculate_closed_trade(999999999)
+        self.assertIsNone(result)
+
+    async def test_refreshes_orders_and_recomputes_pnl_from_fresh_exchange_data(self):
+        """
+        Сделка изначально закрыта без реальных данных от биржи (оценочная
+        комиссия/цена по запрошенным значениям) — recalculate находит
+        настоящую историю сделок биржи и пересчитывает PnL по ней.
+        """
+        from src.execution.executor import ExecutionEngine
+        from src.db.session import get_session
+        from src.db.models import Order, Trade
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "real"
+        engine.is_paper = False
+        engine.exchange_id = "bybit"
+        engine.exchange = AsyncMock()
+        engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"RECALC1": 0.0}, "RECALC1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        engine.exchange.create_market_buy_order.return_value = {
+            "id": "recalc-open-1", "filled": 10.0, "average": 100.0, "price": None,
+            "fee": {"cost": 0, "currency": None},
+        }
+        engine.exchange.fetch_order_trades = AsyncMock(return_value=None)
+        engine.exchange.fetch_my_trades = AsyncMock(return_value=None)
+        order = await engine.create_order(
+            symbol="RECALC1/USDT", side="buy", amount=10.0, price=100.0, order_type="market",
+        )
+        self.assertIsNotNone(order)
+        self.assertEqual(order.order_id_exchange, "recalc-open-1")
+
+        engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"RECALC1": 10.0}, "RECALC1": {"free": 10.0, "used": 0, "total": 10.0},
+        })
+        engine.exchange.create_market_sell_order.return_value = {
+            "id": "recalc-close-1", "filled": 10.0, "average": 110.0, "price": None,
+            "fee": {"cost": 0, "currency": None},
+        }
+        result = await engine.close_real_position(
+            symbol="RECALC1/USDT", side="long", entry_price=100.0, amount=10.0,
+            reason="take_profit_3", entry_fee=0.0, holding_seconds=60, order_open_id=order.id,
+        )
+        self.assertIsNotNone(result)
+        trade_id = result["trade_id"]
+
+        # Теперь "биржа отдала" настоящую историю сделок — с реальной
+        # комиссией в base-валюте на открытии.
+        async def fake_fetch_order_trades(order_id, symbol):
+            if order_id == "recalc-open-1":
+                return [{"id": "t1", "amount": 10.0, "price": 100.0, "cost": 1000.0,
+                          "fee": {"cost": 0.05, "currency": "RECALC1"}}]
+            if order_id == "recalc-close-1":
+                return [{"id": "t2", "amount": 10.0, "price": 108.0, "cost": 1080.0,
+                          "fee": {"cost": 1.08, "currency": "USDT"}}]
+            return None
+        engine.exchange.fetch_order_trades = AsyncMock(side_effect=fake_fetch_order_trades)
+
+        recalced = await engine.recalculate_closed_trade(trade_id)
+        self.assertIsNotNone(recalced)
+        self.assertTrue(recalced["updated"])
+        # (108 - 100) * 10 - (0.05 * 100) - 1.08 = 80 - 5 - 1.08 = 73.92
+        self.assertAlmostEqual(recalced["pnl"], 73.92, places=4)
+        self.assertEqual(recalced["outcome"], "win")
+
+        async with get_session() as session:
+            refreshed_trade = await session.get(Trade, trade_id)
+            self.assertAlmostEqual(float(refreshed_trade.pnl), 73.92, places=4)
+            self.assertAlmostEqual(float(refreshed_trade.exit_price), 108.0)
+            refreshed_open = await session.get(Order, order.id)
+            self.assertEqual(refreshed_open.fee_currency, "RECALC1")
+
+    async def test_returns_not_updated_when_exchange_has_nothing_new(self):
+        from src.execution.executor import ExecutionEngine
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "real"
+        engine.is_paper = False
+        engine.exchange_id = "bybit"
+        engine.exchange = AsyncMock()
+        engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"RECALC2": 0.0}, "RECALC2": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        engine.exchange.create_market_buy_order.return_value = {
+            "id": "recalc2-open-1", "filled": 5.0, "average": 50.0, "price": None,
+            "fee": {"cost": 0.1, "currency": "USDT"},
+        }
+        engine.exchange.fetch_order_trades = AsyncMock(return_value=None)
+        engine.exchange.fetch_my_trades = AsyncMock(return_value=None)
+        order = await engine.create_order(
+            symbol="RECALC2/USDT", side="buy", amount=5.0, price=50.0, order_type="market",
+        )
+        engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"RECALC2": 5.0}, "RECALC2": {"free": 5.0, "used": 0, "total": 5.0},
+        })
+        engine.exchange.create_market_sell_order.return_value = {
+            "id": "recalc2-close-1", "filled": 5.0, "average": 55.0, "price": None,
+            "fee": {"cost": 0.1, "currency": "USDT"},
+        }
+        result = await engine.close_real_position(
+            symbol="RECALC2/USDT", side="long", entry_price=50.0, amount=5.0,
+            reason="take_profit_3", entry_fee=0.1, holding_seconds=60, order_open_id=order.id,
+        )
+        self.assertIsNotNone(result)
+
+        # Ни fetch_order_trades, ни fetch_my_trades по-прежнему ничего не
+        # находят — как и было при закрытии.
+        recalced = await engine.recalculate_closed_trade(result["trade_id"])
+        self.assertEqual(recalced, {"updated": False})
+
+
 class TestClosePositionAtomicity(unittest.IsolatedAsyncioTestCase):
     """
     close_paper_position mutated paper_balance/paper_positions BEFORE

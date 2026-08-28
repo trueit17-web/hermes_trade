@@ -1700,6 +1700,121 @@ class ExecutionEngine:
 
         return {"pnl": pnl, "pnl_pct": pnl_pct, "outcome": outcome, "trade_id": trade_id}
 
+    async def recalculate_closed_trade(self, trade_id: int) -> dict | None:
+        """
+        Перезапросить у биржи реальные цену/объём/комиссию для открывающего
+        ордера и КАЖДОЙ "ноги" закрытия позиции (Trade.order_open_id может
+        быть общим для нескольких строк Trade — частичные закрытия по
+        уровням TP1/TP2/TP3, см. GET /trades/{id}/detail) и пересчитать
+        PnL каждой — ручной способ подтянуть точные данные постфактум для
+        сделки, изначально записанной по оценке (биржа не успела вовремя
+        отдать комиссию/цену — см. _resolve_fee, "не подтверждён по
+        filled" и т.п.), не дожидаясь следующего похожего инцидента.
+        Только для real — в paper реальных данных с биржи для сверки нет
+        вообще.
+
+        Возвращает {"updated": bool, "pnl", "pnl_pct", "outcome"} —
+        суммарные PnL/PnL% по всей группе (updated False, если у биржи
+        так и не нашлось ничего нового ни по одному из ордеров — как и
+        остальные best-effort сверки с биржей в этом классе) или None,
+        если сделка/её открывающий ордер не найдены.
+        """
+        if self.is_paper:
+            return None
+
+        async with get_session() as session:
+            trade = await session.get(Trade, trade_id)
+            if trade is None or trade.order_open_id is None:
+                return None
+            symbol_row = await session.get(Symbol, trade.symbol_id)
+            symbol = symbol_row.symbol if symbol_row else None
+            opening_order = await session.get(Order, trade.order_open_id)
+            if not symbol or opening_order is None:
+                return None
+
+            legs = (
+                await session.execute(select(Trade).where(Trade.order_open_id == trade.order_open_id))
+            ).scalars().all()
+            closing_orders = {}
+            for leg in legs:
+                if leg.order_close_id is not None:
+                    closing_orders[leg.id] = await session.get(Order, leg.order_close_id)
+
+            refreshed = False
+            for order in [opening_order, *closing_orders.values()]:
+                if order is None or not order.order_id_exchange:
+                    continue
+                # order_id_exchange хранит либо ID самого ордера (обычный
+                # случай, когда история сделок биржи не нашлась сразу — см.
+                # _execute_real_order/close_real_position), либо список ID
+                # СДЕЛОК через запятую, если она уже нашлась тогда же —
+                # пересчитывать в этом случае уже нечего (данные и так
+                # точные), fetch_order_trades по ID сделки просто ничего не
+                # найдёт, что здесь безопасно эквивалентно "нового нет".
+                order_ref = order.order_id_exchange.split(",")[0]
+                fill = await self._fetch_fill_details_via_trades(order_ref, symbol)
+                if fill is None:
+                    continue
+                order.filled_price = fill["average"]
+                order.filled_amount = fill["amount"]
+                fee = fill.get("fee") or {}
+                order.fee = fee.get("cost")
+                order.fee_currency = fee.get("currency")
+                if fill.get("trade_ids"):
+                    order.order_id_exchange = ",".join(fill["trade_ids"])
+                refreshed = True
+
+            if not refreshed:
+                return {"updated": False}
+
+            base_currency = symbol.split("/")[0]
+            total_amount = 0.0
+            total_pnl = 0.0
+            for leg in legs:
+                closing_order = closing_orders.get(leg.id)
+                if closing_order is None or opening_order.filled_price is None or closing_order.filled_price is None:
+                    total_amount += float(leg.amount)
+                    total_pnl += float(leg.pnl)
+                    continue
+                entry_price = float(opening_order.filled_price)
+                exit_price = float(closing_order.filled_price)
+                # closing_order соответствует ровно этой "ноге" один к
+                # одному — берём именно его объём как источник истины (мог
+                # чуть отличаться от ранее записанного Trade.amount), а не
+                # оставляем устаревшее значение.
+                amount = float(closing_order.filled_amount) if closing_order.filled_amount else float(leg.amount)
+                entry_fee = (
+                    float(opening_order.fee or 0) * (amount / float(opening_order.filled_amount))
+                    if opening_order.filled_amount else 0.0
+                )
+                exit_fee = float(closing_order.fee or 0)
+                # Та же конвертация комиссии открытия в USDT-эквивалент,
+                # что и в close_real_position — иначе base-валютная
+                # комиссия ("105.49 TAC") считалась бы quote-валютной.
+                entry_fee_quote = (
+                    entry_fee * entry_price if opening_order.fee_currency == base_currency else entry_fee
+                )
+
+                leg.amount = amount
+                leg.entry_price = entry_price
+                leg.exit_price = exit_price
+                pnl = (exit_price - entry_price) * amount - entry_fee_quote - exit_fee
+                leg.pnl = pnl
+                leg.pnl_pct = (pnl / (entry_price * amount) * 100) if entry_price and amount else 0.0
+                leg.outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "break-even")
+                total_amount += amount
+                total_pnl += pnl
+
+            await session.commit()
+
+        total_pnl_pct = (total_pnl / (float(opening_order.filled_price) * total_amount) * 100) if total_amount else 0.0
+        outcome = "win" if total_pnl > 0 else ("loss" if total_pnl < 0 else "break-even")
+        logger.info(
+            f"🔄 Сделка #{trade_id} ({symbol}) пересчитана по данным биржи: "
+            f"PnL {total_pnl:+.2f} ({total_pnl_pct:+.2f}%)"
+        )
+        return {"updated": True, "pnl": total_pnl, "pnl_pct": total_pnl_pct, "outcome": outcome}
+
     async def _reconcile_phantom_position(self, symbol: str, order_open_id: int | None):
         """
         Снять с учёта позицию, которую больше невозможно закрыть обычной
