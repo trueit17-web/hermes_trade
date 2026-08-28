@@ -355,6 +355,13 @@
   @media (max-width: 900px) {
     .settings-layout { grid-template-columns: 1fr; }
   }
+  #settingsGroups {
+    column-count: 2;
+    column-gap: 20px;
+  }
+  @media (max-width: 900px) {
+    #settingsGroups { column-count: 1; }
+  }
   .settings-group {
     background: var(--panel);
     border: 1px solid var(--panel-border);
@@ -515,6 +522,10 @@
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 11.5px;
   }
+  /* Вкладка "Логи" отдана логам целиком (не делит окно со вкладкой
+     Настройки, как раньше) — есть место показать заметно больше строк
+     без скролла. */
+  .logs-box-full { max-height: calc(100vh - 320px); }
   .log-line {
     padding: 4px 16px;
     display: flex;
@@ -542,6 +553,7 @@
     <button class="tab-btn active" data-tab="dashboard">Дашборд</button>
     <button class="tab-btn" data-tab="manual">Ручная торговля</button>
     <button class="tab-btn" data-tab="settings">Настройки</button>
+    <button class="tab-btn" data-tab="logs">Логи</button>
   </nav>
   <div class="header-actions">
     <span class="ws-indicator" title="WebSocket real-time соединение">
@@ -657,47 +669,41 @@
 </div>
 
 <div id="tabSettings" class="tab-panel" style="display:none">
-  <div class="settings-layout">
+  <div class="settings-save-bar">
+    <button id="btnSaveSettings" class="btn-primary">💾 Сохранить настройки</button>
+  </div>
+  <div id="settingsGroups"><div class="muted">Загрузка…</div></div>
+</div>
 
-    <div class="settings-col">
-      <div class="settings-save-bar">
-        <button id="btnSaveSettings" class="btn-primary">💾 Сохранить настройки</button>
-      </div>
-      <div id="settingsGroups"><div class="muted">Загрузка…</div></div>
-    </div>
+<div id="tabLogs" class="tab-panel" style="display:none">
+  <div class="side-panel">
+    <h2>Статусы подключений</h2>
+    <div id="connectionsBody"><div class="conn-row muted">Загрузка…</div></div>
+  </div>
 
-    <div class="settings-side">
-      <div class="side-panel">
-        <h2>Статусы подключений</h2>
-        <div id="connectionsBody"><div class="conn-row muted">Загрузка…</div></div>
-      </div>
-
-      <div class="side-panel">
-        <h2>Логи</h2>
-        <div class="log-filters">
-          <select id="logLevelFilter">
-            <option value="">Все уровни</option>
-            <option value="DEBUG">DEBUG+</option>
-            <option value="INFO" selected>INFO+</option>
-            <option value="WARNING">WARNING+</option>
-            <option value="ERROR">ERROR+</option>
-          </select>
-          <input type="text" id="logSearchFilter" placeholder="Поиск по тексту…">
-          <div class="module-dropdown" id="moduleDropdown">
-            <button type="button" id="moduleDropdownBtn" class="module-dropdown-btn">Модули: все ▾</button>
-            <div class="module-dropdown-panel" id="moduleDropdownPanel" style="display:none">
-              <div class="module-dropdown-actions">
-                <button type="button" id="moduleSelectAll" class="btn-ghost">Все</button>
-                <button type="button" id="moduleSelectNone" class="btn-ghost">Нет</button>
-              </div>
-              <div id="moduleCheckboxes"><div class="muted" style="padding:6px 10px">Загрузка…</div></div>
-            </div>
+  <div class="side-panel">
+    <h2>Логи</h2>
+    <div class="log-filters">
+      <select id="logLevelFilter">
+        <option value="">Все уровни</option>
+        <option value="DEBUG">DEBUG+</option>
+        <option value="INFO" selected>INFO+</option>
+        <option value="WARNING">WARNING+</option>
+        <option value="ERROR">ERROR+</option>
+      </select>
+      <input type="text" id="logSearchFilter" placeholder="Поиск по тексту…">
+      <div class="module-dropdown" id="moduleDropdown">
+        <button type="button" id="moduleDropdownBtn" class="module-dropdown-btn">Модули: все ▾</button>
+        <div class="module-dropdown-panel" id="moduleDropdownPanel" style="display:none">
+          <div class="module-dropdown-actions">
+            <button type="button" id="moduleSelectAll" class="btn-ghost">Все</button>
+            <button type="button" id="moduleSelectNone" class="btn-ghost">Нет</button>
           </div>
+          <div id="moduleCheckboxes"><div class="muted" style="padding:6px 10px">Загрузка…</div></div>
         </div>
-        <div class="logs-box" id="logsBox"><div class="muted" style="padding:12px 16px">Загрузка…</div></div>
       </div>
     </div>
-
+    <div class="logs-box logs-box-full" id="logsBox"><div class="muted" style="padding:12px 16px">Загрузка…</div></div>
   </div>
 </div>
 
@@ -1797,8 +1803,11 @@ function switchTab(tab) {
   document.getElementById("tabDashboard").style.display = tab === "dashboard" ? "" : "none";
   document.getElementById("tabManual").style.display = tab === "manual" ? "" : "none";
   document.getElementById("tabSettings").style.display = tab === "settings" ? "" : "none";
+  document.getElementById("tabLogs").style.display = tab === "logs" ? "" : "none";
   if (tab === "settings") {
     loadSettings();
+  }
+  if (tab === "logs") {
     loadConnections();
     loadModuleList().then(loadLogs);
   }
@@ -1877,7 +1886,19 @@ function renderSettingsField(f) {
     inputHtml = `<input type="text" id="${id}" data-key="${f.key}" data-type="${f.type}" value="${escapeHtml(f.value ?? "")}">`;
   }
   const descHtml = f.description ? `<div class="settings-field-desc">${escapeHtml(f.description)}</div>` : "";
-  return `<div class="settings-field"><label for="${id}">${f.label}</label>${inputHtml}${descHtml}</div>`;
+  const dependsAttr = f.depends_on ? ` data-depends-on="${f.depends_on}"` : "";
+  return `<div class="settings-field"${dependsAttr}><label for="${id}">${f.label}</label>${inputHtml}${descHtml}</div>`;
+}
+
+// Поля с depends_on (например ATR-множители, видимые только пока включён
+// "ATR-адаптивный SL/TP") показываются, только когда чекбокс-переключатель,
+// от которого они зависят, включён — иначе на экране постоянно висели
+// настройки, не имеющие вообще никакого эффекта при выключенной функции.
+function applySettingsDependencies() {
+  document.querySelectorAll("#settingsGroups [data-depends-on]").forEach(el => {
+    const gate = document.getElementById(`set_${el.dataset.dependsOn}`);
+    el.style.display = gate && gate.checked ? "" : "none";
+  });
 }
 
 async function loadSettings() {
@@ -1897,6 +1918,10 @@ async function loadSettings() {
         ${byGroup[g].map(renderSettingsField).join("")}
       </div>
     `).join("");
+    applySettingsDependencies();
+    container.querySelectorAll('input[type="checkbox"][data-key]').forEach(cb => {
+      cb.addEventListener("change", applySettingsDependencies);
+    });
   } catch (err) {
     container.innerHTML = `<div class="muted">Ошибка загрузки: ${err.message}</div>`;
   }
@@ -2120,7 +2145,7 @@ async function loadLogs() {
 });
 
 setInterval(() => {
-  if (currentTab === "settings") {
+  if (currentTab === "logs") {
     loadConnections();
     loadModuleList();
     loadLogs();
