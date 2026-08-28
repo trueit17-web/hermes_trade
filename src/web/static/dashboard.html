@@ -775,9 +775,12 @@
 const REFRESH_MS = 5000;
 let lastStatus = null;
 
+// digits — верхняя граница знаков после запятой, а не фиксированное их
+// число: 100 остаётся "100" (не "100,000000"), а 100.123456789 обрежется
+// до "100,123457" — незачем дополнять нулями то, чего в самом числе нет.
 function fmt(n, digits = 2) {
   if (n === null || n === undefined || Number.isNaN(n)) return "—";
-  return Number(n).toLocaleString("ru-RU", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+  return Number(n).toLocaleString("ru-RU", { minimumFractionDigits: 0, maximumFractionDigits: digits });
 }
 
 // Высокая точность (но не безграничная) — для цен (entry/current/SL/TP),
