@@ -1649,6 +1649,51 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
             refreshed = await session.get(Order, opening_order.id)
             self.assertEqual(refreshed.status, "rejected")
 
+    async def test_close_real_position_skips_sell_order_when_amount_already_zero(self):
+        """
+        Реальный инцидент: ETH/USDT — из-за бага реконструкции при рестарте
+        (комиссия в quote-валюте вычиталась как если бы была в base) объём
+        позиции стал ровно 0.0, хотя на бирже реально лежал весь объём.
+        close_real_position(amount=0.0) НЕ должен вообще пытаться создать
+        ордер на бирже (0.0 — невалидное количество, Bybit отклоняет с
+        "Data sent for paramter '' is not valid" на каждой попытке) —
+        нечего продавать, позиция сразу снимается с учёта.
+        """
+        from src.db.models import Order
+        from src.db.session import get_session
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "zeroamt-open-1", "filled": 0.157, "price": None, "average": 2490.41,
+            "fee": {"cost": 0.05, "currency": "USDT"},
+        }
+        opening_order = await self.engine.create_order(
+            symbol="ZEROAMT1/USDT", side="buy", amount=0.157, price=2490.41,
+            order_type="market", stop_loss=2465.0, take_profit=2540.0,
+        )
+        self.assertIsNotNone(opening_order)
+        # create_order уже вызвал create_market_sell_order один раз, чтобы
+        # выставить биржевой SL сразу после открытия — интересует только
+        # то, что происходит (не происходит) при самом закрытии.
+        self.engine.exchange.create_market_sell_order.reset_mock()
+
+        result = await self.engine.close_real_position(
+            symbol="ZEROAMT1/USDT", side="long", entry_price=2490.41, amount=0.0,
+            reason="stop_loss", entry_fee=0.0, holding_seconds=60,
+            order_open_id=opening_order.id,
+        )
+
+        self.assertIsNone(result)
+        self.engine.exchange.create_market_sell_order.assert_not_called()
+        self.assertNotIn("ZEROAMT1/USDT", self.engine.real_positions)
+
+        async with get_session() as session:
+            refreshed = await session.get(Order, opening_order.id)
+            self.assertEqual(refreshed.status, "rejected")
+
     async def test_close_real_position_reconciles_phantom_when_remaining_dust_below_minimum(self):
         """
         Второй вариант того же класса бага: доступный остаток положительный
@@ -2180,7 +2225,7 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.engine.exchange = AsyncMock()
         self.engine.exchange.create_market_buy_order.return_value = {
             "id": "ex-fee-3", "filled": 100.0, "price": None, "average": 0.5,
-            "fee": {"cost": 0.1, "currency": "1INCH"},
+            "fee": {"cost": 0.1, "currency": "RESTOREFEE1"},
         }
         order = await self.engine.create_order(
             symbol="RESTOREFEE1/USDT", side="buy", amount=100.0, price=0.5,
@@ -2190,6 +2235,33 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
 
         real_positions, _, _ = await self.engine._load_open_positions_from_db(is_paper=False)
         self.assertAlmostEqual(real_positions["RESTOREFEE1/USDT"]["amount"], 99.9)
+
+    async def test_restore_real_position_does_not_subtract_quote_currency_fee(self):
+        """
+        Комиссия открытия не всегда в base-валюте — Bybit нередко списывает
+        её в USDT (quote). Реальный инцидент: ETH/USDT, комиссия 0.39 USDT
+        (в quote) БОЛЬШЕ восстановленного объёма 0.157 ETH — старый код
+        вычитал её как если бы она была в ETH, объём уходил в отрицательный
+        и схлопывался до 0.0 (max(0.0, ...)), хотя на бирже реально лежал
+        весь объём нетронутым. Бот затем бесконечно пытался продать 0.0,
+        биржа отклоняла ордер на каждой итерации цикла.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "ex-fee-quote-1", "filled": 0.157, "price": None, "average": 2490.41,
+            "fee": {"cost": 0.39, "currency": "USDT"},
+        }
+        order = await self.engine.create_order(
+            symbol="RESTOREFEEQUOTE1/USDT", side="buy", amount=0.157, price=2490.41,
+            order_type="market", stop_loss=2465.0, take_profit=2540.0,
+        )
+        self.assertIsNotNone(order)
+
+        real_positions, _, _ = await self.engine._load_open_positions_from_db(is_paper=False)
+        self.assertAlmostEqual(real_positions["RESTOREFEEQUOTE1/USDT"]["amount"], 0.157)
 
     async def test_restore_paper_position_does_not_subtract_fee(self):
         """
