@@ -771,12 +771,14 @@ function fmt(n, digits = 2) {
   return Number(n).toLocaleString("ru-RU", { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 
-// Полная точность без округления — для цен (entry/current/SL/TP), где
-// fmt(n, 2) превращал бы, например, 0.00000821 (типичная цена альт-пары)
-// в бесполезные "0.00".
+// Высокая точность (но не безграничная) — для цен (entry/current/SL/TP),
+// где fmt(n, 2) превращал бы, например, 0.00000821 (типичная цена
+// альт-пары) в бесполезные "0.00". Ограничено 7 знаками после запятой —
+// дальше цифры уже не несут смысла для чтения глазами, только раздувают
+// таблицы.
 function fmtPrice(n) {
   if (n === null || n === undefined || Number.isNaN(n)) return "—";
-  return Number(n).toLocaleString("ru-RU", { minimumFractionDigits: 0, maximumFractionDigits: 12 });
+  return Number(n).toLocaleString("ru-RU", { minimumFractionDigits: 0, maximumFractionDigits: 7 });
 }
 
 // Логи показывались как сырой UTC-таймстамп (просто вырезали "HH:MM:SS" из
