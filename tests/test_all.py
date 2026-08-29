@@ -2699,6 +2699,53 @@ class TestGeminiSignalParser(unittest.IsolatedAsyncioTestCase):
         result = await gemini_parser_module.parse_with_gemini("покупаем биток в районе 69к, стоп 68к")
         self.assertIsNone(result)
 
+    async def test_truncated_json_response_returns_none_not_raises(self):
+        """
+        Реальный инцидент (прод): ответ Gemini обрывается посередине JSON
+        ("thinking"-бюджет модели съедает часть max_output_tokens ДО
+        собственно ответа) — json.loads падает с "Unterminated string
+        starting at:", а не с обычной "не json вообще". Тот же контракт:
+        None, а не исключение наружу.
+        """
+        import src.telegram.gemini_parser as gemini_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.gemini_api_key = "test-key"
+
+        mock_client = MagicMock()
+        bad_resp = MagicMock()
+        bad_resp.text = '{"is_signal": true, "base": "BTC", "side": "long", "entry'
+        mock_client.aio.models.generate_content = AsyncMock(return_value=bad_resp)
+        gemini_parser_module._client = mock_client
+
+        result = await gemini_parser_module.parse_with_gemini("покупаем биток в районе 69к, стоп 68к")
+        self.assertIsNone(result)
+
+    async def test_requests_larger_output_budget_to_avoid_truncation(self):
+        """
+        Регресс на прод-инцидент: max_output_tokens=512 было мало —
+        "thinking"-бюджет модели съедал часть лимита до собственно JSON,
+        ответ обрывался, сигнал тихо терялся (единственный работающий
+        уровень LLM-фолбэка — Anthropic не настроен). Бюджет увеличен;
+        здесь просто фиксируем, что теперь запрашивается заметно больше,
+        чем было — если кто-то случайно вернёт лимит обратно к 512, тест
+        упадёт.
+        """
+        import src.telegram.gemini_parser as gemini_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.gemini_api_key = "test-key"
+
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(return_value=self._mock_response({
+            "is_signal": True, "base": "BTC", "side": "long", "entry": 69000.0,
+            "take_profits": [70000.0], "stop_loss": 68000.0, "confidence": 0.9,
+        }))
+        gemini_parser_module._client = mock_client
+
+        await gemini_parser_module.parse_with_gemini("покупаем биток в районе 69к, стоп 68к")
+
+        _, kwargs = mock_client.aio.models.generate_content.call_args
+        self.assertGreaterEqual(kwargs["config"]["max_output_tokens"], 2048)
+
     async def test_parse_telegram_signal_falls_back_to_gemini_when_anthropic_not_configured(self):
         """
         Anthropic не настроен (нет ключа) — цепочка должна дойти до

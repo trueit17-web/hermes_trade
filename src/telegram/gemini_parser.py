@@ -78,7 +78,17 @@ async def parse_with_gemini(text: str, channel_config: dict | None = None) -> di
                 "system_instruction": _SYSTEM,
                 "response_mime_type": "application/json",
                 "response_json_schema": _RESPONSE_SCHEMA,
-                "max_output_tokens": 512,
+                # 512 оказалось мало на практике (реальный инцидент, прод):
+                # "thinking"-модели (в т.ч. flash-варианты) тратят часть
+                # max_output_tokens на внутренние рассуждения ДО собственно
+                # JSON-ответа — бюджет выбивался ПОСЕРЕДИНЕ JSON, и
+                # json.loads падал с "Unterminated string starting at:",
+                # сигнал тихо терялся (Anthropic-фолбэк не настроен —
+                # единственный работающий уровень LLM-парсинга отваливался
+                # на каждом таком сообщении). Схема ответа компактная
+                # (несколько чисел/строк) — 2048 с запасом покрывает и
+                # рассуждения, и сам JSON.
+                "max_output_tokens": 2048,
             },
         )
     except Exception as e:
@@ -86,9 +96,18 @@ async def parse_with_gemini(text: str, channel_config: dict | None = None) -> di
         return None
 
     try:
-        data = json.loads(resp.text)
+        raw_text = resp.text or ""
     except Exception as e:
-        logger.warning(f"Gemini-парсер сигнала: не удалось разобрать JSON-ответ — {e}")
+        logger.warning(f"Gemini-парсер сигнала: не удалось прочитать текст ответа — {e}")
+        return None
+
+    try:
+        data = json.loads(raw_text)
+    except Exception as e:
+        logger.warning(
+            f"Gemini-парсер сигнала: не удалось разобрать JSON-ответ — {e} | "
+            f"сырой ответ: {raw_text[:500]!r}"
+        )
         return None
 
     if not isinstance(data, dict):
