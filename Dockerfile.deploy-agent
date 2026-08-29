@@ -4,21 +4,33 @@
 # scripts/deploy_agent.py про поверхность атаки).
 FROM python:3.12-slim
 
-# git — для `git pull`; docker.io — CLI `docker` для управления СОСЕДНИМИ
-# контейнерами через смонтированный docker.sock хоста (см.
-# docker-compose.yml, сервис deploy-agent).
+# git — для `git pull`. Сам `docker` CLI НЕ ставим через apt: пакет
+# docker.io на Debian (в т.ч. trixie, на который сейчас резолвится
+# python:3.12-slim) на практике не кладёт бинарник на PATH (реальный
+# инцидент: "docker: command not found" при выполнении деплоя, хотя
+# apt-get install отрабатывал без ошибок) — берём вместо этого
+# официальный статический бинарник напрямую с download.docker.com, тем
+# же способом, что и плагин compose ниже.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git docker.io curl ca-certificates \
+    && apt-get install -y --no-install-recommends git curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Плагин `docker compose` (v2) — пакета docker-compose-v2 нет гарантированно
-# во всех версиях Debian (например, отсутствует в trixie), поэтому берём
-# официальный статический бинарник напрямую с GitHub Releases вместо apt.
+# docker CLI (только клиентский бинарник — дальше он просто говорит с
+# ДЕМОНОМ ХОСТА через смонтированный docker.sock, свой демон тут не
+# нужен) + плагин `docker compose` (v2, пакета docker-compose-v2 нет
+# гарантированно во всех версиях Debian) — оба официальные статические
+# бинарники, а не из apt, чтобы не зависеть от того, что конкретно
+# содержит docker.io/docker-compose-v2 в текущем Debian-релизе.
 # /usr/libexec/docker/cli-plugins/ — один из стандартных путей поиска
-# плагинов у docker CLI, действует независимо от того, каким пакетом
-# установлен сам docker.
+# плагинов у docker CLI.
+ARG DOCKER_VERSION=27.3.1
 ARG COMPOSE_VERSION=v2.29.7
 RUN mkdir -p /usr/libexec/docker/cli-plugins \
+    && curl -fsSL "https://download.docker.com/linux/static/stable/$(uname -m)/docker-${DOCKER_VERSION}.tgz" \
+       -o /tmp/docker.tgz \
+    && tar -xzf /tmp/docker.tgz -C /usr/local/bin --strip-components=1 docker/docker \
+    && rm /tmp/docker.tgz \
+    && chmod +x /usr/local/bin/docker \
     && curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-$(uname -m)" \
        -o /usr/libexec/docker/cli-plugins/docker-compose \
     && chmod +x /usr/libexec/docker/cli-plugins/docker-compose
