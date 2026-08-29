@@ -4,12 +4,24 @@
 # scripts/deploy_agent.py про поверхность атаки).
 FROM python:3.12-slim
 
-# git — для `git pull`; docker.io/docker-compose-v2 — CLI для управления
-# СОСЕДНИМИ контейнерами через смонтированный docker.sock хоста (см.
+# git — для `git pull`; docker.io — CLI `docker` для управления СОСЕДНИМИ
+# контейнерами через смонтированный docker.sock хоста (см.
 # docker-compose.yml, сервис deploy-agent).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git docker.io docker-compose-v2 \
+    && apt-get install -y --no-install-recommends git docker.io curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Плагин `docker compose` (v2) — пакета docker-compose-v2 нет гарантированно
+# во всех версиях Debian (например, отсутствует в trixie), поэтому берём
+# официальный статический бинарник напрямую с GitHub Releases вместо apt.
+# /usr/libexec/docker/cli-plugins/ — один из стандартных путей поиска
+# плагинов у docker CLI, действует независимо от того, каким пакетом
+# установлен сам docker.
+ARG COMPOSE_VERSION=v2.29.7
+RUN mkdir -p /usr/libexec/docker/cli-plugins \
+    && curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-$(uname -m)" \
+       -o /usr/libexec/docker/cli-plugins/docker-compose \
+    && chmod +x /usr/libexec/docker/cli-plugins/docker-compose
 
 WORKDIR /app
 COPY scripts/deploy_agent.py .
