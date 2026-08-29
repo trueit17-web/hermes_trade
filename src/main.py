@@ -814,6 +814,21 @@ class TradingBot:
 
     async def _process_symbol(self, symbol: str):
         """Обработка одной пары."""
+        # Заблокированный (symbol_blacklist) символ без открытой позиции —
+        # пропускаем целиком, а не только на этапе генерации новых сигналов.
+        # _refresh_symbol_universe() намеренно не убирает символ с уже
+        # открытой позицией из active_symbols сразу при блокировке (чтобы
+        # SL/TP по нему продолжали проверяться) — но раньше, после
+        # закрытия этой позиции, символ оставался в active_symbols вплоть
+        # до следующего обновления вселенной (раз в
+        # symbol_universe_refresh_hours) и как ни в чём не бывало снова
+        # получал НОВЫЕ сигналы стратегий: risk_manager.check_signal()
+        # блэклист вообще не проверяет, только доступность позиции по
+        # символу. Реальный инцидент: RLUSD/USDT, USDE/USDT, USDC/USDT —
+        # уже добавленные в блэклист — продолжали открываться заново.
+        if symbol in settings.symbol_blacklist and symbol not in self.open_positions:
+            return
+
         df = await self._refresh_symbol_candles(symbol)
         if df is None or df.empty or len(df) < 50:
             return

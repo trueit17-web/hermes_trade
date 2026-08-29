@@ -4221,6 +4221,62 @@ class TestTpLevels(unittest.TestCase):
         self.assertAlmostEqual(tp3, 70.0)
 
 
+class TestSymbolBlacklistSkipsProcessing(unittest.IsolatedAsyncioTestCase):
+    """
+    _process_symbol должен полностью пропускать блэклист-символы без
+    открытой позиции. Раньше это фильтровалось только при построении
+    active_symbols (_refresh_symbol_universe) — символ с уже открытой
+    позицией на момент блокировки намеренно остаётся в active_symbols
+    (чтобы SL/TP по нему продолжали проверяться), но между обновлениями
+    вселенной (раз в symbol_universe_refresh_hours) он, после закрытия
+    этой позиции, как ни в чём не бывало продолжал получать НОВЫЕ сигналы
+    стратегий — risk_manager.check_signal() блэклист вообще не проверяет.
+    Реальный инцидент (прод): RLUSD/USDT, USDE/USDT, USDC/USDT — уже
+    добавленные в блэклист — продолжали открываться заново.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved_blacklist = settings.symbol_blacklist
+
+    def tearDown(self):
+        settings.symbol_blacklist = self._saved_blacklist
+
+    async def test_blacklisted_symbol_without_position_is_skipped_entirely(self):
+        settings.symbol_blacklist = ["RLUSD/USDT"]
+        bot = self._make_bot()
+        bot._refresh_symbol_candles = AsyncMock()
+
+        await bot._process_symbol("RLUSD/USDT")
+
+        bot._refresh_symbol_candles.assert_not_called()
+
+    async def test_blacklisted_symbol_with_open_position_still_processed(self):
+        settings.symbol_blacklist = ["RLUSD/USDT"]
+        bot = self._make_bot()
+        bot.open_positions["RLUSD/USDT"] = {"side": "long", "entry_price": 1.0, "amount": 10.0}
+        bot._refresh_symbol_candles = AsyncMock(return_value=None)
+
+        await bot._process_symbol("RLUSD/USDT")
+
+        bot._refresh_symbol_candles.assert_called_once_with("RLUSD/USDT")
+
+    async def test_non_blacklisted_symbol_is_processed_normally(self):
+        settings.symbol_blacklist = ["RLUSD/USDT"]
+        bot = self._make_bot()
+        bot._refresh_symbol_candles = AsyncMock(return_value=None)
+
+        await bot._process_symbol("BTC/USDT")
+
+        bot._refresh_symbol_candles.assert_called_once_with("BTC/USDT")
+
+
 class TestExpectancySizing(unittest.IsolatedAsyncioTestCase):
     """
     Expectancy-based sizing (портировано из clonerbot: scoring/channel_scorer.py):
