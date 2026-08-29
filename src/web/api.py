@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -1231,6 +1232,59 @@ async def restart_bot():
 
     asyncio.create_task(_delayed_exit())
     return {"success": True, "message": "Бот перезапускается"}
+
+
+@app.post("/system/redeploy")
+async def redeploy_bot():
+    """
+    Запросить редеплой (git pull + docker compose build/up + alembic
+    upgrade) через отдельный деплой-агент, который работает ВНЕ контейнера
+    бота (см. scripts/deploy_agent.py, docker-compose.yml). Сам бот
+    намеренно не получает доступа к docker.sock хоста — только шлёт
+    HTTP-запрос агенту с общим секретом; агент запускает деплой в фоне и
+    отвечает сразу же, не дожидаясь окончания (сборка образа может занять
+    заметное время) — прогресс можно смотреть через /system/redeploy/status.
+    """
+    if not settings.deploy_agent_url:
+        raise HTTPException(
+            status_code=503,
+            detail="Деплой-агент не настроен (DEPLOY_AGENT_URL) — см. scripts/deploy_agent.py и docker-compose.yml",
+        )
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{settings.deploy_agent_url}/deploy",
+                headers={"Authorization": f"Bearer {settings.deploy_agent_token or ''}"},
+            )
+        if resp.status_code == 409:
+            return {"success": False, "message": "Деплой уже выполняется"}
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Деплой-агент отклонил запрос: {e.response.status_code} {e.response.text}",
+        ) from e
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Не удалось связаться с деплой-агентом: {e}") from e
+
+
+@app.get("/system/redeploy/status")
+async def redeploy_status():
+    """Текущее состояние деплой-агента (идёт ли деплой сейчас, код выхода
+    последнего, хвост лога) — для прогресса кнопки "Редеплой" в дашборде."""
+    if not settings.deploy_agent_url:
+        raise HTTPException(status_code=503, detail="Деплой-агент не настроен (DEPLOY_AGENT_URL)")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{settings.deploy_agent_url}/status",
+                headers={"Authorization": f"Bearer {settings.deploy_agent_token or ''}"},
+            )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Не удалось связаться с деплой-агентом: {e}") from e
 
 
 @app.get("/telegram/channels")

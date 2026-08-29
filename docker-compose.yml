@@ -17,6 +17,12 @@ services:
       - REDIS_URL=redis://redis:6379
       - WEB_HOST=0.0.0.0
       - WEB_PORT=8000
+      # Кнопка "Редеплой" в дашборде — бот сам НЕ трогает docker/git,
+      # только шлёт запрос отдельному deploy-agent (см. ниже и
+      # scripts/deploy_agent.py). DEPLOY_AGENT_TOKEN общий с deploy-agent —
+      # задаётся в .env.
+      - DEPLOY_AGENT_URL=http://deploy-agent:8091
+      - DEPLOY_AGENT_TOKEN=${DEPLOY_AGENT_TOKEN}
     ports:
       - "8000:8000"
     volumes:
@@ -58,6 +64,35 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # Кнопка "Редеплой" в дашборде дёргает этот сервис (POST /deploy), а он
+  # уже сам выполняет git pull + docker compose build/up + alembic upgrade
+  # — см. scripts/deploy_agent.py. Специально ОТДЕЛЬНЫЙ от bot контейнер:
+  # только у него есть доступ к docker.sock хоста (сиблинг-контейнеры) —
+  # у самого бота с его гораздо более широкой веб-панелью такого доступа
+  # нет и не должно быть.
+  deploy-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.deploy-agent
+    container_name: cryptobot-deploy-agent
+    restart: unless-stopped
+    environment:
+      - DEPLOY_AGENT_TOKEN=${DEPLOY_AGENT_TOKEN}
+      - DEPLOY_REPO_DIR=/opt/cryptobot
+      - DEPLOY_COMPOSE_SERVICE=bot
+      - DEPLOY_GIT_BRANCH=main
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # ВАЖНО: путь монтирования справа ДОЛЖЕН быть тем же самым путём,
+      # что и на ХОСТЕ (а не произвольным, как обычно для volumes). Этот
+      # контейнер обращается к докер-демону ХОСТА через сокет — когда
+      # `docker compose` внутри него резолвит build-контекст в абсолютный
+      # путь, демон ищет этот путь на файловой системе ХОСТА, а не внутри
+      # контейнера деплой-агента (особенность sibling-container паттерна).
+      # Если репозиторий развёрнут не в /opt/cryptobot — поменяйте путь
+      # здесь И DEPLOY_REPO_DIR выше на реальный.
+      - /opt/cryptobot:/opt/cryptobot
 
   # Optional: web-panel as separate service (if split UI)
   # web:

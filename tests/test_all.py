@@ -5510,5 +5510,167 @@ class TestManualTrading(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("MANUALLIST1/USDT", symbols_other)
 
 
+class TestSystemRedeploy(unittest.IsolatedAsyncioTestCase):
+    """
+    POST /system/redeploy и GET /system/redeploy/status: бот сам НЕ трогает
+    docker/git — только проксирует HTTP-запрос отдельному деплой-агенту вне
+    своего контейнера (см. scripts/deploy_agent.py, docker-compose.yml) с
+    общим секретом. Здесь тестируется только эта проксирующая логика;
+    сам деплой-агент (чистый stdlib HTTP-сервис, никаких сторонних
+    зависимостей) не покрыт этим тест-сьютом.
+    """
+
+    def setUp(self):
+        from fastapi import HTTPException
+        self.HTTPException = HTTPException
+        self._saved = {
+            "deploy_agent_url": settings.deploy_agent_url,
+            "deploy_agent_token": settings.deploy_agent_token,
+        }
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            setattr(settings, key, value)
+
+    @staticmethod
+    def _mock_response(status_code, json_data, raise_error=None):
+        resp = MagicMock()
+        resp.status_code = status_code
+        resp.json.return_value = json_data
+        resp.text = str(json_data)
+        resp.raise_for_status.side_effect = raise_error
+        resp.raise_for_status.return_value = None
+        return resp
+
+    @staticmethod
+    def _mock_client_cm(response=None, post_side_effect=None, get_side_effect=None):
+        client = MagicMock()
+        client.post = AsyncMock(return_value=response, side_effect=post_side_effect)
+        client.get = AsyncMock(return_value=response, side_effect=get_side_effect)
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=client)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        return cm, client
+
+    async def test_redeploy_returns_503_when_agent_not_configured(self):
+        from src.web.api import redeploy_bot
+        settings.deploy_agent_url = None
+
+        with self.assertRaises(self.HTTPException) as ctx:
+            await redeploy_bot()
+        self.assertEqual(ctx.exception.status_code, 503)
+
+    async def test_redeploy_calls_agent_with_token_and_returns_result(self):
+        from src.web.api import redeploy_bot
+        settings.deploy_agent_url = "http://deploy-agent:8091"
+        settings.deploy_agent_token = "secret-token"
+
+        response = self._mock_response(202, {"success": True, "message": "Деплой запущен"})
+        cm, client = self._mock_client_cm(response=response)
+
+        with patch("src.web.api.httpx.AsyncClient", return_value=cm):
+            result = await redeploy_bot()
+
+        self.assertEqual(result, {"success": True, "message": "Деплой запущен"})
+        _, kwargs = client.post.call_args
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer secret-token")
+        self.assertIn("http://deploy-agent:8091/deploy", client.post.call_args.args)
+
+    async def test_redeploy_reports_already_running_without_raising(self):
+        from src.web.api import redeploy_bot
+        settings.deploy_agent_url = "http://deploy-agent:8091"
+        settings.deploy_agent_token = "secret-token"
+
+        response = self._mock_response(409, {"error": "деплой уже выполняется"})
+        cm, _ = self._mock_client_cm(response=response)
+
+        with patch("src.web.api.httpx.AsyncClient", return_value=cm):
+            result = await redeploy_bot()
+
+        self.assertFalse(result["success"])
+
+    async def test_redeploy_raises_502_when_agent_unreachable(self):
+        from src.web.api import redeploy_bot
+        settings.deploy_agent_url = "http://deploy-agent:8091"
+        settings.deploy_agent_token = "secret-token"
+
+        cm, _ = self._mock_client_cm(post_side_effect=ConnectionError("connection refused"))
+
+        with patch("src.web.api.httpx.AsyncClient", return_value=cm):
+            with self.assertRaises(self.HTTPException) as ctx:
+                await redeploy_bot()
+        self.assertEqual(ctx.exception.status_code, 502)
+
+    async def test_redeploy_status_returns_503_when_agent_not_configured(self):
+        from src.web.api import redeploy_status
+        settings.deploy_agent_url = None
+
+        with self.assertRaises(self.HTTPException) as ctx:
+            await redeploy_status()
+        self.assertEqual(ctx.exception.status_code, 503)
+
+    async def test_redeploy_status_returns_agent_state(self):
+        from src.web.api import redeploy_status
+        settings.deploy_agent_url = "http://deploy-agent:8091"
+        settings.deploy_agent_token = "secret-token"
+
+        response = self._mock_response(200, {
+            "running": False, "exit_code": 0, "started_at": 1.0, "finished_at": 2.0,
+            "log_tail": ["ok"],
+        })
+        cm, client = self._mock_client_cm(response=response)
+
+        with patch("src.web.api.httpx.AsyncClient", return_value=cm):
+            result = await redeploy_status()
+
+        self.assertFalse(result["running"])
+        self.assertEqual(result["exit_code"], 0)
+        _, kwargs = client.get.call_args
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer secret-token")
+
+
+class TestDeployAgentScript(unittest.TestCase):
+    """
+    scripts/deploy_agent.py — минимальный HTTP-сервис ВНЕ контейнера бота,
+    единственный с доступом к docker.sock хоста (см. подробный комментарий
+    в самом файле). Тестируем только чистую логику (сборка shell-команды,
+    сверка токена constant-time) — сам HTTP-сервер (ThreadingHTTPServer) и
+    subprocess.run здесь не поднимаются.
+    """
+
+    def _load_module(self):
+        import importlib.util
+        import os
+        path = os.path.join(os.path.dirname(__file__), "..", "scripts", "deploy_agent.py")
+        spec = importlib.util.spec_from_file_location("deploy_agent_module", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_build_deploy_command_runs_steps_in_correct_order(self):
+        """
+        Порядок принципиален: миграции — ПОСЛЕ пересоздания контейнера (на
+        новом образе/файлах миграций), иначе alembic upgrade применится ещё
+        по старому коду.
+        """
+        module = self._load_module()
+        cmd = module.build_deploy_command(repo_dir="/opt/cryptobot", branch="main", service="bot")
+
+        pull_idx = cmd.index("git pull origin main")
+        build_idx = cmd.index("docker compose build bot")
+        up_idx = cmd.index("docker compose up -d bot")
+        migrate_idx = cmd.index("docker compose exec -T bot alembic upgrade head")
+        self.assertTrue(pull_idx < build_idx < up_idx < migrate_idx)
+        self.assertTrue(cmd.startswith("cd /opt/cryptobot &&"))
+
+    def test_build_deploy_command_uses_given_branch_and_service(self):
+        module = self._load_module()
+        cmd = module.build_deploy_command(repo_dir="/srv/bot", branch="release", service="worker")
+        self.assertIn("git pull origin release", cmd)
+        self.assertIn("docker compose build worker", cmd)
+        self.assertIn("docker compose up -d worker", cmd)
+        self.assertIn("docker compose exec -T worker alembic upgrade head", cmd)
+
+
 if __name__ == "__main__":
     unittest.main()

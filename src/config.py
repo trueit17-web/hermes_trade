@@ -155,6 +155,14 @@ class Settings(BaseSettings):
     web_admin_password: str = "changeme"
     web_cookie_secure: bool = False
 
+    # === Деплой-агент (кнопка "Редеплой" в дашборде) ===
+    # Отдельный сервис ВНЕ контейнера бота (см. scripts/deploy_agent.py,
+    # docker-compose.yml) — сам бот НЕ получает доступ к docker.sock хоста,
+    # только шлёт этому сервису HTTP-запрос с общим секретом. deploy_agent_url —
+    # адрес агента (в docker-compose сети — http://deploy-agent:8091).
+    deploy_agent_url: str | None = None
+    deploy_agent_token: str | None = None
+
     # === Торговая вселенная ===
     # Вместо фиксированного списка пар — торгуются все активные spot-пары
     # с котировкой symbol_quote_currency, кроме symbol_blacklist (топ
