@@ -4223,16 +4223,25 @@ class TestTpLevels(unittest.TestCase):
 
 class TestSymbolBlacklistSkipsProcessing(unittest.IsolatedAsyncioTestCase):
     """
-    _process_symbol должен полностью пропускать блэклист-символы без
-    открытой позиции. Раньше это фильтровалось только при построении
-    active_symbols (_refresh_symbol_universe) — символ с уже открытой
-    позицией на момент блокировки намеренно остаётся в active_symbols
-    (чтобы SL/TP по нему продолжали проверяться), но между обновлениями
-    вселенной (раз в symbol_universe_refresh_hours) он, после закрытия
-    этой позиции, как ни в чём не бывало продолжал получать НОВЫЕ сигналы
-    стратегий — risk_manager.check_signal() блэклист вообще не проверяет.
+    _process_symbol должен переставать генерировать НОВЫЕ сигналы стратегий
+    для блэклист-символов без открытой позиции. Раньше это фильтровалось
+    только при построении active_symbols (_refresh_symbol_universe) —
+    символ с уже открытой позицией на момент блокировки намеренно остаётся
+    в active_symbols (чтобы SL/TP по нему продолжали проверяться), но между
+    обновлениями вселенной (раз в symbol_universe_refresh_hours) он, после
+    закрытия этой позиции, как ни в чём не бывало продолжал получать НОВЫЕ
+    сигналы — risk_manager.check_signal() блэклист вообще не проверяет.
     Реальный инцидент (прод): RLUSD/USDT, USDE/USDT, USDC/USDT — уже
     добавленные в блэклист — продолжали открываться заново.
+
+    ВАЖНО: первая версия этого фикса ставила проверку блэклиста ДО
+    _check_position_exit() и ловила регресс именно на том сценарии, который
+    тестирует test_blacklisted_symbol_with_stale_position_entry_* ниже —
+    self.open_positions синхронно чистится (лениво, при закрытии в обход
+    основного цикла — кнопка "Закрыть" в дашборде и т.п.) только ВНУТРИ
+    _check_position_exit(); проверка до него видела устаревшую запись и
+    пропускала обработку дальше как если бы позиция всё ещё была открыта —
+    ровно то же самое поведение, которое чинил исходный баг.
     """
 
     def _make_bot(self):
@@ -4242,39 +4251,89 @@ class TestSymbolBlacklistSkipsProcessing(unittest.IsolatedAsyncioTestCase):
             self.skipTest(f"src.main not importable in this environment: {e}")
         return main_module.TradingBot()
 
+    @staticmethod
+    def _make_candles_df():
+        return pd.DataFrame({
+            "open": [1.0] * 60, "high": [1.0] * 60, "low": [1.0] * 60,
+            "close": [1.0] * 60, "volume": [1.0] * 60,
+        })
+
     def setUp(self):
-        self._saved_blacklist = settings.symbol_blacklist
+        self._saved = {
+            "symbol_blacklist": settings.symbol_blacklist,
+            "trading_mode": settings.trading_mode,
+        }
+        settings.trading_mode = "paper"
 
     def tearDown(self):
-        settings.symbol_blacklist = self._saved_blacklist
+        for key, value in self._saved.items():
+            setattr(settings, key, value)
 
-    async def test_blacklisted_symbol_without_position_is_skipped_entirely(self):
+    async def test_blacklisted_symbol_never_had_position_is_skipped(self):
         settings.symbol_blacklist = ["RLUSD/USDT"]
         bot = self._make_bot()
-        bot._refresh_symbol_candles = AsyncMock()
+        bot.feature_engine = MagicMock()
+        bot._refresh_symbol_candles = AsyncMock(return_value=self._make_candles_df())
 
         await bot._process_symbol("RLUSD/USDT")
 
-        bot._refresh_symbol_candles.assert_not_called()
+        bot.feature_engine.compute_all_indicators.assert_not_called()
 
-    async def test_blacklisted_symbol_with_open_position_still_processed(self):
+    async def test_blacklisted_symbol_with_stale_position_entry_is_cleaned_up_and_skipped(self):
+        """
+        Точный сценарий прод-инцидента: позицию закрыли в обход основного
+        цикла (POST /positions/close трогает execution_engine, но НЕ
+        self.open_positions напрямую) — запись в self.open_positions
+        осталась устаревшей до следующего вызова _check_position_exit.
+        """
         settings.symbol_blacklist = ["RLUSD/USDT"]
         bot = self._make_bot()
-        bot.open_positions["RLUSD/USDT"] = {"side": "long", "entry_price": 1.0, "amount": 10.0}
-        bot._refresh_symbol_candles = AsyncMock(return_value=None)
+        bot.open_positions["RLUSD/USDT"] = {
+            "side": "long", "entry_price": 1.0, "amount": 10.0, "sl": None, "tp": None,
+            "tp_hit_count": 0, "strategy_id": "manual", "order_id": 1,
+        }
+        bot.feature_engine = MagicMock()
+        bot._refresh_symbol_candles = AsyncMock(return_value=self._make_candles_df())
 
-        await bot._process_symbol("RLUSD/USDT")
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.paper_positions = {}
+            mock_engine.real_positions = {}
+            mock_engine.last_prices = {}
+            await bot._process_symbol("RLUSD/USDT")
 
-        bot._refresh_symbol_candles.assert_called_once_with("RLUSD/USDT")
+        self.assertNotIn("RLUSD/USDT", bot.open_positions)
+        bot.feature_engine.compute_all_indicators.assert_not_called()
+
+    async def test_blacklisted_symbol_with_genuinely_open_position_is_still_processed(self):
+        settings.symbol_blacklist = ["RLUSD/USDT"]
+        bot = self._make_bot()
+        bot.open_positions["RLUSD/USDT"] = {
+            "side": "long", "entry_price": 1.0, "amount": 10.0, "sl": None, "tp": None,
+            "tp_hit_count": 0, "strategy_id": "manual", "order_id": 1,
+        }
+        bot.feature_engine = MagicMock()
+        bot._refresh_symbol_candles = AsyncMock(return_value=self._make_candles_df())
+
+        with patch("src.main.execution_engine") as mock_engine, \
+                patch("src.main.strategy_registry.get_active", return_value=[]):
+            mock_engine.paper_positions = {"RLUSD/USDT": bot.open_positions["RLUSD/USDT"]}
+            mock_engine.real_positions = {}
+            mock_engine.last_prices = {}
+            await bot._process_symbol("RLUSD/USDT")
+
+        self.assertIn("RLUSD/USDT", bot.open_positions)
+        bot.feature_engine.compute_all_indicators.assert_called_once()
 
     async def test_non_blacklisted_symbol_is_processed_normally(self):
         settings.symbol_blacklist = ["RLUSD/USDT"]
         bot = self._make_bot()
-        bot._refresh_symbol_candles = AsyncMock(return_value=None)
+        bot.feature_engine = MagicMock()
+        bot._refresh_symbol_candles = AsyncMock(return_value=self._make_candles_df())
 
-        await bot._process_symbol("BTC/USDT")
+        with patch("src.main.strategy_registry.get_active", return_value=[]):
+            await bot._process_symbol("BTC/USDT")
 
-        bot._refresh_symbol_candles.assert_called_once_with("BTC/USDT")
+        bot.feature_engine.compute_all_indicators.assert_called_once()
 
 
 class TestExpectancySizing(unittest.IsolatedAsyncioTestCase):

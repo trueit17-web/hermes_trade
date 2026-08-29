@@ -814,21 +814,6 @@ class TradingBot:
 
     async def _process_symbol(self, symbol: str):
         """Обработка одной пары."""
-        # Заблокированный (symbol_blacklist) символ без открытой позиции —
-        # пропускаем целиком, а не только на этапе генерации новых сигналов.
-        # _refresh_symbol_universe() намеренно не убирает символ с уже
-        # открытой позицией из active_symbols сразу при блокировке (чтобы
-        # SL/TP по нему продолжали проверяться) — но раньше, после
-        # закрытия этой позиции, символ оставался в active_symbols вплоть
-        # до следующего обновления вселенной (раз в
-        # symbol_universe_refresh_hours) и как ни в чём не бывало снова
-        # получал НОВЫЕ сигналы стратегий: risk_manager.check_signal()
-        # блэклист вообще не проверяет, только доступность позиции по
-        # символу. Реальный инцидент: RLUSD/USDT, USDE/USDT, USDC/USDT —
-        # уже добавленные в блэклист — продолжали открываться заново.
-        if symbol in settings.symbol_blacklist and symbol not in self.open_positions:
-            return
-
         df = await self._refresh_symbol_candles(symbol)
         if df is None or df.empty or len(df) < 50:
             return
@@ -841,6 +826,28 @@ class TradingBot:
         self._apply_trailing_stop(symbol, close)
         if await self._check_position_exit(symbol, close):
             return  # позиция закрыта в этой итерации — новый сигнал сгенерируем в следующем цикле
+
+        # Заблокированный (symbol_blacklist) символ без открытой позиции —
+        # дальше сигналы для него не генерируем. _refresh_symbol_universe()
+        # намеренно не убирает символ с уже открытой позицией из
+        # active_symbols сразу при блокировке (чтобы SL/TP по нему
+        # продолжали проверяться) — но раньше, после закрытия этой позиции,
+        # символ оставался в active_symbols вплоть до следующего обновления
+        # вселенной (раз в symbol_universe_refresh_hours) и как ни в чём не
+        # бывало снова получал НОВЫЕ сигналы стратегий: risk_manager.
+        # check_signal() блэклист вообще не проверяет, только занятость
+        # позиции по символу. Реальный инцидент: RLUSD/USDT, USDE/USDT,
+        # USDC/USDT — уже добавленные в блэклист — продолжали открываться
+        # заново. ВАЖНО: эта проверка должна идти именно ПОСЛЕ
+        # _check_position_exit(), а не до — self.open_positions синхронно
+        # актуализируется (лениво чистится) только внутри него, когда
+        # позиция была закрыта в обход основного цикла (кнопка "Закрыть" в
+        # дашборде, /positions/close — он трогает execution_engine, но НЕ
+        # self.open_positions напрямую); проверка блэклиста ДО этой чистки
+        # видела бы устаревшую запись и пропускала бы обработку дальше как
+        # если бы позиция всё ещё была открыта.
+        if symbol in settings.symbol_blacklist and symbol not in self.open_positions:
+            return
 
         # Фичи
         features = self.feature_engine.compute_all_indicators(df)
