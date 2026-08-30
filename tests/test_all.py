@@ -1945,10 +1945,13 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         Один fetch_balance() должен: (1) снять с учёта позицию, для которой
         реальный остаток ниже торгуемого минимума, (2) НЕ трогать позицию с
         достаточным остатком, (3) вернуть актуальный USDT-баланс из того же
-        запроса.
+        запроса. Позиция искусственно "состарена" (opened_at в прошлом) —
+        см. test_reconcile_real_positions_grace_period_protects_fresh_position
+        ниже про grace-период для только что открытых позиций.
         """
         from src.db.models import Order
         from src.db.session import get_session
+        from src.utils.timeutils import utcnow
 
         settings.trading_mode = "real"
         self.engine.is_paper = False
@@ -1965,6 +1968,7 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
             symbol="RECONDUST1/USDT", side="buy", amount=416.0, price=0.5, order_type="market",
         )
         self.assertIsNotNone(dust_order)
+        self.engine.real_positions["RECONDUST1/USDT"]["opened_at"] = utcnow() - timedelta(minutes=10)
 
         self.engine.exchange.create_market_buy_order.return_value = {
             "id": "reconok-open-1", "filled": 10.0, "price": None, "average": 1.0,
@@ -1990,6 +1994,46 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         async with get_session() as session:
             refreshed = await session.get(Order, dust_order.id)
             self.assertEqual(refreshed.status, "rejected")
+
+    async def test_reconcile_real_positions_grace_period_protects_fresh_position(self):
+        """
+        Регресс на прод-инцидент: CHZ/MANA/ZRX были куплены и подтверждены
+        исполненными, но ~90с спустя fetch_balance() всё ещё показывал
+        available≈0 (биржа не успела отразить актив) — периодическая сверка
+        ошибочно списывала свежую позицию как фантомную, а стратегия тут
+        же открывала ДУБЛИРУЮЩУЮ новую на тот же символ (реальные деньги от
+        первой зависали без SL/TP и без отслеживания). Позиция младше
+        RECONCILE_MIN_AGE_SECONDS не должна списываться, даже если выглядит
+        как несомненная пыль.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.markets = {
+            "RECONFRESH1/USDT": {"limits": {"amount": {"min": 0.001}}},
+        }
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "reconfresh-open-1", "filled": 39083.21766, "price": None, "average": 0.01,
+            "fee": {"cost": 0.05, "currency": "USDT"},
+        }
+        order = await self.engine.create_order(
+            symbol="RECONFRESH1/USDT", side="buy", amount=39083.21766, price=0.01, order_type="market",
+        )
+        self.assertIsNotNone(order)
+        # opened_at выставляется create_order() в момент вызова — позиция
+        # только что открыта, никакого искусственного состаривания.
+
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 50.0, "RECONFRESH1": 0.00766},
+            "RECONFRESH1": {"free": 0.00766, "used": 0, "total": 0.00766},
+        })
+
+        balance = await self.engine.reconcile_real_positions()
+
+        self.assertAlmostEqual(balance, 50.0)
+        self.assertIn("RECONFRESH1/USDT", self.engine.real_positions)
+        self.assertAlmostEqual(self.engine.real_positions["RECONFRESH1/USDT"]["amount"], 39083.21766, places=3)
 
     async def test_reconcile_phantom_position_also_clears_risk_manager_count(self):
         """
