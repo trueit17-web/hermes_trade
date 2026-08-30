@@ -1336,6 +1336,22 @@ class TradingBot:
         )
 
         if result is None:
+            # close_fn мог не просто "не суметь закрыть сейчас, попробуем
+            # снова" — при недопродаваемом остатке (пыль ниже минимума
+            # биржи) close_real_position/close_paper_position сами снимают
+            # позицию с учёта в execution_engine ВНУТРИ себя (см.
+            # _reconcile_phantom_position) и возвращают None. Без этой
+            # проверки self.open_positions оставался бы со устаревшей
+            # записью до следующего вызова этой же функции — а между тем
+            # _process_symbol() уже успевал бы (в той же итерации) сгенерировать
+            # и исполнить НОВЫЙ сигнал на тот же символ, думая, что позиция
+            # всё ещё открыта (реальный инцидент: RLUSD/USDT, USDC/USDT —
+            # неудачное закрытие пыли по SL тут же сменялось открытием
+            # дублирующей новой позиции на блэклист-символ в той же
+            # итерации).
+            tracked = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
+            if symbol not in tracked:
+                del self.open_positions[symbol]
             return False
 
         risk_manager.on_trade_closed(result["pnl"])

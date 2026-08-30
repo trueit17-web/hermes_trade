@@ -4380,6 +4380,86 @@ class TestSymbolBlacklistSkipsProcessing(unittest.IsolatedAsyncioTestCase):
         bot.feature_engine.compute_all_indicators.assert_called_once()
 
 
+class TestCheckPositionExitCleansStaleEntryOnFailedClose(unittest.IsolatedAsyncioTestCase):
+    """
+    Регресс на прод-инцидент: close_real_position/close_paper_position могут
+    САМИ снять позицию с учёта execution_engine ВНУТРИ себя (недопродаваемая
+    пыль ниже минимума биржи — см. _reconcile_phantom_position) и вернуть
+    None вызывающему коду. Раньше _check_position_exit() в этом случае
+    просто возвращал False, не трогая self.open_positions — запись
+    оставалась устаревшей, и _process_symbol() в ТОЙ ЖЕ итерации, чуть
+    ниже по коду, успевал сгенерировать и исполнить НОВЫЙ сигнал на тот же
+    символ, думая, что позиция ещё открыта (реальный инцидент: неудачное
+    закрытие пыли по SL на RLUSD/USDT и USDC/USDT — обоих блэклист-символов
+    — тут же сменялось открытием дублирующей новой позиции в той же
+    итерации, до следующего вызова _check_position_exit).
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot(), main_module.execution_engine
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "paper"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_stale_open_positions_entry_cleaned_up_when_close_reconciles_away(self):
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        engine.paper_positions["DUSTCLOSE1/USDT"] = {
+            "side": "long", "entry_price": 1.0, "amount": 0.0001,
+        }
+        bot.open_positions["DUSTCLOSE1/USDT"] = {
+            "side": "long", "entry_price": 1.0, "amount": 0.0001, "sl": 1.0, "tp": None,
+            "tp_hit_count": 0, "strategy_id": "ensemble_voter", "opened_at": utcnow(),
+        }
+
+        async def fake_close_paper_position(**kwargs):
+            # Имитирует поведение _reconcile_phantom_position внутри
+            # close_paper_position: позиция снята с учёта execution_engine,
+            # но самому close_fn закрыть её обычным способом не удалось —
+            # возвращает None, как и при реальной непродаваемой пыли.
+            engine.paper_positions.pop("DUSTCLOSE1/USDT", None)
+            return None
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close_paper_position):
+            closed = await bot._check_position_exit("DUSTCLOSE1/USDT", 1.0)
+
+        self.assertFalse(closed)
+        self.assertNotIn("DUSTCLOSE1/USDT", bot.open_positions)
+
+    async def test_open_positions_entry_kept_when_close_genuinely_just_failed(self):
+        """
+        Отличие от предыдущего теста: close_fn вернул None, НО execution_engine
+        всё ещё отслеживает позицию (просто временная ошибка — сетевой сбой
+        и т.п., а не реконсиляция фантомной пыли) — запись НЕ должна
+        стираться, чтобы попытка закрытия повторилась на следующей итерации.
+        """
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        engine.paper_positions["DUSTCLOSE2/USDT"] = {
+            "side": "long", "entry_price": 1.0, "amount": 5.0,
+        }
+        bot.open_positions["DUSTCLOSE2/USDT"] = {
+            "side": "long", "entry_price": 1.0, "amount": 5.0, "sl": 1.0, "tp": None,
+            "tp_hit_count": 0, "strategy_id": "ensemble_voter", "opened_at": utcnow(),
+        }
+
+        with patch.object(engine, "close_paper_position", AsyncMock(return_value=None)):
+            closed = await bot._check_position_exit("DUSTCLOSE2/USDT", 1.0)
+
+        self.assertFalse(closed)
+        self.assertIn("DUSTCLOSE2/USDT", bot.open_positions)
+
+
 class TestExpectancySizing(unittest.IsolatedAsyncioTestCase):
     """
     Expectancy-based sizing (портировано из clonerbot: scoring/channel_scorer.py):
