@@ -798,18 +798,35 @@ class TradingBot:
         только последние свечи (а не весь 200-свечной снимок) — этого
         достаточно, чтобы close оставался живым каждую итерацию, а текущая
         ещё не закрытая часовая свеча обновлялась вместе с ценой.
+
+        ВАЖНО: слияние делаем через self.ingest.merge_candles() и пишем
+        результат напрямую в self.candles_buffer (буфер САМОГО TradingBot).
+        Раньше здесь вызывался self.ingest.update_buffer(), который пишет в
+        self.ingest.candles_buffer — ОТДЕЛЬНЫЙ dict, не имеющий отношения к
+        self.candles_buffer, — а следующая строка тут же читала
+        self.candles_buffer[symbol], как будто он только что обновился. Для
+        пары, впервые открытой не через _refresh_symbol_universe (например,
+        Telegram-сигнал/ручная сделка — см. _execute_telegram_signal,
+        register_manual_position), self.candles_buffer[symbol] вообще не
+        существовал → KeyError на каждой итерации (полная 200-свечная
+        перезагрузка так и не приживалась в буфере). Для уже известных пар
+        KeyError не было (запись в self.candles_buffer от
+        _refresh_symbol_universe уже существовала), но свежие свечи из
+        incremental-запроса точно так же терялись — возвращался старый
+        снимок, то есть "цена не обновляется" воспроизводилось и после
+        предыдущего исправления этого бага.
         """
         df = self.candles_buffer.get(symbol)
         if df is None or df.empty or len(df) < 50:
-            df = await self.ingest.fetch_ohlcv(symbol, "1h", limit=200)
-            if df is not None:
-                self.ingest.update_buffer(symbol, df)
-                df = self.candles_buffer[symbol]
+            fetched = await self.ingest.fetch_ohlcv(symbol, "1h", limit=200)
+            if fetched is not None:
+                df = self.ingest.merge_candles(df, fetched)
+                self.candles_buffer[symbol] = df
         else:
             fresh = await self.ingest.fetch_ohlcv(symbol, "1h", limit=3)
             if fresh is not None:
-                self.ingest.update_buffer(symbol, fresh)
-                df = self.candles_buffer[symbol]
+                df = self.ingest.merge_candles(df, fresh)
+                self.candles_buffer[symbol] = df
         return df
 
     async def _process_symbol(self, symbol: str):

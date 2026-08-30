@@ -159,19 +159,29 @@ class MarketDataIngest:
 
     def update_buffer(self, symbol: str, df: pd.DataFrame):
         """Обновить буфер свечей для символа."""
-        if symbol not in self.candles_buffer:
-            self.candles_buffer[symbol] = df
+        self.candles_buffer[symbol] = self.merge_candles(self.candles_buffer.get(symbol), df)
+
+    @staticmethod
+    def merge_candles(existing: pd.DataFrame | None, new: pd.DataFrame) -> pd.DataFrame:
+        """
+        Слить новые свечи в существующий буфер: дедуп по индексу (новые
+        значения перекрывают старые), сортировка по времени, обрезка до
+        candlesticks_cache_size. Вынесено в отдельный метод (не зависящий от
+        self.candles_buffer), чтобы вызывающий код мог применить ту же логику
+        слияния к СВОЕМУ собственному буферу — например, TradingBot.candles_buffer
+        в main.py, который является отдельным dict от MarketDataIngest.candles_buffer
+        и должен обновляться напрямую, а не через побочный эффект в буфере ingest.
+        """
+        if existing is None:
+            combined = new
         else:
-            # Объединяем, удаляя дубликаты по индексу
-            existing = self.candles_buffer[symbol]
-            combined = pd.concat([existing, df])
+            combined = pd.concat([existing, new])
             combined = combined[~combined.index.duplicated(keep="last")]
             combined.sort_index(inplace=True)
-            # Ограничиваем размер буфера
-            max_rows = settings.candlesticks_cache_size
-            if len(combined) > max_rows:
-                combined = combined.iloc[-max_rows:]
-            self.candles_buffer[symbol] = combined
+        max_rows = settings.candlesticks_cache_size
+        if len(combined) > max_rows:
+            combined = combined.iloc[-max_rows:]
+        return combined
 
     def get_latest_candle(self, symbol: str) -> dict | None:
         """Получить последнюю свечу из буфера."""

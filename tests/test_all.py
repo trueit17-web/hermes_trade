@@ -5911,5 +5911,120 @@ class TestDeployAgentScript(unittest.TestCase):
         self.assertIn("docker compose exec -T worker alembic upgrade head", cmd)
 
 
+class TestMarketDataMergeCandles(unittest.TestCase):
+    """
+    MarketDataIngest.merge_candles() — чистая функция слияния свечей,
+    вынесенная из update_buffer(), чтобы TradingBot.candles_buffer в
+    main.py мог применять ту же логику дедупликации/обрезки к СВОЕМУ
+    собственному буферу, не завязываясь на self.ingest.candles_buffer
+    (см. TestRefreshSymbolCandlesUsesOwnBuffer ниже — регресс на реальный
+    прод-баг, где эти два разных dict'а перепутали).
+    """
+
+    @staticmethod
+    def _df(index, value=1.0):
+        return pd.DataFrame(
+            {"open": value, "high": value, "low": value, "close": value, "volume": value},
+            index=pd.to_datetime(index, unit="h"),
+        )
+
+    def test_merge_into_empty_buffer_returns_new_as_is(self):
+        from src.data_ingest.market_data import MarketDataIngest
+        new = self._df([1, 2, 3])
+        merged = MarketDataIngest.merge_candles(None, new)
+        self.assertEqual(len(merged), 3)
+
+    def test_merge_deduplicates_by_index_keeping_newest(self):
+        from src.data_ingest.market_data import MarketDataIngest
+        existing = self._df([1, 2, 3], value=1.0)
+        new = self._df([3, 4], value=2.0)
+        merged = MarketDataIngest.merge_candles(existing, new)
+        self.assertEqual(len(merged), 4)
+        overlapping_ts = pd.to_datetime(3, unit="h")
+        self.assertEqual(merged.loc[overlapping_ts, "close"], 2.0)
+
+    def test_merge_trims_to_cache_size(self):
+        from src.data_ingest.market_data import MarketDataIngest
+        saved = settings.candlesticks_cache_size
+        try:
+            settings.candlesticks_cache_size = 5
+            existing = self._df(range(10))
+            new = self._df(range(10, 12))
+            merged = MarketDataIngest.merge_candles(existing, new)
+            self.assertEqual(len(merged), 5)
+        finally:
+            settings.candlesticks_cache_size = saved
+
+
+class TestRefreshSymbolCandlesUsesOwnBuffer(unittest.IsolatedAsyncioTestCase):
+    """
+    Регресс на прод-инцидент: TIA/USDT (открыт через авто-исполнение
+    Telegram-сигнала, см. _execute_telegram_signal) валился с
+    "Ошибка обработки TIA/USDT: 'TIA/USDT'" на КАЖДОЙ итерации подряд —
+    KeyError('TIA/USDT').
+
+    Причина: _refresh_symbol_candles() звал self.ingest.update_buffer(...),
+    который пишет в self.ingest.candles_buffer — ОТДЕЛЬНЫЙ dict от
+    self.candles_buffer (буфер самого TradingBot, используемый везде
+    дальше в _process_symbol) — а затем тут же читал
+    self.candles_buffer[symbol], как будто он обновился. Для пары,
+    впервые открытой не через _refresh_symbol_universe (которая пишет в
+    self.candles_buffer напрямую), там никогда не было записи → KeyError
+    на каждой итерации без единого шанса на восстановление. Для уже
+    известных пар KeyError не было, но свежие свечи из инкрементального
+    запроса точно так же терялись — буфер молча оставался устаревшим.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    @staticmethod
+    def _df(rows, value=1.0, start_hour=0):
+        return pd.DataFrame(
+            {"open": value, "high": value, "low": value, "close": value, "volume": value},
+            index=pd.to_datetime(range(start_hour, start_hour + rows), unit="h"),
+        )
+
+    async def test_new_symbol_not_in_own_buffer_does_not_raise_keyerror(self):
+        """Символ, открытый напрямую (Telegram-сигнал/ручная сделка) и
+        никогда не проходивший через _refresh_symbol_universe — буфер
+        TradingBot для него пуст с самого начала."""
+        from src.data_ingest.market_data import MarketDataIngest
+
+        bot = self._make_bot()
+        self.assertNotIn("TIA/USDT", bot.candles_buffer)
+        bot.ingest = MarketDataIngest("bybit")
+        bot.ingest.fetch_ohlcv = AsyncMock(return_value=self._df(200))
+
+        df = await bot._refresh_symbol_candles("TIA/USDT")
+
+        self.assertIsNotNone(df)
+        self.assertEqual(len(df), 200)
+        self.assertIn("TIA/USDT", bot.candles_buffer)
+
+    async def test_incremental_refresh_updates_own_buffer_not_stale_copy(self):
+        """Пара уже в буфере TradingBot (>=50 строк) — инкрементальный
+        запрос новых свечей должен реально попасть в bot.candles_buffer,
+        а не потеряться в отдельном буфере ingest."""
+        from src.data_ingest.market_data import MarketDataIngest
+
+        bot = self._make_bot()
+        bot.candles_buffer["BTC/USDT"] = self._df(60, value=1.0)
+        fresh = self._df(3, value=999.0, start_hour=60)
+        bot.ingest = MarketDataIngest("bybit")
+        bot.ingest.fetch_ohlcv = AsyncMock(return_value=fresh)
+
+        df = await bot._refresh_symbol_candles("BTC/USDT")
+
+        self.assertIsNotNone(df)
+        latest_ts = pd.to_datetime(62, unit="h")
+        self.assertEqual(df.loc[latest_ts, "close"], 999.0)
+        self.assertEqual(bot.candles_buffer["BTC/USDT"].loc[latest_ts, "close"], 999.0)
+
+
 if __name__ == "__main__":
     unittest.main()
