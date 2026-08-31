@@ -6026,5 +6026,163 @@ class TestRefreshSymbolCandlesUsesOwnBuffer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.candles_buffer["BTC/USDT"].loc[latest_ts, "close"], 999.0)
 
 
+class TestShortSignalRejectedBeforeExecutionInRealMode(unittest.IsolatedAsyncioTestCase):
+    """
+    Регресс на прод-инцидент: ML/Ensemble стратегия продолжала генерировать
+    SHORT-сигнал для GRAM/USDT в реальном (спот) режиме — каждый такой
+    сигнал доходил до execution_engine.create_order() ->
+    _execute_real_order(), которая ПРАВИЛЬНО его отклоняла (на споте
+    шорта не существует — см. защиту в executor.py, добавленную после
+    инцидента ENA/USDT), но КАЖДУЮ итерацию (~раз в минуту) это означало
+    лишний запрос к бирже (fetch_ticker) и ERROR в логах — бесконечно,
+    пока модель не изменит мнение. Итог был предрешён ещё на этапе
+    сигнала, поэтому короткие сигналы в реальном режиме теперь
+    отклоняются раньше, не доходя до execution_engine.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    @staticmethod
+    def _make_candles_df():
+        return pd.DataFrame({
+            "open": [1.0] * 60, "high": [1.0] * 60, "low": [1.0] * 60,
+            "close": [1.0] * 60, "volume": [1.0] * 60,
+        })
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "real"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_short_signal_rejected_without_hitting_execution_engine(self):
+        from src.strategy import StrategySignal
+
+        bot = self._make_bot()
+        bot.feature_engine = MagicMock()
+        bot.ml_inference = None
+        bot._refresh_symbol_candles = AsyncMock(return_value=self._make_candles_df())
+
+        fake_strategy = MagicMock()
+        fake_strategy.strategy_id = "ml_direction"
+        fake_strategy.name = "ML"
+        fake_strategy.weight = 1.0
+        fake_strategy.generate_signal.return_value = StrategySignal(
+            strategy_id="ml_direction", symbol="GRAM/USDT", side="short", confidence=0.66,
+        )
+
+        with patch("src.main.strategy_registry.get_active", return_value=[fake_strategy]), \
+                patch("src.main.strategy_registry.get", return_value=None), \
+                patch("src.main.execution_engine") as mock_engine, \
+                patch("src.main.risk_manager") as mock_risk:
+            mock_engine.paper_positions = {}
+            mock_engine.real_positions = {}
+            mock_engine.last_prices = {}
+            mock_engine.create_order = AsyncMock()
+            mock_risk.check_signal.return_value = (True, "")
+
+            await bot._process_symbol("GRAM/USDT")
+
+        mock_engine.create_order.assert_not_awaited()
+
+    async def test_long_signal_still_reaches_execution_engine(self):
+        """Убедиться, что фикс не блокирует обычные long-сигналы в реальном режиме."""
+        from src.strategy import StrategySignal
+
+        bot = self._make_bot()
+        bot.feature_engine = MagicMock()
+        bot.ml_inference = None
+        bot._refresh_symbol_candles = AsyncMock(return_value=self._make_candles_df())
+
+        fake_strategy = MagicMock()
+        fake_strategy.strategy_id = "ml_direction"
+        fake_strategy.name = "ML"
+        fake_strategy.weight = 1.0
+        fake_strategy.generate_signal.return_value = StrategySignal(
+            strategy_id="ml_direction", symbol="BTC/USDT", side="long", confidence=0.66,
+            entry_price=100.0,
+        )
+
+        with patch("src.main.strategy_registry.get_active", return_value=[fake_strategy]), \
+                patch("src.main.strategy_registry.get", return_value=None), \
+                patch("src.main.execution_engine") as mock_engine, \
+                patch("src.main.risk_manager") as mock_risk, \
+                patch("src.main.protection_manager") as mock_protections, \
+                patch("src.main.expectancy_sizing") as mock_sizing:
+            mock_engine.paper_positions = {}
+            mock_engine.real_positions = {}
+            mock_engine.last_prices = {}
+            mock_engine.create_order = AsyncMock(return_value=None)
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_risk.check_signal.return_value = (True, "")
+            mock_protections.locked_reason = AsyncMock(return_value=None)
+            mock_sizing.size_multiplier = AsyncMock(return_value=1.0)
+
+            await bot._process_symbol("BTC/USDT")
+
+        mock_engine.create_order.assert_awaited_once()
+        self.assertEqual(mock_engine.create_order.await_args.kwargs["side"], "buy")
+
+
+class TestTelegramSignalShortRejectedInRealMode(unittest.IsolatedAsyncioTestCase):
+    """Тот же класс бага, что и TestShortSignalRejectedBeforeExecutionInRealMode,
+    но для пути исполнения Telegram-сигналов (_execute_telegram_signal)."""
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "real"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_short_telegram_signal_rejected_without_hitting_execution_engine(self):
+        bot = self._make_bot()
+
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.create_order = AsyncMock()
+            order = await bot._execute_telegram_signal({
+                "parsed_pair": "GRAM/USDT",
+                "parsed_side": "short",
+                "parsed_entry": 1.34,
+                "parsed_sl": 1.36,
+                "parsed_tp": 1.32,
+                "channel_id": "@test_channel",
+            })
+
+        self.assertIsNone(order)
+        mock_engine.create_order.assert_not_awaited()
+
+    async def test_long_telegram_signal_still_reaches_execution_engine(self):
+        bot = self._make_bot()
+
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 50000.0,
+                "parsed_sl": 49000.0,
+                "parsed_tp": 52000.0,
+                "channel_id": "@test_channel",
+            })
+
+        mock_engine.create_order.assert_awaited_once()
+        self.assertEqual(mock_engine.create_order.await_args.kwargs["side"], "buy")
+
+
 if __name__ == "__main__":
     unittest.main()

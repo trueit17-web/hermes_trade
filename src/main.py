@@ -565,6 +565,15 @@ class TradingBot:
         symbol = pair
         order_side = "buy" if side == "long" else "sell"
 
+        if not settings.is_paper and side == "short":
+            # Тот же случай, что и для стратегийных сигналов (см.
+            # _trading_iteration): на споте в реальном режиме шорт
+            # неисполним, execution_engine._execute_real_order() всё равно
+            # отклонит такой ордер — отклоняем сразу, не тратя запрос
+            # баланса и не оставляя ERROR в логах на ровном месте.
+            logger.info(f"🚫 Сигнал по {pair} отклонён: short — на споте (реальный режим) шорт не поддерживается")
+            return None
+
         if settings.is_paper:
             balance = execution_engine.get_paper_balance()
         else:
@@ -989,6 +998,19 @@ class TradingBot:
 
             if not can_execute:
                 logger.info(f"🚫 Сигнал отклонён (risk): {symbol} {signal.side} — {reason}")
+                continue
+
+            if not settings.is_paper and signal.side == "short":
+                # На споте (реальный режим) шорта не существует —
+                # _execute_real_order() в executor.py всё равно отклонит
+                # такой ордер (см. защиту там, добавленную после инцидента
+                # ENA/USDT), но раньше сигнал каждый раз доходил до неё —
+                # лишний fetch_ticker() и ERROR в логах на КАЖДОЙ итерации,
+                # пока ML/ансамбль продолжает считать пару "шортовой"
+                # (реальный инцидент: GRAM/USDT, ERROR повторялся ~раз в
+                # минуту непрерывно). Итог был предрешён ещё здесь — короче
+                # отклонить сразу, не тратя вызов к бирже.
+                logger.info(f"🚫 Сигнал отклонён: {symbol} short — на споте (реальный режим) шорт не поддерживается")
                 continue
 
             lock_reason = await protection_manager.locked_reason(
