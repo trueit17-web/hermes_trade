@@ -594,6 +594,7 @@ class TradingBot:
         entry = signal_event.get("parsed_entry", 0)
         sl = signal_event.get("parsed_sl")
         tp = signal_event.get("parsed_tp")
+        take_profits = signal_event.get("parsed_take_profits") or []
 
         symbol = pair
         order_side = "buy" if side == "long" else "sell"
@@ -662,6 +663,10 @@ class TradingBot:
                 "side": side, "entry_price": entry,
                 "amount": amount, "strategy_id": "telegram_signal",
                 "rationale": "Telegram сигнал", "sl": sl, "tp": tp,
+                # Реальные цели канала (если их несколько) — _tp_levels()
+                # использует их напрямую вместо интерполяции между entry и
+                # одним числом tp (см. комментарий в _tp_levels).
+                "take_profits": take_profits,
                 "tp_hit_count": 0,
                 "opened_at": utcnow(),
                 "order_id": order.id, "entry_fee": order.fee,
@@ -1199,23 +1204,50 @@ class TradingBot:
             logger.debug(f"Не удалось сохранить ML-обучающий пример для {symbol}: {e}")
 
     @staticmethod
-    def _tp_levels(entry_price: float, tp: float | None, strategy_id: str | None = None) -> tuple:
+    def _tp_levels(
+        entry_price: float, tp: float | None, strategy_id: str | None = None,
+        take_profits: list[float] | None = None,
+    ) -> tuple:
         """
-        3 уровня частичной фиксации прибыли — линейная интерполяция между
-        ценой входа и итоговым TP (TP3): TP1 = 1/3 пути, TP2 = 2/3 пути.
-        Формула симметрична для long и short (tp > entry для long,
-        tp < entry для short — интерполяция работает в обе стороны).
-        Возвращает (None, None, None), если TP не задан.
+        3 уровня частичной фиксации прибыли (TP1 закрывает 50% остатка,
+        TP2 — ещё 50% (25% от исходного объёма), TP3 — всё, что осталось —
+        см. _check_position_exit).
+
+        Если канал прислал реальные несколько целей (take_profits — самая
+        близкая к входу первая), используем ИХ напрямую вместо интерполяции:
+        ближайшая цель -> TP1 (сработает первой), самая дальняя -> TP3
+        (финальный выход). Меньше 3 значений — недостающие ближние уровни
+        (TP1 и/или TP2) просто пропускаются (None), а не выдумываются: одна
+        цель канала — TP3=та единственная цена, полное закрытие по ней, как
+        для сделок без Telegram-сигнала ниже. Раньше даже при явных TP1/TP2/
+        TP3 от канала здесь всё равно линейно интерполировались фейковые
+        уровни между entry и ОДНИМ числом (после того как парсер схлопывал
+        несколько целей в одно) — реальные, прямо указанные каналом цены
+        отбрасывались.
+
+        Без take_profits — прежнее поведение: линейная интерполяция между
+        entry и tp (TP1 = 1/3 пути, TP2 = 2/3 пути), симметричная для long/
+        short (tp > entry для long, tp < entry для short).
 
         Для сделок НЕ от Telegram-канала (strategy_id != "telegram_signal")
-        временно используется только одинарный TP (TP1=TP2=None, TP3=tp) —
-        позиция закрывается целиком по единственному уровню, без частичных
-        фиксаций.
+        используется только одинарный TP (TP1=TP2=None, TP3=tp) — позиция
+        закрывается целиком по единственному уровню, без частичных фиксаций.
         """
+        if strategy_id != "telegram_signal":
+            return None, None, tp if tp else None
+        if take_profits:
+            # take_profits приходит уже отсортированным по возрастанию
+            # расстояния от входа в прибыльную сторону (ближайшая цель
+            # первая) — см. parse_with_regex/parse_with_llm/parse_with_gemini
+            # в src/telegram/.
+            values = list(take_profits)[:3]
+            if len(values) == 1:
+                return None, None, values[0]
+            if len(values) == 2:
+                return None, values[0], values[1]
+            return values[0], values[1], values[2]
         if not tp:
             return None, None, None
-        if strategy_id != "telegram_signal":
-            return None, None, tp
         tp1 = entry_price + (tp - entry_price) / 3
         tp2 = entry_price + (tp - entry_price) * 2 / 3
         return tp1, tp2, tp
@@ -1380,7 +1412,10 @@ class TradingBot:
         side = position["side"]
         sl = position.get("sl")
         tp_hit_count = position.get("tp_hit_count", 0)
-        tp1, tp2, tp3 = self._tp_levels(position["entry_price"], position.get("tp"), position.get("strategy_id"))
+        tp1, tp2, tp3 = self._tp_levels(
+            position["entry_price"], position.get("tp"), position.get("strategy_id"),
+            position.get("take_profits"),
+        )
 
         reason = None
         if side == "long":

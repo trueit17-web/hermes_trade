@@ -123,6 +123,13 @@ async def monitor_channels(channels: list[dict]):
                 "parsed_entry": parsed.get("entry"),
                 "parsed_sl": parsed.get("sl"),
                 "parsed_tp": parsed.get("tp"),
+                # Реальные цели канала (ближайшая первая), если их несколько
+                # — см. extract_all_prices()/_tp_levels() (main.py): без
+                # этого несколько явных целей канала схлопывались в parsed_tp
+                # (одно число), а _tp_levels() сам синтезировал 3 фейковых
+                # уровня линейной интерполяцией вместо использования того,
+                # что канал реально указал.
+                "parsed_take_profits": parsed.get("take_profits", []),
                 "parsed_rationale": parsed.get("rationale", ""),
                 "parsed_raw": parsed.get("raw", ""),
                 # Регэксп-парсер (parse_with_regex) не оценивает уверенность —
@@ -283,7 +290,13 @@ def parse_with_regex(text: str) -> dict | None:
     # Ищем entry, SL, TP
     entry = extract_price(text, side, "entry", "price", "entry_price")
     sl = extract_price(text, side, "sl", "stop", "stop_loss", "stop loss")
-    tp = extract_price(text, side, "tp", "target", "take_profit", "take profit", "profit")
+    tp_keywords = ("tp", "target", "take_profit", "take profit", "profit")
+    # Несколько целей ("TP1: 51000 TP2: 52000 TP3: 53000") — канал обычно
+    # перечисляет их от ближайшей к самой дальней, порядок появления в
+    # тексте сохраняется как есть (то же соглашение, которого придерживается
+    # _tp_levels() в main.py: take_profits[0] — ближайшая цель).
+    take_profits = extract_all_prices(text, *tp_keywords)
+    tp = take_profits[-1] if take_profits else extract_price(text, side, *tp_keywords)
 
     if entry is None:
         # Формат без ключевого слова: "BTCUSDT LONG 1.85 SL 1.70 TP 2.10" —
@@ -304,6 +317,7 @@ def parse_with_regex(text: str) -> dict | None:
         "entry": entry,
         "sl": sl,
         "tp": tp,
+        "take_profits": take_profits,
         "raw": text,
     }
 
@@ -344,3 +358,36 @@ def extract_price(
                     continue
 
     return None
+
+
+def extract_all_prices(text: str, *keywords) -> list[float]:
+    """
+    Найти ВСЕ числа по первому подошедшему ключевому слову — в отличие от
+    extract_price(), не останавливается на первом совпадении. Нужно для
+    нескольких целей ("TP1: 51000 TP2: 52000 TP3: 53000"): раньше все
+    парсеры (regex и LLM-фолбэки) схлопывали такой список в одно число ещё
+    до того, как оно доходило до _tp_levels() в main.py, а тот сам
+    синтезировал 3 фейковых уровня линейной интерполяцией между входом и
+    этим единственным числом — реальные цены, прямо указанные каналом,
+    отбрасывались.
+
+    Порядок результата — порядок появления в тексте (без пересортировки):
+    каналы пишут цели от ближайшей к самой дальней (TP1, TP2, TP3...), это
+    соглашение и ожидает вызывающий код.
+    """
+    for keyword in keywords:
+        pattern = rf"{keyword}\d*\s*[:\-–—]?\s*([\d.]+)"
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        if not matches:
+            continue
+        values: list[float] = []
+        for m in matches:
+            try:
+                v = float(m)
+            except ValueError:
+                continue
+            if v not in values:
+                values.append(v)
+        if values:
+            return values
+    return []

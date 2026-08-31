@@ -110,8 +110,16 @@ async def parse_with_llm(text: str, channel_config: dict | None = None) -> dict 
     quote = data.get("quote") or "USDT"
     pair = normalize_pair(f"{base}{quote}")
 
-    take_profits = [float(x) for x in (data.get("take_profits") or [])]
-    tp = max(take_profits) if side == "long" else (min(take_profits) if take_profits else None)
+    # Промпт просит цели по возрастанию ЦЕНЫ ("ascending"), а _tp_levels()
+    # в main.py ожидает порядок по возрастанию РАССТОЯНИЯ ОТ ВХОДА В
+    # ПРИБЫЛЬНУЮ СТОРОНУ (ближайшая цель первая) — для long это то же
+    # самое (цена растёт), а для short ровно наоборот (профит растёт при
+    # падении цены, значит ближайшая цель — самая ВЫСОКАЯ из тех, что ниже
+    # входа) — разворачиваем список для short.
+    take_profits = sorted(float(x) for x in (data.get("take_profits") or []))
+    if side == "short":
+        take_profits.reverse()
+    tp = take_profits[-1] if take_profits else None
     sl = data.get("stop_loss")
 
     return {
@@ -120,6 +128,7 @@ async def parse_with_llm(text: str, channel_config: dict | None = None) -> dict 
         "entry": float(entry),
         "sl": float(sl) if sl is not None else None,
         "tp": float(tp) if tp is not None else None,
+        "take_profits": take_profits,
         "confidence": float(data.get("confidence", _MIN_CONFIDENCE)),
         "raw": text,
     }

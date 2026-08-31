@@ -2523,12 +2523,35 @@ class TestTelegramSignalParser(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["entry"], 50000.0)
         self.assertEqual(result["sl"], 49000.0)
-        self.assertEqual(result["tp"], 51000.0)
+        # tp — итоговая (самая дальняя) цель; см. test_multiple_tp_targets_
+        # captured_as_list_nearest_first ниже для полного списка TP1/TP2/TP3.
+        self.assertEqual(result["tp"], 53000.0)
 
     def test_numbered_sl_target_does_not_swallow_the_numbering_digit(self):
         result = self.parse("ETH/USDT SHORT Entry: 3500 SL1: 3600 TP: 3200")
         self.assertIsNotNone(result)
         self.assertEqual(result["sl"], 3600.0)
+
+    def test_multiple_tp_targets_captured_as_list_nearest_first(self):
+        """
+        Регресс: раньше несколько целей канала схлопывались в ОДНО число
+        (parsed_tp) ещё на этапе парсинга — реальные TP1/TP2/TP3 нигде не
+        сохранялись, и _tp_levels() (main.py) сам синтезировал 3 фейковых
+        уровня линейной интерполяцией между входом и этим единственным
+        числом вместо использования того, что канал реально указал.
+        """
+        result = self.parse(
+            "BTC/USDT LONG Entry: 50000 SL: 49000 TP1: 51000 TP2: 52000 TP3: 53000"
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["take_profits"], [51000.0, 52000.0, 53000.0])
+        self.assertEqual(result["tp"], 53000.0)  # финальная (самая дальняя) цель
+
+    def test_single_tp_still_populates_take_profits_list(self):
+        result = self.parse("BTC/USDT Long 69000 SL 68000 TP 72000")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["take_profits"], [72000.0])
+        self.assertEqual(result["tp"], 72000.0)
 
 
 class TestLlmSignalParser(unittest.IsolatedAsyncioTestCase):
@@ -2586,6 +2609,33 @@ class TestLlmSignalParser(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["entry"], 69000.0)
         self.assertEqual(result["sl"], 68000.0)
         self.assertEqual(result["tp"], 72000.0)  # long -> максимальный TP
+        # long: ascending цена = ascending расстояние от входа -> порядок как есть
+        self.assertEqual(result["take_profits"], [70000.0, 72000.0])
+
+    async def test_take_profits_reversed_for_short_to_stay_nearest_first(self):
+        """
+        Регресс: промпт отдаёт цели по возрастанию ЦЕНЫ, а _tp_levels()
+        (main.py) ожидает порядок по возрастанию расстояния от входа В
+        ПРИБЫЛЬНУЮ СТОРОНУ (ближайшая первая) — для short это обратный
+        порядок цены (профит растёт при падении цены).
+        """
+        import src.telegram.llm_parser as llm_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = "test-key"
+
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=self._mock_tool_use_response({
+            "is_signal": True, "base": "ETH", "quote": "USDT", "side": "short",
+            "entry": 3500.0, "take_profits": [3200.0, 3300.0], "stop_loss": 3600.0,
+            "confidence": 0.9,
+        }))
+        llm_parser_module._client = mock_client
+
+        result = await llm_parser_module.parse_with_llm("шортим эфир")
+        self.assertIsNotNone(result)
+        # ближайшая цель для short — самая высокая цена ниже входа
+        self.assertEqual(result["take_profits"], [3300.0, 3200.0])
+        self.assertEqual(result["tp"], 3200.0)
 
     async def test_low_confidence_is_rejected(self):
         import src.telegram.llm_parser as llm_parser_module
@@ -2712,6 +2762,25 @@ class TestGeminiSignalParser(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["entry"], 69000.0)
         self.assertEqual(result["sl"], 68000.0)
         self.assertEqual(result["tp"], 72000.0)  # long -> максимальный TP
+        self.assertEqual(result["take_profits"], [70000.0, 72000.0])
+
+    async def test_take_profits_reversed_for_short_to_stay_nearest_first(self):
+        import src.telegram.gemini_parser as gemini_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.gemini_api_key = "test-key"
+
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(return_value=self._mock_response({
+            "is_signal": True, "base": "ETH", "quote": "USDT", "side": "short",
+            "entry": 3500.0, "take_profits": [3200.0, 3300.0], "stop_loss": 3600.0,
+            "confidence": 0.9,
+        }))
+        gemini_parser_module._client = mock_client
+
+        result = await gemini_parser_module.parse_with_gemini("шортим эфир")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["take_profits"], [3300.0, 3200.0])
+        self.assertEqual(result["tp"], 3200.0)
 
     async def test_low_confidence_is_rejected(self):
         import src.telegram.gemini_parser as gemini_parser_module
@@ -4302,6 +4371,60 @@ class TestTpLevels(unittest.TestCase):
         self.assertAlmostEqual(tp1, 90.0)
         self.assertAlmostEqual(tp2, 80.0)
         self.assertAlmostEqual(tp3, 70.0)
+
+
+class TestTpLevelsUsesRealChannelTargets(unittest.TestCase):
+    """
+    Регресс: даже когда канал прислал явные TP1/TP2/TP3, _tp_levels()
+    всё равно линейно интерполировал 3 фейковых уровня между entry и ОДНИМ
+    числом (после того как парсер уже схлопнул несколько целей в одно) —
+    реальные цены, прямо указанные каналом, отбрасывались. Теперь
+    take_profits (ближайшая цель первая) используется напрямую.
+    """
+
+    def _tp_levels(self, entry_price, tp, strategy_id, take_profits):
+        import src.main as main_module
+        return main_module.TradingBot._tp_levels(entry_price, tp, strategy_id, take_profits)
+
+    def test_three_real_targets_used_directly_not_interpolated(self):
+        tp1, tp2, tp3 = self._tp_levels(100.0, 130.0, "telegram_signal", [111.0, 122.0, 130.0])
+        self.assertEqual(tp1, 111.0)
+        self.assertEqual(tp2, 122.0)
+        self.assertEqual(tp3, 130.0)
+
+    def test_two_real_targets_map_to_tp2_tp3_leaving_tp1_none(self):
+        """Только 2 цели — недостающий ближний уровень (TP1) пропускается,
+        а не выдумывается интерполяцией."""
+        tp1, tp2, tp3 = self._tp_levels(100.0, 130.0, "telegram_signal", [120.0, 130.0])
+        self.assertIsNone(tp1)
+        self.assertEqual(tp2, 120.0)
+        self.assertEqual(tp3, 130.0)
+
+    def test_single_real_target_is_full_close_not_partial_split(self):
+        tp1, tp2, tp3 = self._tp_levels(100.0, 130.0, "telegram_signal", [130.0])
+        self.assertIsNone(tp1)
+        self.assertIsNone(tp2)
+        self.assertEqual(tp3, 130.0)
+
+    def test_more_than_three_targets_uses_first_three(self):
+        tp1, tp2, tp3 = self._tp_levels(
+            100.0, 140.0, "telegram_signal", [110.0, 120.0, 130.0, 140.0],
+        )
+        self.assertEqual(tp1, 110.0)
+        self.assertEqual(tp2, 120.0)
+        self.assertEqual(tp3, 130.0)
+
+    def test_empty_take_profits_falls_back_to_interpolation(self):
+        tp1, tp2, tp3 = self._tp_levels(100.0, 130.0, "telegram_signal", [])
+        self.assertAlmostEqual(tp1, 110.0)
+        self.assertAlmostEqual(tp2, 120.0)
+        self.assertAlmostEqual(tp3, 130.0)
+
+    def test_real_targets_ignored_for_non_telegram_source(self):
+        tp1, tp2, tp3 = self._tp_levels(100.0, 130.0, "ensemble_voter", [111.0, 122.0, 130.0])
+        self.assertIsNone(tp1)
+        self.assertIsNone(tp2)
+        self.assertEqual(tp3, 130.0)
 
 
 class TestSymbolBlacklistSkipsProcessing(unittest.IsolatedAsyncioTestCase):
@@ -6690,6 +6813,60 @@ class TestTelegramChannelPositionSizePct(unittest.IsolatedAsyncioTestCase):
 
         passed_event = exec_mock.await_args.args[0]
         self.assertEqual(passed_event["channel_position_size_pct"], 9.0)
+
+
+class TestExecuteTelegramSignalStoresRealTakeProfits(unittest.IsolatedAsyncioTestCase):
+    """_execute_telegram_signal() должен сохранять реальные цели канала
+    (parsed_take_profits) в open_positions — иначе _check_position_exit
+    не может передать их в _tp_levels() и всё равно скатывается к
+    интерполяции одного числа."""
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "real"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_open_positions_gets_take_profits_from_signal_event(self):
+        bot = self._make_bot()
+        bot._refresh_symbol_candles = AsyncMock()
+        fake_order = MagicMock(id=1, fee=0.0)
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=fake_order)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 53000.0,
+                "parsed_take_profits": [51000.0, 52000.0, 53000.0],
+                "channel_id": "@test_channel",
+            })
+
+        self.assertEqual(
+            bot.open_positions["BTC/USDT"]["take_profits"], [51000.0, 52000.0, 53000.0],
+        )
+
+    async def test_missing_parsed_take_profits_defaults_to_empty_list(self):
+        bot = self._make_bot()
+        bot._refresh_symbol_candles = AsyncMock()
+        fake_order = MagicMock(id=1, fee=0.0)
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=fake_order)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 52000.0,
+                "channel_id": "@test_channel",
+            })
+
+        self.assertEqual(bot.open_positions["BTC/USDT"]["take_profits"], [])
 
 
 if __name__ == "__main__":
