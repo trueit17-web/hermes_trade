@@ -41,9 +41,11 @@ from src.risk.protections import (
 from src.risk.risk_manager import risk_manager
 from src.strategy import strategy_registry
 from src.telegram.channel_monitor import (
+    add_channel_to_monitoring,
     close_telegram,
     init_telegram,
     monitor_channels,
+    remove_channel_from_monitoring,
     subscribe_telegram_signal,
 )
 from src.telegram.notifier import send_notification
@@ -418,9 +420,15 @@ class TradingBot:
     async def _start_telegram_monitoring(self):
         """Загрузить активные каналы из БД и запустить их мониторинг.
 
-        Список фиксируется на момент старта бота: добавление/удаление
-        канала через дашборд начинает применяться только после рестарта
-        (см. пометку "требуется рестарт" в веб-панели).
+        Список каналов больше НЕ фиксируется на момент старта — monitor_
+        channels() регистрирует Telethon-обработчик один раз без привязки
+        к конкретному набору чатов (см. channel_monitor._handler), а
+        добавление/удаление канала через дашборд (create_telegram_channel/
+        delete_telegram_channel в src/web/api.py) применяется сразу же,
+        через add_telegram_channel_to_live_monitoring/remove_telegram_
+        channel_from_live_monitoring ниже — вызывается всегда, даже если
+        активных каналов на момент старта нет, чтобы обработчик уже был
+        готов принять канал, добавленный позже без рестарта бота.
         """
         from src.telegram.quality_scorer import signal_quality_scorer
         await signal_quality_scorer.restore_channel_stats_from_db()
@@ -439,12 +447,34 @@ class TradingBot:
             ]
             self._telegram_channel_db_ids = {c.channel_id: c.id for c in channels}
 
-        if not channel_dicts:
-            logger.info("Telegram: нет активных каналов для мониторинга")
-            return
-
         await monitor_channels(channel_dicts)
         logger.info(f"👂 Мониторинг Telegram-каналов запущен: {len(channel_dicts)}")
+
+    async def add_telegram_channel_to_live_monitoring(
+        self, channel_id: str, channel_title: str, parser_config: dict, db_id: int,
+    ) -> bool:
+        """
+        Добавить только что созданный канал в live-мониторинг без рестарта
+        бота — вызывается из POST /telegram/channels (src/web/api.py) сразу
+        после коммита в БД. Обновляет и channel_monitor._monitored (для
+        маршрутизации входящих сообщений), и self._telegram_channel_db_ids
+        (иначе _get_channel_settings ниже не нашла бы db_id этого канала и
+        откатилась бы на глобальные настройки вместо порога/автоисполнения/
+        размера позиции, заданных при создании канала).
+        """
+        added = await add_channel_to_monitoring({
+            "channel_id": channel_id, "channel_title": channel_title,
+            "parser_config": parser_config,
+        })
+        if added:
+            self._telegram_channel_db_ids[channel_id] = db_id
+        return added
+
+    def remove_telegram_channel_from_live_monitoring(self, channel_id: str) -> None:
+        """Обратная операция к add_telegram_channel_to_live_monitoring —
+        вызывается из DELETE /telegram/channels/{id} (src/web/api.py)."""
+        remove_channel_from_monitoring(channel_id)
+        self._telegram_channel_db_ids.pop(channel_id, None)
 
     async def _get_channel_settings(self, channel_id: str) -> tuple[float, bool, float]:
         """

@@ -23,6 +23,20 @@ SESSION_PATH = str(SESSION_DIR / "crypto_bot_sessions")
 _telegram_client: TelegramClient | None = None
 _subscribers: list[callable] = []
 
+# chat_id (числовой, нормализованный Telethon-ID) -> словарь канала
+# {"channel_id", "channel_title", "parser_config"}. Единый источник правды
+# для _handler() ниже — добавление/удаление канала (add_channel_to_monitoring/
+# remove_channel_from_monitoring) просто мутирует этот dict, без пересоздания
+# Telethon-обработчика: раньше список отслеживаемых каналов фиксировался
+# один раз при регистрации @client.on(events.NewMessage(chats=entities)) —
+# добавление/удаление канала через дашборд применялось только после
+# рестарта бота (сообщение об этом до сих пор в веб-панели верно для
+# исторических данных до этого коммита, но подпись там теперь неточна —
+# см. update_telegram_channel/create_telegram_channel/delete_telegram_channel
+# в src/web/api.py, которые вызывают эти функции сразу).
+_monitored: dict[int, dict] = {}
+_handler_registered = False
+
 
 async def init_telegram():
     """Инициализировать Telegram клиент."""
@@ -50,11 +64,19 @@ async def init_telegram():
 
 async def close_telegram():
     """Закрыть Telegram клиент."""
-    global _telegram_client
+    global _telegram_client, _handler_registered
     if _telegram_client:
         await _telegram_client.disconnect()
         logger.info("Telegram клиент закрыт")
         _telegram_client = None
+    # Обработчик регистрировался на конкретном client-объекте — после
+    # disconnect() он больше не действует, сбрасываем флаг и очищаем
+    # список каналов, чтобы следующий init_telegram()+monitor_channels()
+    # (если процесс когда-нибудь переинициализирует Telegram без полного
+    # рестарта) начинал с чистого состояния, а не решил, что обработчик
+    # уже зарегистрирован на закрытом клиенте.
+    _handler_registered = False
+    _monitored.clear()
 
 
 def get_telegram_client() -> TelegramClient | None:
@@ -62,9 +84,85 @@ def get_telegram_client() -> TelegramClient | None:
     return _telegram_client
 
 
+async def _handler(event: events.NewMessage.Event):
+    """
+    Единственный обработчик входящих сообщений — регистрируется РОВНО ОДИН
+    раз (_ensure_handler_registered) без фильтра chats=, поэтому диспетчер
+    Telethon доставляет сюда любое новое сообщение из любого чата аккаунта.
+    Фильтрация до реально отслеживаемых каналов происходит здесь же, через
+    live-словарь _monitored — благодаря этому add_channel_to_monitoring()/
+    remove_channel_from_monitoring() могут просто мутировать _monitored, не
+    трогая сам обработчик и не пересоздавая его: раньше список каналов был
+    жёстко зашит в chats= entities на момент регистрации, и его нельзя было
+    расширить без полной пересборки обработчика.
+    """
+    message: Message = event.message
+    channel = _monitored.get(event.chat_id)
+
+    if channel is None:
+        return
+
+    raw_text = message.text or ""
+    logger.debug(f"[TG] Получено сообщение из {channel['channel_id']}: {raw_text[:100]}...")
+
+    parsed = await parse_telegram_signal(raw_text, channel)
+
+    if parsed:
+        signal_event = {
+            "type": "telegram_signal",
+            "channel_id": channel["channel_id"],
+            "channel_title": channel.get("channel_title", ""),
+            "raw_message": raw_text,
+            "message_date": utcnow(),
+            "parsed_pair": parsed.get("pair"),
+            "parsed_side": parsed.get("side"),
+            "parsed_entry": parsed.get("entry"),
+            "parsed_sl": parsed.get("sl"),
+            "parsed_tp": parsed.get("tp"),
+            # Реальные цели канала (ближайшая первая), если их несколько
+            # — см. extract_all_prices()/_tp_levels() (main.py): без
+            # этого несколько явных целей канала схлопывались в parsed_tp
+            # (одно число), а _tp_levels() сам синтезировал 3 фейковых
+            # уровня линейной интерполяцией вместо использования того,
+            # что канал реально указал.
+            "parsed_take_profits": parsed.get("take_profits", []),
+            "parsed_rationale": parsed.get("rationale", ""),
+            "parsed_raw": parsed.get("raw", ""),
+            # Регэксп-парсер (parse_with_regex) не оценивает уверенность —
+            # для точного совпадения по ключевым словам это не 0.5
+            # "нейтрально", а полная определённость: 1.0. LLM-фолбэки
+            # (parse_with_llm/parse_with_gemini) кладут в parsed["confidence"]
+            # свою реальную оценку (0.5..1.0, порог отсечения уже применён
+            # внутри них) — пробрасываем её как есть.
+            "parsed_confidence": parsed.get("confidence", 1.0),
+        }
+        logger.info(
+            f"[TG SIGNAL] {signal_event['parsed_pair']} {signal_event['parsed_side'].upper()} | "
+            f"Entry: {signal_event['parsed_entry']} | SL: {signal_event['parsed_sl']} | TP: {signal_event['parsed_tp']}"
+        )
+
+        # Уведомить подписчиков
+        for cb in _subscribers:
+            try:
+                await cb(signal_event)
+            except Exception as e:
+                logger.error(f"Ошибка уведомления подписчика Telegram сигнала: {e}")
+
+
+def _ensure_handler_registered(client: TelegramClient):
+    """Зарегистрировать _handler ровно один раз за жизнь процесса — без
+    фильтра chats=, см. docstring _handler()."""
+    global _handler_registered
+    if _handler_registered:
+        return
+    client.add_event_handler(_handler, events.NewMessage())
+    _handler_registered = True
+
+
 async def monitor_channels(channels: list[dict]):
     """
-    Запустить мониторинг каналов.
+    Запустить мониторинг каналов (вызывается один раз при старте бота —
+    см. TradingBot._start_telegram_monitoring в main.py).
     channels: [{"channel_id": "@channelname", "channel_title": "Channel Name", "parser_config": {...}}]
     """
     if not _telegram_client:
@@ -72,87 +170,65 @@ async def monitor_channels(channels: list[dict]):
         return
 
     client = _telegram_client
+    _ensure_handler_registered(client)
 
     logger.info(f"Запуск мониторинга каналов: {[c['channel_id'] for c in channels]}")
 
-    # event.chat_id из Telethon — это всегда нормализованный числовой ID
-    # (напр. -1001234567890), а channel_id в БД чаще всего — то, что ввёл
-    # пользователь в дашборде ("@channelname"). Раньше матчинг делался как
-    # `c["channel_id"] == str(event.chat_id)`, что для username-каналов не
-    # совпадало НИКОГДА — все сообщения из таких каналов тихо отбрасывались
-    # без единой ошибки в логах. Резолвим каждый канал в реальную entity
-    # заранее и матчим по числовому id, а не по исходной строке.
-    resolved: dict[int, dict] = {}
-    entities = []
     for c in channels:
-        try:
-            entity = await client.get_entity(c["channel_id"])
-            chat_id = get_peer_id(entity)
-            resolved[chat_id] = c
-            entities.append(entity)
-        except Exception as e:
-            logger.error(f"Telegram: не удалось найти канал {c['channel_id']}: {e}")
+        await add_channel_to_monitoring(c)
 
-    if not resolved:
-        logger.warning("Telegram: ни один канал не удалось резолвить — мониторинг не запущен")
+    if not _monitored:
+        logger.warning("Telegram: ни один канал не удалось резолвить — мониторинг каналов не начат")
         return
 
-    @client.on(events.NewMessage(chats=entities))
-    async def handler(event: events.NewMessage.Event):
-        message: Message = event.message
-        channel = resolved.get(event.chat_id)
+    logger.info(f"Мониторинг каналов запущен: {[c['channel_id'] for c in _monitored.values()]}")
 
-        if channel is None:
-            return
 
-        raw_text = message.text or ""
-        logger.debug(f"[TG] Получено сообщение из {channel['channel_id']}: {raw_text[:100]}...")
+async def add_channel_to_monitoring(channel: dict) -> bool:
+    """
+    Добавить один канал в live-мониторинг без рестарта бота — резолвит
+    entity и кладёт в _monitored; _handler() тут же начинает пропускать
+    его сообщения дальше в парсер. Вызывается из POST /telegram/channels
+    (src/web/api.py) сразу после создания канала в БД. Возвращает False,
+    если клиент не инициализирован или канал не удалось резолвить (канал
+    всё равно создаётся в БД — просто останется неактивным до ручного
+    рестарта, как и раньше).
 
-        # Парсинг сигнала
-        parsed = await parse_telegram_signal(raw_text, channel)
+    event.chat_id из Telethon — это всегда нормализованный числовой ID
+    (напр. -1001234567890), а channel_id в БД чаще всего — то, что ввёл
+    пользователь в дашборде ("@channelname"). Матчинг по исходной строке
+    ("@channelname" == str(event.chat_id)) не совпадал бы никогда — все
+    сообщения из таких каналов тихо отбрасывались бы без единой ошибки в
+    логах, поэтому резолвим в реальную entity и матчим по числовому id.
+    """
+    if not _telegram_client:
+        logger.warning(f"Telegram клиент не инициализирован — {channel['channel_id']} не добавлен в мониторинг")
+        return False
+    _ensure_handler_registered(_telegram_client)
+    try:
+        entity = await _telegram_client.get_entity(channel["channel_id"])
+        chat_id = get_peer_id(entity)
+    except Exception as e:
+        logger.error(f"Telegram: не удалось найти канал {channel['channel_id']}: {e}")
+        return False
+    _monitored[chat_id] = channel
+    logger.info(f"👂 Канал {channel['channel_id']} добавлен в live-мониторинг")
+    return True
 
-        if parsed:
-            signal_event = {
-                "type": "telegram_signal",
-                "channel_id": channel["channel_id"],
-                "channel_title": channel.get("channel_title", ""),
-                "raw_message": raw_text,
-                "message_date": utcnow(),
-                "parsed_pair": parsed.get("pair"),
-                "parsed_side": parsed.get("side"),
-                "parsed_entry": parsed.get("entry"),
-                "parsed_sl": parsed.get("sl"),
-                "parsed_tp": parsed.get("tp"),
-                # Реальные цели канала (ближайшая первая), если их несколько
-                # — см. extract_all_prices()/_tp_levels() (main.py): без
-                # этого несколько явных целей канала схлопывались в parsed_tp
-                # (одно число), а _tp_levels() сам синтезировал 3 фейковых
-                # уровня линейной интерполяцией вместо использования того,
-                # что канал реально указал.
-                "parsed_take_profits": parsed.get("take_profits", []),
-                "parsed_rationale": parsed.get("rationale", ""),
-                "parsed_raw": parsed.get("raw", ""),
-                # Регэксп-парсер (parse_with_regex) не оценивает уверенность —
-                # для точного совпадения по ключевым словам это не 0.5
-                # "нейтрально", а полная определённость: 1.0. LLM-фолбэки
-                # (parse_with_llm/parse_with_gemini) кладут в parsed["confidence"]
-                # свою реальную оценку (0.5..1.0, порог отсечения уже применён
-                # внутри них) — пробрасываем её как есть.
-                "parsed_confidence": parsed.get("confidence", 1.0),
-            }
-            logger.info(
-                f"[TG SIGNAL] {signal_event['parsed_pair']} {signal_event['parsed_side'].upper()} | "
-                f"Entry: {signal_event['parsed_entry']} | SL: {signal_event['parsed_sl']} | TP: {signal_event['parsed_tp']}"
-            )
 
-            # Уведомить подписчиков
-            for cb in _subscribers:
-                try:
-                    await cb(signal_event)
-                except Exception as e:
-                    logger.error(f"Ошибка уведомления подписчика Telegram сигнала: {e}")
-
-    logger.info(f"Мониторинг каналов запущен: {[c['channel_id'] for c in resolved.values()]}")
+def remove_channel_from_monitoring(channel_id: str) -> int:
+    """
+    Убрать канал из live-мониторинга по channel_id (строка из БД, а не
+    числовой chat_id) без рестарта бота. Вызывается из
+    DELETE /telegram/channels/{id} (src/web/api.py). Возвращает количество
+    удалённых записей (обычно 0 или 1).
+    """
+    stale_chat_ids = [cid for cid, c in _monitored.items() if c["channel_id"] == channel_id]
+    for cid in stale_chat_ids:
+        del _monitored[cid]
+    if stale_chat_ids:
+        logger.info(f"👋 Канал {channel_id} убран из live-мониторинга")
+    return len(stale_chat_ids)
 
 
 def subscribe_telegram_signal(callback: callable):

@@ -1224,11 +1224,13 @@ async def connections_status():
 
 @app.post("/system/restart")
 async def restart_bot():
-    """Перезапустить процесс бота (например, чтобы подхватить добавленные/удалённые
-    Telegram-каналы — их список фиксируется при старте). Полагается на
-    `restart: unless-stopped` в docker-compose.yml: процесс просто завершается,
-    Docker поднимает контейнер заново. Без такой restart-политики (голый
-    `python -m src.main` или systemd без Restart=) бот после этого не поднимется сам."""
+    """Перезапустить процесс бота (например, если Telegram-канал не удалось
+    зарезолвить при добавлении — см. create_telegram_channel — или изменились
+    ключи API Telegram; добавление/удаление канала само по себе рестарта уже
+    не требует). Полагается на `restart: unless-stopped` в docker-compose.yml:
+    процесс просто завершается, Docker поднимает контейнер заново. Без такой
+    restart-политики (голый `python -m src.main` или systemd без Restart=)
+    бот после этого не поднимется сам."""
     logger.warning("🔄 Перезапуск бота запрошен через веб-панель")
 
     async def _delayed_exit():
@@ -1322,7 +1324,14 @@ async def list_telegram_channels():
 
 @app.post("/telegram/channels")
 async def create_telegram_channel(channel: TelegramChannelCreate):
-    """Добавить Telegram канал."""
+    """
+    Добавить Telegram канал. Начинает live-мониториться сразу же — без
+    рестарта бота (см. TradingBot.add_telegram_channel_to_live_monitoring
+    в main.py) — если резолв канала (Telethon get_entity) не удался (опечатка
+    в username, бот не состоит в канале и т.п.), канал всё равно создаётся
+    в БД, просто останется неактивным до ручного рестарта; success в ответе
+    относится к созданию записи в БД, а не к живому мониторингу.
+    """
     async with get_session() as session:
         existing = (
             await session.execute(
@@ -1346,7 +1355,23 @@ async def create_telegram_channel(channel: TelegramChannelCreate):
         await session.commit()
 
         logger.info(f"Telegram канал добавлен: {channel.channel_id}")
-        return {"success": True, "channel": {
+
+        import src.main as main_module
+        live_monitoring = False
+        if main_module.current_bot is not None:
+            live_monitoring = await main_module.current_bot.add_telegram_channel_to_live_monitoring(
+                channel_id=new_channel.channel_id,
+                channel_title=new_channel.channel_title or "",
+                parser_config=new_channel.parser_config or {},
+                db_id=new_channel.id,
+            )
+            if not live_monitoring:
+                logger.warning(
+                    f"⚠️ Канал {channel.channel_id} создан в БД, но не удалось начать live-мониторинг "
+                    f"(см. предыдущую ошибку) — потребуется рестарт бота."
+                )
+
+        return {"success": True, "live_monitoring": live_monitoring, "channel": {
             "id": new_channel.id,
             "channel_id": new_channel.channel_id,
             "channel_title": new_channel.channel_title,
@@ -1359,10 +1384,11 @@ async def create_telegram_channel(channel: TelegramChannelCreate):
 async def update_telegram_channel(channel_id: int, update: TelegramChannelUpdate):
     """
     Изменить настройки существующего канала (порог качества, автоисполнение,
-    название). quality_threshold/auto_execute читаются "вживую" из БД при
-    обработке каждого Telegram-сигнала (см. TradingBot._get_channel_quality_threshold
-    в main.py), поэтому применяются сразу, без перезапуска бота — в отличие
-    от списка отслеживаемых каналов, который фиксируется при старте.
+    размер позиции, название). quality_threshold/auto_execute/position_size_pct
+    читаются "вживую" из БД при обработке каждого Telegram-сигнала (см.
+    TradingBot._get_channel_settings в main.py), поэтому применяются сразу,
+    без перезапуска бота — как и добавление/удаление самого канала (см.
+    create_telegram_channel/delete_telegram_channel).
     """
     async with get_session() as session:
         channel = await session.get(TelegramChannel, channel_id)
@@ -1380,16 +1406,24 @@ async def update_telegram_channel(channel_id: int, update: TelegramChannelUpdate
 
 @app.delete("/telegram/channels/{channel_id}")
 async def delete_telegram_channel(channel_id: int):
-    """Удалить Telegram канал."""
+    """Удалить Telegram канал — перестаёт live-мониториться сразу же, без
+    рестарта бота (см. TradingBot.remove_telegram_channel_from_live_monitoring
+    в main.py)."""
     async with get_session() as session:
         channel = (
             await session.execute(select(TelegramChannel).where(TelegramChannel.id == channel_id))
         ).scalar_one_or_none()
         if not channel:
             raise HTTPException(status_code=404, detail="Канал не найден")
+        channel_string_id = channel.channel_id
         await session.delete(channel)
         await session.commit()
-        logger.info(f"Telegram канал удалён: {channel.channel_id}")
+        logger.info(f"Telegram канал удалён: {channel_string_id}")
+
+        import src.main as main_module
+        if main_module.current_bot is not None:
+            main_module.current_bot.remove_telegram_channel_from_live_monitoring(channel_string_id)
+
         return {"success": True}
 
 

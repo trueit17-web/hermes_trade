@@ -715,7 +715,7 @@
       <button type="submit" class="btn-primary">+ Добавить канал</button>
     </form>
     <div class="restart-hint">
-      <span class="muted">Добавление/удаление канала применяется к прослушиванию сообщений только после перезапуска бота.</span>
+      <span class="muted">Добавление/удаление канала начинает действовать сразу, без перезапуска. Рестарт нужен только если канал не удалось найти (см. тост при добавлении) или изменились ключи API Telegram.</span>
       <button type="button" id="btnRestartBot" class="btn-warn">🔄 Перезапустить бота</button>
     </div>
     <div class="table-wrap">
@@ -1977,7 +1977,7 @@ document.getElementById("addChannelForm").addEventListener("submit", async (e) =
   if (!channelId) return;
 
   try {
-    await api("/telegram/channels", {
+    const result = await api("/telegram/channels", {
       method: "POST",
       body: JSON.stringify({
         channel_id: channelId,
@@ -1987,7 +1987,12 @@ document.getElementById("addChannelForm").addEventListener("submit", async (e) =
         auto_execute: autoExecute,
       }),
     });
-    showToast(`Канал ${channelId} добавлен`);
+    showToast(
+      result.live_monitoring
+        ? `Канал ${channelId} добавлен и уже мониторится`
+        : `Канал ${channelId} добавлен, но не резолвится (проверьте написание/доступ) — нужен рестарт после исправления`,
+      !result.live_monitoring,
+    );
     document.getElementById("addChannelForm").reset();
     document.getElementById("channelThresholdInput").value = "0.5";
     document.getElementById("channelPositionSizeInput").value = "5";

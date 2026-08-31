@@ -7046,5 +7046,229 @@ class TestDecideTelegramSignal(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.exception.status_code, 400)
 
 
+class TestDynamicChannelMonitoring(unittest.IsolatedAsyncioTestCase):
+    """
+    Раньше список отслеживаемых Telegram-каналов был жёстко зашит в
+    chats=entities на момент регистрации @client.on(events.NewMessage(...))
+    в monitor_channels() — добавление/удаление канала через дашборд
+    применялось только после рестарта бота. Обработчик теперь
+    регистрируется один раз без фильтра chats= и читает live-словарь
+    channel_monitor._monitored — add_channel_to_monitoring()/
+    remove_channel_from_monitoring() просто мутируют его.
+    """
+
+    def setUp(self):
+        import src.telegram.channel_monitor as cm
+        self.cm = cm
+        self._saved_client = cm._telegram_client
+        self._saved_monitored = dict(cm._monitored)
+        self._saved_registered = cm._handler_registered
+        cm._monitored.clear()
+        cm._handler_registered = False
+
+    def tearDown(self):
+        self.cm._telegram_client = self._saved_client
+        self.cm._monitored.clear()
+        self.cm._monitored.update(self._saved_monitored)
+        self.cm._handler_registered = self._saved_registered
+
+    def _install_fake_client(self, entity_chat_id=-100123, raise_on_resolve=False):
+        client = MagicMock()
+        client.add_event_handler = MagicMock()
+        if raise_on_resolve:
+            client.get_entity = AsyncMock(side_effect=RuntimeError("no such channel"))
+        else:
+            fake_entity = MagicMock()
+            client.get_entity = AsyncMock(return_value=fake_entity)
+            self._patcher = patch("src.telegram.channel_monitor.get_peer_id", return_value=entity_chat_id)
+            self._patcher.start()
+            self.addCleanup(self._patcher.stop)
+        self.cm._telegram_client = client
+        return client
+
+    async def test_add_channel_to_monitoring_resolves_and_registers(self):
+        client = self._install_fake_client(entity_chat_id=-100999)
+
+        added = await self.cm.add_channel_to_monitoring(
+            {"channel_id": "@newchan", "channel_title": "New", "parser_config": {}}
+        )
+
+        self.assertTrue(added)
+        self.assertIn(-100999, self.cm._monitored)
+        self.assertEqual(self.cm._monitored[-100999]["channel_id"], "@newchan")
+        client.add_event_handler.assert_called_once()
+        self.assertTrue(self.cm._handler_registered)
+
+    async def test_add_channel_returns_false_without_client(self):
+        self.cm._telegram_client = None
+        added = await self.cm.add_channel_to_monitoring(
+            {"channel_id": "@newchan", "channel_title": "New", "parser_config": {}}
+        )
+        self.assertFalse(added)
+        self.assertEqual(self.cm._monitored, {})
+
+    async def test_add_channel_returns_false_when_resolve_fails(self):
+        self._install_fake_client(raise_on_resolve=True)
+        added = await self.cm.add_channel_to_monitoring(
+            {"channel_id": "@badchan", "channel_title": "Bad", "parser_config": {}}
+        )
+        self.assertFalse(added)
+        self.assertEqual(self.cm._monitored, {})
+
+    async def test_handler_registered_exactly_once_across_multiple_adds(self):
+        client = self._install_fake_client(entity_chat_id=-1)
+        await self.cm.add_channel_to_monitoring({"channel_id": "@a", "channel_title": "A", "parser_config": {}})
+        await self.cm.add_channel_to_monitoring({"channel_id": "@b", "channel_title": "B", "parser_config": {}})
+        client.add_event_handler.assert_called_once()
+
+    def test_remove_channel_from_monitoring_deletes_matching_entry(self):
+        self.cm._monitored[-100111] = {"channel_id": "@toremove", "channel_title": "X"}
+        self.cm._monitored[-100222] = {"channel_id": "@keepme", "channel_title": "Y"}
+
+        removed_count = self.cm.remove_channel_from_monitoring("@toremove")
+
+        self.assertEqual(removed_count, 1)
+        self.assertNotIn(-100111, self.cm._monitored)
+        self.assertIn(-100222, self.cm._monitored)
+
+    def test_remove_unknown_channel_is_a_noop(self):
+        removed_count = self.cm.remove_channel_from_monitoring("@nonexistent")
+        self.assertEqual(removed_count, 0)
+
+    async def test_handler_ignores_events_from_unmonitored_chats(self):
+        event = MagicMock()
+        event.chat_id = -100555
+        event.message.text = "BTC/USDT LONG 50000 SL 49000 TP 52000"
+        # _monitored пуст -> обработчик должен тихо выйти, не пытаясь
+        # парсить/уведомлять подписчиков.
+        with patch.object(self.cm, "parse_telegram_signal", new=AsyncMock()) as parse_mock:
+            await self.cm._handler(event)
+        parse_mock.assert_not_called()
+
+    async def test_monitor_channels_registers_handler_even_with_zero_channels(self):
+        """Без этого канал, добавленный ПОСЛЕ старта (без изначально
+        настроенных каналов), не имел бы работающего обработчика вообще —
+        monitor_channels([]) раньше выходил раньше регистрации."""
+        client = self._install_fake_client()
+        await self.cm.monitor_channels([])
+        client.add_event_handler.assert_called_once()
+        self.assertTrue(self.cm._handler_registered)
+
+
+class TestTradingBotLiveTelegramChannelWiring(unittest.IsolatedAsyncioTestCase):
+    """TradingBot.add_telegram_channel_to_live_monitoring/remove_telegram_
+    channel_from_live_monitoring — держат main.py:_telegram_channel_db_ids
+    (используется _get_channel_settings) в синхроне с channel_monitor._monitored."""
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    async def test_successful_add_updates_db_id_mapping(self):
+        bot = self._make_bot()
+        with patch("src.main.add_channel_to_monitoring", new=AsyncMock(return_value=True)) as add_mock:
+            result = await bot.add_telegram_channel_to_live_monitoring(
+                channel_id="@livewire", channel_title="Live", parser_config={}, db_id=42,
+            )
+        self.assertTrue(result)
+        self.assertEqual(bot._telegram_channel_db_ids["@livewire"], 42)
+        add_mock.assert_awaited_once()
+
+    async def test_failed_add_does_not_update_db_id_mapping(self):
+        bot = self._make_bot()
+        with patch("src.main.add_channel_to_monitoring", new=AsyncMock(return_value=False)):
+            result = await bot.add_telegram_channel_to_live_monitoring(
+                channel_id="@unresolvable", channel_title="X", parser_config={}, db_id=7,
+            )
+        self.assertFalse(result)
+        self.assertNotIn("@unresolvable", bot._telegram_channel_db_ids)
+
+    def test_remove_clears_db_id_mapping(self):
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids["@livewire"] = 42
+        with patch("src.main.remove_channel_from_monitoring") as remove_mock:
+            bot.remove_telegram_channel_from_live_monitoring("@livewire")
+        remove_mock.assert_called_once_with("@livewire")
+        self.assertNotIn("@livewire", bot._telegram_channel_db_ids)
+
+
+class TestTelegramChannelEndpointsWireLiveMonitoring(unittest.IsolatedAsyncioTestCase):
+    """POST/DELETE /telegram/channels вызывают add_telegram_channel_to_live_
+    monitoring/remove_telegram_channel_from_live_monitoring на current_bot,
+    если он готов — раньше добавление/удаление канала не имело вообще
+    никакого эффекта до рестарта бота."""
+
+    def setUp(self):
+        import src.main as main_module
+        self.main_module = main_module
+        self._saved_current_bot = main_module.current_bot
+
+    def tearDown(self):
+        self.main_module.current_bot = self._saved_current_bot
+
+    async def test_create_channel_calls_live_wiring_and_reports_result(self):
+        from src.web.api import TelegramChannelCreate, create_telegram_channel
+
+        bot = MagicMock()
+        bot.add_telegram_channel_to_live_monitoring = AsyncMock(return_value=True)
+        self.main_module.current_bot = bot
+
+        result = await create_telegram_channel(TelegramChannelCreate(
+            channel_id="@wiring_test_channel",
+        ))
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["live_monitoring"])
+        bot.add_telegram_channel_to_live_monitoring.assert_awaited_once()
+        call_kwargs = bot.add_telegram_channel_to_live_monitoring.await_args.kwargs
+        self.assertEqual(call_kwargs["channel_id"], "@wiring_test_channel")
+        self.assertEqual(call_kwargs["db_id"], result["channel"]["id"])
+
+    async def test_create_channel_reports_failed_live_wiring(self):
+        from src.web.api import TelegramChannelCreate, create_telegram_channel
+
+        bot = MagicMock()
+        bot.add_telegram_channel_to_live_monitoring = AsyncMock(return_value=False)
+        self.main_module.current_bot = bot
+
+        result = await create_telegram_channel(TelegramChannelCreate(
+            channel_id="@wiring_test_channel_2",
+        ))
+
+        self.assertFalse(result["live_monitoring"])
+
+    async def test_create_channel_without_ready_bot_reports_not_live(self):
+        from src.web.api import TelegramChannelCreate, create_telegram_channel
+
+        self.main_module.current_bot = None
+        result = await create_telegram_channel(TelegramChannelCreate(
+            channel_id="@wiring_test_channel_3",
+        ))
+        self.assertFalse(result["live_monitoring"])
+
+    async def test_delete_channel_calls_live_wiring(self):
+        from src.db.models import TelegramChannel
+        from src.db.session import get_session
+        from src.web.api import delete_telegram_channel
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@to_be_deleted_wiring_test", active=True)
+            session.add(channel)
+            await session.commit()
+            channel_db_id = channel.id
+
+        bot = MagicMock()
+        bot.remove_telegram_channel_from_live_monitoring = MagicMock()
+        self.main_module.current_bot = bot
+
+        result = await delete_telegram_channel(channel_db_id)
+
+        self.assertTrue(result["success"])
+        bot.remove_telegram_channel_from_live_monitoring.assert_called_once_with("@to_be_deleted_wiring_test")
+
+
 if __name__ == "__main__":
     unittest.main()
