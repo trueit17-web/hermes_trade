@@ -496,7 +496,15 @@ class TradingBot:
 
         decision = "pending"
         order = None
-        if quality < quality_threshold:
+        if settings.active_trading_mode != "signals":
+            # Переключатель "сигналы"/"алго" в шапке дашборда (см. тот же
+            # гейт для встроенных стратегий в _process_symbol) — сигнал всё
+            # равно оцениваем и сохраняем в БД (статистика/качество канала
+            # не должны прерываться из-за переключения режима), просто не
+            # исполняем, пока активен алго-режим.
+            decision = "rejected"
+            logger.info(f"🚫 Сигнал по {pair} отклонён: активен режим 'алго' — сигнальная торговля выключена")
+        elif quality < quality_threshold:
             decision = "rejected"
             logger.info(f"🚫 Сигнал отклонён (quality={quality:.2f} < {quality_threshold:.2f})")
         elif auto_execute:
@@ -924,9 +932,20 @@ class TradingBot:
             "day_of_week": latest_features.get("day_of_week", 0),
         }
 
+        # Режим "сигналы"/"алго" (active_trading_mode, переключается кнопкой
+        # в шапке дашборда — POST /trading-source-mode): в режиме "signals"
+        # новые позиции открывают только Telegram-каналы (_on_telegram_signal),
+        # встроенные ML/Ensemble/BB-стратегии здесь вообще не запускаются —
+        # ни инференс, ни генерация сигналов. Уже открытые позиции (любого
+        # источника) это не затрагивает — SL/TP/трейлинг выше по функции
+        # проверяются всегда, независимо от режима. _record_ml_training_sample
+        # тоже не гейтится: продолжаем копить размеченные данные для будущего
+        # переобучения моделей, даже пока алго-режим выключен.
+        algo_enabled = settings.active_trading_mode == "algo"
+
         # ML inference
         predicted_volatility = None
-        if self.ml_inference:
+        if self.ml_inference and algo_enabled:
             ml_result = await self.ml_inference.predict_direction(strategy_data)
             if ml_result:
                 strategy_data["ml_proba_up"] = ml_result.get("proba_up")
@@ -947,42 +966,43 @@ class TradingBot:
 
         # Сигналы от стратегий
         signals = []
-        for strategy in strategy_registry.get_active():
-            signal = strategy.generate_signal(strategy_data)
-            if signal:
-                signals.append(signal)
-                decision_logger.log_strategy_signal(
-                    strategy_id=strategy.strategy_id,
-                    strategy_name=strategy.name,
-                    signal_side=signal.side,
-                    confidence=signal.confidence,
-                    entry_price=signal.entry_price or close,
-                    stop_loss=signal.stop_loss,
-                    take_profit=signal.take_profit,
-                    rationale=signal.rationale,
+        if algo_enabled:
+            for strategy in strategy_registry.get_active():
+                signal = strategy.generate_signal(strategy_data)
+                if signal:
+                    signals.append(signal)
+                    decision_logger.log_strategy_signal(
+                        strategy_id=strategy.strategy_id,
+                        strategy_name=strategy.name,
+                        signal_side=signal.side,
+                        confidence=signal.confidence,
+                        entry_price=signal.entry_price or close,
+                        stop_loss=signal.stop_loss,
+                        take_profit=signal.take_profit,
+                        rationale=signal.rationale,
+                    )
+
+            # ML score log
+            if "ml_proba_up" in strategy_data:
+                active_model = await model_registry.get_active_model("direction_classifier")
+                decision_logger.log_ml_score(
+                    model_type="direction_classifier",
+                    model_version=(active_model or {}).get("version", 1),
+                    proba_up=strategy_data["ml_proba_up"],
+                    proba_down=strategy_data["ml_proba_down"],
+                    proba_neutral=strategy_data["ml_proba_neutral"],
                 )
 
-        # ML score log
-        if "ml_proba_up" in strategy_data:
-            active_model = await model_registry.get_active_model("direction_classifier")
-            decision_logger.log_ml_score(
-                model_type="direction_classifier",
-                model_version=(active_model or {}).get("version", 1),
-                proba_up=strategy_data["ml_proba_up"],
-                proba_down=strategy_data["ml_proba_down"],
-                proba_neutral=strategy_data["ml_proba_neutral"],
-            )
-
-        # Ensemble
-        ensemble = strategy_registry.get("ensemble_voter")
-        if ensemble and signals:
-            for s in signals:
-                source_strategy = strategy_registry.get(s.strategy_id)
-                if source_strategy:
-                    ensemble.set_strategy_weight(s.strategy_id, source_strategy.weight)
-            aggregated = ensemble.aggregate_signals(signals)
-            if aggregated:
-                signals = [aggregated]
+            # Ensemble
+            ensemble = strategy_registry.get("ensemble_voter")
+            if ensemble and signals:
+                for s in signals:
+                    source_strategy = strategy_registry.get(s.strategy_id)
+                    if source_strategy:
+                        ensemble.set_strategy_weight(s.strategy_id, source_strategy.weight)
+                aggregated = ensemble.aggregate_signals(signals)
+                if aggregated:
+                    signals = [aggregated]
 
         if not signals:
             return

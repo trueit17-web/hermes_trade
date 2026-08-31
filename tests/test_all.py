@@ -2505,6 +2505,31 @@ class TestTelegramSignalParser(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["pair"], "BTC/USDT")
 
+    def test_numbered_tp_targets_do_not_swallow_the_numbering_digit(self):
+        """
+        Регресс: "TP1: 51000" раньше матчился как keyword="tp" + число="1"
+        (первая цифра самой нумерации TP1/TP2/TP3), а не как реальная цена
+        51000 — без разделителя между словом и числом ([:\\-–—]? и \\s* оба
+        необязательные) регэксп охотно "хватал" саму цифру нумерации.
+        Итоговый TP получался околонулевым — при 3-уровневой интерполяции
+        (_tp_levels в main.py) это немедленно "срабатывало" бы как
+        достигнутая цель на первой же проверке после открытия позиции,
+        закрывая её почти сразу вместо реального тейк-профита. Формат
+        "TP1/TP2/TP3" — стандартный для каналов с несколькими целями.
+        """
+        result = self.parse(
+            "BTC/USDT LONG Entry: 50000 SL: 49000 TP1: 51000 TP2: 52000 TP3: 53000"
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["entry"], 50000.0)
+        self.assertEqual(result["sl"], 49000.0)
+        self.assertEqual(result["tp"], 51000.0)
+
+    def test_numbered_sl_target_does_not_swallow_the_numbering_digit(self):
+        result = self.parse("ETH/USDT SHORT Entry: 3500 SL1: 3600 TP: 3200")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["sl"], 3600.0)
+
 
 class TestLlmSignalParser(unittest.IsolatedAsyncioTestCase):
     """
@@ -6056,10 +6081,15 @@ class TestShortSignalRejectedBeforeExecutionInRealMode(unittest.IsolatedAsyncioT
 
     def setUp(self):
         self._saved_trading_mode = settings.trading_mode
+        self._saved_active_trading_mode = settings.active_trading_mode
         settings.trading_mode = "real"
+        # Тестирует путь встроенных стратегий (_process_symbol) — он
+        # запускается только в режиме "algo" (см. TestTradingSourceMode*).
+        settings.active_trading_mode = "algo"
 
     def tearDown(self):
         settings.trading_mode = self._saved_trading_mode
+        settings.active_trading_mode = self._saved_active_trading_mode
 
     async def test_short_signal_rejected_without_hitting_execution_engine(self):
         from src.strategy import StrategySignal
@@ -6182,6 +6212,202 @@ class TestTelegramSignalShortRejectedInRealMode(unittest.IsolatedAsyncioTestCase
 
         mock_engine.create_order.assert_awaited_once()
         self.assertEqual(mock_engine.create_order.await_args.kwargs["side"], "buy")
+
+
+class TestTradingSourceModeEndpoint(unittest.IsolatedAsyncioTestCase):
+    """
+    POST /trading-source-mode — переключатель "сигналы"/"алго" в шапке
+    дашборда. Тот же apply_settings_update, что и вкладка "Настройки":
+    применяется немедленно (settings.active_trading_mode) и сохраняется в
+    BotConfig на будущие перезапуски.
+    """
+
+    def setUp(self):
+        self._saved_mode = settings.active_trading_mode
+
+    def tearDown(self):
+        settings.active_trading_mode = self._saved_mode
+
+    async def test_valid_mode_updates_live_setting(self):
+        from src.web.api import set_trading_source_mode
+
+        result = await set_trading_source_mode(mode="algo")
+
+        self.assertEqual(result, {"success": True, "mode": "algo"})
+        self.assertEqual(settings.active_trading_mode, "algo")
+
+    async def test_invalid_mode_is_rejected_without_changing_setting(self):
+        from fastapi import HTTPException
+
+        from src.web.api import set_trading_source_mode
+
+        settings.active_trading_mode = "signals"
+        with self.assertRaises(HTTPException) as ctx:
+            await set_trading_source_mode(mode="both")
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(settings.active_trading_mode, "signals")
+
+
+class TestTradingSourceModeGatesAlgoStrategies(unittest.IsolatedAsyncioTestCase):
+    """
+    Регресс/новая функциональность: переключатель "сигналы"/"алго" — в
+    режиме "signals" встроенные ML/Ensemble/BB-стратегии вообще не должны
+    запускаться в _process_symbol (ни инференс, ни generate_signal, ни
+    исполнение) — новые позиции в этом режиме открывают только
+    Telegram-каналы. Уже открытые позиции (проверка SL/TP выше по функции)
+    режимом не гейтятся — это отдельная, всегда активная часть
+    _process_symbol, здесь не проверяется напрямую (покрыто другими
+    тестами), только то, что генерация НОВЫХ сигналов зависит от режима.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    @staticmethod
+    def _make_candles_df():
+        return pd.DataFrame({
+            "open": [1.0] * 60, "high": [1.0] * 60, "low": [1.0] * 60,
+            "close": [1.0] * 60, "volume": [1.0] * 60,
+        })
+
+    def setUp(self):
+        self._saved_mode = settings.active_trading_mode
+
+    def tearDown(self):
+        settings.active_trading_mode = self._saved_mode
+
+    async def test_signals_mode_never_calls_strategies(self):
+        from src.strategy import StrategySignal
+
+        settings.active_trading_mode = "signals"
+        bot = self._make_bot()
+        bot.feature_engine = MagicMock()
+        bot.ml_inference = None
+        bot._refresh_symbol_candles = AsyncMock(return_value=self._make_candles_df())
+
+        fake_strategy = MagicMock()
+        fake_strategy.strategy_id = "ml_direction"
+        fake_strategy.generate_signal.return_value = StrategySignal(
+            strategy_id="ml_direction", symbol="BTC/USDT", side="long", confidence=0.9,
+            entry_price=1.0,
+        )
+
+        with patch("src.main.strategy_registry.get_active", return_value=[fake_strategy]) as get_active_mock, \
+                patch("src.main.execution_engine") as mock_engine:
+            mock_engine.paper_positions = {}
+            mock_engine.real_positions = {}
+            mock_engine.last_prices = {}
+            mock_engine.create_order = AsyncMock()
+
+            await bot._process_symbol("BTC/USDT")
+
+        get_active_mock.assert_not_called()
+        fake_strategy.generate_signal.assert_not_called()
+        mock_engine.create_order.assert_not_awaited()
+
+    async def test_algo_mode_still_calls_strategies(self):
+        from src.strategy import StrategySignal
+
+        settings.active_trading_mode = "algo"
+        bot = self._make_bot()
+        bot.feature_engine = MagicMock()
+        bot.ml_inference = None
+        bot._refresh_symbol_candles = AsyncMock(return_value=self._make_candles_df())
+
+        fake_strategy = MagicMock()
+        fake_strategy.strategy_id = "ml_direction"
+        fake_strategy.name = "ML"
+        fake_strategy.weight = 1.0
+        fake_strategy.generate_signal.return_value = StrategySignal(
+            strategy_id="ml_direction", symbol="BTC/USDT", side="long", confidence=0.9,
+            entry_price=1.0,
+        )
+
+        with patch("src.main.strategy_registry.get_active", return_value=[fake_strategy]), \
+                patch("src.main.strategy_registry.get", return_value=None), \
+                patch("src.main.execution_engine") as mock_engine, \
+                patch("src.main.risk_manager") as mock_risk, \
+                patch("src.main.protection_manager") as mock_protections, \
+                patch("src.main.expectancy_sizing") as mock_sizing:
+            mock_engine.paper_positions = {}
+            mock_engine.real_positions = {}
+            mock_engine.last_prices = {}
+            mock_engine.create_order = AsyncMock(return_value=None)
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.get_paper_balance = MagicMock(return_value=10000.0)
+            mock_risk.check_signal.return_value = (True, "")
+            mock_protections.locked_reason = AsyncMock(return_value=None)
+            mock_sizing.size_multiplier = AsyncMock(return_value=1.0)
+
+            await bot._process_symbol("BTC/USDT")
+
+        fake_strategy.generate_signal.assert_called_once()
+        mock_engine.create_order.assert_awaited_once()
+
+
+class TestTradingSourceModeGatesTelegramSignals(unittest.IsolatedAsyncioTestCase):
+    """Та же переключалка "сигналы"/"алго", но для пути Telegram-сигналов
+    (_on_telegram_signal) — в режиме "algo" автоисполнение канала должно
+    отклоняться, даже если качество прошло порог и auto_execute=True."""
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved_mode = settings.active_trading_mode
+
+    def tearDown(self):
+        settings.active_trading_mode = self._saved_mode
+
+    async def test_algo_mode_rejects_auto_execute_telegram_signal(self):
+        settings.active_trading_mode = "algo"
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True))
+        bot._save_telegram_signal = AsyncMock()
+
+        with patch.object(bot, "_execute_telegram_signal", new=AsyncMock()) as exec_mock:
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "BTC/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 50000.0,
+                "raw_message": "test",
+            })
+
+        exec_mock.assert_not_awaited()
+        bot._save_telegram_signal.assert_awaited_once()
+        self.assertEqual(bot._save_telegram_signal.await_args.args[2], "rejected")
+
+    async def test_signals_mode_still_auto_executes_telegram_signal(self):
+        settings.active_trading_mode = "signals"
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True))
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        fake_order = MagicMock(id=1)
+        with patch.object(bot, "_execute_telegram_signal", new=AsyncMock(return_value=fake_order)) as exec_mock:
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "BTC/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 50000.0,
+                "raw_message": "test",
+            })
+
+        exec_mock.assert_awaited_once()
+        self.assertEqual(bot._save_telegram_signal.await_args.args[2], "executed")
 
 
 if __name__ == "__main__":

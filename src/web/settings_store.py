@@ -22,6 +22,10 @@ from src.utils.logging import logger
 SETTINGS_SCHEMA: list[dict] = [
     {"key": "trading_mode", "label": "Режим торговли", "group": "Общие", "type": "select", "options": ["paper", "real"],
      "description": "paper — виртуальная торговля без реальных денег (для проверки стратегии). real — реальные ордера на бирже."},
+    {"key": "active_trading_mode", "label": "Источник сигналов", "group": "Общие", "type": "select", "options": ["signals", "algo"],
+     "description": "signals — новые позиции открывают только Telegram-каналы. algo — только встроенные ML/Ensemble/BB-стратегии. "
+                     "Уже открытые позиции обоих источников продолжают отслеживаться (SL/TP) независимо от режима. "
+                     "Тот же переключатель есть в шапке дашборда."},
     {"key": "startup_capital_usdt", "label": "Стартовый капитал (USDT)", "group": "Общие", "type": "float",
      "description": "Виртуальный баланс paper-счёта при первом запуске или сбросе. На real-режим не влияет — там баланс берётся с биржи."},
     {"key": "log_level", "label": "Уровень логирования", "group": "Общие", "type": "select", "options": ["DEBUG", "INFO", "WARNING", "ERROR"],

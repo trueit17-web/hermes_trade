@@ -363,6 +363,24 @@
   .header-actions { display: flex; align-items: center; gap: 14px; }
   .btn-logout { background: transparent; border-color: var(--panel-border); color: var(--text-dim); padding: 7px 12px; }
 
+  .mode-toggle {
+    display: flex;
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .mode-toggle-btn {
+    border: none;
+    border-radius: 0;
+    background: var(--panel);
+    color: var(--text-dim);
+    padding: 7px 14px;
+    font-size: 13px;
+  }
+  .mode-toggle-btn + .mode-toggle-btn { border-left: 1px solid var(--panel-border); }
+  .mode-toggle-btn.active { background: var(--accent); color: #fff; }
+  .mode-toggle-btn:disabled { opacity: .6; cursor: default; }
+
   .settings-layout {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -587,6 +605,10 @@
     <button class="tab-btn" data-tab="logs">Логи</button>
   </nav>
   <div class="header-actions">
+    <div class="mode-toggle" id="tradingSourceToggle" title="Источник новых сигналов: Telegram-каналы или встроенные ML/Ensemble/BB-стратегии. Уже открытые позиции обоих источников отслеживаются всегда.">
+      <button type="button" class="mode-toggle-btn" data-mode="signals" id="btnModeSignals">📲 Сигналы</button>
+      <button type="button" class="mode-toggle-btn" data-mode="algo" id="btnModeAlgo">🤖 Алго</button>
+    </div>
     <span class="ws-indicator" title="WebSocket real-time соединение">
       <span id="wsStatusDot" class="conn-dot conn-not_connected"></span>
       <span id="wsStatusLabel" class="muted">офлайн</span>
@@ -909,6 +931,10 @@ function renderHeader(status) {
 
   document.getElementById("btnClearKill").disabled = !status.risk_state.kill_switch;
   document.getElementById("btnKillSwitch").disabled = status.risk_state.kill_switch;
+
+  const activeMode = status.active_trading_mode || "signals";
+  document.getElementById("btnModeSignals").classList.toggle("active", activeMode === "signals");
+  document.getElementById("btnModeAlgo").classList.toggle("active", activeMode === "algo");
 }
 
 function renderStats(status, trades) {
@@ -2385,6 +2411,26 @@ document.getElementById("btnClearKill").addEventListener("click", async () => {
   try {
     await api("/risk/clear-kill-switch", { method: "POST" });
     showToast("Kill switch сброшен");
+    await refreshAll();
+  } catch (err) {
+    showToast(`Ошибка: ${err.message}`, true);
+  }
+});
+
+document.getElementById("tradingSourceToggle").addEventListener("click", async (e) => {
+  const btn = e.target.closest(".mode-toggle-btn");
+  if (!btn || btn.classList.contains("active")) return;
+  const mode = btn.dataset.mode;
+  const modeLabel = mode === "signals" ? "Сигналы (Telegram-каналы)" : "Алго (встроенные стратегии)";
+  if (!confirm(
+    `Переключить источник новых сигналов на «${modeLabel}»?\n\n` +
+    "Уже открытые позиции (обоих источников) продолжат отслеживаться " +
+    "(SL/TP) как обычно — переключатель влияет только на то, откуда " +
+    "открываются НОВЫЕ позиции."
+  )) return;
+  try {
+    await api(`/trading-source-mode?mode=${encodeURIComponent(mode)}`, { method: "POST" });
+    showToast(`Источник сигналов переключён: ${modeLabel}`);
     await refreshAll();
   } catch (err) {
     showToast(`Ошибка: ${err.message}`, true);

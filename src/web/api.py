@@ -375,6 +375,7 @@ async def get_status():
 
     return {
         "trading_mode": settings.trading_mode,
+        "active_trading_mode": settings.active_trading_mode,
         "is_paper": settings.is_paper,
         "startup_capital": settings.startup_capital_usdt,
         "risk_state": risk_manager.get_state(),
@@ -1168,6 +1169,28 @@ async def set_trading_mode(mode: str):
         raise HTTPException(status_code=400, detail=result["errors"])
 
     logger.info(f"Режим торговли изменён на: {mode}")
+    return {"success": True, "mode": mode}
+
+
+@app.post("/trading-source-mode")
+async def set_trading_source_mode(mode: str):
+    """
+    Переключить источник новых торговых сигналов: signals (только
+    Telegram-каналы) или algo (только встроенные ML/Ensemble/BB-стратегии).
+    Уже открытые позиции обоих источников продолжают отслеживаться (SL/TP)
+    независимо от режима — переключатель гейтит только открытие НОВЫХ
+    позиций (см. TradingBot._process_symbol/_on_telegram_signal в main.py).
+    Тот же apply_settings_update, что и вкладка "Настройки" — применяется
+    немедленно и сохраняется на будущие перезапуски.
+    """
+    if mode not in ("signals", "algo"):
+        raise HTTPException(status_code=400, detail="Режим должен быть signals или algo")
+
+    result = await apply_settings_update({"active_trading_mode": mode})
+    if result["errors"]:
+        raise HTTPException(status_code=400, detail=result["errors"])
+
+    logger.info(f"Источник торговых сигналов изменён на: {mode}")
     return {"success": True, "mode": mode}
 
 

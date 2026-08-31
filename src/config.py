@@ -16,6 +16,16 @@ class Settings(BaseSettings):
     # Режим торговли: paper или real
     trading_mode: str = "paper"
 
+    # Источник новых сигналов: "signals" — только Telegram-каналы,
+    # "algo" — только встроенные ML/Ensemble/BB-стратегии. Переключается
+    # кнопкой в шапке дашборда (POST /trading-source-mode). Уже открытые
+    # позиции (любого источника) не затрагивает — SL/TP проверяются
+    # всегда, режим гейтит только открытие НОВЫХ позиций (см.
+    # TradingBot._process_symbol/_on_telegram_signal в main.py). По
+    # умолчанию "signals" — совмещение обоих источников в одном
+    # торговом контуре искажало статистику и риск друг друга.
+    active_trading_mode: str = "signals"
+
     # Стартовый капитал (USDT) — виртуальный для paper, реальный для real
     startup_capital_usdt: float = 10000.0
 
