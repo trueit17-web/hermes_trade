@@ -227,6 +227,10 @@ class TelegramChannel(Base):
     parser_config: Mapped[dict] = mapped_column(JSON, default={})
     quality_threshold: Mapped[float] = mapped_column(Float, default=0.5)
     auto_execute: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Базовый размер позиции (% от баланса) для сигналов этого канала —
+    # раньше был захардкожен 5.0 для ВСЕХ каналов одинаково (main.py:
+    # _execute_telegram_signal), хотя доверие к разным каналам обычно разное.
+    position_size_pct: Mapped[float] = mapped_column(Float, default=5.0)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(

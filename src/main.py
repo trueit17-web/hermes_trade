@@ -446,9 +446,10 @@ class TradingBot:
         await monitor_channels(channel_dicts)
         logger.info(f"👂 Мониторинг Telegram-каналов запущен: {len(channel_dicts)}")
 
-    async def _get_channel_settings(self, channel_id: str) -> tuple[float, bool]:
+    async def _get_channel_settings(self, channel_id: str) -> tuple[float, bool, float]:
         """
-        Порог качества и автоисполнение конкретного Telegram-канала.
+        Порог качества, автоисполнение и базовый размер позиции (%)
+        конкретного Telegram-канала.
 
         Раньше main.py вообще не читал TelegramChannel.quality_threshold/
         auto_execute — оба параметра брались из общих
@@ -456,6 +457,9 @@ class TradingBot:
         каналов сразу, поэтому индивидуальный порог/автоисполнение,
         выставленные при добавлении канала или через дашборд, не имели
         никакого эффекта (канал вёл себя как будто там всегда 0.5/False).
+        position_size_pct — той же природы: раньше в _execute_telegram_signal
+        был захардкожен единый размер 5.0% для всех каналов сразу, хотя
+        доверие к разным каналам обычно разное.
 
         Читаем из БД "вживую" на каждый сигнал, а не кэшируем при старте —
         иначе изменение через дашборд не действовало бы без перезапуска
@@ -470,10 +474,10 @@ class TradingBot:
                 async with get_session() as session:
                     channel = await session.get(TelegramChannel, db_id)
                     if channel is not None:
-                        return channel.quality_threshold, channel.auto_execute
+                        return channel.quality_threshold, channel.auto_execute, channel.position_size_pct
             except Exception as e:
                 logger.warning(f"Не удалось прочитать настройки канала {channel_id}: {e}")
-        return settings.telegram_signals_quality_threshold, settings.telegram_signals_auto_execute
+        return settings.telegram_signals_quality_threshold, settings.telegram_signals_auto_execute, 5.0
 
     async def _on_telegram_signal(self, signal_event: dict):
         """Обработка Telegram сигнала."""
@@ -509,7 +513,8 @@ class TradingBot:
             },
             channel_id,
         )
-        quality_threshold, auto_execute = await self._get_channel_settings(channel_id)
+        quality_threshold, auto_execute, position_size_pct = await self._get_channel_settings(channel_id)
+        signal_event["channel_position_size_pct"] = position_size_pct
         logger.info(
             f"📲 Telegram сигнал: {pair} {side.upper()} | quality={quality:.2f} (порог канала {quality_threshold:.2f})"
         )
@@ -631,7 +636,8 @@ class TradingBot:
         if mult <= 0:
             logger.info(f"🚫 Сигнал по {pair} отклонён: канал в минусе по мат. ожиданию (expectancy sizing)")
             return None
-        size_pct = 5.0 * mult
+        base_size_pct = signal_event.get("channel_position_size_pct", 5.0)
+        size_pct = base_size_pct * mult
         position_value = balance * (size_pct / 100)
         amount = position_value / entry
 

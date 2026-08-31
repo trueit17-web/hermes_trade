@@ -4642,7 +4642,7 @@ class TestChannelQualitySettings(unittest.IsolatedAsyncioTestCase):
         async with get_session() as session:
             channel = TelegramChannel(
                 channel_id="@channelsettings_unittest", channel_title="X",
-                quality_threshold=0.85, auto_execute=True, active=True,
+                quality_threshold=0.85, auto_execute=True, position_size_pct=7.5, active=True,
             )
             session.add(channel)
             await session.commit()
@@ -4651,9 +4651,10 @@ class TestChannelQualitySettings(unittest.IsolatedAsyncioTestCase):
         bot = main_module.TradingBot()
         bot._telegram_channel_db_ids = {"@channelsettings_unittest": db_id}
 
-        threshold, auto_execute = await bot._get_channel_settings("@channelsettings_unittest")
+        threshold, auto_execute, position_size_pct = await bot._get_channel_settings("@channelsettings_unittest")
         self.assertAlmostEqual(threshold, 0.85)
         self.assertTrue(auto_execute)
+        self.assertAlmostEqual(position_size_pct, 7.5)
 
     async def test_falls_back_to_global_settings_for_unknown_channel(self):
         try:
@@ -4664,9 +4665,10 @@ class TestChannelQualitySettings(unittest.IsolatedAsyncioTestCase):
         bot = main_module.TradingBot()
         bot._telegram_channel_db_ids = {}
 
-        threshold, auto_execute = await bot._get_channel_settings("@unknown_channel_unittest")
+        threshold, auto_execute, position_size_pct = await bot._get_channel_settings("@unknown_channel_unittest")
         self.assertEqual(threshold, settings.telegram_signals_quality_threshold)
         self.assertEqual(auto_execute, settings.telegram_signals_auto_execute)
+        self.assertEqual(position_size_pct, 5.0)
 
 
 class TestTelegramAutoExecuteIgnoresProtections(unittest.IsolatedAsyncioTestCase):
@@ -6386,7 +6388,7 @@ class TestTradingSourceModeGatesTelegramSignals(unittest.IsolatedAsyncioTestCase
         settings.active_trading_mode = "algo"
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0))
         bot._save_telegram_signal = AsyncMock()
 
         with patch.object(bot, "_execute_telegram_signal", new=AsyncMock()) as exec_mock:
@@ -6406,7 +6408,7 @@ class TestTradingSourceModeGatesTelegramSignals(unittest.IsolatedAsyncioTestCase
         settings.active_trading_mode = "signals"
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -6452,7 +6454,7 @@ class TestTelegramSignalQualityScoringUsesCorrectShape(unittest.IsolatedAsyncioT
 
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(1.1, False))  # порог недостижим — просто проверяем вызов
+        bot._get_channel_settings = AsyncMock(return_value=(1.1, False, 5.0))  # порог недостижим — просто проверяем вызов
         bot._save_telegram_signal = AsyncMock()
 
         with patch.object(signal_quality_scorer, "score_signal", return_value=0.9) as score_mock:
@@ -6483,7 +6485,7 @@ class TestTelegramSignalQualityScoringUsesCorrectShape(unittest.IsolatedAsyncioT
 
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(1.1, False))
+        bot._get_channel_settings = AsyncMock(return_value=(1.1, False, 5.0))
         bot._save_telegram_signal = AsyncMock()
         signal_quality_scorer.channel_stats.pop("@quality_shape_test", None)
 
@@ -6602,6 +6604,92 @@ class TestTelegramSignalDefaultStopLoss(unittest.IsolatedAsyncioTestCase):
 
         applied_sl = mock_engine.create_order.await_args.kwargs["stop_loss"]
         self.assertIsNone(applied_sl)
+
+
+class TestTelegramChannelPositionSizePct(unittest.IsolatedAsyncioTestCase):
+    """
+    Раньше _execute_telegram_signal() всегда считал размер позиции от
+    захардкоженных 5.0% для ЛЮБОГО канала (size_pct = 5.0 * mult) — доверие
+    к разным каналам обычно разное, но настроить это было негде.
+    TelegramChannel.position_size_pct (читается через _get_channel_settings
+    в _on_telegram_signal и пробрасывается в signal_event) теперь задаёт
+    базовый % персонально по каналу.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "real"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_execute_uses_channel_specific_position_size_pct(self):
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 52000.0,
+                "channel_id": "@test_channel", "channel_position_size_pct": 12.0,
+            })
+
+        amount = mock_engine.create_order.await_args.kwargs["amount"]
+        # balance=10000, 12% -> position_value=1200, entry=50000 -> amount=0.024
+        self.assertAlmostEqual(amount, 1200.0 / 50000.0)
+
+    async def test_execute_falls_back_to_5pct_when_not_provided(self):
+        """signal_event без channel_position_size_pct (например, старый код
+        пути или сбой чтения настроек канала) — прежнее поведение 5%."""
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 52000.0,
+                "channel_id": "@test_channel",
+            })
+
+        amount = mock_engine.create_order.await_args.kwargs["amount"]
+        self.assertAlmostEqual(amount, 500.0 / 50000.0)
+
+    async def test_on_telegram_signal_passes_channel_position_size_pct_through(self):
+        from src.db.models import TelegramChannel
+        from src.db.session import get_session
+
+        async with get_session() as session:
+            channel = TelegramChannel(
+                channel_id="@sizing_pipeline_test", channel_title="X",
+                quality_threshold=0.0, auto_execute=True, position_size_pct=9.0, active=True,
+            )
+            session.add(channel)
+            await session.commit()
+            db_id = channel.id
+
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {"@sizing_pipeline_test": db_id}
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        with patch.object(bot, "_execute_telegram_signal", new=AsyncMock(return_value=None)) as exec_mock:
+            await bot._on_telegram_signal({
+                "channel_id": "@sizing_pipeline_test",
+                "parsed_pair": "BTC/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 50000.0,
+                "raw_message": "test",
+            })
+
+        passed_event = exec_mock.await_args.args[0]
+        self.assertEqual(passed_event["channel_position_size_pct"], 9.0)
 
 
 if __name__ == "__main__":

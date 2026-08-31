@@ -199,6 +199,7 @@ class TelegramChannelCreate(BaseModel):
     parser_config: dict = Field(default_factory=dict)
     quality_threshold: float = 0.5
     auto_execute: bool = False
+    position_size_pct: float = 5.0
 
 
 class TelegramChannelUpdate(BaseModel):
@@ -206,6 +207,7 @@ class TelegramChannelUpdate(BaseModel):
     channel_title: str | None = None
     quality_threshold: float | None = None
     auto_execute: bool | None = None
+    position_size_pct: float | None = None
 
 
 class TelegramSignalConfirm(BaseModel):
@@ -1310,6 +1312,7 @@ async def list_telegram_channels():
                     "auto_execute": c.auto_execute,
                     "active": c.active,
                     "quality_threshold": c.quality_threshold,
+                    "position_size_pct": c.position_size_pct,
                     "signals_count": len(c.signals),
                     "created_at": c.created_at.isoformat() + "Z" if c.created_at else None,
                 }
@@ -1337,6 +1340,7 @@ async def create_telegram_channel(channel: TelegramChannelCreate):
             parser_config=channel.parser_config,
             quality_threshold=channel.quality_threshold,
             auto_execute=channel.auto_execute,
+            position_size_pct=channel.position_size_pct,
             active=True,
         )
         session.add(new_channel)
