@@ -579,6 +579,7 @@ class TradingBot:
                     parsed_entry=signal_event.get("parsed_entry"),
                     parsed_sl=signal_event.get("parsed_sl"),
                     parsed_tp=signal_event.get("parsed_tp"),
+                    parsed_take_profits=signal_event.get("parsed_take_profits") or None,
                     quality_score=quality,
                     decision=decision,
                     executed_order_id=order.id if order else None,

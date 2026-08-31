@@ -164,6 +164,12 @@
     font-size: 16px;
     padding: 2px 8px;
   }
+  .btn-icon {
+    background: transparent;
+    border: none;
+    font-size: 14px;
+    padding: 2px 4px;
+  }
 
   section {
     background: var(--panel);
@@ -1835,6 +1841,14 @@ async function toggleChannelSignals(row) {
   const cell = detailsRow.querySelector("td");
   if (cell.dataset.loaded) return;
 
+  await loadChannelSignals(id, cell);
+}
+
+// Общая логика загрузки истории сигналов канала — вынесена из
+// toggleChannelSignals(), чтобы её же можно было вызвать повторно после
+// ручного решения по pending-сигналу (обновить только эту таблицу, не
+// весь дашборд).
+async function loadChannelSignals(id, cell) {
   cell.innerHTML = `<div class="muted" style="padding:10px 16px">Загрузка…</div>`;
   try {
     const data = await api(`/telegram/signals?channel_id=${id}&limit=50`);
@@ -1842,9 +1856,36 @@ async function toggleChannelSignals(row) {
     cell.innerHTML = html;
     cell.dataset.loaded = "1";
     if (expandedChannels.has(id)) expandedChannels.set(id, html);
+    wireSignalDecisionButtons(cell, id);
   } catch (err) {
     cell.innerHTML = `<div class="muted" style="padding:10px 16px">Ошибка загрузки: ${err.message}</div>`;
   }
+}
+
+// "⏳ Ожидает подтверждения" раньше было тупиковым статусом: сигнал
+// сохранялся, но исполнить/отклонить его вручную было негде. Кнопки
+// рендерятся вместо статичного бейджа только для decision === "pending".
+function wireSignalDecisionButtons(cell, channelId) {
+  cell.querySelectorAll(".signal-decide-btn").forEach(btn => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const signalId = btn.dataset.signalId;
+      const action = btn.dataset.action;
+      if (action === "execute" && !confirm("Исполнить этот сигнал сейчас — открыть реальную позицию?")) return;
+      btn.disabled = true;
+      try {
+        await api(`/telegram/signals/${signalId}/decide`, {
+          method: "POST", body: JSON.stringify({ action }),
+        });
+        showToast(action === "execute" ? "Сигнал исполнен" : "Сигнал отклонён");
+        await loadChannelSignals(channelId, cell);
+        await renderTelegram();
+      } catch (err) {
+        showToast(`Ошибка: ${err.message}`, true);
+        btn.disabled = false;
+      }
+    });
+  });
 }
 
 // Восстановить визуально развёрнутое состояние строки канала после того,
@@ -1863,6 +1904,7 @@ function restoreExpandedChannel(row) {
     const cell = detailsRow.querySelector("td");
     cell.innerHTML = cachedHtml;
     cell.dataset.loaded = "1";
+    wireSignalDecisionButtons(cell, id);
   }
 }
 
@@ -1896,6 +1938,13 @@ function renderChannelSignalsTable(signals) {
             } else if (s.order) {
               outcome = "открыта";
             }
+            const tpDisplay = s.parsed_take_profits && s.parsed_take_profits.length > 1
+              ? s.parsed_take_profits.map(v => fmtPrice(v)).join(" → ")
+              : (s.parsed_tp !== null ? fmtPrice(s.parsed_tp) : "—");
+            const decisionCell = s.decision === "pending"
+              ? `<button type="button" class="btn-icon signal-decide-btn" data-signal-id="${s.id}" data-action="execute" title="Исполнить">✅</button>
+                 <button type="button" class="btn-icon signal-decide-btn" data-signal-id="${s.id}" data-action="reject" title="Отклонить">🚫</button>`
+              : signalDecisionBadge(s.decision);
             return `
             <tr>
               <td class="muted">${s.created_at ? new Date(s.created_at).toLocaleString("ru-RU") : "—"}</td>
@@ -1903,9 +1952,9 @@ function renderChannelSignalsTable(signals) {
               <td class="side-${s.parsed_side === 'long' ? 'long' : 'short'}">${(s.parsed_side || "—").toUpperCase()}</td>
               <td>${s.parsed_entry !== null ? fmtPrice(s.parsed_entry) : "—"}</td>
               <td>${s.parsed_sl !== null ? fmtPrice(s.parsed_sl) : "—"}</td>
-              <td>${s.parsed_tp !== null ? fmtPrice(s.parsed_tp) : "—"}</td>
+              <td>${tpDisplay}</td>
               <td>${s.quality_score !== null ? fmt(s.quality_score, 2) : "—"}</td>
-              <td>${signalDecisionBadge(s.decision)}</td>
+              <td>${decisionCell}</td>
               <td>${order}</td>
               <td>${outcome}</td>
             </tr>

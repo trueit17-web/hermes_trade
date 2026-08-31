@@ -6869,5 +6869,182 @@ class TestExecuteTelegramSignalStoresRealTakeProfits(unittest.IsolatedAsyncioTes
         self.assertEqual(bot.open_positions["BTC/USDT"]["take_profits"], [])
 
 
+class TestDecideTelegramSignal(unittest.IsolatedAsyncioTestCase):
+    """
+    POST /telegram/signals/{id}/decide — раньше "⏳ Ожидает подтверждения"
+    (decision="pending": канал не в автоисполнении, но сигнал прошёл порог
+    качества) было тупиковым статусом — TelegramSignalConfirm существовал
+    как Pydantic-модель, но ни один endpoint её не использовал, и исполнить
+    или отклонить такой сигнал вручную было негде.
+    """
+
+    def setUp(self):
+        import src.main as main_module
+        import src.web.api as api_module
+        self.main_module = main_module
+        self.api_module = api_module
+        self._saved_trading_mode = settings.trading_mode
+        self._saved_current_bot = main_module.current_bot
+        self._saved_engine = api_module.execution_engine
+        self._saved_main_engine = main_module.execution_engine
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+        self.main_module.current_bot = self._saved_current_bot
+        self.api_module.execution_engine = self._saved_engine
+        self.main_module.execution_engine = self._saved_main_engine
+
+    async def _install_engine_and_bot(self):
+        from src.execution.executor import ExecutionEngine
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "paper"
+        engine.is_paper = True
+        engine.exchange_id = "binance"
+        self.api_module.execution_engine = engine
+        # _execute_telegram_signal (main.py) обращается к своему СОБСТВЕННОМУ
+        # импортированному имени execution_engine, а не к api_module'ному —
+        # без этого ордер ушёл бы в исходный (не-paper, не наш) движок.
+        self.main_module.execution_engine = engine
+
+        bot = self.main_module.TradingBot()
+        bot.ingest = AsyncMock()
+        bot.ingest.fetch_ohlcv = AsyncMock(return_value=None)
+        self.main_module.current_bot = bot
+        return engine, bot
+
+    async def _make_pending_signal(self, **overrides) -> int:
+        import uuid
+
+        from src.db.models import TelegramChannel, TelegramSignal
+        from src.db.session import get_session
+        from src.utils.timeutils import utcnow
+
+        async with get_session() as session:
+            channel = TelegramChannel(
+                channel_id=f"@decide_test_channel_{uuid.uuid4().hex[:8]}", channel_title="X",
+                quality_threshold=0.0, auto_execute=False, position_size_pct=6.0, active=True,
+            )
+            session.add(channel)
+            await session.flush()
+            signal = TelegramSignal(
+                channel_id=channel.id,
+                raw_message="test message", message_date=utcnow(),
+                parsed_pair=overrides.get("parsed_pair", "BTC/USDT"),
+                parsed_side=overrides.get("parsed_side", "long"),
+                parsed_entry=overrides.get("parsed_entry", 50000.0),
+                parsed_sl=overrides.get("parsed_sl", 49000.0),
+                parsed_tp=overrides.get("parsed_tp", 52000.0),
+                parsed_take_profits=overrides.get("parsed_take_profits"),
+                quality_score=0.9,
+                decision=overrides.get("decision", "pending"),
+            )
+            session.add(signal)
+            await session.commit()
+            return signal.id
+
+    async def test_reject_marks_signal_rejected_without_executing(self):
+        from src.web.api import TelegramSignalDecision, decide_telegram_signal
+        from src.db.models import TelegramSignal
+        from src.db.session import get_session
+
+        await self._install_engine_and_bot()
+        signal_id = await self._make_pending_signal()
+
+        result = await decide_telegram_signal(signal_id, TelegramSignalDecision(action="reject"))
+
+        self.assertEqual(result, {"success": True, "decision": "rejected"})
+        async with get_session() as session:
+            signal = await session.get(TelegramSignal, signal_id)
+            self.assertEqual(signal.decision, "rejected")
+        self.assertNotIn("BTC/USDT", self.main_module.current_bot.open_positions)
+
+    async def test_execute_opens_position_with_real_take_profits(self):
+        from src.web.api import TelegramSignalDecision, decide_telegram_signal
+        from src.db.models import TelegramSignal
+        from src.db.session import get_session
+
+        engine, bot = await self._install_engine_and_bot()
+        signal_id = await self._make_pending_signal(
+            parsed_pair="EXEC1/USDT", parsed_tp=53000.0,
+            parsed_take_profits=[51000.0, 52000.0, 53000.0],
+        )
+
+        result = await decide_telegram_signal(signal_id, TelegramSignalDecision(action="execute"))
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["decision"], "executed")
+        self.assertIn("EXEC1/USDT", bot.open_positions)
+        self.assertEqual(
+            bot.open_positions["EXEC1/USDT"]["take_profits"], [51000.0, 52000.0, 53000.0],
+        )
+        # Размер позиции взят из TelegramChannel.position_size_pct (6.0),
+        # а не захардкоженных 5.0.
+        self.assertIn("EXEC1/USDT", engine.paper_positions)
+        async with get_session() as session:
+            signal = await session.get(TelegramSignal, signal_id)
+            self.assertEqual(signal.decision, "executed")
+            self.assertIsNotNone(signal.executed_order_id)
+
+    async def test_execute_rejects_when_position_already_open(self):
+        from fastapi import HTTPException
+
+        from src.web.api import TelegramSignalDecision, decide_telegram_signal
+
+        _, bot = await self._install_engine_and_bot()
+        bot.open_positions["BTC/USDT"] = {"side": "long", "amount": 1.0}
+        signal_id = await self._make_pending_signal(parsed_pair="BTC/USDT")
+
+        with self.assertRaises(HTTPException) as ctx:
+            await decide_telegram_signal(signal_id, TelegramSignalDecision(action="execute"))
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    async def test_execute_fails_when_bot_not_ready(self):
+        from fastapi import HTTPException
+
+        from src.web.api import TelegramSignalDecision, decide_telegram_signal
+
+        await self._install_engine_and_bot()
+        self.main_module.current_bot = None
+        signal_id = await self._make_pending_signal()
+
+        with self.assertRaises(HTTPException) as ctx:
+            await decide_telegram_signal(signal_id, TelegramSignalDecision(action="execute"))
+        self.assertEqual(ctx.exception.status_code, 503)
+
+    async def test_already_decided_signal_cannot_be_decided_again(self):
+        from fastapi import HTTPException
+
+        from src.web.api import TelegramSignalDecision, decide_telegram_signal
+
+        await self._install_engine_and_bot()
+        signal_id = await self._make_pending_signal(decision="executed")
+
+        with self.assertRaises(HTTPException) as ctx:
+            await decide_telegram_signal(signal_id, TelegramSignalDecision(action="reject"))
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    async def test_unknown_signal_id_returns_404(self):
+        from fastapi import HTTPException
+
+        from src.web.api import TelegramSignalDecision, decide_telegram_signal
+
+        await self._install_engine_and_bot()
+        with self.assertRaises(HTTPException) as ctx:
+            await decide_telegram_signal(999999999, TelegramSignalDecision(action="reject"))
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    async def test_invalid_action_returns_400(self):
+        from fastapi import HTTPException
+
+        from src.web.api import TelegramSignalDecision, decide_telegram_signal
+
+        await self._install_engine_and_bot()
+        signal_id = await self._make_pending_signal()
+        with self.assertRaises(HTTPException) as ctx:
+            await decide_telegram_signal(signal_id, TelegramSignalDecision(action="bogus"))
+        self.assertEqual(ctx.exception.status_code, 400)
+
+
 if __name__ == "__main__":
     unittest.main()

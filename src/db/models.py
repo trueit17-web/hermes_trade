@@ -259,6 +259,12 @@ class TelegramSignal(Base):
     parsed_entry: Mapped[float | None] = mapped_column(DECIMAL)
     parsed_sl: Mapped[float | None] = mapped_column(DECIMAL)
     parsed_tp: Mapped[float | None] = mapped_column(DECIMAL)
+    # Реальные цели канала (ближайшая первая), если их несколько — parsed_tp
+    # хранит только финальную (см. _tp_levels в main.py). Без этого ручное
+    # подтверждение pending-сигнала (POST /telegram/signals/{id}/decide)
+    # теряло бы многоуровневый TP — сообщение, из которого он был разобран,
+    # к моменту подтверждения уже недоступно.
+    parsed_take_profits: Mapped[list | None] = mapped_column(JSON, nullable=True)
     quality_score: Mapped[float | None] = mapped_column(Float)
     decision: Mapped[str] = mapped_column(
         String(30), default="pending"

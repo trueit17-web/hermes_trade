@@ -210,9 +210,8 @@ class TelegramChannelUpdate(BaseModel):
     position_size_pct: float | None = None
 
 
-class TelegramSignalConfirm(BaseModel):
-    """Подтверждение Telegram сигнала."""
-    signal_id: int
+class TelegramSignalDecision(BaseModel):
+    """Ручное решение по pending-сигналу (POST /telegram/signals/{id}/decide)."""
     action: str  # execute, reject
 
 
@@ -1485,6 +1484,7 @@ async def list_telegram_signals(channel_id: int | None = None, limit: int = 100)
                     "parsed_entry": float(s.parsed_entry) if s.parsed_entry else None,
                     "parsed_sl": float(s.parsed_sl) if s.parsed_sl else None,
                     "parsed_tp": float(s.parsed_tp) if s.parsed_tp else None,
+                    "parsed_take_profits": s.parsed_take_profits,
                     "quality_score": s.quality_score,
                     "decision": s.decision,
                     "order": _order_data(s.executed_order),
@@ -1495,6 +1495,88 @@ async def list_telegram_signals(channel_id: int | None = None, limit: int = 100)
             ],
             "total": len(signals),
         }
+
+
+@app.post("/telegram/signals/{signal_id}/decide")
+async def decide_telegram_signal(signal_id: int, decision: TelegramSignalDecision):
+    """
+    Ручное решение по сигналу, ожидающему подтверждения (decision="pending" —
+    канал не в автоисполнении, но сигнал прошёл порог качества). Раньше
+    "⏳ Ожидает подтверждения" в дашборде было тупиковым статусом: сигнал
+    сохранялся, но ни исполнить, ни отклонить его вручную было негде.
+
+    Намеренно НЕ проверяет settings.active_trading_mode ("сигналы"/"алго") —
+    это не автоматическое исполнение, а осознанное решение человека по
+    конкретному просмотренному сигналу, тот же уровень доверия, что и у
+    ручного ордера (POST /manual/order). Kill switch/пауза по-прежнему
+    останавливают исполнение — они проверяются внутри execution_engine.
+    create_order(), как и для любого другого пути.
+    """
+    if decision.action not in ("execute", "reject"):
+        raise HTTPException(status_code=400, detail="action должен быть execute или reject")
+
+    async with get_session() as session:
+        signal = (
+            await session.execute(
+                select(TelegramSignal)
+                .options(selectinload(TelegramSignal.channel))
+                .where(TelegramSignal.id == signal_id)
+            )
+        ).scalar_one_or_none()
+        if signal is None:
+            raise HTTPException(status_code=404, detail="Сигнал не найден")
+        if signal.decision != "pending":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Сигнал уже обработан (decision={signal.decision}) — повторное решение невозможно",
+            )
+
+        if decision.action == "reject":
+            signal.decision = "rejected"
+            await session.commit()
+            logger.info(f"Telegram-сигнал #{signal_id} отклонён вручную")
+            return {"success": True, "decision": "rejected"}
+
+        # Копируем нужные поля в обычные переменные ДО закрытия сессии —
+        # _execute_telegram_signal() ниже сам открывает свои сессии
+        # (через execution_engine.create_order), а signal/signal.channel
+        # (ORM-объекты) после закрытия внешней сессии стали бы недоступны
+        # (DetachedInstanceError) при попытке прочитать их атрибуты позже.
+        signal_event = {
+            "channel_id": signal.channel.channel_id if signal.channel else "",
+            "parsed_pair": signal.parsed_pair,
+            "parsed_side": signal.parsed_side,
+            "parsed_entry": float(signal.parsed_entry) if signal.parsed_entry else 0,
+            "parsed_sl": float(signal.parsed_sl) if signal.parsed_sl else None,
+            "parsed_tp": float(signal.parsed_tp) if signal.parsed_tp else None,
+            "parsed_take_profits": signal.parsed_take_profits or [],
+            "channel_position_size_pct": signal.channel.position_size_pct if signal.channel else 5.0,
+        }
+        pair = signal.parsed_pair
+
+    import src.main as main_module
+    bot = main_module.current_bot
+    if bot is None:
+        raise HTTPException(status_code=503, detail="Бот ещё не готов (current_bot=None)")
+    if pair in bot.open_positions:
+        # Та же защита, что и в _on_telegram_signal для автоисполнения —
+        # доливка/закрытие существующей позиции чужим сигналом небезопасны.
+        raise HTTPException(status_code=400, detail=f"По {pair} уже есть открытая позиция")
+
+    order = await bot._execute_telegram_signal(signal_event)
+
+    async with get_session() as session:
+        signal = await session.get(TelegramSignal, signal_id)
+        signal.decision = "executed" if order else "rejected"
+        if order:
+            signal.executed_order_id = order.id
+        await session.commit()
+
+    if not order:
+        raise HTTPException(status_code=502, detail="Не удалось исполнить ордер — см. логи")
+
+    logger.info(f"Telegram-сигнал #{signal_id} исполнен вручную: {order.client_order_id}")
+    return {"success": True, "decision": "executed", "order_id": order.id}
 
 
 @app.get("/performance")
