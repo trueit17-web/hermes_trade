@@ -593,6 +593,23 @@ class TradingBot:
         symbol = pair
         order_side = "buy" if side == "long" else "sell"
 
+        if sl is None and settings.telegram_signals_default_sl_pct > 0:
+            # Канал не указал SL — без него позиция открылась бы вообще без
+            # биржевого защитного ордера (sync_stop_loss_order пропускает
+            # выставление SL на бирже, если stop_loss falsy) и защищалась бы
+            # только опросом бота раз в цикл (~60-90с): при падении/рестарте
+            # процесса такая позиция осталась бы полностью незащищённой на
+            # неопределённое время. TelegramSignal.parsed_sl в БД (см.
+            # _save_telegram_signal ниже) намеренно остаётся None — это
+            # честная запись того, что канал реально написал; fallback
+            # применяется только к фактически исполняемому ордеру.
+            pct = settings.telegram_signals_default_sl_pct / 100
+            sl = entry * (1 - pct) if side == "long" else entry * (1 + pct)
+            logger.info(
+                f"⚠️ Сигнал по {pair} без SL — применён дефолтный защитный SL "
+                f"{settings.telegram_signals_default_sl_pct:.1f}% ({sl:.6f})"
+            )
+
         if not settings.is_paper and side == "short":
             # Тот же случай, что и для стратегийных сигналов (см.
             # _trading_iteration): на споте в реальном режиме шорт

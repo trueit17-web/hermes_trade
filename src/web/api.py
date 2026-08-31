@@ -1153,25 +1153,6 @@ async def update_config(key: str, value: Any):
     return {"success": True, "key": key, "value": value}
 
 
-@app.post("/trading-mode")
-async def set_trading_mode(mode: str):
-    """Установить режим торговли (paper/real)."""
-    if mode not in ["paper", "real"]:
-        raise HTTPException(status_code=400, detail="Режим должен быть paper или real")
-
-    # Раньше это применялось только к живому settings.trading_mode и никогда
-    # не сохранялось в BotConfig — после рестарта бот тихо возвращался в
-    # режим из .env. apply_settings_update — тот же путь, что и вкладка
-    # "Настройки", уже применяет live-эффект (переинициализацию execution
-    # engine) и сохраняет для будущих рестартов.
-    result = await apply_settings_update({"trading_mode": mode})
-    if result["errors"]:
-        raise HTTPException(status_code=400, detail=result["errors"])
-
-    logger.info(f"Режим торговли изменён на: {mode}")
-    return {"success": True, "mode": mode}
-
-
 @app.post("/trading-source-mode")
 async def set_trading_source_mode(mode: str):
     """

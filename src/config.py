@@ -148,6 +148,11 @@ class Settings(BaseSettings):
     # === Telegram сигналы ===
     telegram_signals_auto_execute: bool = False
     telegram_signals_quality_threshold: float = 0.5
+    # Дефолтный защитный SL (% от entry), если канал сам не указал уровень —
+    # без него позиция открывалась бы вообще без биржевого стоп-ордера (см.
+    # TradingBot._execute_telegram_signal в main.py). 0 — не подставлять
+    # (открывать как раньше, полностью без SL).
+    telegram_signals_default_sl_pct: float = 3.0
     # LLM-фолбэк парсинга: когда регулярки не смогли распознать сообщение,
     # пробуем через Anthropic API (перенос из clonerbot: parser/llm_parser.py),
     # а если он не настроен/не смог — через Gemini API (второй уровень,

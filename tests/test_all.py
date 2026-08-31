@@ -6513,5 +6513,96 @@ class TestTelegramSignalQualityScoringUsesCorrectShape(unittest.IsolatedAsyncioT
         self.assertGreater(with_sl_tp, without_sl_tp)
 
 
+class TestTelegramSignalDefaultStopLoss(unittest.IsolatedAsyncioTestCase):
+    """
+    Раньше сигнал канала без явного SL открывал реальную позицию вообще
+    без биржевого защитного ордера — sync_stop_loss_order() (executor.py)
+    пропускает выставление SL на бирже, если stop_loss falsy, и позиция
+    защищалась только опросом бота раз в торговый цикл (~60-90с): при
+    падении/рестарте процесса она оставалась полностью незащищённой на
+    неопределённое время. telegram_signals_default_sl_pct подставляет
+    защитный SL от entry_price, когда канал сам его не указал.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved = {
+            "trading_mode": settings.trading_mode,
+            "telegram_signals_default_sl_pct": settings.telegram_signals_default_sl_pct,
+        }
+        settings.trading_mode = "real"
+        settings.telegram_signals_default_sl_pct = 3.0
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            setattr(settings, key, value)
+
+    async def test_missing_sl_gets_default_fallback_for_long(self):
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": None, "parsed_tp": 52000.0,
+                "channel_id": "@test_channel",
+            })
+
+        applied_sl = mock_engine.create_order.await_args.kwargs["stop_loss"]
+        self.assertAlmostEqual(applied_sl, 50000.0 * 0.97)
+
+    async def test_missing_sl_gets_default_fallback_for_short_paper(self):
+        """paper-режим тоже поддерживает short — направление fallback-SL
+        должно быть зеркальным (выше входа, а не ниже)."""
+        bot = self._make_bot()
+        settings.trading_mode = "paper"
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_paper_balance = MagicMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "short",
+                "parsed_entry": 50000.0, "parsed_sl": None, "parsed_tp": 48000.0,
+                "channel_id": "@test_channel",
+            })
+
+        applied_sl = mock_engine.create_order.await_args.kwargs["stop_loss"]
+        self.assertAlmostEqual(applied_sl, 50000.0 * 1.03)
+
+    async def test_explicit_sl_from_channel_is_not_overridden(self):
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49500.0, "parsed_tp": 52000.0,
+                "channel_id": "@test_channel",
+            })
+
+        applied_sl = mock_engine.create_order.await_args.kwargs["stop_loss"]
+        self.assertEqual(applied_sl, 49500.0)
+
+    async def test_zero_default_pct_disables_fallback(self):
+        settings.telegram_signals_default_sl_pct = 0.0
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": None, "parsed_tp": 52000.0,
+                "channel_id": "@test_channel",
+            })
+
+        applied_sl = mock_engine.create_order.await_args.kwargs["stop_loss"]
+        self.assertIsNone(applied_sl)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -148,18 +148,6 @@ class SignalQualityScorer:
 
         return round(score, 3)
 
-    def get_threshold(self, channel_id: str) -> float:
-        """Получить порог качества для канала."""
-        config = self.channel_stats.get(channel_id, {})
-        return config.get("quality_threshold", 0.5)
-
-    def set_threshold(self, channel_id: str, threshold: float):
-        """Установить порог качества для канала."""
-        if channel_id not in self.channel_stats:
-            self.channel_stats[channel_id] = {}
-        self.channel_stats[channel_id]["quality_threshold"] = threshold
-        logger.info(f"Порог качества канала {channel_id} установлен: {threshold:.2f}")
-
 
 # Глобальный экземпляр
 signal_quality_scorer = SignalQualityScorer()
