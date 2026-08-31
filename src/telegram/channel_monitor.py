@@ -125,6 +125,13 @@ async def monitor_channels(channels: list[dict]):
                 "parsed_tp": parsed.get("tp"),
                 "parsed_rationale": parsed.get("rationale", ""),
                 "parsed_raw": parsed.get("raw", ""),
+                # Регэксп-парсер (parse_with_regex) не оценивает уверенность —
+                # для точного совпадения по ключевым словам это не 0.5
+                # "нейтрально", а полная определённость: 1.0. LLM-фолбэки
+                # (parse_with_llm/parse_with_gemini) кладут в parsed["confidence"]
+                # свою реальную оценку (0.5..1.0, порог отсечения уже применён
+                # внутри них) — пробрасываем её как есть.
+                "parsed_confidence": parsed.get("confidence", 1.0),
             }
             logger.info(
                 f"[TG SIGNAL] {signal_event['parsed_pair']} {signal_event['parsed_side'].upper()} | "

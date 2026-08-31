@@ -481,14 +481,34 @@ class TradingBot:
         pair = signal_event.get("parsed_pair", "")
         side = signal_event.get("parsed_side", "")
         entry = signal_event.get("parsed_entry", 0)
-        signal_event.get("parsed_sl")
-        signal_event.get("parsed_tp")
+        sl = signal_event.get("parsed_sl")
+        tp = signal_event.get("parsed_tp")
 
         if not pair or not side or entry <= 0:
             return
 
         from src.telegram.quality_scorer import signal_quality_scorer
-        quality = signal_quality_scorer.score_signal(signal_event, channel_id)
+        # score_signal() ожидает "нормальную" форму сигнала (side/entry/sl/
+        # tp/confidence — тот же формат, что возвращают parse_with_regex/
+        # parse_with_llm/parse_with_gemini), а не signal_event с его
+        # префиксом parsed_*. Раньше сюда передавался signal_event
+        # напрямую — signal.get("side")/("sl")/("tp")/("confidence") внутри
+        # score_signal ни разу не находили эти ключи (там parsed_side,
+        # parsed_sl, ...) и молча брали дефолты (side="", sl/tp/entry=0,
+        # confidence=0.5) — фактически ВСЕ компоненты оценки качества,
+        # кроме исторического win_rate канала (35% веса), были мертвы:
+        # штраф "нет SL" (-0.15) применялся всегда, бонус за RR и рыночный
+        # контекст не срабатывал никогда, уверенность LLM-парсера
+        # игнорировалась. Итоговый quality был у любого сигнала практически
+        # одинаковым (около win_rate*0.35 + 0.025) независимо от того, что
+        # реально было в сообщении канала.
+        quality = signal_quality_scorer.score_signal(
+            {
+                "side": side, "entry": entry, "sl": sl, "tp": tp,
+                "confidence": signal_event.get("parsed_confidence", 1.0),
+            },
+            channel_id,
+        )
         quality_threshold, auto_execute = await self._get_channel_settings(channel_id)
         logger.info(
             f"📲 Telegram сигнал: {pair} {side.upper()} | quality={quality:.2f} (порог канала {quality_threshold:.2f})"

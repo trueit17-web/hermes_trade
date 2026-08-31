@@ -134,5 +134,6 @@ async def parse_with_gemini(text: str, channel_config: dict | None = None) -> di
         "entry": float(entry),
         "sl": float(sl) if sl is not None else None,
         "tp": float(tp) if tp is not None else None,
+        "confidence": float(data.get("confidence", _MIN_CONFIDENCE)),
         "raw": text,
     }

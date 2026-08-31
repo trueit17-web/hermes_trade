@@ -122,9 +122,15 @@ class SignalQualityScorer:
             score -= 0.15  # нет SL — рискованно
 
         # 5. Справедливый RR (risk/reward) — до 10%
-        entry = signal.get("entry", 0)
-        sl = signal.get("sl", 0)
-        tp = signal.get("tp", 0)
+        # "or 0" — не просто fallback на отсутствующий ключ: signal.get(...)
+        # с явным ключом, чьё значение None (SL/TP не распознаны в
+        # сообщении канала), возвращает именно None, а не default 0 —
+        # .get(key, default) подставляет default только когда ключа нет
+        # вообще. Без "or 0" сравнение "None > 0" ниже падало бы с
+        # TypeError на любом сигнале без SL/TP.
+        entry = signal.get("entry", 0) or 0
+        sl = signal.get("sl", 0) or 0
+        tp = signal.get("tp", 0) or 0
         if entry > 0 and sl > 0 and tp > 0:
             risk = abs(entry - sl)
             reward = abs(tp - entry)

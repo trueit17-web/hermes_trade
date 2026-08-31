@@ -2870,6 +2870,20 @@ class TestQualificationScorer(unittest.TestCase):
         score = self.scorer.score_signal(signal, "bad_channel")
         self.assertLess(score, 0.5)
 
+    def test_score_signal_with_explicit_none_sl_tp_does_not_raise(self):
+        """
+        Регресс: signal.get("sl", 0)/("tp", 0) с ключом, ЯВНО присутствующим
+        со значением None (а не отсутствующим), возвращают None — .get()
+        подставляет default только при отсутствующем ключе — и "None > 0"
+        в RR-блоке падал с TypeError. Именно такую форму (ключи sl/tp
+        присутствуют и равны None, если канал не указал уровни) шлёт
+        _on_telegram_signal в main.py.
+        """
+        signal = {"pair": "BTC/USDT", "side": "long", "entry": 50000.0,
+                  "sl": None, "tp": None, "confidence": 0.9}
+        score = self.scorer.score_signal(signal, "no_sl_tp_channel")
+        self.assertIsInstance(score, float)
+
 
 class TestQualityScorerRestoreFromDb(unittest.IsolatedAsyncioTestCase):
     """
@@ -6408,6 +6422,95 @@ class TestTradingSourceModeGatesTelegramSignals(unittest.IsolatedAsyncioTestCase
 
         exec_mock.assert_awaited_once()
         self.assertEqual(bot._save_telegram_signal.await_args.args[2], "executed")
+
+
+class TestTelegramSignalQualityScoringUsesCorrectShape(unittest.IsolatedAsyncioTestCase):
+    """
+    Регресс: _on_telegram_signal() передавал в signal_quality_scorer.
+    score_signal() сырой signal_event (ключи с префиксом parsed_* —
+    parsed_side/parsed_entry/parsed_sl/parsed_tp), а score_signal() читает
+    side/entry/sl/tp/confidence (без префикса — формат, который
+    возвращают parse_with_regex/parse_with_llm/parse_with_gemini). Из-за
+    несовпадения имён ключей signal.get("sl")/("tp") всегда возвращали
+    None, signal.get("side") — всегда "", а signal.get("confidence") —
+    всегда дефолтные 0.5: штраф "нет SL" (-0.15) применялся к КАЖДОМУ
+    сигналу независимо от реального SL/TP в сообщении канала, бонус за
+    risk/reward не срабатывал никогда, а уверенность LLM-парсера
+    игнорировалась — итоговый quality был у любого сигнала практически
+    одинаковым, независимо от его реального содержания.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    async def test_score_signal_receives_normalized_shape_not_raw_event(self):
+        from src.telegram.quality_scorer import signal_quality_scorer
+
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(1.1, False))  # порог недостижим — просто проверяем вызов
+        bot._save_telegram_signal = AsyncMock()
+
+        with patch.object(signal_quality_scorer, "score_signal", return_value=0.9) as score_mock:
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "BTC/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 50000.0,
+                "parsed_sl": 49000.0,
+                "parsed_tp": 52000.0,
+                "parsed_confidence": 0.87,
+                "raw_message": "test",
+            })
+
+        score_mock.assert_called_once()
+        passed_signal = score_mock.call_args.args[0]
+        self.assertEqual(passed_signal["side"], "long")
+        self.assertEqual(passed_signal["entry"], 50000.0)
+        self.assertEqual(passed_signal["sl"], 49000.0)
+        self.assertEqual(passed_signal["tp"], 52000.0)
+        self.assertEqual(passed_signal["confidence"], 0.87)
+
+    async def test_signal_with_sl_tp_scores_meaningfully_higher_than_without(self):
+        """Интеграционная проверка через реальный (не замоканный) score_signal:
+        наличие SL/TP и хороший RR должны реально поднимать quality, а не
+        давать одинаковый результат независимо от содержания сигнала."""
+        from src.telegram.quality_scorer import signal_quality_scorer
+
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(1.1, False))
+        bot._save_telegram_signal = AsyncMock()
+        signal_quality_scorer.channel_stats.pop("@quality_shape_test", None)
+
+        await bot._on_telegram_signal({
+            "channel_id": "@quality_shape_test",
+            "parsed_pair": "BTC/USDT",
+            "parsed_side": "long",
+            "parsed_entry": 50000.0,
+            "parsed_sl": 49000.0,
+            "parsed_tp": 52000.0,  # RR = 2.0 -> максимальный бонус
+            "parsed_confidence": 1.0,
+            "raw_message": "test",
+        })
+        with_sl_tp = bot._save_telegram_signal.await_args.args[1]
+
+        bot._save_telegram_signal.reset_mock()
+        await bot._on_telegram_signal({
+            "channel_id": "@quality_shape_test",
+            "parsed_pair": "BTC/USDT",
+            "parsed_side": "long",
+            "parsed_entry": 50000.0,
+            "parsed_confidence": 1.0,
+            "raw_message": "test",
+        })
+        without_sl_tp = bot._save_telegram_signal.await_args.args[1]
+
+        self.assertGreater(with_sl_tp, without_sl_tp)
 
 
 if __name__ == "__main__":
