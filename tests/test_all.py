@@ -2081,6 +2081,39 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
         self.assertNotIn("RISKCOUNT1/USDT", global_risk_manager.state.open_positions)
 
+    async def test_reconcile_phantom_position_cancels_orphaned_sl_order(self):
+        """
+        _reconcile_phantom_position() снимала позицию с учёта, не отменяя
+        выставленный по ней биржевой SL-ордер (см. sync_stop_loss_order) —
+        он навсегда оставался висеть на бирже (мы больше никогда не
+        вернёмся к этому symbol), продолжая держать часть актива в
+        "used"-балансе. Живой симптом: список балансов дашборда (GET
+        /balances) показывал БОЛЬШЕ валют с ненулевым "в ордерах", чем
+        реально открытых позиций — расхождение от осиротевших SL-ордеров,
+        накопленных за время работы бота при каждом списании непродаваемой
+        (пыль/ниже минимума биржи) позиции.
+        """
+        self.engine.exchange = AsyncMock()
+        self.engine.real_positions["PHANTOMSL/USDT"] = {
+            "amount": 10.0, "entry_price": 1.0, "side": "long", "sl_order_id": "sl-order-42",
+        }
+
+        await self.engine._reconcile_phantom_position("PHANTOMSL/USDT", None)
+
+        self.engine.exchange.cancel_order.assert_awaited_once_with("sl-order-42", "PHANTOMSL/USDT")
+        self.assertNotIn("PHANTOMSL/USDT", self.engine.real_positions)
+
+    async def test_reconcile_phantom_position_without_sl_order_does_not_call_cancel(self):
+        """Позиция без выставленного SL-ордера (sl_order_id=None) — отменять нечего."""
+        self.engine.exchange = AsyncMock()
+        self.engine.real_positions["NOSL/USDT"] = {
+            "amount": 10.0, "entry_price": 1.0, "side": "long", "sl_order_id": None,
+        }
+
+        await self.engine._reconcile_phantom_position("NOSL/USDT", None)
+
+        self.engine.exchange.cancel_order.assert_not_called()
+
     async def test_close_real_position_uses_actual_fill_price(self):
         """
         close_real_position должен считать PnL по фактической цене исполнения
