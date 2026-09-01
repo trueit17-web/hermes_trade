@@ -391,6 +391,21 @@ async def get_status():
     }
 
 
+@app.get("/balances")
+async def get_balances():
+    """
+    Все ненулевые балансы аккаунта на активной бирже (не только котируемая
+    валюта, которую показывает карточка "Баланс" на /status) — чтобы видеть
+    реально удерживаемые активы, включая пыль, оставшуюся после списания
+    непродаваемых позиций (см. _reconcile_phantom_position в executor.py).
+    В paper-режиме реальных биржевых балансов нет — возвращаем пустой список.
+    """
+    if settings.is_paper:
+        return {"balances": [], "trading_mode": settings.trading_mode}
+    balances = await execution_engine.get_all_balances()
+    return {"balances": balances or [], "trading_mode": settings.trading_mode}
+
+
 @app.post("/paper/reset")
 async def reset_paper_account():
     """

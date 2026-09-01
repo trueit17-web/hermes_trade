@@ -5437,6 +5437,100 @@ class TestExtractUsdtBalance(unittest.TestCase):
         self.assertEqual(ExecutionEngine._extract_usdt_balance({}), 0.0)
 
 
+class TestGetAllBalances(unittest.IsolatedAsyncioTestCase):
+    """
+    get_all_balances() — все ненулевые балансы аккаунта на бирже (не
+    только USDT, как get_real_balance()), для отображения на дашборде
+    (см. запрос "можно в дашборде отображать все актуальные балансы
+    аккаунта на бирже, не только в базовой монете").
+    """
+
+    async def test_returns_only_nonzero_currencies_sorted(self):
+        engine = ExecutionEngine()
+        engine.exchange = MagicMock()
+        engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 100.0, "BTC": 0.001, "ETH": 0.0},
+            "used": {"USDT": 5.0, "BTC": 0.0},
+            "total": {"USDT": 105.0, "BTC": 0.001, "ETH": 0.0},
+        })
+        result = await engine.get_all_balances()
+        self.assertEqual([b["currency"] for b in result], ["BTC", "USDT"])
+        usdt = next(b for b in result if b["currency"] == "USDT")
+        self.assertEqual(usdt, {"currency": "USDT", "free": 100.0, "used": 5.0, "total": 105.0})
+
+    async def test_falls_back_to_nested_currency_dict(self):
+        engine = ExecutionEngine()
+        engine.exchange = MagicMock()
+        engine.exchange.fetch_balance = AsyncMock(return_value={
+            "USDT": {"free": 50.0, "used": 0.0, "total": 50.0},
+        })
+        result = await engine.get_all_balances()
+        self.assertEqual(result, [{"currency": "USDT", "free": 50.0, "used": 0.0, "total": 50.0}])
+
+    async def test_no_exchange_returns_none(self):
+        engine = ExecutionEngine()
+        engine.exchange = None
+        self.assertIsNone(await engine.get_all_balances())
+
+    async def test_fetch_error_returns_none(self):
+        engine = ExecutionEngine()
+        engine.exchange = MagicMock()
+        engine.exchange.fetch_balance = AsyncMock(side_effect=RuntimeError("boom"))
+        self.assertIsNone(await engine.get_all_balances())
+
+
+class TestBalancesEndpoint(unittest.IsolatedAsyncioTestCase):
+    """GET /balances — список всех ненулевых балансов аккаунта для дашборда."""
+
+    def setUp(self):
+        self._saved_mode = settings.trading_mode
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_mode
+
+    async def test_paper_mode_returns_empty_list(self):
+        from src.web.api import get_balances
+
+        settings.trading_mode = "paper"
+        result = await get_balances()
+        self.assertEqual(result, {"balances": [], "trading_mode": "paper"})
+
+    async def test_real_mode_returns_engine_balances(self):
+        import src.web.api as api_module
+        from src.web.api import get_balances
+
+        settings.trading_mode = "real"
+        saved_engine = api_module.execution_engine
+        mock_engine = MagicMock()
+        mock_engine.get_all_balances = AsyncMock(return_value=[
+            {"currency": "USDT", "free": 100.0, "used": 0.0, "total": 100.0},
+        ])
+        api_module.execution_engine = mock_engine
+        try:
+            result = await get_balances()
+        finally:
+            api_module.execution_engine = saved_engine
+
+        self.assertEqual(result["trading_mode"], "real")
+        self.assertEqual(result["balances"], [{"currency": "USDT", "free": 100.0, "used": 0.0, "total": 100.0}])
+
+    async def test_real_mode_none_from_engine_becomes_empty_list(self):
+        import src.web.api as api_module
+        from src.web.api import get_balances
+
+        settings.trading_mode = "real"
+        saved_engine = api_module.execution_engine
+        mock_engine = MagicMock()
+        mock_engine.get_all_balances = AsyncMock(return_value=None)
+        api_module.execution_engine = mock_engine
+        try:
+            result = await get_balances()
+        finally:
+            api_module.execution_engine = saved_engine
+
+        self.assertEqual(result, {"balances": [], "trading_mode": "real"})
+
+
 class TestRealBalanceReseedsRiskState(unittest.IsolatedAsyncioTestCase):
     """
     RiskState.start_balance был захардкожен на settings.startup_capital_usdt

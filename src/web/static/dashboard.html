@@ -648,6 +648,16 @@
     </div>
   </section>
 
+  <section id="balancesSection" style="display:none;">
+    <h2>💰 Балансы на бирже</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Валюта</th><th>Свободно</th><th>В ордерах</th><th>Всего</th></tr></thead>
+        <tbody id="balancesBody"></tbody>
+      </table>
+    </div>
+  </section>
+
   <section>
     <h2>Открытые позиции</h2>
     <div class="table-wrap">
@@ -1935,6 +1945,13 @@ function renderChannelSignalsTable(signals) {
               outcome = s.trade.is_open
                 ? "открыта"
                 : `<span class="${cls}">${s.trade.pnl >= 0 ? "+" : ""}${fmt(s.trade.pnl)} (${fmt(s.trade.pnl_pct, 2)}%)</span>`;
+            } else if (s.order && s.order.status === "rejected") {
+              // order.status становится "rejected" ЗАДНИМ ЧИСЛОМ, когда бот не
+              // смог продать позицию на бирже (пыль/ниже минимального объёма) и
+              // снял её с учёта, не создавая Trade (см. _reconcile_phantom_position
+              // в executor.py) — такая позиция уже не открыта и не будет закрыта
+              // обычным путём, писать "открыта" тут вводит в заблуждение.
+              outcome = `<span class="muted">снята с учёта (не продать на бирже)</span>`;
             } else if (s.order) {
               outcome = "открыта";
             }
@@ -2447,6 +2464,26 @@ async function renderProtections() {
   }
 }
 
+async function renderBalances() {
+  const section = document.getElementById("balancesSection");
+  const body = document.getElementById("balancesBody");
+  try {
+    const data = await api("/balances");
+    const balances = data.balances || [];
+    section.style.display = balances.length ? "" : "none";
+    body.innerHTML = balances.map(b => `
+      <tr>
+        <td>${escapeHtml(b.currency)}</td>
+        <td>${fmt(b.free, 8)}</td>
+        <td>${fmt(b.used, 8)}</td>
+        <td>${fmt(b.total, 8)}</td>
+      </tr>
+    `).join("");
+  } catch (err) {
+    section.style.display = "none";
+  }
+}
+
 async function refreshAll() {
   try {
     const status = await api("/status");
@@ -2460,6 +2497,7 @@ async function refreshAll() {
     await renderMlModels();
     await renderTelegram();
     await renderProtections();
+    await renderBalances();
     if (currentTab === "manual") await renderManualTrades();
     document.getElementById("lastUpdated").textContent =
       "Обновлено: " + new Date().toLocaleTimeString("ru-RU");

@@ -2208,23 +2208,64 @@ class ExecutionEngine:
         return ExecutionEngine._extract_currency_balance(balance, "USDT")
 
     @staticmethod
-    def _extract_currency_balance(balance: dict, currency: str) -> float:
+    def _extract_currency_balance(balance: dict, currency: str, field: str = "free") -> float:
         """
         ccxt fetch_balance() кладёт баланс валюты в ВЛОЖЕННЫЙ словарь:
-        balance['free'][currency] (плоское число) и/или balance[currency] =
+        balance[field][currency] (плоское число) и/или balance[currency] =
         {'free':, 'used':, 'total':} (сам по себе словарь, а НЕ число).
         Старый код фильтровал `isinstance(v, (int, float))` по
         balance.items() верхнего уровня — balance[currency] там всегда
         словарь, значит проверка никогда не проходила, и баланс всегда
         читался как 0 независимо от биржи и реального остатка на счёте.
+
+        field — "free" (по умолчанию, как и раньше), "used" или "total" —
+        тот же вложенный формат под любым из этих трёх ключей.
         """
-        free = balance.get("free") or {}
-        value = free.get(currency)
+        top = balance.get(field) or {}
+        value = top.get(currency)
         if value is None:
             entry = balance.get(currency)
             if isinstance(entry, dict):
-                value = entry.get("free")
+                value = entry.get(field)
         return float(value or 0.0)
+
+    async def get_all_balances(self) -> list[dict] | None:
+        """
+        Все ненулевые балансы аккаунта на бирже — все валюты, а не только
+        котируемая (USDT), которую показывает get_real_balance(). Нужно для
+        дашборда: бот может держать актив по любой открытой позиции (и
+        пыль, оставшуюся после _reconcile_phantom_position), а пользователь
+        иначе видел только один агрегированный USDT-баланс и не мог свериться
+        с тем, что реально лежит на счету биржи.
+        """
+        if not self.exchange:
+            return None
+        try:
+            balance = await self.exchange.fetch_balance()
+        except Exception as e:
+            logger.error(f"Ошибка получения балансов: {e}")
+            return None
+        # Валюты берём и из плоских словарей free/used/total, и из формата,
+        # где balance[currency] сам по себе словарь {'free':,'used':,'total':}
+        # (см. _extract_currency_balance) — иначе биржи/сборки ccxt, которые
+        # отдают ТОЛЬКО второй формат (без верхнеуровневых free/used/total),
+        # всегда возвращали бы пустой список балансов.
+        reserved_keys = {"info", "timestamp", "datetime", "free", "used", "total"}
+        currencies = set(balance.get("free") or {}) | set(balance.get("used") or {}) | set(balance.get("total") or {})
+        currencies |= {k for k, v in balance.items() if k not in reserved_keys and isinstance(v, dict)}
+        result = []
+        for currency in currencies:
+            total = self._extract_currency_balance(balance, currency, "total")
+            if total <= 0:
+                continue
+            result.append({
+                "currency": currency,
+                "free": self._extract_currency_balance(balance, currency, "free"),
+                "used": self._extract_currency_balance(balance, currency, "used"),
+                "total": total,
+            })
+        result.sort(key=lambda b: b["currency"])
+        return result
 
     async def _fetch_confirmed_order(
         self, order: dict, symbol: str, attempts: int = 8, delay: float = 0.75,
