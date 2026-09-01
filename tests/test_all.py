@@ -5453,10 +5453,30 @@ class TestGetAllBalances(unittest.IsolatedAsyncioTestCase):
             "used": {"USDT": 5.0, "BTC": 0.0},
             "total": {"USDT": 105.0, "BTC": 0.001, "ETH": 0.0},
         })
+        engine.exchange.fetch_ticker = AsyncMock(return_value={"last": 60000.0})
         result = await engine.get_all_balances()
         self.assertEqual([b["currency"] for b in result], ["BTC", "USDT"])
+        engine.exchange.fetch_ticker.assert_awaited_once_with("BTC/USDT")
+        btc = next(b for b in result if b["currency"] == "BTC")
+        self.assertEqual(
+            btc, {"currency": "BTC", "free": 0.001, "used": 0.0, "total": 0.001, "usdt_value": 60.0},
+        )
         usdt = next(b for b in result if b["currency"] == "USDT")
-        self.assertEqual(usdt, {"currency": "USDT", "free": 100.0, "used": 5.0, "total": 105.0})
+        self.assertEqual(
+            usdt, {"currency": "USDT", "free": 100.0, "used": 5.0, "total": 105.0, "usdt_value": 105.0},
+        )
+
+    async def test_ticker_error_yields_none_usdt_value(self):
+        engine = ExecutionEngine()
+        engine.exchange = MagicMock()
+        engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"SOMECOIN": 10.0}, "used": {}, "total": {"SOMECOIN": 10.0},
+        })
+        engine.exchange.fetch_ticker = AsyncMock(side_effect=RuntimeError("no such market"))
+        result = await engine.get_all_balances()
+        self.assertEqual(result, [
+            {"currency": "SOMECOIN", "free": 10.0, "used": 0.0, "total": 10.0, "usdt_value": None},
+        ])
 
     async def test_falls_back_to_nested_currency_dict(self):
         engine = ExecutionEngine()
@@ -5465,7 +5485,9 @@ class TestGetAllBalances(unittest.IsolatedAsyncioTestCase):
             "USDT": {"free": 50.0, "used": 0.0, "total": 50.0},
         })
         result = await engine.get_all_balances()
-        self.assertEqual(result, [{"currency": "USDT", "free": 50.0, "used": 0.0, "total": 50.0}])
+        self.assertEqual(
+            result, [{"currency": "USDT", "free": 50.0, "used": 0.0, "total": 50.0, "usdt_value": 50.0}],
+        )
 
     async def test_no_exchange_returns_none(self):
         engine = ExecutionEngine()

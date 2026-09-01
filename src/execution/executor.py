@@ -2264,6 +2264,22 @@ class ExecutionEngine:
                 "used": self._extract_currency_balance(balance, currency, "used"),
                 "total": total,
             })
+
+        async def _fill_usdt_value(item: dict) -> None:
+            if item["currency"] == "USDT":
+                item["usdt_value"] = item["total"]
+                return
+            try:
+                ticker = await self.exchange.fetch_ticker(f"{item['currency']}/USDT")
+                price = ticker.get("last") or ticker.get("bid") or ticker.get("ask")
+                item["usdt_value"] = item["total"] * price if price else None
+            except Exception:
+                # Валюта без прямой пары к USDT на бирже (или временная ошибка
+                # тикера) — не критично для списка балансов в целом, просто
+                # эта строка показывает эквивалент как "—" на дашборде.
+                item["usdt_value"] = None
+
+        await asyncio.gather(*(_fill_usdt_value(item) for item in result))
         result.sort(key=lambda b: b["currency"])
         return result
 

@@ -194,6 +194,15 @@
   tbody tr:hover { background: rgba(255,255,255,.02); }
   .empty-row td { color: var(--text-dim); text-align: center; padding: 24px; }
 
+  .sortable-th { cursor: pointer; user-select: none; }
+  .sortable-th:hover { color: var(--text); }
+  .sortable-th .sort-arrow { display: inline-block; width: 1em; opacity: .6; }
+  .section-toggle-btn {
+    background: none; border: none; color: var(--text-dim); cursor: pointer;
+    font-size: 12px; margin-left: 10px; padding: 2px 6px;
+  }
+  .section-toggle-btn:hover { color: var(--text); }
+
   .side-long { color: var(--green); font-weight: 600; }
   .side-short { color: var(--red); font-weight: 600; }
   .side-buy { color: var(--green); font-weight: 700; }
@@ -649,10 +658,16 @@
   </section>
 
   <section id="balancesSection" style="display:none;">
-    <h2>💰 Балансы на бирже</h2>
-    <div class="table-wrap">
+    <h2>💰 Балансы на бирже <button type="button" id="balancesToggleBtn" class="section-toggle-btn">▾ Свернуть</button></h2>
+    <div class="table-wrap" id="balancesWrap">
       <table>
-        <thead><tr><th>Валюта</th><th>Свободно</th><th>В ордерах</th><th>Всего</th></tr></thead>
+        <thead><tr>
+          <th class="sortable-th" data-sort="currency">Валюта <span class="sort-arrow"></span></th>
+          <th class="sortable-th" data-sort="free">Свободно <span class="sort-arrow"></span></th>
+          <th class="sortable-th" data-sort="used">В ордерах <span class="sort-arrow"></span></th>
+          <th class="sortable-th" data-sort="total">Всего <span class="sort-arrow"></span></th>
+          <th class="sortable-th" data-sort="usdt_value">≈ USDT <span class="sort-arrow"></span></th>
+        </tr></thead>
         <tbody id="balancesBody"></tbody>
       </table>
     </div>
@@ -2464,25 +2479,66 @@ async function renderProtections() {
   }
 }
 
+let lastBalances = [];
+let balancesSortKey = "usdt_value";
+let balancesSortDir = "desc";
+
+function drawBalancesTable() {
+  const body = document.getElementById("balancesBody");
+  const sorted = [...lastBalances].sort((a, b) => {
+    const va = a[balancesSortKey], vb = b[balancesSortKey];
+    // null (нет курса к USDT) — всегда в конец, независимо от направления сортировки.
+    if (va === null || va === undefined) return 1;
+    if (vb === null || vb === undefined) return -1;
+    let cmp = typeof va === "string" ? va.localeCompare(vb) : va - vb;
+    return balancesSortDir === "asc" ? cmp : -cmp;
+  });
+  body.innerHTML = sorted.map(b => `
+    <tr>
+      <td>${escapeHtml(b.currency)}</td>
+      <td>${fmt(b.free, 8)} ${escapeHtml(b.currency)}</td>
+      <td>${fmt(b.used, 8)} ${escapeHtml(b.currency)}</td>
+      <td>${fmt(b.total, 8)} ${escapeHtml(b.currency)}</td>
+      <td>${b.usdt_value === null || b.usdt_value === undefined ? "—" : "$" + fmt(b.usdt_value, 2)}</td>
+    </tr>
+  `).join("");
+  document.querySelectorAll("#balancesSection .sortable-th").forEach(th => {
+    const arrow = th.querySelector(".sort-arrow");
+    arrow.textContent = th.dataset.sort === balancesSortKey ? (balancesSortDir === "asc" ? "▲" : "▼") : "";
+  });
+}
+
 async function renderBalances() {
   const section = document.getElementById("balancesSection");
-  const body = document.getElementById("balancesBody");
   try {
     const data = await api("/balances");
-    const balances = data.balances || [];
-    section.style.display = balances.length ? "" : "none";
-    body.innerHTML = balances.map(b => `
-      <tr>
-        <td>${escapeHtml(b.currency)}</td>
-        <td>${fmt(b.free, 8)}</td>
-        <td>${fmt(b.used, 8)}</td>
-        <td>${fmt(b.total, 8)}</td>
-      </tr>
-    `).join("");
+    lastBalances = data.balances || [];
+    section.style.display = lastBalances.length ? "" : "none";
+    drawBalancesTable();
   } catch (err) {
     section.style.display = "none";
   }
 }
+
+document.querySelectorAll("#balancesSection .sortable-th").forEach(th => {
+  th.addEventListener("click", () => {
+    const key = th.dataset.sort;
+    if (balancesSortKey === key) {
+      balancesSortDir = balancesSortDir === "asc" ? "desc" : "asc";
+    } else {
+      balancesSortKey = key;
+      balancesSortDir = key === "currency" ? "asc" : "desc";
+    }
+    drawBalancesTable();
+  });
+});
+
+document.getElementById("balancesToggleBtn").addEventListener("click", () => {
+  const wrap = document.getElementById("balancesWrap");
+  const collapsed = wrap.style.display === "none";
+  wrap.style.display = collapsed ? "" : "none";
+  document.getElementById("balancesToggleBtn").textContent = collapsed ? "▾ Свернуть" : "▸ Развернуть";
+});
 
 async function refreshAll() {
   try {
