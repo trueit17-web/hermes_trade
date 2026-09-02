@@ -1045,7 +1045,7 @@ class ExecutionEngine:
 
         return {"pnl": pnl, "pnl_pct": pnl_pct, "outcome": outcome, "trade_id": trade_id}
 
-    def _market_limits(self, symbol: str) -> dict | None:
+    def _market_limits(self, symbol: str, exchange: ccxt.Exchange | None = None) -> dict | None:
         """
         market["limits"] для symbol, если оно есть и имеет ожидаемую форму
         словаря — иначе None. Общий защитный доступ для
@@ -1053,9 +1053,17 @@ class ExecutionEngine:
         markets[symbol] не гарантирована (разные биржи, тестовые mock-объекты
         без выставленного .markets), а падать из-за необязательной проверки
         не должны ни отправка ордера, ни сверка позиций.
+
+        exchange по умолчанию — self.exchange (клиент ТЕКУЩЕГО тумблера) —
+        верно для _below_exchange_minimum (открытие ВСЕГДА идёт на текущий
+        рынок). Для сверки позиции с рынком, отличным от текущего тумблера,
+        нужно передать явно клиент ЕЁ рынка (см. _reconcile_futures_position/
+        _reconcile_spot_position) — иначе лимиты читались бы со structurally
+        другого markets dict чужого рынка.
         """
         try:
-            markets = self.exchange.markets if self.exchange else None
+            ex = exchange if exchange is not None else self.exchange
+            markets = ex.markets if ex else None
             if not isinstance(markets, dict):
                 return None
             market = markets.get(symbol)
@@ -1066,8 +1074,8 @@ class ExecutionEngine:
         except Exception:
             return None
 
-    def _market_min_amount(self, symbol: str) -> float | None:
-        limits = self._market_limits(symbol)
+    def _market_min_amount(self, symbol: str, exchange: ccxt.Exchange | None = None) -> float | None:
+        limits = self._market_limits(symbol, exchange)
         if not limits:
             return None
         amount_limits = limits.get("amount")
@@ -2183,11 +2191,11 @@ class ExecutionEngine:
 
     async def reconcile_real_positions(self) -> float | None:
         """
-        Сверить ВСЕ отслеживаемые реальные позиции с фактическими остатками
-        на бирже одним вызовом fetch_balance() и снять с учёта те, которые
-        обычной продажей закрыть уже невозможно (актива нет вообще или его
-        остаток ниже минимального торгуемого объёма пары) — ДО того, как
-        расхождение попадёт в _compute_equity()/просадку в main.py.
+        Сверить ВСЕ отслеживаемые реальные позиции (спот и фьючерсы, каждая
+        через клиент СВОЕГО рынка — см. _exchange_for) с фактическим
+        состоянием на бирже и снять с учёта те, которые обычным закрытием
+        уже невозможно закрыть — ДО того, как расхождение попадёт в
+        _compute_equity()/просадку в main.py.
 
         До этого сверка была чисто РЕАКТИВНОЙ: она случалась только в
         момент попытки закрыть позицию (close_real_position), то есть
@@ -2198,10 +2206,11 @@ class ExecutionEngine:
         (учтено 416.5, на бирже 0.00046) превратил "Просадку" в дашборде в
         "-220110,7%".
 
-        Возвращает актуальный свободный баланс USDT из ТОГО ЖЕ запроса —
+        Возвращает актуальный свободный баланс USDT ТЕКУЩЕГО тумблера —
         вызывающий код (main.py, расчёт equity) должен использовать именно
-        его вместо отдельного get_real_balance(), чтобы не делать два
-        одинаковых запроса к бирже за одну итерацию.
+        его вместо отдельного get_real_balance(), чтобы не делать лишний
+        запрос к бирже за одну итерацию. Агрегация баланса по ОБОИМ рынкам
+        сразу — намеренно вне рамок (то же упрощение, что и в Этапе 3).
         """
         if not self.exchange:
             return None
@@ -2211,73 +2220,139 @@ class ExecutionEngine:
             logger.error(f"Ошибка получения баланса: {e}")
             return None
 
-        if settings.market_type == "futures":
-            # Весь цикл сверки ниже спот-специфичен: сравнивает отслеживаемый
-            # объём позиции с ОСТАТКОМ БАЗОВОЙ ВАЛЮТЫ НА КОШЕЛЬКЕ — на
-            # фьючерсах позиция не выражается остатком монеты на кошельке
-            # (это контракт, маржа в USDT, сверяется через fetch_positions(),
-            # а не fetch_balance()). Прогонять эту логику для фьючерсов
-            # значило бы сравнивать несравнимое и ошибочно списывать реально
-            # открытые позиции. Фьючерсная сверка позиций — отдельный,
-            # более поздний этап; пока просто возвращаем баланс без неё.
-            return self._extract_usdt_balance(balance)
-
+        # Спот и фьючерсы сверяются РАЗНЫМИ способами (остаток монеты на
+        # кошельке vs размер открытой позиции-контракта) — маршрутизация по
+        # market_type КАЖДОЙ позиции, а не по текущему тумблеру: обе могут
+        # быть отслеживаемы одновременно (см. _exchange_for/Этап 3).
+        # spot_balance резолвится лениво и переиспользуется на все спотовые
+        # позиции за один проход — `balance` выше уже spot, если текущий
+        # тумблер сам на споте, иначе нужен отдельный запрос к spot-клиенту.
+        spot_balance = balance if settings.market_type == "spot" else None
         for symbol, pos in list(self.real_positions.items()):
-            tracked_amount = pos.get("amount") or 0
-            if tracked_amount <= 0:
+            if pos.get("market_type", "spot") == "futures":
+                await self._reconcile_futures_position(symbol, pos)
                 continue
-            base_currency = symbol.split("/")[0]
-            available = self._extract_currency_balance(balance, base_currency)
-            if available >= tracked_amount:
-                continue
-            min_amount = self._market_min_amount(symbol)
-            unsellable = available == 0 or (min_amount is not None and available < min_amount)
-            if not unsellable:
-                continue
-            # Прежде чем списывать позицию как фантомную (без PnL), проверяем
-            # ДВА способа объяснить исчезновение реальным закрытием на бирже
-            # (а не багом/пылью) — по возрастающей специфичности:
-            # 1) свой же биржевой SL-ордер сработал сам по себе, без участия
-            #    бота (см. sync_stop_loss_order) — знаем точный order id;
-            # 2) более общий случай — позиции без выставленного SL-ордера
-            #    (SL не настроен, отклонён биржей, или закрыто вручную/через
-            #    TP на самой бирже) — ищем недавнюю продажу в истории сделок
-            #    биржи по объёму (см. _finalize_via_recent_trade_history).
-            # Оба варианта пишут закрытие с настоящими ценой/комиссией/PnL —
-            # без них любое закрытие в обход обычного цикла бота (в т.ч.
-            # ручное на бирже) молча терялось бы из истории сделок навсегда,
-            # а не появлялось бы даже после рестарта. Проверяем их ДО
-            # grace-периода ниже — SL/TP вполне может сработать по-настоящему
-            # уже через несколько секунд после открытия, и такое реальное
-            # закрытие нужно распознать сразу, а не откладывать.
-            if await self._finalize_externally_closed_position(symbol, pos):
-                continue
-            if await self._finalize_via_recent_trade_history(symbol, pos):
-                continue
-            # Свежеоткрытая позиция, для которой не нашлось объяснения через
-            # SL-ордер/историю сделок, — биржа иногда не успевает отразить
-            # только что купленный актив в ответе fetch_balance() сразу
-            # (реальный инцидент, прод: CHZ/MANA/ZRX — ~90с после открытия
-            # и подтверждения ордера как исполненного, fetch_balance() всё
-            # ещё показывал available≈0; позицию ошибочно списали как
-            # фантомную, а стратегия тут же открыла ДУБЛИРУЮЩУЮ новую на тот
-            # же символ — реальные деньги от первой позиции повисли на
-            # бирже без SL/TP и без отслеживания). Даём бирже время
-            # догнать состояние вместо немедленного списания — если
-            # расхождение реальное, а не задержка репликации баланса,
-            # следующий цикл сверки поймает его снова, когда позиция
-            # перестанет быть "свежей".
-            opened_at = pos.get("opened_at")
-            if opened_at and (utcnow() - opened_at).total_seconds() < RECONCILE_MIN_AGE_SECONDS:
-                continue
-            logger.warning(
-                f"⚠️ Периодическая сверка позиций: {symbol} — учтено {tracked_amount:.8f}, "
-                f"на бирже доступно {available:.8f} (продать невозможно) — расхождение поймано "
-                f"до попытки закрытия, чтобы не портить equity/просадку."
-            )
-            await self._reconcile_phantom_position(symbol, pos.get("order_id"))
+            if spot_balance is None:
+                spot_exchange = self._exchanges.get("spot")
+                if spot_exchange is None:
+                    continue
+                try:
+                    spot_balance = await spot_exchange.fetch_balance()
+                except Exception as e:
+                    logger.debug(f"Не удалось получить spot-баланс для сверки позиций: {e}")
+                    continue
+            await self._reconcile_spot_position(symbol, pos, spot_balance)
 
         return self._extract_usdt_balance(balance)
+
+    async def _reconcile_spot_position(self, symbol: str, pos: dict, balance: dict) -> None:
+        """
+        Спотовая часть reconcile_real_positions — сверяет отслеживаемый
+        объём с остатком БАЗОВОЙ ВАЛЮТЫ НА КОШЕЛЬКЕ (balance — снимок
+        СПОТОВОГО клиента этой позиции, не обязательно текущего тумблера).
+        """
+        tracked_amount = pos.get("amount") or 0
+        if tracked_amount <= 0:
+            return
+        base_currency = symbol.split("/")[0]
+        available = self._extract_currency_balance(balance, base_currency)
+        if available >= tracked_amount:
+            return
+        min_amount = self._market_min_amount(symbol, self._exchanges.get("spot"))
+        unsellable = available == 0 or (min_amount is not None and available < min_amount)
+        if not unsellable:
+            return
+        # Прежде чем списывать позицию как фантомную (без PnL), проверяем
+        # ДВА способа объяснить исчезновение реальным закрытием на бирже
+        # (а не багом/пылью) — по возрастающей специфичности:
+        # 1) свой же биржевой SL-ордер сработал сам по себе, без участия
+        #    бота (см. sync_stop_loss_order) — знаем точный order id;
+        # 2) более общий случай — позиции без выставленного SL-ордера
+        #    (SL не настроен, отклонён биржей, или закрыто вручную/через
+        #    TP на самой бирже) — ищем недавнюю продажу в истории сделок
+        #    биржи по объёму (см. _finalize_via_recent_trade_history).
+        # Оба варианта пишут закрытие с настоящими ценой/комиссией/PnL —
+        # без них любое закрытие в обход обычного цикла бота (в т.ч.
+        # ручное на бирже) молча терялось бы из истории сделок навсегда,
+        # а не появлялось бы даже после рестарта. Проверяем их ДО
+        # grace-периода ниже — SL/TP вполне может сработать по-настоящему
+        # уже через несколько секунд после открытия, и такое реальное
+        # закрытие нужно распознать сразу, а не откладывать.
+        if await self._finalize_externally_closed_position(symbol, pos):
+            return
+        if await self._finalize_via_recent_trade_history(symbol, pos):
+            return
+        # Свежеоткрытая позиция, для которой не нашлось объяснения через
+        # SL-ордер/историю сделок, — биржа иногда не успевает отразить
+        # только что купленный актив в ответе fetch_balance() сразу
+        # (реальный инцидент, прод: CHZ/MANA/ZRX — ~90с после открытия
+        # и подтверждения ордера как исполненного, fetch_balance() всё
+        # ещё показывал available≈0; позицию ошибочно списали как
+        # фантомную, а стратегия тут же открыла ДУБЛИРУЮЩУЮ новую на тот
+        # же символ — реальные деньги от первой позиции повисли на
+        # бирже без SL/TP и без отслеживания). Даём бирже время
+        # догнать состояние вместо немедленного списания — если
+        # расхождение реальное, а не задержка репликации баланса,
+        # следующий цикл сверки поймает его снова, когда позиция
+        # перестанет быть "свежей".
+        opened_at = pos.get("opened_at")
+        if opened_at and (utcnow() - opened_at).total_seconds() < RECONCILE_MIN_AGE_SECONDS:
+            return
+        logger.warning(
+            f"⚠️ Периодическая сверка позиций: {symbol} — учтено {tracked_amount:.8f}, "
+            f"на бирже доступно {available:.8f} (продать невозможно) — расхождение поймано "
+            f"до попытки закрытия, чтобы не портить equity/просадку."
+        )
+        await self._reconcile_phantom_position(symbol, pos.get("order_id"))
+
+    async def _reconcile_futures_position(self, symbol: str, pos: dict) -> None:
+        """
+        Фьючерсная часть reconcile_real_positions — прямая параллель
+        _reconcile_spot_position, но вместо остатка базовой валюты на
+        кошельке сравнивает отслеживаемый объём с фактическим размером
+        ПОЗИЦИИ на бирже (fetch_position — контракт, а не монета на
+        балансе; позиция не выражается остатком монеты на фьючерсах).
+
+        fetch_position() у ccxt/bybit всегда возвращает dict (даже для
+        закрытой позиции — с contracts=0), не бросает исключение и не
+        возвращает пустой список — единственный способ отличить "позиции
+        нет" — проверить актуальный объём контракта.
+        """
+        tracked_amount = pos.get("amount") or 0
+        if tracked_amount <= 0:
+            return
+        exchange = self._exchange_for(pos)
+        if exchange is None:
+            return
+        try:
+            position = await exchange.fetch_position(symbol)
+            actual_amount = float(position.get("contracts") or 0)
+        except Exception as e:
+            logger.debug(f"Не удалось сверить фьючерсную позицию {symbol}: {e}")
+            return
+        if actual_amount >= tracked_amount:
+            return
+        min_amount = self._market_min_amount(symbol, exchange)
+        unsellable = actual_amount == 0 or (min_amount is not None and actual_amount < min_amount)
+        if not unsellable:
+            return
+        # Та же цепочка объяснений исчезновения, что и на споте (см.
+        # _reconcile_spot_position) — оба _finalize_* уже рынко-осознанны
+        # (резолвят клиент по market_type позиции, Этап 3), изменений не
+        # требуют.
+        if await self._finalize_externally_closed_position(symbol, pos):
+            return
+        if await self._finalize_via_recent_trade_history(symbol, pos):
+            return
+        opened_at = pos.get("opened_at")
+        if opened_at and (utcnow() - opened_at).total_seconds() < RECONCILE_MIN_AGE_SECONDS:
+            return
+        logger.warning(
+            f"⚠️ Периодическая сверка фьючерсных позиций: {symbol} — учтено {tracked_amount:.8f}, "
+            f"на бирже открыто {actual_amount:.8f} контрактов — расхождение поймано до попытки "
+            f"закрытия, чтобы не портить equity/просадку."
+        )
+        await self._reconcile_phantom_position(symbol, pos.get("order_id"))
 
     async def _finalize_externally_closed_position(self, symbol: str, pos: dict) -> bool:
         """

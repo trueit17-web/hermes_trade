@@ -6345,13 +6345,14 @@ class TestCloseRealPositionOnFutures(unittest.IsolatedAsyncioTestCase):
         self.assertIn("FUTCLOSE4/USDT", self.engine.real_positions)
 
 
-class TestReconcileRealPositionsSkipsFutures(unittest.IsolatedAsyncioTestCase):
+class TestReconcileFuturesPositions(unittest.IsolatedAsyncioTestCase):
     """
-    ЭТАП 2: reconcile_real_positions() сверяет отслеживаемый объём позиции
-    с остатком БАЗОВОЙ ВАЛЮТЫ НА СПОТОВОМ КОШЕЛЬКЕ — на фьючерсах это
-    сравнение бессмысленно (позиция не выражается остатком монеты).
-    Для market_type=="futures" функция не должна трогать real_positions,
-    только вернуть свежий USDT-баланс.
+    ЭТАП 5 перехода на фьючерсы: reconcile_real_positions() теперь сверяет
+    и фьючерсные позиции (раньше при market_type=="futures" сверка
+    ВООБЩЕ не выполнялась — это уже устаревшая premise, см. историю).
+    Фьючерсная сверка сравнивает отслеживаемый объём с фактическим
+    размером ПОЗИЦИИ на бирже (fetch_position — контракт, а не остаток
+    монеты на кошельке, как на споте).
     """
 
     async def asyncSetUp(self):
@@ -6368,7 +6369,7 @@ class TestReconcileRealPositionsSkipsFutures(unittest.IsolatedAsyncioTestCase):
         settings.market_type = self._saved_market_type
         settings.trading_mode = self._saved_trading_mode
 
-    async def test_does_not_touch_positions_on_futures(self):
+    async def test_removes_phantom_futures_position_when_contracts_zero(self):
         from src.utils.timeutils import utcnow
 
         settings.market_type = "futures"
@@ -6376,19 +6377,101 @@ class TestReconcileRealPositionsSkipsFutures(unittest.IsolatedAsyncioTestCase):
         self.engine.is_paper = False
         self.engine.exchange_id = "bybit"
         self.engine.exchange = AsyncMock()
-        self.engine.real_positions["FUTRECON1/USDT"] = {
-            "amount": 10.0, "entry_price": 2.0, "side": "long",
-            "opened_at": utcnow() - timedelta(hours=1), "sl_order_id": None, "order_id": None,
-        }
         self.engine.exchange.fetch_balance = AsyncMock(return_value={
             "free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0},
         })
+        self.engine.exchange.fetch_position = AsyncMock(return_value={"contracts": 0.0})
+        self.engine.real_positions["FUTRECON1/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long",
+            "opened_at": utcnow() - timedelta(hours=1), "sl_order_id": None, "order_id": None,
+            "market_type": "futures",
+        }
 
         balance = await self.engine.reconcile_real_positions()
 
         self.assertAlmostEqual(balance, 500.0)
-        self.assertIn("FUTRECON1/USDT", self.engine.real_positions)
-        self.engine.exchange.fetch_balance.assert_awaited_once()
+        self.assertNotIn("FUTRECON1/USDT", self.engine.real_positions)
+
+    async def test_keeps_futures_position_when_contracts_match(self):
+        from src.utils.timeutils import utcnow
+
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0},
+        })
+        self.engine.exchange.fetch_position = AsyncMock(return_value={"contracts": 10.0})
+        self.engine.real_positions["FUTRECON2/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long",
+            "opened_at": utcnow() - timedelta(hours=1), "sl_order_id": None, "order_id": None,
+            "market_type": "futures",
+        }
+
+        balance = await self.engine.reconcile_real_positions()
+
+        self.assertAlmostEqual(balance, 500.0)
+        self.assertIn("FUTRECON2/USDT", self.engine.real_positions)
+
+    async def test_futures_position_within_grace_period_not_removed(self):
+        from src.utils.timeutils import utcnow
+
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0},
+        })
+        self.engine.exchange.fetch_position = AsyncMock(return_value={"contracts": 0.0})
+        self.engine.real_positions["FUTRECON3/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long",
+            "opened_at": utcnow(), "sl_order_id": None, "order_id": None,
+            "market_type": "futures",
+        }
+
+        await self.engine.reconcile_real_positions()
+
+        self.assertIn("FUTRECON3/USDT", self.engine.real_positions)
+
+    async def test_mixed_markets_fetches_spot_balance_from_spot_client_not_current_toggle(self):
+        """
+        Реальный сценарий с прода: тумблер стоит на futures, но
+        отслеживается и спотовая позиция (как MON/USDT) — сверка спота
+        должна брать баланс со SPOT-клиента, а не с клиента текущего
+        тумблера (futures), иначе спотовая позиция ошибочно казалась бы
+        "без остатка на кошельке" и списывалась бы как фантомная.
+        """
+        from src.utils.timeutils import utcnow
+
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        futures_mock = AsyncMock()
+        futures_mock.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0},
+        })
+        spot_mock = AsyncMock()
+        spot_mock.fetch_balance = AsyncMock(return_value={
+            "free": {"MON": 5238.2565, "USDT": 10.0},
+            "MON": {"free": 5238.2565, "used": 0, "total": 5238.2565},
+        })
+        self.engine._exchanges = {"futures": futures_mock, "spot": spot_mock}
+        self.engine.real_positions["MON/USDT"] = {
+            "amount": 5238.2565, "entry_price": 0.0257, "side": "long",
+            "opened_at": utcnow() - timedelta(days=5), "sl_order_id": None, "order_id": None,
+            "market_type": "spot",
+        }
+
+        balance = await self.engine.reconcile_real_positions()
+
+        self.assertAlmostEqual(balance, 500.0)
+        spot_mock.fetch_balance.assert_awaited_once()
+        self.assertIn("MON/USDT", self.engine.real_positions)
 
 
 class TestSyncStopLossOrderOnFutures(unittest.IsolatedAsyncioTestCase):
