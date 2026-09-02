@@ -90,11 +90,20 @@ class ExecutionEngine:
                 await self._restore_paper_state_from_db()
                 return
 
+            # market_type=="futures" переключает ccxt на linear-swap рынок
+            # (USDT-perpetual) вместо спота — см. комментарий у
+            # settings.market_type. defaultSubType нужен, чтобы попасть
+            # именно на linear (USDT-margined), а не inverse-контракты.
+            market_options = (
+                {"defaultType": "swap", "defaultSubType": "linear"}
+                if settings.market_type == "futures"
+                else {"defaultType": "spot"}
+            )
             exchange_config: dict = {
                 "apiKey": api_key,
                 "secret": api_secret,
                 "enableRateLimit": True,
-                "options": {"defaultType": "spot"},
+                "options": market_options,
             }
             if passphrase:
                 exchange_config["password"] = passphrase
@@ -127,6 +136,7 @@ class ExecutionEngine:
             logger.info(
                 f"🔗 Execution Engine: подключено к {exchange_id}"
                 f"{' (демо-счёт)' if settings.use_exchange_sandbox else ' (LIVE, реальные средства)'}"
+                f"{' [фьючерсы/swap — этап 1, исполнение ордеров ещё не реализовано]' if settings.market_type == 'futures' else ' [спот]'}"
             )
 
             await self._warn_if_okx_trade_permission_missing(exchange_id)
@@ -1238,6 +1248,22 @@ class ExecutionEngine:
         side = order_data["side"]
         amount = order_data["amount"]
         price = order_data["price"]
+
+        # ЭТАП 1 перехода на фьючерсы (см. settings.market_type): переключатель
+        # в шапке дашборда уже подключает execution_engine к linear-swap рынку
+        # (initialize() выше), но модель позиции/закрытия/SL здесь и в
+        # close_real_position/reconcile_real_positions всё ещё завязана на
+        # спот (amount = буквально монета на кошельке, а не контракт с
+        # плечом/маржой) — исполнение ордера на фьючерсах этой логикой дало
+        # бы неверные результаты. Пока явно отказываем, чтобы не рисковать
+        # реальным исполнением на недоделанном пути — следующий этап уберёт
+        # эту заглушку вместе с фьючерсно-осознанной логикой открытия/закрытия.
+        if settings.market_type == "futures":
+            logger.warning(
+                f"⚠️ Реальный ордер {symbol} пропущен: подключён рынок фьючерсов (этап 1 перехода), "
+                f"но исполнение ордеров на фьючерсах ещё не реализовано — пока поддерживается только спот."
+            )
+            return None
 
         # На споте нет встроенного шорта — этот метод вызывается ТОЛЬКО для
         # ОТКРЫТИЯ новой позиции (create_order -> _execute_real_order);

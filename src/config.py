@@ -40,6 +40,16 @@ class Settings(BaseSettings):
     # set_sandbox_mode) — включено по умолчанию, чтобы переключение в
     # real-режим само по себе не начинало торговать настоящими деньгами.
     use_exchange_sandbox: bool = True
+    # Тип рынка для real-режима: "spot" (обычный спот — шорт не
+    # поддерживается, см. _execute_real_order) или "futures" (USDT-perpetual,
+    # linear swap). ЭТАП 1 перехода на фьючерсы: переключатель подключает
+    # execution_engine к нужному рынку ccxt (defaultType), но исполнение
+    # ордеров на фьючерсах ЕЩЁ НЕ реализовано — _execute_real_order
+    # сознательно отказывает в открытии позиций при market_type=="futures",
+    # пока не появится фьючерсно-осознанная логика открытия/закрытия/SL/
+    # риска (следующие этапы). Переключается кнопкой в шапке дашборда
+    # (POST /market-type).
+    market_type: str = "spot"
     binance_api_key: str | None = None
     binance_api_secret: str | None = None
     bybit_api_key: str | None = None

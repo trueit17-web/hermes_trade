@@ -624,6 +624,10 @@
       <button type="button" class="mode-toggle-btn" data-mode="signals" id="btnModeSignals">📲 Сигналы</button>
       <button type="button" class="mode-toggle-btn" data-mode="algo" id="btnModeAlgo">🤖 Алго</button>
     </div>
+    <div class="mode-toggle" id="marketTypeToggle" title="Тип рынка для real-режима. ЭТАП 1 перехода: futures пока только подключает бота к рынку фьючерсов — открытие ордеров там ещё не реализовано.">
+      <button type="button" class="mode-toggle-btn" data-market="spot" id="btnMarketSpot">💰 Спот</button>
+      <button type="button" class="mode-toggle-btn" data-market="futures" id="btnMarketFutures">📈 Фьючерсы</button>
+    </div>
     <span class="ws-indicator" title="WebSocket real-time соединение">
       <span id="wsStatusDot" class="conn-dot conn-not_connected"></span>
       <span id="wsStatusLabel" class="muted">офлайн</span>
@@ -967,6 +971,10 @@ function renderHeader(status) {
   const activeMode = status.active_trading_mode || "signals";
   document.getElementById("btnModeSignals").classList.toggle("active", activeMode === "signals");
   document.getElementById("btnModeAlgo").classList.toggle("active", activeMode === "algo");
+
+  const marketType = status.market_type || "spot";
+  document.getElementById("btnMarketSpot").classList.toggle("active", marketType === "spot");
+  document.getElementById("btnMarketFutures").classList.toggle("active", marketType === "futures");
 }
 
 function renderStats(status, trades) {
@@ -2609,6 +2617,25 @@ document.getElementById("tradingSourceToggle").addEventListener("click", async (
   try {
     await api(`/trading-source-mode?mode=${encodeURIComponent(mode)}`, { method: "POST" });
     showToast(`Источник сигналов переключён: ${modeLabel}`);
+    await refreshAll();
+  } catch (err) {
+    showToast(`Ошибка: ${err.message}`, true);
+  }
+});
+
+document.getElementById("marketTypeToggle").addEventListener("click", async (e) => {
+  const btn = e.target.closest(".mode-toggle-btn");
+  if (!btn || btn.classList.contains("active")) return;
+  const marketType = btn.dataset.market;
+  const label = marketType === "spot" ? "Спот" : "Фьючерсы (USDT-perpetual)";
+  const extraWarning = marketType === "futures"
+    ? "\n\nЭТАП 1 перехода: бот только подключится к рынку фьючерсов (переподключит биржу). " +
+      "Открытие/закрытие ордеров на фьючерсах ещё НЕ реализовано — новые real-позиции открываться не будут."
+    : "";
+  if (!confirm(`Переключить тип рынка на «${label}»?${extraWarning}`)) return;
+  try {
+    await api(`/market-type?market_type=${encodeURIComponent(marketType)}`, { method: "POST" });
+    showToast(`Тип рынка переключён: ${label}`);
     await refreshAll();
   } catch (err) {
     showToast(`Ошибка: ${err.message}`, true);

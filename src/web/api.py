@@ -377,6 +377,7 @@ async def get_status():
     return {
         "trading_mode": settings.trading_mode,
         "active_trading_mode": settings.active_trading_mode,
+        "market_type": settings.market_type,
         "is_paper": settings.is_paper,
         "startup_capital": settings.startup_capital_usdt,
         "risk_state": risk_manager.get_state(),
@@ -1189,6 +1190,28 @@ async def set_trading_source_mode(mode: str):
 
     logger.info(f"Источник торговых сигналов изменён на: {mode}")
     return {"success": True, "mode": mode}
+
+
+@app.post("/market-type")
+async def set_market_type(market_type: str):
+    """
+    Переключить тип рынка для real-режима: spot (обычный спот, шорт не
+    поддерживается) или futures (USDT-perpetual/linear swap). ЭТАП 1
+    перехода на фьючерсы — переключатель подключает execution_engine к
+    нужному рынку ccxt (см. apply_settings_update/executor.initialize), но
+    исполнение ордеров на фьючерсах ещё не реализовано (см.
+    _execute_real_order) — бот при market_type=="futures" пока только
+    подключается к рынку и наблюдает, новые real-позиции не открывает.
+    """
+    if market_type not in ("spot", "futures"):
+        raise HTTPException(status_code=400, detail="Тип рынка должен быть spot или futures")
+
+    result = await apply_settings_update({"market_type": market_type})
+    if result["errors"]:
+        raise HTTPException(status_code=400, detail=result["errors"])
+
+    logger.info(f"Тип рынка изменён на: {market_type}")
+    return {"success": True, "market_type": market_type}
 
 
 @app.get("/settings")

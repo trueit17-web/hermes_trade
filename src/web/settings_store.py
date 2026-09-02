@@ -167,6 +167,11 @@ SETTINGS_SCHEMA: list[dict] = [
      "description": "На какой бирже исполняются реальные ордера в real-режиме. Требует заполненных ключей этой биржи ниже. Смена применяется сразу, без перезапуска бота."},
     {"key": "use_exchange_sandbox", "label": "Демо-счёт (sandbox/testnet)", "group": "Биржи", "type": "bool",
      "description": "Торговать на демо/testnet-счету биржи вместо реальных денег, тем же API-ключом. Рекомендуется держать включённым, пока не проверили бота вживую."},
+    {"key": "market_type", "label": "Тип рынка (real-режим)", "group": "Биржи", "type": "select", "options": ["spot", "futures"],
+     "description": "spot — обычный спот-рынок (шорт не поддерживается). futures — USDT-перпетуалы (linear swap). "
+                     "ЭТАП 1 перехода: переключатель подключает бота к нужному рынку биржи, но открытие ордеров на "
+                     "фьючерсах пока не реализовано — бот только подключается и наблюдает. "
+                     "Тот же переключатель есть в шапке дашборда."},
     {"key": "binance_api_key", "label": "Binance API key", "group": "Биржи", "type": "secret",
      "description": "Ключ API Binance для торговли в real-режиме. Выдавайте права только на торговлю, без вывода средств."},
     {"key": "binance_api_secret", "label": "Binance API secret", "group": "Биржи", "type": "secret",
@@ -296,18 +301,23 @@ async def apply_settings_update(updates: dict[str, Any]) -> dict:
         from src.risk.risk_manager import risk_manager
         risk_manager.configure(risk_changes)
 
-    if "trading_mode" in updated or "active_exchange" in updated or "use_exchange_sandbox" in updated:
+    if (
+        "trading_mode" in updated or "active_exchange" in updated
+        or "use_exchange_sandbox" in updated or "market_type" in updated
+    ):
         from src.execution.executor import execution_engine
         if settings.trading_mode == "real":
-            # Три случая требуют (пере)подключения с нуля: первый переход в
-            # real, смена активной биржи, смена sandbox/live при уже
-            # включённом real — во всех трёх старое соединение ccxt уже не
-            # соответствует нужному режиму.
+            # Случаи, требующие (пере)подключения с нуля: первый переход в
+            # real, смена активной биржи, смена sandbox/live, смена типа
+            # рынка (spot/futures) при уже включённом real — во всех этих
+            # случаях старое соединение ccxt уже не соответствует нужному
+            # режиму (defaultType/sandbox/exchange отличаются).
             if (
                 execution_engine.is_paper
                 or execution_engine.exchange_id != settings.active_exchange
                 or "active_exchange" in updated
                 or "use_exchange_sandbox" in updated
+                or "market_type" in updated
             ):
                 # initialize() САМ ПЕРВЫМ ДЕЛОМ проверяет self.is_paper и,
                 # если он всё ещё True, молча остаётся в paper-режиме, даже

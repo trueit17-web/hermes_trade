@@ -5745,6 +5745,117 @@ class TestRealBalanceReseedsRiskState(unittest.IsolatedAsyncioTestCase):
                 await session.commit()
 
 
+class TestMarketTypeFuturesConnection(unittest.IsolatedAsyncioTestCase):
+    """
+    ЭТАП 1 перехода на фьючерсы (см. запрос "давай начнём первый этап на
+    demo... переключение в шапке по аналогии сигналы/алго"): settings.market_type
+    должен определять, к какому рынку ccxt подключается execution_engine —
+    linear-swap (USDT-perpetual) при "futures", обычный spot при "spot"
+    (значение по умолчанию, без изменений в поведении).
+    """
+
+    def setUp(self):
+        self._saved = {
+            k: getattr(settings, k) for k in (
+                "trading_mode", "market_type", "bybit_api_key", "bybit_api_secret", "use_exchange_sandbox",
+            )
+        }
+        settings.trading_mode = "real"
+        settings.bybit_api_key = "key"
+        settings.bybit_api_secret = "secret"
+        settings.use_exchange_sandbox = True
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(settings, k, v)
+
+    async def test_futures_market_type_connects_to_linear_swap(self):
+        settings.market_type = "futures"
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        mock_exchange = AsyncMock()
+        mock_exchange.enable_demo_trading = MagicMock()
+        mock_exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"USDT": 100.0}, "USDT": {"free": 100.0, "used": 0, "total": 100.0}}
+        )
+        with patch("src.execution.executor.ccxt.bybit", return_value=mock_exchange) as mock_class:
+            await engine.initialize("bybit")
+
+        called_config = mock_class.call_args[0][0]
+        self.assertEqual(called_config["options"], {"defaultType": "swap", "defaultSubType": "linear"})
+
+    async def test_spot_market_type_still_connects_to_spot(self):
+        settings.market_type = "spot"
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        mock_exchange = AsyncMock()
+        mock_exchange.enable_demo_trading = MagicMock()
+        mock_exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"USDT": 100.0}, "USDT": {"free": 100.0, "used": 0, "total": 100.0}}
+        )
+        with patch("src.execution.executor.ccxt.bybit", return_value=mock_exchange) as mock_class:
+            await engine.initialize("bybit")
+
+        called_config = mock_class.call_args[0][0]
+        self.assertEqual(called_config["options"], {"defaultType": "spot"})
+
+
+class TestExecuteRealOrderRefusesOnFuturesMarketType(unittest.IsolatedAsyncioTestCase):
+    """
+    Рынок фьючерсов уже можно подключить (market_type=futures), но модель
+    позиции/закрытия/риска в executor.py всё ещё завязана на спот (amount —
+    буквально монета на кошельке спота, а не контракт с плечом/маржой) —
+    _execute_real_order должен явно отказывать в исполнении, а не молча
+    прогонять ордер недоделанной спот-логикой.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+
+    async def test_refuses_order_when_market_type_is_futures(self):
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+
+        order = await self.engine.create_order(
+            symbol="FUTGUARD1/USDT", side="buy", amount=10.0, price=2.0, order_type="market",
+        )
+
+        self.assertIsNone(order)
+        self.engine.exchange.create_market_buy_order.assert_not_called()
+
+    async def test_spot_market_type_still_executes_normally(self):
+        settings.market_type = "spot"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"FUTGUARD2": 0.0}, "FUTGUARD2": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "futguard-order-1", "filled": 10.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="FUTGUARD2/USDT", side="buy", amount=10.0, price=2.0, order_type="market",
+        )
+
+        self.assertIsNotNone(order)
+
+
 class TestOkxTradePermissionCheck(unittest.IsolatedAsyncioTestCase):
     """
     OKX отдаёт реально выданные API-ключу права прямо в GET /account/config
@@ -6535,6 +6646,47 @@ class TestTradingSourceModeEndpoint(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertEqual(settings.active_trading_mode, "signals")
+
+
+class TestMarketTypeEndpoint(unittest.IsolatedAsyncioTestCase):
+    """
+    POST /market-type — переключатель "спот"/"фьючерсы" в шапке дашборда
+    (ЭТАП 1 перехода на фьючерсы). Тот же apply_settings_update, что и
+    вкладка "Настройки".
+    """
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+        self._saved_trading_mode = settings.trading_mode
+        # paper — чтобы apply_settings_update не пытался (пере)подключить
+        # execution_engine к реальной бирже внутри этого теста (market_type
+        # входит в список триггеров реконнекта только при trading_mode=="real",
+        # см. settings_store.apply_settings_update).
+        settings.trading_mode = "paper"
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_valid_type_updates_live_setting(self):
+        from src.web.api import set_market_type
+
+        result = await set_market_type(market_type="futures")
+
+        self.assertEqual(result, {"success": True, "market_type": "futures"})
+        self.assertEqual(settings.market_type, "futures")
+
+    async def test_invalid_type_is_rejected_without_changing_setting(self):
+        from fastapi import HTTPException
+
+        from src.web.api import set_market_type
+
+        settings.market_type = "spot"
+        with self.assertRaises(HTTPException) as ctx:
+            await set_market_type(market_type="margin")
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(settings.market_type, "spot")
 
 
 class TestTradingSourceModeGatesAlgoStrategies(unittest.IsolatedAsyncioTestCase):
