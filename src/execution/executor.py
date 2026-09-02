@@ -2317,6 +2317,12 @@ class ExecutionEngine:
         закрытой позиции — с contracts=0), не бросает исключение и не
         возвращает пустой список — единственный способ отличить "позиции
         нет" — проверить актуальный объём контракта.
+
+        Попутно (без дополнительного запроса к бирже — используем тот же
+        ответ) кэширует leverage/margin_usdt на pos для отображения на
+        дашборде (Этап 6): settings.futures_leverage — глобальная
+        настройка, могла измениться ПОСЛЕ открытия конкретной позиции, так
+        что единственный надёжный источник факта — сама биржа.
         """
         tracked_amount = pos.get("amount") or 0
         if tracked_amount <= 0:
@@ -2330,6 +2336,8 @@ class ExecutionEngine:
         except Exception as e:
             logger.debug(f"Не удалось сверить фьючерсную позицию {symbol}: {e}")
             return
+        pos["leverage"] = position.get("leverage")
+        pos["margin_usdt"] = position.get("initialMargin")
         if actual_amount >= tracked_amount:
             return
         min_amount = self._market_min_amount(symbol, exchange)

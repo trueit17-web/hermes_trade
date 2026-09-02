@@ -6415,6 +6415,38 @@ class TestReconcileFuturesPositions(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(balance, 500.0)
         self.assertIn("FUTRECON2/USDT", self.engine.real_positions)
 
+    async def test_caches_leverage_and_margin_from_fetch_position(self):
+        """
+        ЭТАП 6: leverage/margin_usdt кэшируются на pos из ТОГО ЖЕ ответа
+        fetch_position (без доп. запроса к бирже) — для отображения на
+        дашборде. settings.futures_leverage — глобальная настройка, могла
+        измениться ПОСЛЕ открытия позиции, поэтому источник истины — сама
+        биржа, не текущее значение настройки.
+        """
+        from src.utils.timeutils import utcnow
+
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0},
+        })
+        self.engine.exchange.fetch_position = AsyncMock(
+            return_value={"contracts": 10.0, "leverage": 5.0, "initialMargin": 40.0}
+        )
+        self.engine.real_positions["FUTLEV1/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long",
+            "opened_at": utcnow() - timedelta(hours=1), "sl_order_id": None, "order_id": None,
+            "market_type": "futures",
+        }
+
+        await self.engine.reconcile_real_positions()
+
+        self.assertEqual(self.engine.real_positions["FUTLEV1/USDT"]["leverage"], 5.0)
+        self.assertEqual(self.engine.real_positions["FUTLEV1/USDT"]["margin_usdt"], 40.0)
+
     async def test_futures_position_within_grace_period_not_removed(self):
         from src.utils.timeutils import utcnow
 

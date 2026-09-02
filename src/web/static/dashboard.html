@@ -1025,9 +1025,15 @@ function renderPositions(status) {
     const slBadge = !status.is_paper && pos.stop_loss
       ? (pos.sl_order_id ? ` <span title="SL выставлен на бирже">🛡️</span>` : ` <span title="SL НЕ подтверждён биржей — защита только внутри бота">⚠️</span>`)
       : "";
+    // Плечо/маржа — реальные значения с биржи (см. _reconcile_futures_position
+    // в executor.py), а не текущая настройка futures_leverage: та могла
+    // измениться ПОСЛЕ открытия конкретной позиции.
+    const leverageBadge = !status.is_paper && pos.market_type === "futures" && pos.leverage
+      ? ` <span class="muted" title="Плечо ${pos.leverage}x${pos.margin_usdt ? `, маржа ≈ $${fmt(pos.margin_usdt, 2)}` : ""}">⚡${pos.leverage}x</span>`
+      : "";
     return `
     <tr>
-      <td>${symbol}</td>
+      <td>${symbol}${leverageBadge}</td>
       <td class="side-${pos.side === 'long' ? 'long' : 'short'}">${(pos.side || '').toUpperCase()}</td>
       <td>${fmt(pos.amount, 6)}</td>
       <td>${fmtPrice(pos.entry_price)}</td>
@@ -1085,9 +1091,15 @@ function renderManualPositions(status) {
     const slBadge = !status.is_paper && pos.stop_loss
       ? (pos.sl_order_id ? ` <span title="SL выставлен на бирже">🛡️</span>` : ` <span title="SL НЕ подтверждён биржей — защита только внутри бота">⚠️</span>`)
       : "";
+    // Плечо/маржа — реальные значения с биржи (см. _reconcile_futures_position
+    // в executor.py), а не текущая настройка futures_leverage: та могла
+    // измениться ПОСЛЕ открытия конкретной позиции.
+    const leverageBadge = !status.is_paper && pos.market_type === "futures" && pos.leverage
+      ? ` <span class="muted" title="Плечо ${pos.leverage}x${pos.margin_usdt ? `, маржа ≈ $${fmt(pos.margin_usdt, 2)}` : ""}">⚡${pos.leverage}x</span>`
+      : "";
     return `
     <tr>
-      <td>${symbol}</td>
+      <td>${symbol}${leverageBadge}</td>
       <td class="side-${pos.side === 'long' ? 'long' : 'short'}">${(pos.side || '').toUpperCase()}</td>
       <td>${fmt(pos.amount, 6)}</td>
       <td>${fmtPrice(pos.entry_price)}</td>
