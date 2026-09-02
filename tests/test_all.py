@@ -5586,6 +5586,44 @@ class TestBalancesEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"balances": [], "trading_mode": "real"})
 
 
+class TestRestartBotSendsSigtermNotOsExit(unittest.IsolatedAsyncioTestCase):
+    """
+    POST /system/restart раньше завершал процесс через os._exit(0) — это
+    убивает процесс мгновенно на уровне C, минуя ЛЮБУЮ Python-очистку,
+    включая уже существующий SIGTERM-обработчик в main.py, который как раз
+    закрывает ccxt-биржу (execution_engine.close()) перед выходом. Реальный
+    симптом: каждый рестарт через эту кнопку логировал "Unclosed client
+    session"/"Unclosed connector" от aiohttp, хотя для docker stop/recreate
+    (тоже SIGTERM) это уже было починено раньше. Кнопка должна слать себе
+    тот же SIGTERM, каким останавливает контейнер docker — тогда сработает
+    тот же graceful shutdown.
+    """
+
+    async def test_delayed_task_sends_sigterm_to_self(self):
+        import src.web.api as api_module
+        from src.web.api import restart_bot
+
+        captured_tasks = []
+        real_create_task = asyncio.create_task
+
+        def _capture(coro, *args, **kwargs):
+            task = real_create_task(coro, *args, **kwargs)
+            captured_tasks.append(task)
+            return task
+
+        with (
+            patch("src.web.api.asyncio.sleep", new=AsyncMock()),
+            patch("src.web.api.os.kill") as mock_kill,
+            patch("src.web.api.asyncio.create_task", side_effect=_capture),
+        ):
+            result = await restart_bot()
+            self.assertTrue(captured_tasks)
+            await captured_tasks[0]
+
+        self.assertEqual(result, {"success": True, "message": "Бот перезапускается"})
+        mock_kill.assert_called_once_with(api_module.os.getpid(), api_module.signal.SIGTERM)
+
+
 class TestRealBalanceReseedsRiskState(unittest.IsolatedAsyncioTestCase):
     """
     RiskState.start_balance был захардкожен на settings.startup_capital_usdt

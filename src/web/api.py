@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import os
+import signal
 from pathlib import Path
 from typing import Any
 
@@ -1273,7 +1274,18 @@ async def restart_bot():
 
     async def _delayed_exit():
         await asyncio.sleep(1)  # даём HTTP-ответу время дойти до клиента
-        os._exit(0)
+        # os._exit(0) убивал процесс мгновенно, минуя ЛЮБУЮ Python-очистку —
+        # включая уже существующий SIGTERM-обработчик в main.py, который как
+        # раз и был добавлен, чтобы execution_engine.close() успевал закрыть
+        # ccxt-биржу и её aiohttp ClientSession перед завершением процесса
+        # (см. комментарий у _request_shutdown в main.py). Реальный симптом:
+        # каждый рестарт через эту кнопку логировал "Unclosed client
+        # session"/"Unclosed connector" от aiohttp, хотя для остановки
+        # контейнера через docker (SIGTERM) это уже было починено. Отправляем
+        # себе тот же SIGTERM, которым штатно останавливает docker — процесс
+        # пройдёт тот же graceful shutdown и всё равно завершится (после чего
+        # Docker поднимет контейнер заново той же restart-политикой).
+        os.kill(os.getpid(), signal.SIGTERM)
 
     asyncio.create_task(_delayed_exit())
     return {"success": True, "message": "Бот перезапускается"}
