@@ -5660,6 +5660,67 @@ class TestRestartBotSendsSigtermNotOsExit(unittest.IsolatedAsyncioTestCase):
         mock_kill.assert_called_once_with(api_module.os.getpid(), api_module.signal.SIGTERM)
 
 
+class TestInitializeClosesPreviousExchangeConnection(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент (прод): живое переключение market_type/active_exchange/
+    use_exchange_sandbox БЕЗ рестарта процесса (см. settings_store.
+    apply_settings_update — вызывает execution_engine.initialize() повторно
+    на уже работающем движке) оставляло старое соединение (ccxt +
+    aiohttp ClientSession) незакрытым, перезаписывая его новым — та же
+    "Unclosed client session"/"Unclosed connector", что и в баге #31
+    (кнопка "Перезапустить бота"), но по другому пути: там процесс убивался
+    целиком мимо graceful shutdown, здесь процесс живёт, а initialize()
+    просто не закрывал ПРЕДЫДУЩЕЕ соединение перед созданием нового.
+    """
+
+    def setUp(self):
+        self._saved = {
+            k: getattr(settings, k) for k in (
+                "trading_mode", "bybit_api_key", "bybit_api_secret", "use_exchange_sandbox", "market_type",
+            )
+        }
+        settings.trading_mode = "real"
+        settings.bybit_api_key = "key"
+        settings.bybit_api_secret = "secret"
+        settings.use_exchange_sandbox = True
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(settings, k, v)
+
+    async def test_second_initialize_closes_first_exchange(self):
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        old_exchange = AsyncMock()
+        engine.exchange = old_exchange
+
+        new_exchange = AsyncMock()
+        new_exchange.enable_demo_trading = MagicMock()
+        new_exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"USDT": 10.0}, "USDT": {"free": 10.0, "used": 0, "total": 10.0}}
+        )
+        with patch("src.execution.executor.ccxt.bybit", return_value=new_exchange):
+            await engine.initialize("bybit")
+
+        old_exchange.close.assert_awaited_once()
+        self.assertIs(engine.exchange, new_exchange)
+
+    async def test_first_initialize_with_no_prior_exchange_does_not_error(self):
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        self.assertIsNone(engine.exchange)
+
+        new_exchange = AsyncMock()
+        new_exchange.enable_demo_trading = MagicMock()
+        new_exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"USDT": 10.0}, "USDT": {"free": 10.0, "used": 0, "total": 10.0}}
+        )
+        with patch("src.execution.executor.ccxt.bybit", return_value=new_exchange):
+            await engine.initialize("bybit")
+
+        self.assertIs(engine.exchange, new_exchange)
+
+
 class TestRealBalanceReseedsRiskState(unittest.IsolatedAsyncioTestCase):
     """
     RiskState.start_balance был захардкожен на settings.startup_capital_usdt

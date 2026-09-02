@@ -61,6 +61,24 @@ class ExecutionEngine:
             await self._restore_paper_state_from_db()
             return
 
+        # initialize() может вызываться повторно в УЖЕ РАБОТАЮЩЕМ процессе —
+        # без рестарта контейнера, при живом переключении настроек биржи
+        # (market_type/active_exchange/use_exchange_sandbox, см.
+        # settings_store.apply_settings_update) — старое соединение (ccxt +
+        # его aiohttp ClientSession) при этом просто перезаписывалось новым
+        # без закрытия. Для рестарта ВСЕГО процесса эта утечка уже была
+        # починена (см. _cleanup() в main.py — вызывается перед выходом), но
+        # переключение настройки на лету, пока процесс жив, идёт другим
+        # путём — реальный инцидент: переключение market_type на проде дало
+        # ту же "Unclosed client session"/"Unclosed connector" от aiohttp,
+        # что и рестарт до фикса #31.
+        if self.exchange:
+            try:
+                await self.exchange.close()
+            except Exception as e:
+                logger.debug(f"Не удалось закрыть предыдущее соединение с биржей: {e}")
+            self.exchange = None
+
         # Real mode: подключаемся к бирже
         try:
             # Раньше здесь БЕЗУСЛОВНО брались settings.binance_api_key/secret
