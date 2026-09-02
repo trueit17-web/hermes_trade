@@ -39,7 +39,22 @@ class ExecutionEngine:
     """Движок исполнения ордеров."""
 
     def __init__(self):
-        self.exchange: ccxt.Exchange | None = None
+        # Раньше — единственный self.exchange, привязанный к ТЕКУЩЕМУ
+        # settings.market_type. Реальные позиции могут существовать
+        # одновременно и на споте, и на фьючерсах (пользователь переключил
+        # тумблер, пока часть позиций ещё открыта на другом рынке) — тогда
+        # нужны ОБА подключения сразу, иначе ведение "чужой" по текущему
+        # тумблеру позиции (SL, закрытие) уходит не в тот ccxt-клиент.
+        # Реальный инцидент: при переключении на фьючерсы 3 спотовые позиции
+        # (MON/RLUSD/USDC) стали обслуживаться так, будто они фьючерсные.
+        # self.exchange ниже остаётся как свойство для обратной
+        # совместимости — это клиент ИМЕННО текущего рынка (используется
+        # везде, где операция не привязана к конкретной позиции: получение
+        # тикера/баланса, открытие НОВОЙ позиции). Для операций над
+        # конкретной УЖЕ ОТКРЫТОЙ позицией используется _exchange_for(pos),
+        # который резолвит клиент по market_type САМОЙ позиции, а не по
+        # текущему тумблеру.
+        self._exchanges: dict[str, ccxt.Exchange] = {}
         self.exchange_id: str | None = None
         self.is_paper: bool = settings.is_paper
         self.paper_balance: float = settings.startup_capital_usdt
@@ -47,6 +62,21 @@ class ExecutionEngine:
         self.real_positions: dict[str, dict] = {}
         self.last_prices: dict[str, float] = {}
         self.order_counter = 0
+
+    @property
+    def exchange(self) -> ccxt.Exchange | None:
+        return self._exchanges.get(settings.market_type)
+
+    @exchange.setter
+    def exchange(self, value: ccxt.Exchange | None) -> None:
+        self._exchanges[settings.market_type] = value
+
+    def _exchange_for(self, pos: dict | None) -> ccxt.Exchange | None:
+        """Ccxt-клиент рынка, на котором была открыта КОНКРЕТНАЯ позиция —
+        не текущего тумблера settings.market_type (см. комментарий в __init__)."""
+        if pos is None:
+            return self.exchange
+        return self._exchanges.get(pos.get("market_type", "spot"))
 
     def get_open_positions(self) -> dict:
         """Открытые позиции для текущего режима (paper или real)."""
@@ -64,20 +94,22 @@ class ExecutionEngine:
         # initialize() может вызываться повторно в УЖЕ РАБОТАЮЩЕМ процессе —
         # без рестарта контейнера, при живом переключении настроек биржи
         # (market_type/active_exchange/use_exchange_sandbox, см.
-        # settings_store.apply_settings_update) — старое соединение (ccxt +
-        # его aiohttp ClientSession) при этом просто перезаписывалось новым
+        # settings_store.apply_settings_update) — старые соединения (ccxt +
+        # их aiohttp ClientSession) при этом просто перезаписывались новыми
         # без закрытия. Для рестарта ВСЕГО процесса эта утечка уже была
         # починена (см. _cleanup() в main.py — вызывается перед выходом), но
         # переключение настройки на лету, пока процесс жив, идёт другим
         # путём — реальный инцидент: переключение market_type на проде дало
         # ту же "Unclosed client session"/"Unclosed connector" от aiohttp,
-        # что и рестарт до фикса #31.
-        if self.exchange:
+        # что и рестарт до фикса #31. Закрываем ВСЕ подключённые клиенты
+        # (не только текущего рынка) — после предыдущего initialize() мог
+        # остаться и лениво поднятый клиент второго рынка (см. ниже).
+        for market_type, exchange in list(self._exchanges.items()):
             try:
-                await self.exchange.close()
+                await exchange.close()
             except Exception as e:
-                logger.debug(f"Не удалось закрыть предыдущее соединение с биржей: {e}")
-            self.exchange = None
+                logger.debug(f"Не удалось закрыть предыдущее соединение с биржей [{market_type}]: {e}")
+        self._exchanges = {}
 
         # Real mode: подключаемся к бирже
         try:
@@ -108,53 +140,11 @@ class ExecutionEngine:
                 await self._restore_paper_state_from_db()
                 return
 
-            # market_type=="futures" переключает ccxt на linear-swap рынок
-            # (USDT-perpetual) вместо спота — см. комментарий у
-            # settings.market_type. defaultSubType нужен, чтобы попасть
-            # именно на linear (USDT-margined), а не inverse-контракты.
-            market_options = (
-                {"defaultType": "swap", "defaultSubType": "linear"}
-                if settings.market_type == "futures"
-                else {"defaultType": "spot"}
-            )
-            exchange_config: dict = {
-                "apiKey": api_key,
-                "secret": api_secret,
-                "enableRateLimit": True,
-                "options": market_options,
-            }
-            if passphrase:
-                exchange_config["password"] = passphrase
-            self.exchange = exchange_class(exchange_config)
-
-            if settings.use_exchange_sandbox:
-                if exchange_id == "bybit":
-                    # У Bybit это НЕ то же самое, что set_sandbox_mode.
-                    # set_sandbox_mode(True) шлёт запросы на testnet.bybit.com —
-                    # отдельная песочница со своей регистрацией и своими
-                    # ключами. Ключ, который пользователь создаёт как "демо
-                    # счёт" через переключатель Demo Trading в обычном
-                    # live-аккаунте (обычный путь для retail), живёт на
-                    # api-demo.bybit.com и требует отдельного метода
-                    # enable_demo_trading() — иначе тот же самый, реально
-                    # валидный ключ отправлялся на testnet, который его не
-                    # знает, и Bybit отвечал "API key is invalid" (retCode
-                    # 10003). Методы взаимоисключающие: enable_demo_trading()
-                    # падает с NotSupported, если до этого уже включён
-                    # set_sandbox_mode.
-                    self.exchange.enable_demo_trading(True)
-                else:
-                    # Тот же API-ключ, но запросы идут на demo/testnet-счёт
-                    # биржи вместо реального — ccxt сам подменяет нужные
-                    # адреса (testnet.binance.vision для Binance, demo-режим
-                    # OKX).
-                    self.exchange.set_sandbox_mode(True)
-
-            await self.exchange.load_markets()
+            self.exchange = await self._connect_exchange(exchange_id, settings.market_type)
             logger.info(
                 f"🔗 Execution Engine: подключено к {exchange_id}"
                 f"{' (демо-счёт)' if settings.use_exchange_sandbox else ' (LIVE, реальные средства)'}"
-                f"{' [фьючерсы/swap — этап 1, исполнение ордеров ещё не реализовано]' if settings.market_type == 'futures' else ' [спот]'}"
+                f"{' [фьючерсы/swap]' if settings.market_type == 'futures' else ' [спот]'}"
             )
 
             await self._warn_if_okx_trade_permission_missing(exchange_id)
@@ -163,6 +153,30 @@ class ExecutionEngine:
             # (см. ниже) на счету с уже открытыми real-позициями базой для
             # drawdown становился один только свободный кэш.
             await self._restore_real_positions_from_db()
+
+            # Позиция могла быть открыта на ДРУГОМ рынке, чем текущий
+            # тумблер (например, тумблер сейчас на spot, но восстановлена
+            # фьючерсная short-позиция, открытая раньше) — без отдельного
+            # подключения к тому рынку её SL/закрытие уходили бы в клиент
+            # текущего тумблера, привязанный к неверному типу рынка.
+            other_markets = {
+                pos.get("market_type", "spot") for pos in self.real_positions.values()
+            } - {settings.market_type}
+            for other_market_type in other_markets:
+                try:
+                    self._exchanges[other_market_type] = await self._connect_exchange(
+                        exchange_id, other_market_type,
+                    )
+                    logger.info(
+                        f"🔗 Execution Engine: дополнительно подключено к {exchange_id} "
+                        f"[{other_market_type}] — есть открытые real-позиции на этом рынке."
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"⚠️ Не удалось подключить {exchange_id} [{other_market_type}] для "
+                        f"восстановленных позиций этого рынка: {e}"
+                    )
+
             await self._rearm_stop_loss_orders_after_restart()
 
             # Проверка баланса
@@ -204,6 +218,67 @@ class ExecutionEngine:
         except Exception as e:
             logger.error(f"Ошибка инициализации биржи {exchange_id}: {e}")
             self.is_paper = True
+
+    async def _connect_exchange(self, exchange_id: str, market_type: str) -> ccxt.Exchange:
+        """
+        Собрать и подключить один ccxt-клиент для указанного рынка (spot/
+        futures) — общая логика между эagerly подключаемым клиентом текущего
+        тумблера и лениво подключаемым клиентом для позиций, восстановленных
+        на ДРУГОМ рынке (см. initialize()). Ключи и sandbox-настройки
+        читаются из settings — они общие для аккаунта независимо от рынка.
+        """
+        credentials: dict[str, tuple[str | None, str | None, str | None]] = {
+            "binance": (settings.binance_api_key, settings.binance_api_secret, None),
+            "bybit": (settings.bybit_api_key, settings.bybit_api_secret, None),
+            "okx": (settings.okx_api_key, settings.okx_api_secret, settings.okx_passphrase),
+        }
+        api_key, api_secret, passphrase = credentials.get(exchange_id, (None, None, None))
+        exchange_class = getattr(ccxt, exchange_id)
+
+        # market_type=="futures" переключает ccxt на linear-swap рынок
+        # (USDT-perpetual) вместо спота — см. комментарий у
+        # settings.market_type. defaultSubType нужен, чтобы попасть именно
+        # на linear (USDT-margined), а не inverse-контракты.
+        market_options = (
+            {"defaultType": "swap", "defaultSubType": "linear"}
+            if market_type == "futures"
+            else {"defaultType": "spot"}
+        )
+        exchange_config: dict = {
+            "apiKey": api_key,
+            "secret": api_secret,
+            "enableRateLimit": True,
+            "options": market_options,
+        }
+        if passphrase:
+            exchange_config["password"] = passphrase
+        exchange = exchange_class(exchange_config)
+
+        if settings.use_exchange_sandbox:
+            if exchange_id == "bybit":
+                # У Bybit это НЕ то же самое, что set_sandbox_mode.
+                # set_sandbox_mode(True) шлёт запросы на testnet.bybit.com —
+                # отдельная песочница со своей регистрацией и своими
+                # ключами. Ключ, который пользователь создаёт как "демо
+                # счёт" через переключатель Demo Trading в обычном
+                # live-аккаунте (обычный путь для retail), живёт на
+                # api-demo.bybit.com и требует отдельного метода
+                # enable_demo_trading() — иначе тот же самый, реально
+                # валидный ключ отправлялся на testnet, который его не
+                # знает, и Bybit отвечал "API key is invalid" (retCode
+                # 10003). Методы взаимоисключающие: enable_demo_trading()
+                # падает с NotSupported, если до этого уже включён
+                # set_sandbox_mode.
+                exchange.enable_demo_trading(True)
+            else:
+                # Тот же API-ключ, но запросы идут на demo/testnet-счёт
+                # биржи вместо реального — ccxt сам подменяет нужные
+                # адреса (testnet.binance.vision для Binance, demo-режим
+                # OKX).
+                exchange.set_sandbox_mode(True)
+
+        await exchange.load_markets()
+        return exchange
 
     async def _warn_if_okx_trade_permission_missing(self, exchange_id: str):
         """
@@ -330,10 +405,18 @@ class ExecutionEngine:
             # реконструируем такую позицию заново при каждом рестарте —
             # сам факт её появления уже исправлен, а восстановление только
             # заново засоряло бы логи той же неустранимой ошибкой закрытия.
-            # На фьючерсах (ЭТАП 2, market_type=="futures") short — штатная
-            # открытая позиция, и её нужно восстанавливать точно так же,
-            # как long, иначе она "теряется" при каждом рестарте бота.
-            if position_side == "short" and not is_paper and settings.market_type == "spot":
+            # На фьючерсах short — штатная открытая позиция, и её нужно
+            # восстанавливать точно так же, как long, иначе она "теряется"
+            # при каждом рестарте бота. Решение берётся из СОБСТВЕННОГО
+            # market_type ордера (новое поле, привязка позиции к рынку, на
+            # котором она реально была открыта), а не из текущего положения
+            # тумблера settings.market_type — иначе восстановление зависело
+            # бы от того, где сейчас стоит тумблер, а не от того, где
+            # позиция реально была открыта (реальный инцидент: спотовые
+            # позиции MON/RLUSD/USDC при переключении тумблера на futures
+            # обслуживались так, будто они фьючерсные).
+            order_market_type = o.market_type or "spot"
+            if position_side == "short" and not is_paper and order_market_type == "spot":
                 logger.warning(
                     f"⚠️ Пропущен осиротевший short-ордер {symbol} (id={o.id}) при восстановлении "
                     f"real-позиций — на споте шорт не поддерживается, закрыть такую 'позицию' всё "
@@ -372,7 +455,7 @@ class ExecutionEngine:
                 "amount": 0.0, "entry_price": 0.0, "side": position_side,
                 "strategy_id": None, "stop_loss": None, "take_profit": None,
                 "order_id": None, "entry_fee": 0.0, "opened_at": None,
-                "tp_hit_count": 0,
+                "tp_hit_count": 0, "market_type": order_market_type,
             })
             pos["entry_price"] = (
                 (pos["entry_price"] * pos["amount"] + price * amount) / (pos["amount"] + amount)
@@ -380,6 +463,7 @@ class ExecutionEngine:
             )
             pos["amount"] += amount
             pos["side"] = position_side
+            pos["market_type"] = order_market_type
             pos["strategy_id"] = o.strategy.name if o.strategy else pos["strategy_id"]
             pos["stop_loss"] = float(o.stop_loss) if o.stop_loss else pos["stop_loss"]
             pos["take_profit"] = float(o.take_profit) if o.take_profit else pos["take_profit"]
@@ -465,10 +549,13 @@ class ExecutionEngine:
             amount = pos.get("amount") or 0
             if not stop_loss or amount <= 0:
                 continue
+            exchange = self._exchange_for(pos)
+            if exchange is None:
+                continue
             try:
-                open_orders = await self.exchange.fetch_open_orders(symbol, params={"orderFilter": "tpslOrder"})
+                open_orders = await exchange.fetch_open_orders(symbol, params={"orderFilter": "tpslOrder"})
                 for o in (open_orders or []):
-                    await self._cancel_order_safe(symbol, o.get("id"))
+                    await self._cancel_order_safe(symbol, o.get("id"), exchange)
             except Exception as e:
                 logger.debug(f"Не удалось получить список условных ордеров {symbol} перед переустановкой SL: {e}")
             await self.sync_stop_loss_order(symbol, amount, stop_loss)
@@ -549,10 +636,16 @@ class ExecutionEngine:
         return {"orders_deleted": len(order_ids), "trades_deleted": len(trade_ids)}
 
     async def close(self):
-        """Закрыть соединение с биржей."""
-        if self.exchange:
-            await self.exchange.close()
-            logger.info("🔌 Execution Engine: соединение закрыто")
+        """Закрыть все подключённые соединения с биржей (spot и/или futures)."""
+        if not self._exchanges:
+            return
+        for market_type, exchange in list(self._exchanges.items()):
+            try:
+                await exchange.close()
+            except Exception as e:
+                logger.debug(f"Не удалось закрыть соединение с биржей [{market_type}]: {e}")
+        self._exchanges = {}
+        logger.info("🔌 Execution Engine: соединение закрыто")
 
     async def _resolve_symbol_id(self, session, symbol: str) -> tuple[int, int]:
         """Получить (или создать) id биржи и торговой пары в БД."""
@@ -1003,7 +1096,8 @@ class ExecutionEngine:
         return None
 
     async def _fetch_fill_details_via_trades(
-        self, order_id: str | None, symbol: str, attempts: int = 6, delay: float = 1.5,
+        self, order_id: str | None, symbol: str, exchange: ccxt.Exchange | None = None,
+        attempts: int = 6, delay: float = 1.5,
     ) -> dict | None:
         """
         Точные детали исполнения (средняя цена, объём, комиссия) через
@@ -1034,22 +1128,25 @@ class ExecutionEngine:
         if not order_id:
             return None
         for attempt in range(attempts):
-            result = await self._fetch_fill_details_via_trades_once(order_id, symbol)
+            result = await self._fetch_fill_details_via_trades_once(order_id, symbol, exchange)
             if result is not None:
                 return result
             if attempt < attempts - 1:
                 await asyncio.sleep(delay)
         return None
 
-    async def _fetch_fill_details_via_trades_once(self, order_id: str, symbol: str) -> dict | None:
+    async def _fetch_fill_details_via_trades_once(
+        self, order_id: str, symbol: str, exchange: ccxt.Exchange | None = None,
+    ) -> dict | None:
+        ex = exchange if exchange is not None else self.exchange
         try:
             trades = None
             try:
-                trades = await self.exchange.fetch_order_trades(order_id, symbol)
+                trades = await ex.fetch_order_trades(order_id, symbol)
             except Exception:
                 trades = None
             if not trades:
-                recent = await self.exchange.fetch_my_trades(symbol, limit=10)
+                recent = await ex.fetch_my_trades(symbol, limit=10)
                 trades = [t for t in (recent or []) if t.get("order") == order_id]
             if not trades:
                 return None
@@ -1141,7 +1238,9 @@ class ExecutionEngine:
         estimated = filled_amount * fill_price * (settings.paper_fee_pct / 100)
         return estimated, quote_currency
 
-    async def _place_stop_loss_order(self, symbol: str, amount: float, stop_loss_price: float) -> str | None:
+    async def _place_stop_loss_order(
+        self, symbol: str, amount: float, stop_loss_price: float, exchange: ccxt.Exchange | None = None,
+    ) -> str | None:
         """
         Разместить биржевой стоп-ордер (Bybit spot: условный 'tpslOrder' —
         рыночная продажа по достижении stop_loss_price), чтобы защита
@@ -1164,6 +1263,9 @@ class ExecutionEngine:
         """
         if amount <= 0 or not stop_loss_price:
             return None
+        ex = exchange if exchange is not None else self.exchange
+        if ex is None:
+            return None
         # Отслеживаемый объём позиции мог немного разойтись с реальным
         # остатком на бирже — та же причина, что и в close_real_position
         # (комиссии, округление лота, накопленный дрейф за несколько
@@ -1174,7 +1276,7 @@ class ExecutionEngine:
         # LINK/USDT после нескольких частичных TP).
         try:
             base_currency = symbol.split("/")[0]
-            balance = await self.exchange.fetch_balance()
+            balance = await ex.fetch_balance()
             available = self._extract_currency_balance(balance, base_currency)
             if 0 < available < amount:
                 logger.debug(
@@ -1185,7 +1287,7 @@ class ExecutionEngine:
         except Exception as e:
             logger.debug(f"Не удалось сверить баланс перед выставлением SL {symbol}: {e}")
         try:
-            order = await self.exchange.create_market_sell_order(
+            order = await ex.create_market_sell_order(
                 symbol, amount, params={"stopLossPrice": stop_loss_price},
             )
             order_id = order.get("id") if order else None
@@ -1202,12 +1304,17 @@ class ExecutionEngine:
             )
             return None
 
-    async def _cancel_order_safe(self, symbol: str, order_id: str | None) -> None:
+    async def _cancel_order_safe(
+        self, symbol: str, order_id: str | None, exchange: ccxt.Exchange | None = None,
+    ) -> None:
         """Best-effort отмена ордера — он мог уже исполниться или быть отменённым, это не ошибка."""
         if not order_id:
             return
+        ex = exchange if exchange is not None else self.exchange
+        if ex is None:
+            return
         try:
-            await self.exchange.cancel_order(order_id, symbol)
+            await ex.cancel_order(order_id, symbol)
         except Exception as e:
             logger.debug(f"Не удалось отменить ордер {order_id} ({symbol}) — возможно, уже неактивен: {e}")
 
@@ -1219,31 +1326,35 @@ class ExecutionEngine:
         старый биржевой ордер продавал бы либо неверный объём, либо по
         неверной, уже неактуальной цене. Отменяет прежний отслеживаемый
         SL-ордер (если был) и, если задан stop_loss_price и остаток > 0,
-        ставит новый.
+        ставит новый. Клиент резолвится по СОБСТВЕННОМУ market_type позиции
+        (_exchange_for), а не по текущему тумблеру settings.market_type —
+        позиция могла быть открыта на рынке, отличном от текущего.
 
-        На фьючерсах (market_type=="futures") новый SL-ордер НЕ ставится —
-        _place_stop_loss_order всегда шлёт спотовый conditional sell (годится
-        только для long, а на фьючерсах может быть и short — sell в этом
-        случае был бы попыткой продать несуществующий на кошельке актив на
-        рынке, где позиция вообще не выражается остатком монеты). Реальный
-        инцидент: восстановление short-позиции ENA/USDT после рестарта на
-        фьючерсах поставило "sell"-стоп на короткую позицию — семантически
-        неверно (SL шорта должен быть buy выше входа, а не sell). Фьючерсный
-        SL — отдельный, следующий этап; пока позиция под защитой только
-        внутреннего поллинга цены (_check_position_exit в main.py). Прежний
-        отслеживаемый ордер всё равно отменяем — на случай, если он остался
-        от вызова ДО этого фикса.
+        На фьючерсах (позиция с market_type=="futures") новый SL-ордер НЕ
+        ставится — _place_stop_loss_order всегда шлёт спотовый conditional
+        sell (годится только для long, а на фьючерсах может быть и short —
+        sell в этом случае был бы попыткой продать несуществующий на
+        кошельке актив на рынке, где позиция вообще не выражается остатком
+        монеты). Реальный инцидент: восстановление short-позиции ENA/USDT
+        после рестарта на фьючерсах поставило "sell"-стоп на короткую
+        позицию — семантически неверно (SL шорта должен быть buy выше
+        входа, а не sell). Фьючерсный SL — отдельный, следующий этап; пока
+        позиция под защитой только внутреннего поллинга цены
+        (_check_position_exit в main.py). Прежний отслеживаемый ордер всё
+        равно отменяем — на случай, если он остался от вызова ДО этого фикса.
         """
         pos = self.real_positions.get(symbol)
         if pos is None:
             return
-        await self._cancel_order_safe(symbol, pos.get("sl_order_id"))
+        exchange = self._exchange_for(pos)
+        await self._cancel_order_safe(symbol, pos.get("sl_order_id"), exchange)
         pos["sl_order_id"] = None
-        if stop_loss_price and amount > 0 and settings.market_type != "futures":
-            pos["sl_order_id"] = await self._place_stop_loss_order(symbol, amount, stop_loss_price)
+        if stop_loss_price and amount > 0 and pos.get("market_type", "spot") != "futures":
+            pos["sl_order_id"] = await self._place_stop_loss_order(symbol, amount, stop_loss_price, exchange)
 
     async def _confirm_fill_via_balance(
         self, symbol: str, side: str, balance_before: float, expected_amount: float,
+        exchange: ccxt.Exchange | None = None,
     ) -> float | None:
         """
         Второй, независимый от статуса ордера способ подтвердить исполнение —
@@ -1264,8 +1375,9 @@ class ExecutionEngine:
         запрошенного (защита от шума округления/несвязанной активности на
         счету — тот же счёт может использоваться и вручную).
         """
+        ex = exchange if exchange is not None else self.exchange
         try:
-            balance = await self.exchange.fetch_balance()
+            balance = await ex.fetch_balance()
         except Exception as e:
             logger.debug(f"Не удалось сверить баланс {symbol} для второй проверки исполнения: {e}")
             return None
@@ -1448,6 +1560,7 @@ class ExecutionEngine:
                     fee_currency=fee_currency,
                     stop_loss=order_data["stop_loss"],
                     take_profit=order_data["take_profit"],
+                    market_type=settings.market_type,
                     order_id_exchange=",".join(trade_ids) if trade_ids else order["id"],
                     client_order_id=order_data["client_order_id"],
                 )
@@ -1475,6 +1588,12 @@ class ExecutionEngine:
                 "entry_fee": fill_fee,
                 "opened_at": utcnow(),
                 "sl_order_id": None,
+                # Рынок, на котором позиция РЕАЛЬНО открыта — привязка к
+                # текущему тумблеру в момент открытия, а не постоянная
+                # ссылка на него: дальнейшее ведение позиции (SL, закрытие)
+                # использует именно это поле через _exchange_for(pos), даже
+                # если тумблер потом переключат на другой рынок.
+                "market_type": settings.market_type,
             }
             # Биржевой SL — спот-специфичный путь (_place_stop_loss_order
             # всегда продаёт, защищает только long): фьючерсный SL —
@@ -1530,12 +1649,22 @@ class ExecutionEngine:
         _execute_real_order уже не позволяет открыть short-позицию
         (create_market_sell_order без имеющегося актива на споте просто
         упадёт с ошибкой недостатка баланса — исполнение вернёт None и
-        позиция никогда не будет создана). На фьючерсах (market_type=="futures",
-        ЭТАП 2) поддержаны обе стороны: long закрывается продажей, short —
-        покупкой (buy to cover), обе — с reduceOnly, чтобы рассинхрон объёма
-        не открыл встречную позицию вместо закрытия текущей.
+        позиция никогда не будет создана). На фьючерсах поддержаны обе
+        стороны: long закрывается продажей, short — покупкой (buy to
+        cover), обе — с reduceOnly, чтобы рассинхрон объёма не открыл
+        встречную позицию вместо закрытия текущей.
+
+        Рынок и ccxt-клиент резолвятся по СОБСТВЕННОМУ market_type
+        отслеживаемой позиции (_exchange_for), а не по текущему положению
+        тумблера settings.market_type — позиция могла быть открыта на
+        рынке, отличном от текущего (реальный инцидент: спотовые позиции
+        MON/RLUSD/USDC при переключении тумблера на futures обслуживались
+        так, будто они фьючерсные).
         """
-        is_futures = settings.market_type == "futures"
+        tracked_pos = self.real_positions.get(symbol)
+        market_type = tracked_pos.get("market_type", "spot") if tracked_pos is not None else settings.market_type
+        is_futures = market_type == "futures"
+        exchange = self._exchange_for(tracked_pos)
         if not is_futures and side != "long":
             logger.error(f"close_real_position: закрытие {side}-позиции не поддерживается на споте: {symbol}")
             return None
@@ -1561,9 +1690,15 @@ class ExecutionEngine:
         # иначе он остаётся висеть параллельно с этим закрытием (не важно,
         # по какой причине оно происходит — TP, ручное закрытие или сам же
         # SL) и может конфликтовать за один и тот же остаток базовой валюты.
-        tracked_pos = self.real_positions.get(symbol)
         if tracked_pos is not None:
-            await self._cancel_order_safe(symbol, tracked_pos.get("sl_order_id"))
+            await self._cancel_order_safe(symbol, tracked_pos.get("sl_order_id"), exchange)
+
+        if exchange is None:
+            logger.error(
+                f"❌ Не удалось закрыть реальную позицию {symbol}: нет подключения к бирже "
+                f"для рынка '{market_type}'."
+            )
+            return None
 
         # Отслеживаемый объём позиции — оценка (комиссии, округление лота
         # биржей и т.п. могут понемногу расходиться с реальным остатком) —
@@ -1577,7 +1712,7 @@ class ExecutionEngine:
         if not is_futures:
             try:
                 base_currency = symbol.split("/")[0]
-                balance = await self.exchange.fetch_balance()
+                balance = await exchange.fetch_balance()
                 available = self._extract_currency_balance(balance, base_currency)
                 if 0 < available < amount:
                     logger.warning(
@@ -1594,12 +1729,12 @@ class ExecutionEngine:
                 # если объём вдруг разошёлся с тем, что реально открыто на бирже.
                 params = {"reduceOnly": True}
                 order = (
-                    await self.exchange.create_market_sell_order(symbol, closing_amount, params=params)
+                    await exchange.create_market_sell_order(symbol, closing_amount, params=params)
                     if closing_side == "sell"
-                    else await self.exchange.create_market_buy_order(symbol, closing_amount, params=params)
+                    else await exchange.create_market_buy_order(symbol, closing_amount, params=params)
                 )
             else:
-                order = await self.exchange.create_market_sell_order(symbol, closing_amount)
+                order = await exchange.create_market_sell_order(symbol, closing_amount)
         except Exception as e:
             # available логируется прямо здесь (а не только по debug выше) —
             # без этого "Insufficient balance" от биржи ни разу не говорил,
@@ -1650,13 +1785,13 @@ class ExecutionEngine:
                 await self._reconcile_phantom_position(symbol, order_open_id)
             return None
 
-        order = await self._fetch_confirmed_order(order, symbol)
+        order = await self._fetch_confirmed_order(order, symbol, exchange)
         trade_ids: list[str] | None = None
         # Историю сделок биржи пробуем ВСЕГДА (см. тот же приоритет и
         # обоснование при открытии в _execute_real_order) — это то же самое,
         # что видно как Filled Price/комиссия в истории сделок на самой
         # бирже, и точнее, чем order["average"]/order["fee"] из fetch_order.
-        trade_fill = await self._fetch_fill_details_via_trades(order.get("id"), symbol)
+        trade_fill = await self._fetch_fill_details_via_trades(order.get("id"), symbol, exchange)
         if trade_fill:
             order = dict(order)
             order["filled"] = trade_fill["amount"]
@@ -1670,7 +1805,7 @@ class ExecutionEngine:
             # снят с биржи чуть выше (до отправки sell), так что здесь не
             # нужен ещё один запрос баланса "до".
             confirmed_amount = (
-                await self._confirm_fill_via_balance(symbol, closing_side, available, closing_amount)
+                await self._confirm_fill_via_balance(symbol, closing_side, available, closing_amount, exchange)
                 if available is not None else None
             )
             if confirmed_amount is None:
@@ -1764,6 +1899,7 @@ class ExecutionEngine:
                 filled_price=exit_price,
                 fee=exit_fee,
                 fee_currency=exit_fee_currency,
+                market_type=market_type,
                 order_id_exchange=",".join(trade_ids) if trade_ids else order["id"],
                 client_order_id=str(uuid.uuid4())[:12],
                 notes=f"Real close ({reason})",
@@ -1969,7 +2105,7 @@ class ExecutionEngine:
         """
         pos = self.real_positions.pop(symbol, None)
         if pos is not None:
-            await self._cancel_order_safe(symbol, pos.get("sl_order_id"))
+            await self._cancel_order_safe(symbol, pos.get("sl_order_id"), self._exchange_for(pos))
         if order_open_id is not None:
             async with get_session() as session:
                 await session.execute(
@@ -2131,8 +2267,11 @@ class ExecutionEngine:
         sl_order_id = pos.get("sl_order_id")
         if not sl_order_id:
             return False
+        exchange = self._exchange_for(pos)
+        if exchange is None:
+            return False
         try:
-            order = await self.exchange.fetch_order(sl_order_id, symbol)
+            order = await exchange.fetch_order(sl_order_id, symbol)
         except Exception as e:
             logger.debug(f"Не удалось проверить биржевой SL-ордер {sl_order_id} ({symbol}): {e}")
             return False
@@ -2144,7 +2283,7 @@ class ExecutionEngine:
         if amount <= 0:
             return False
 
-        trade_fill = await self._fetch_fill_details_via_trades(str(sl_order_id), symbol)
+        trade_fill = await self._fetch_fill_details_via_trades(str(sl_order_id), symbol, exchange)
         if trade_fill:
             exit_price = trade_fill["average"]
             amount = trade_fill["amount"]
@@ -2188,6 +2327,9 @@ class ExecutionEngine:
         opened_at = pos.get("opened_at")
         if tracked_amount <= 0 or not opened_at:
             return False
+        exchange = self._exchange_for(pos)
+        if exchange is None:
+            return False
         # Как и другие необязательные сверки с биржей в этом классе (см.
         # _fetch_fill_details_via_trades) — вся функция под одним широким
         # try/except: непредвиденный формат ответа биржи/мока (например,
@@ -2195,7 +2337,7 @@ class ExecutionEngine:
         # должен просто означать "сверить не удалось", а не ронять весь
         # reconcile_real_positions.
         try:
-            recent = await self.exchange.fetch_my_trades(symbol, limit=20)
+            recent = await exchange.fetch_my_trades(symbol, limit=20)
             if not recent:
                 return False
 
@@ -2412,7 +2554,8 @@ class ExecutionEngine:
         return result
 
     async def _fetch_confirmed_order(
-        self, order: dict, symbol: str, attempts: int = 8, delay: float = 0.75,
+        self, order: dict, symbol: str, exchange: ccxt.Exchange | None = None,
+        attempts: int = 8, delay: float = 0.75,
     ) -> dict:
         """
         Bybit v5 (и потенциально другие биржи) на СОЗДАНИЕ маркет-ордера
@@ -2449,11 +2592,12 @@ class ExecutionEngine:
         order_id = order.get("id")
         if not order_id:
             return order
+        ex = exchange if exchange is not None else self.exchange
         latest = order
         for _ in range(attempts):
             await asyncio.sleep(delay)
             try:
-                fetched = await self.exchange.fetch_order(order_id, symbol)
+                fetched = await ex.fetch_order(order_id, symbol)
             except Exception as e:
                 logger.debug(f"Не удалось уточнить исполнение ордера {order_id} ({symbol}): {e}")
                 break

@@ -2391,11 +2391,16 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
 
     async def test_restore_real_positions_reconstructs_short_on_futures(self):
         """
-        ЭТАП 2: на фьючерсах (market_type=="futures") short — штатная
-        позиция, а не осиротевший баг-артефакт (как на споте) — при
-        рестарте бота она должна восстанавливаться так же, как long, а не
-        пропускаться (см. test_restore_real_positions_skips_orphaned_short_order
-        для спота — там пропуск остаётся верным поведением).
+        ЭТАП 3: на фьючерсах short — штатная позиция, а не осиротевший
+        баг-артефакт (как на споте) — при рестарте бота она должна
+        восстанавливаться так же, как long, а не пропускаться (см.
+        test_restore_real_positions_skips_orphaned_short_order для спота —
+        там пропуск остаётся верным поведением). Решение теперь принимается
+        по СОБСТВЕННОМУ market_type ордера (Order.market_type), а не по
+        текущему положению тумблера settings.market_type — позиция могла
+        быть открыта на фьючерсах, даже если тумблер сейчас переключён на
+        spot (и наоборот), поэтому market_type тумблера здесь намеренно НЕ
+        трогается.
         """
         from src.db.session import get_session
         from src.db.models import Order
@@ -2403,27 +2408,24 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         settings.trading_mode = "real"
         self.engine.is_paper = False
         self.engine.exchange_id = "bybit"
-        saved_market_type = settings.market_type
-        settings.market_type = "futures"
-        try:
-            async with get_session() as session:
-                exchange_id, symbol_id = await self.engine._resolve_symbol_id(session, "FUTSHORTRESTORE1/USDT")
-                fut_short = Order(
-                    exchange_id=exchange_id, symbol_id=symbol_id,
-                    side="sell", order_type="market", amount=10.0, price=2.0,
-                    status="filled", filled_amount=10.0, filled_price=2.0,
-                    fee=0.01, order_id_exchange="fut-short-restore-1", client_order_id="futshortrestore1",
-                )
-                session.add(fut_short)
-                await session.commit()
+        async with get_session() as session:
+            exchange_id, symbol_id = await self.engine._resolve_symbol_id(session, "FUTSHORTRESTORE1/USDT")
+            fut_short = Order(
+                exchange_id=exchange_id, symbol_id=symbol_id,
+                side="sell", order_type="market", amount=10.0, price=2.0,
+                status="filled", filled_amount=10.0, filled_price=2.0,
+                fee=0.01, market_type="futures",
+                order_id_exchange="fut-short-restore-1", client_order_id="futshortrestore1",
+            )
+            session.add(fut_short)
+            await session.commit()
 
-            real_positions, _, _ = await self.engine._load_open_positions_from_db(is_paper=False)
-        finally:
-            settings.market_type = saved_market_type
+        real_positions, _, _ = await self.engine._load_open_positions_from_db(is_paper=False)
 
         self.assertIsNotNone(real_positions)
         self.assertIn("FUTSHORTRESTORE1/USDT", real_positions)
         self.assertEqual(real_positions["FUTSHORTRESTORE1/USDT"]["side"], "short")
+        self.assertEqual(real_positions["FUTSHORTRESTORE1/USDT"]["market_type"], "futures")
 
     async def test_real_buy_with_base_currency_fee_reduces_tracked_amount(self):
         """
@@ -5406,14 +5408,24 @@ class TestMultiExchangeCredentials(unittest.IsolatedAsyncioTestCase):
         with patch("src.execution.executor.ccxt.bybit", return_value=mock_exchange) as mock_cls:
             await engine.initialize("bybit")
 
-        mock_cls.assert_called_once()
-        config = mock_cls.call_args.args[0]
+        # Первый вызов — клиент ТЕКУЩЕГО рынка (settings.market_type,
+        # эagerly подключается всегда); в общей тестовой БД (см. conftest —
+        # она не очищается между тестами) может найтись реальная позиция,
+        # оставленная ДРУГИМ тестом на другом рынке — тогда initialize()
+        # лениво поднимет и второй клиент для неё (см. план "два
+        # параллельных подключения"). Оба вызова используют одни и те же
+        # bybit-ключи — проверяем именно ПЕРВЫЙ, не количество вызовов.
+        mock_cls.assert_called()
+        config = mock_cls.call_args_list[0].args[0]
         self.assertEqual(config["apiKey"], "correct-bybit-key")
         self.assertEqual(config["secret"], "correct-bybit-secret")
         # Bybit: demo-ключ живёт на api-demo.bybit.com (enable_demo_trading),
         # а НЕ на testnet.bybit.com (set_sandbox_mode) — это разные песочницы
-        # с разными ключами, см. комментарий в executor.py.
-        mock_exchange.enable_demo_trading.assert_called_once_with(True)
+        # с разными ключами, см. комментарий в executor.py. mock_exchange —
+        # один и тот же объект для ЛЮБОГО количества подключений (см.
+        # комментарий выше про возможный второй клиент), поэтому проверяем
+        # факт вызова, а не количество.
+        mock_exchange.enable_demo_trading.assert_called_with(True)
         mock_exchange.set_sandbox_mode.assert_not_called()
         self.assertFalse(engine.is_paper)
 
@@ -5721,6 +5733,170 @@ class TestInitializeClosesPreviousExchangeConnection(unittest.IsolatedAsyncioTes
         self.assertIs(engine.exchange, new_exchange)
 
 
+class TestDualMarketExchangeClients(unittest.IsolatedAsyncioTestCase):
+    """
+    ЭТАП 3 перехода на фьючерсы: settings.market_type — глобальный тумблер,
+    но реальная позиция могла быть открыта на ДРУГОМ рынке и должна
+    оставаться под защитой (SL, закрытие) через клиент ИМЕННО ТОГО рынка,
+    даже если тумблер потом переключили. Реальный инцидент (прод): 3
+    спотовые позиции (MON/RLUSD/USDC) при переключении тумблера на futures
+    стали обслуживаться так, будто они фьючерсные — исполнение шло через
+    единственный self.exchange, привязанный к текущему тумблеру.
+    ExecutionEngine теперь держит словарь _exchanges по рынку, а каждая
+    real-позиция помечена своим market_type (Order.market_type в БД).
+    """
+
+    def setUp(self):
+        self._saved = {
+            k: getattr(settings, k) for k in (
+                "trading_mode", "bybit_api_key", "bybit_api_secret", "use_exchange_sandbox", "market_type",
+            )
+        }
+        settings.trading_mode = "real"
+        settings.bybit_api_key = "key"
+        settings.bybit_api_secret = "secret"
+        settings.use_exchange_sandbox = True
+        settings.market_type = "spot"
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(settings, k, v)
+
+    async def test_initialize_lazily_connects_second_market_for_restored_position(self):
+        """
+        Тумблер сейчас на spot, но в БД есть открытая real-позиция,
+        помеченная как futures (восстановлена раньше или осталась с другого
+        рынка) — initialize() должен эagerly подключить клиент ТЕКУЩЕГО
+        рынка (spot) и ДОПОЛНИТЕЛЬНО лениво поднять клиент для futures, не
+        трогая текущий выбор тумблера.
+        """
+        from src.db.session import get_session
+        from src.db.models import Order
+
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        engine.exchange_id = "bybit"
+
+        symbol = "DUALMKT1/USDT"
+        async with get_session() as session:
+            exchange_id, symbol_id = await engine._resolve_symbol_id(session, symbol)
+            order = Order(
+                exchange_id=exchange_id, symbol_id=symbol_id,
+                side="sell", order_type="market", amount=5.0, price=3.0,
+                status="filled", filled_amount=5.0, filled_price=3.0,
+                fee=0.01, market_type="futures",
+                order_id_exchange="dual-mkt-1", client_order_id="dualmkt1",
+            )
+            session.add(order)
+            await session.commit()
+
+        spot_mock = AsyncMock()
+        spot_mock.enable_demo_trading = MagicMock()
+        spot_mock.fetch_balance = AsyncMock(
+            return_value={"free": {"USDT": 10.0}, "USDT": {"free": 10.0, "used": 0, "total": 10.0}}
+        )
+        futures_mock = AsyncMock()
+        futures_mock.enable_demo_trading = MagicMock()
+
+        def make_exchange(config):
+            options = config.get("options") or {}
+            return futures_mock if options.get("defaultType") == "swap" else spot_mock
+
+        with patch("src.execution.executor.ccxt.bybit", side_effect=make_exchange):
+            await engine.initialize("bybit")
+
+        self.assertIs(engine.exchange, spot_mock)  # текущий рынок (тумблер) — spot, не тронут
+        self.assertIn(symbol, engine.real_positions)
+        self.assertEqual(engine.real_positions[symbol]["market_type"], "futures")
+        self.assertIs(engine._exchange_for(engine.real_positions[symbol]), futures_mock)
+
+    async def test_reinitialize_closes_all_previous_market_clients(self):
+        """
+        Живое переключение настроек (см. settings_store.apply_settings_update)
+        может вызвать initialize() повторно, когда УЖЕ подключены клиенты
+        ОБОИХ рынков (см. предыдущий тест) — все они должны закрываться при
+        реконнекте, а не только клиент текущего рынка (та же утечка, что и
+        TestInitializeClosesPreviousExchangeConnection, но для словаря).
+        """
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        old_spot = AsyncMock()
+        old_futures = AsyncMock()
+        engine._exchanges = {"spot": old_spot, "futures": old_futures}
+
+        new_exchange = AsyncMock()
+        new_exchange.enable_demo_trading = MagicMock()
+        new_exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"USDT": 10.0}, "USDT": {"free": 10.0, "used": 0, "total": 10.0}}
+        )
+        with patch("src.execution.executor.ccxt.bybit", return_value=new_exchange):
+            await engine.initialize("bybit")
+
+        old_spot.close.assert_awaited_once()
+        old_futures.close.assert_awaited_once()
+
+    async def test_close_real_position_resolves_client_by_positions_own_market_type(self):
+        """
+        Тумблер сейчас на spot, но закрываемая позиция помечена как
+        futures — close_real_position должен уйти именно во ФЬЮЧЕРСНЫЙ
+        mock-клиент (по pos["market_type"]), а не в клиент текущего
+        тумблера (который в реальности вообще может быть не подключен под
+        этот символ).
+        """
+        from src.utils.timeutils import utcnow
+
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        spot_mock = AsyncMock()
+        futures_mock = AsyncMock()
+        engine._exchanges = {"spot": spot_mock, "futures": futures_mock}
+        engine.real_positions["DUALCLOSE1/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "short", "sl_order_id": None,
+            "market_type": "futures", "opened_at": utcnow(),
+        }
+        futures_mock.create_market_buy_order.return_value = {
+            "id": "dualclose-1", "filled": 10.0, "average": 2.5, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+
+        result = await engine.close_real_position(
+            symbol="DUALCLOSE1/USDT", side="short", entry_price=2.0, amount=10.0, reason="test",
+        )
+
+        self.assertIsNotNone(result)
+        futures_mock.create_market_buy_order.assert_awaited_once()
+        spot_mock.create_market_buy_order.assert_not_called()
+        spot_mock.create_market_sell_order.assert_not_called()
+        spot_mock.fetch_balance.assert_not_called()
+
+    async def test_sync_stop_loss_order_resolves_client_by_positions_own_market_type(self):
+        """
+        Та же логика для SL: тумблер на futures (глобально биржевой SL для
+        фьючерсов пока не ставится), но позиция сама помечена spot —
+        sync_stop_loss_order должен по-прежнему выставить SL через
+        SPOT-клиент, используя market_type самой позиции, а не текущего
+        тумблера.
+        """
+        settings.market_type = "futures"
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        spot_mock = AsyncMock()
+        futures_mock = AsyncMock()
+        spot_mock.create_market_sell_order.return_value = {"id": "spot-sl-dual-1"}
+        spot_mock.fetch_balance = AsyncMock(return_value={})
+        engine._exchanges = {"spot": spot_mock, "futures": futures_mock}
+        engine.real_positions["DUALSL1/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long", "sl_order_id": None,
+            "market_type": "spot",
+        }
+
+        await engine.sync_stop_loss_order("DUALSL1/USDT", 10.0, 1.8)
+
+        spot_mock.create_market_sell_order.assert_awaited_once()
+        futures_mock.create_market_sell_order.assert_not_called()
+        self.assertEqual(engine.real_positions["DUALSL1/USDT"]["sl_order_id"], "spot-sl-dual-1")
+
+
 class TestRealBalanceReseedsRiskState(unittest.IsolatedAsyncioTestCase):
     """
     RiskState.start_balance был захардкожен на settings.startup_capital_usdt
@@ -5916,7 +6092,12 @@ class TestMarketTypeFuturesConnection(unittest.IsolatedAsyncioTestCase):
         with patch("src.execution.executor.ccxt.bybit", return_value=mock_exchange) as mock_class:
             await engine.initialize("bybit")
 
-        called_config = mock_class.call_args[0][0]
+        # Первый вызов — клиент ТЕКУЩЕГО рынка (эagerly подключается всегда);
+        # последующие вызовы (если есть) — лениво поднятые клиенты ДРУГИХ
+        # рынков для позиций, восстановленных из БД на них (см.
+        # TestInitializeConnectsSecondMarketForRestoredPositions) — не
+        # относятся к этой проверке.
+        called_config = mock_class.call_args_list[0][0][0]
         self.assertEqual(called_config["options"], {"defaultType": "swap", "defaultSubType": "linear"})
 
     async def test_spot_market_type_still_connects_to_spot(self):
@@ -5931,7 +6112,7 @@ class TestMarketTypeFuturesConnection(unittest.IsolatedAsyncioTestCase):
         with patch("src.execution.executor.ccxt.bybit", return_value=mock_exchange) as mock_class:
             await engine.initialize("bybit")
 
-        called_config = mock_class.call_args[0][0]
+        called_config = mock_class.call_args_list[0][0][0]
         self.assertEqual(called_config["options"], {"defaultType": "spot"})
 
 
@@ -6240,6 +6421,7 @@ class TestSyncStopLossOrderSkipsFutures(unittest.IsolatedAsyncioTestCase):
         self.engine.exchange = AsyncMock()
         self.engine.real_positions["FUTSL1/USDT"] = {
             "amount": 10.0, "entry_price": 2.0, "side": "short", "sl_order_id": None,
+            "market_type": "futures",
         }
 
         await self.engine.sync_stop_loss_order("FUTSL1/USDT", 10.0, 2.2)

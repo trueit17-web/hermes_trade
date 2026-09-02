@@ -131,6 +131,13 @@ class Order(Base):
     fee_currency: Mapped[str | None] = mapped_column(String(20))
     stop_loss: Mapped[float | None] = mapped_column(DECIMAL)
     take_profit: Mapped[float | None] = mapped_column(DECIMAL)
+    # Рынок, на котором реально был размещён ордер — "spot" или "futures".
+    # Нужно, чтобы восстановление позиции при рестарте (ExecutionEngine.
+    # _load_open_positions_from_db) и её дальнейшее ведение (SL, закрытие)
+    # шли через верный ccxt-клиент независимо от ТЕКУЩЕГО положения
+    # тумблера settings.market_type в шапке дашборда — без этого поля
+    # позиция ошибочно "переезжала" на другой рынок при каждом переключении.
+    market_type: Mapped[str] = mapped_column(String(10), default="spot", server_default="spot")
     order_id_exchange: Mapped[str | None] = mapped_column(String(100))
     client_order_id: Mapped[str | None] = mapped_column(String(100))
     notes: Mapped[str | None] = mapped_column(Text)
