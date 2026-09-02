@@ -280,6 +280,34 @@ class ExecutionEngine:
         await exchange.load_markets()
         return exchange
 
+    async def _ensure_exchange_connected(self, market_type: str) -> ccxt.Exchange | None:
+        """
+        Клиент нужного рынка, подключая его ПО ТРЕБОВАНИЮ, если ещё нет —
+        в отличие от initialize() (который лениво поднимает второй клиент
+        только для рынков, найденных среди позиций, восстановленных при
+        СТАРТЕ процесса), это нужно при открытии НОВОЙ позиции на рынке,
+        для которого клиента ещё не существует вовсе (например: сигнал
+        Telegram-канала, настроенного на futures, а весь текущий тумблер и
+        все текущие real-позиции — на споте — на фьючерсы за всё время
+        работы процесса ещё не заходили).
+        """
+        existing = self._exchanges.get(market_type)
+        if existing is not None:
+            return existing
+        if self.exchange_id is None:
+            return None
+        try:
+            exchange = await self._connect_exchange(self.exchange_id, market_type)
+        except Exception as e:
+            logger.error(f"Не удалось подключиться к {self.exchange_id} [{market_type}] для нового ордера: {e}")
+            return None
+        self._exchanges[market_type] = exchange
+        logger.info(
+            f"🔗 Execution Engine: лениво подключено к {self.exchange_id} [{market_type}] — "
+            f"сигнал требует этот рынок."
+        )
+        return exchange
+
     async def _warn_if_okx_trade_permission_missing(self, exchange_id: str):
         """
         OKX (в отличие от Binance/Bybit) отдаёт список прав, реально выданных
@@ -718,10 +746,17 @@ class ExecutionEngine:
         take_profit: float | None = None,
         strategy_id: int | None = None,
         signal_data: dict | None = None,
+        market_type: str | None = None,
     ) -> Order | None:
         """
         Создать ордер.
         Возвращает Order объект (сохранённый в БД) или None.
+
+        market_type — рынок для НОВОЙ позиции (spot/futures), если задан
+        явно (например, настройка конкретного Telegram-канала — см.
+        _execute_telegram_signal в main.py) — по умолчанию (None) берётся
+        settings.market_type (текущий тумблер в шапке дашборда), как и
+        раньше для сигналов стратегий/ручных ордеров.
         """
         if risk_manager.state.kill_switch_active:
             logger.warning(f"❌ Попытка создать ордер при активном kill switch: {symbol}")
@@ -732,12 +767,23 @@ class ExecutionEngine:
             return None
 
         client_order_id = str(uuid.uuid4())[:12]
+        order_market_type = market_type or settings.market_type
 
         # Получить цену исполнения
         execution_price = price
         if order_type == "market" and execution_price is None:
             try:
-                ticker = await self.exchange.fetch_ticker(symbol)
+                if self.is_paper:
+                    ticker = await self.exchange.fetch_ticker(symbol)
+                else:
+                    # Тикер снимаем с клиента ЦЕЛЕВОГО рынка ордера, а не
+                    # текущего тумблера — иначе для канала с market_type,
+                    # отличным от тумблера, цена читалась бы не с той пары
+                    # (у фьючерсов и спота разный спред/цена).
+                    ticker_exchange = await self._ensure_exchange_connected(order_market_type)
+                    if ticker_exchange is None:
+                        raise RuntimeError(f"нет подключения к бирже для рынка '{order_market_type}'")
+                    ticker = await ticker_exchange.fetch_ticker(symbol)
                 execution_price = ticker["last"] or ticker["bid"] or ticker["ask"]
             except Exception as e:
                 logger.warning(f"Не удалось получить цену для {symbol}: {e}")
@@ -764,6 +810,7 @@ class ExecutionEngine:
             "fee": fee,
             "strategy_id": strategy_id,
             "signal_data": signal_data,
+            "market_type": order_market_type,
         }
 
         sl_str = f"{stop_loss:.2f}" if stop_loss is not None else "—"
@@ -1054,12 +1101,12 @@ class ExecutionEngine:
         без выставленного .markets), а падать из-за необязательной проверки
         не должны ни отправка ордера, ни сверка позиций.
 
-        exchange по умолчанию — self.exchange (клиент ТЕКУЩЕГО тумблера) —
-        верно для _below_exchange_minimum (открытие ВСЕГДА идёт на текущий
-        рынок). Для сверки позиции с рынком, отличным от текущего тумблера,
-        нужно передать явно клиент ЕЁ рынка (см. _reconcile_futures_position/
-        _reconcile_spot_position) — иначе лимиты читались бы со structurally
-        другого markets dict чужого рынка.
+        exchange по умолчанию — self.exchange (клиент ТЕКУЩЕГО тумблера).
+        Для ордера/позиции на рынке, отличном от текущего тумблера (напр.
+        Telegram-канал настроен на другой рынок — см. _execute_real_order/
+        _reconcile_futures_position/_reconcile_spot_position), нужно
+        передать явно клиент ЕЁ рынка — иначе лимиты читались бы со
+        structurally другого markets dict чужого рынка.
         """
         try:
             ex = exchange if exchange is not None else self.exchange
@@ -1082,7 +1129,9 @@ class ExecutionEngine:
         min_amount = amount_limits.get("min") if isinstance(amount_limits, dict) else None
         return min_amount if isinstance(min_amount, (int, float)) else None
 
-    def _below_exchange_minimum(self, symbol: str, amount: float, price: float | None) -> str | None:
+    def _below_exchange_minimum(
+        self, symbol: str, amount: float, price: float | None, exchange: ccxt.Exchange | None = None,
+    ) -> str | None:
         """
         Проверить объём/стоимость ордера ПРОТИВ биржевых лимитов пары ДО
         отправки запроса — иначе биржа отклоняет ордер (напр. Bybit
@@ -1093,16 +1142,21 @@ class ExecutionEngine:
         допустимый на бирже ордер по этой паре — сигнал безопасно
         пропускается, ошибка это ожидаемая при малом остатке средств.
 
+        exchange — клиент РЫНКА ЭТОГО ОРДЕРА (может отличаться от текущего
+        тумблера — напр. Telegram-канал настроен на другой рынок, см.
+        _execute_real_order); по умолчанию (None) — self.exchange, как и
+        раньше для сигналов без явного override.
+
         Это вспомогательная, необязательная проверка: структура markets[symbol]
         не гарантирована (разные биржи, неполные тестовые/тестовые-mock
         объекты) — при любой неожиданности просто не блокируем ордер,
         оставляя решение самой бирже, как и раньше.
         """
         try:
-            min_amount = self._market_min_amount(symbol)
+            min_amount = self._market_min_amount(symbol, exchange)
             if isinstance(min_amount, (int, float)) and amount < min_amount:
                 return f"объём {amount:.8f} {symbol.split('/')[0]} меньше минимального ({min_amount})"
-            limits = self._market_limits(symbol) or {}
+            limits = self._market_limits(symbol, exchange) or {}
             cost_limits = limits.get("cost")
             min_cost = cost_limits.get("min") if isinstance(cost_limits, dict) else None
             if isinstance(min_cost, (int, float)) and price and amount * price < min_cost:
@@ -1436,7 +1490,20 @@ class ExecutionEngine:
         amount = order_data["amount"]
         price = order_data["price"]
 
-        is_futures = settings.market_type == "futures"
+        # Рынок этого КОНКРЕТНОГО ордера — либо явно передан вызывающим
+        # кодом (напр. настройка Telegram-канала, см. create_order/
+        # _execute_telegram_signal в main.py), либо (market_type не задан)
+        # текущий тумблер settings.market_type — как и раньше для сигналов
+        # стратегий/ручных ордеров.
+        order_market_type = order_data.get("market_type") or settings.market_type
+        is_futures = order_market_type == "futures"
+        exchange = await self._ensure_exchange_connected(order_market_type)
+        if exchange is None:
+            logger.error(
+                f"❌ Реальный ордер {symbol} отклонён: нет подключения к бирже для рынка "
+                f"'{order_market_type}'."
+            )
+            return None
 
         # На споте нет встроенного шорта — этот метод вызывается ТОЛЬКО для
         # ОТКРЫТИЯ новой позиции (create_order -> _execute_real_order);
@@ -1472,11 +1539,11 @@ class ExecutionEngine:
             # значение ("leverage not modified") — это не ошибка, ордер
             # всё равно можно размещать с уже действующим плечом.
             try:
-                await self.exchange.set_leverage(int(settings.futures_leverage), symbol)
+                await exchange.set_leverage(int(settings.futures_leverage), symbol)
             except Exception as e:
                 logger.debug(f"Не удалось установить плечо {settings.futures_leverage}x для {symbol}: {e}")
 
-        below_min = self._below_exchange_minimum(symbol, amount, price)
+        below_min = self._below_exchange_minimum(symbol, amount, price, exchange)
         if below_min:
             logger.warning(
                 f"⚠️ Реальный ордер {symbol} пропущен: {below_min} — доступного баланса "
@@ -1492,7 +1559,7 @@ class ExecutionEngine:
         balance_before = None
         if not is_futures:
             try:
-                snapshot = await self.exchange.fetch_balance()
+                snapshot = await exchange.fetch_balance()
                 balance_before = self._extract_currency_balance(snapshot, symbol.split("/")[0])
             except Exception as e:
                 logger.debug(f"Не удалось снять баланс {symbol} до отправки ордера: {e}")
@@ -1500,19 +1567,19 @@ class ExecutionEngine:
         try:
             if order_data["type"] == "market":
                 if side == "buy":
-                    order = await self.exchange.create_market_buy_order(symbol, amount)
+                    order = await exchange.create_market_buy_order(symbol, amount)
                 else:
-                    order = await self.exchange.create_market_sell_order(symbol, amount)
+                    order = await exchange.create_market_sell_order(symbol, amount)
             elif order_data["type"] == "limit":
                 if side == "buy":
-                    order = await self.exchange.create_limit_buy_order(symbol, price, amount)
+                    order = await exchange.create_limit_buy_order(symbol, price, amount)
                 else:
-                    order = await self.exchange.create_limit_sell_order(symbol, price, amount)
+                    order = await exchange.create_limit_sell_order(symbol, price, amount)
             else:
                 logger.error(f"Неизвестный тип ордера: {order_data['type']}")
                 return None
 
-            order = await self._fetch_confirmed_order(order, symbol)
+            order = await self._fetch_confirmed_order(order, symbol, exchange)
             # Bybit возвращает orderId даже для ордера, который потом не
             # исполнился (например, отклонён движком сопоставления) —
             # получение orderId без исключения НЕ значит, что сделка реально
@@ -1530,7 +1597,7 @@ class ExecutionEngine:
             # чем подтянуть в тот же снимок реальную комиссию — раньше эти
             # (потенциально неполные) данные использовались напрямую, из-за
             # чего комиссия/цена в дашборде расходились с биржей.
-            trade_fill = await self._fetch_fill_details_via_trades(order.get("id"), symbol)
+            trade_fill = await self._fetch_fill_details_via_trades(order.get("id"), symbol, exchange)
             if trade_fill:
                 order = dict(order)
                 order["filled"] = trade_fill["amount"]
@@ -1543,7 +1610,7 @@ class ExecutionEngine:
                 # баланса (объём есть, а цена/комиссия — оценка по
                 # запрошенной цене/стандартной ставке ниже).
                 confirmed_amount = (
-                    await self._confirm_fill_via_balance(symbol, side, balance_before, amount)
+                    await self._confirm_fill_via_balance(symbol, side, balance_before, amount, exchange)
                     if balance_before is not None else None
                 )
                 if confirmed_amount is None:
@@ -1601,7 +1668,7 @@ class ExecutionEngine:
                     fee_currency=fee_currency,
                     stop_loss=order_data["stop_loss"],
                     take_profit=order_data["take_profit"],
-                    market_type=settings.market_type,
+                    market_type=order_market_type,
                     order_id_exchange=",".join(trade_ids) if trade_ids else order["id"],
                     client_order_id=order_data["client_order_id"],
                 )
@@ -1630,11 +1697,13 @@ class ExecutionEngine:
                 "opened_at": utcnow(),
                 "sl_order_id": None,
                 # Рынок, на котором позиция РЕАЛЬНО открыта — привязка к
-                # текущему тумблеру в момент открытия, а не постоянная
-                # ссылка на него: дальнейшее ведение позиции (SL, закрытие)
-                # использует именно это поле через _exchange_for(pos), даже
-                # если тумблер потом переключат на другой рынок.
-                "market_type": settings.market_type,
+                # order_market_type ЭТОГО ордера (текущий тумблер по
+                # умолчанию, либо явный override вызывающего кода — см.
+                # create_order), а не постоянная ссылка на текущий тумблер:
+                # дальнейшее ведение позиции (SL, закрытие) использует
+                # именно это поле через _exchange_for(pos), даже если
+                # тумблер потом переключат на другой рынок.
+                "market_type": order_market_type,
             }
             # Биржевой SL теперь ставится для обоих рынков —
             # sync_stop_loss_order сама выбирает направление ордера по

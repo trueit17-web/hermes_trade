@@ -476,10 +476,10 @@ class TradingBot:
         remove_channel_from_monitoring(channel_id)
         self._telegram_channel_db_ids.pop(channel_id, None)
 
-    async def _get_channel_settings(self, channel_id: str) -> tuple[float, bool, float]:
+    async def _get_channel_settings(self, channel_id: str) -> tuple[float, bool, float, str]:
         """
-        Порог качества, автоисполнение и базовый размер позиции (%)
-        конкретного Telegram-канала.
+        Порог качества, автоисполнение, базовый размер позиции (%) и рынок
+        (spot/futures) конкретного Telegram-канала.
 
         Раньше main.py вообще не читал TelegramChannel.quality_threshold/
         auto_execute — оба параметра брались из общих
@@ -489,7 +489,10 @@ class TradingBot:
         никакого эффекта (канал вёл себя как будто там всегда 0.5/False).
         position_size_pct — той же природы: раньше в _execute_telegram_signal
         был захардкожен единый размер 5.0% для всех каналов сразу, хотя
-        доверие к разным каналам обычно разное.
+        доверие к разным каналам обычно разное. market — аналогично: раньше
+        ВСЕ каналы делили один глобальный settings.market_type (тумблер в
+        шапке дашборда), хотя разные каналы обычно рассчитаны на разный тип
+        торговли (см. _execute_telegram_signal).
 
         Читаем из БД "вживую" на каждый сигнал, а не кэшируем при старте —
         иначе изменение через дашборд не действовало бы без перезапуска
@@ -504,10 +507,16 @@ class TradingBot:
                 async with get_session() as session:
                     channel = await session.get(TelegramChannel, db_id)
                     if channel is not None:
-                        return channel.quality_threshold, channel.auto_execute, channel.position_size_pct
+                        return (
+                            channel.quality_threshold, channel.auto_execute,
+                            channel.position_size_pct, channel.market,
+                        )
             except Exception as e:
                 logger.warning(f"Не удалось прочитать настройки канала {channel_id}: {e}")
-        return settings.telegram_signals_quality_threshold, settings.telegram_signals_auto_execute, 5.0
+        return (
+            settings.telegram_signals_quality_threshold, settings.telegram_signals_auto_execute,
+            5.0, settings.market_type,
+        )
 
     async def _on_telegram_signal(self, signal_event: dict):
         """Обработка Telegram сигнала."""
@@ -543,8 +552,9 @@ class TradingBot:
             },
             channel_id,
         )
-        quality_threshold, auto_execute, position_size_pct = await self._get_channel_settings(channel_id)
+        quality_threshold, auto_execute, position_size_pct, market_type = await self._get_channel_settings(channel_id)
         signal_event["channel_position_size_pct"] = position_size_pct
+        signal_event["channel_market_type"] = market_type
         logger.info(
             f"📲 Telegram сигнал: {pair} {side.upper()} | quality={quality:.2f} (порог канала {quality_threshold:.2f})"
         )
@@ -629,6 +639,12 @@ class TradingBot:
 
         symbol = pair
         order_side = "buy" if side == "long" else "sell"
+        # Рынок этого КОНКРЕТНОГО канала — раньше все каналы делили один
+        # глобальный settings.market_type; теперь берётся настройка канала
+        # (см. _get_channel_settings/_on_telegram_signal), а при её
+        # отсутствии (ручное подтверждение старого сигнала без известного
+        # канала, см. POST /telegram/signals/{id}/decide) — global fallback.
+        market_type = signal_event.get("channel_market_type", settings.market_type)
 
         if sl is None and settings.telegram_signals_default_sl_pct > 0:
             # Канал не указал SL — без него позиция открылась бы вообще без
@@ -647,7 +663,7 @@ class TradingBot:
                 f"{settings.telegram_signals_default_sl_pct:.1f}% ({sl:.6f})"
             )
 
-        if not settings.is_paper and settings.market_type == "spot" and side == "short":
+        if not settings.is_paper and market_type == "spot" and side == "short":
             # Тот же случай, что и для стратегийных сигналов (см.
             # _trading_iteration): на споте в реальном режиме шорт
             # неисполним, execution_engine._execute_real_order() всё равно
@@ -655,6 +671,7 @@ class TradingBot:
             # баланса и не оставляя ERROR в логах на ровном месте. На
             # фьючерсах (market_type=="futures") short реализован — см.
             # executor._execute_real_order/close_real_position (ЭТАП 2).
+            # market_type здесь — рынок ЭТОГО КАНАЛА, не глобальный тумблер.
             logger.info(f"🚫 Сигнал по {pair} отклонён: short — на споте (реальный режим) шорт не поддерживается")
             return None
 
@@ -685,6 +702,7 @@ class TradingBot:
             stop_loss=sl,
             take_profit=tp,
             strategy_id="telegram_signal",
+            market_type=market_type,
         )
         if order:
             logger.info(f"✅ Ордер исполнен: {order.client_order_id}")

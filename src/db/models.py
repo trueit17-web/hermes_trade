@@ -238,6 +238,11 @@ class TelegramChannel(Base):
     # раньше был захардкожен 5.0 для ВСЕХ каналов одинаково (main.py:
     # _execute_telegram_signal), хотя доверие к разным каналам обычно разное.
     position_size_pct: Mapped[float] = mapped_column(Float, default=5.0)
+    # Рынок ("spot"/"futures"), на котором исполняются сигналы ИМЕННО этого
+    # канала — раньше все каналы делили один глобальный settings.market_type
+    # (тумблер в шапке дашборда), хотя разные каналы обычно рассчитаны на
+    # разный тип торговли (см. _execute_telegram_signal в main.py).
+    market: Mapped[str] = mapped_column(String(10), default="spot", server_default="spot")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(

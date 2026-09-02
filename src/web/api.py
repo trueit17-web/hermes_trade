@@ -201,6 +201,7 @@ class TelegramChannelCreate(BaseModel):
     quality_threshold: float = 0.5
     auto_execute: bool = False
     position_size_pct: float = 5.0
+    market: str = "spot"
 
 
 class TelegramChannelUpdate(BaseModel):
@@ -209,6 +210,7 @@ class TelegramChannelUpdate(BaseModel):
     quality_threshold: float | None = None
     auto_execute: bool | None = None
     position_size_pct: float | None = None
+    market: str | None = None
 
 
 class TelegramSignalDecision(BaseModel):
@@ -1364,6 +1366,7 @@ async def list_telegram_channels():
                     "active": c.active,
                     "quality_threshold": c.quality_threshold,
                     "position_size_pct": c.position_size_pct,
+                    "market": c.market,
                     "signals_count": len(c.signals),
                     "created_at": c.created_at.isoformat() + "Z" if c.created_at else None,
                 }
@@ -1382,6 +1385,9 @@ async def create_telegram_channel(channel: TelegramChannelCreate):
     в БД, просто останется неактивным до ручного рестарта; success в ответе
     относится к созданию записи в БД, а не к живому мониторингу.
     """
+    if channel.market not in ("spot", "futures"):
+        raise HTTPException(status_code=400, detail="market должен быть spot или futures")
+
     async with get_session() as session:
         existing = (
             await session.execute(
@@ -1399,6 +1405,7 @@ async def create_telegram_channel(channel: TelegramChannelCreate):
             quality_threshold=channel.quality_threshold,
             auto_execute=channel.auto_execute,
             position_size_pct=channel.position_size_pct,
+            market=channel.market,
             active=True,
         )
         session.add(new_channel)
@@ -1440,6 +1447,9 @@ async def update_telegram_channel(channel_id: int, update: TelegramChannelUpdate
     без перезапуска бота — как и добавление/удаление самого канала (см.
     create_telegram_channel/delete_telegram_channel).
     """
+    if update.market is not None and update.market not in ("spot", "futures"):
+        raise HTTPException(status_code=400, detail="market должен быть spot или futures")
+
     async with get_session() as session:
         channel = await session.get(TelegramChannel, channel_id)
         if channel is None:
@@ -1635,6 +1645,7 @@ async def decide_telegram_signal(signal_id: int, decision: TelegramSignalDecisio
             "parsed_tp": float(signal.parsed_tp) if signal.parsed_tp else None,
             "parsed_take_profits": signal.parsed_take_profits or [],
             "channel_position_size_pct": signal.channel.position_size_pct if signal.channel else 5.0,
+            "channel_market_type": signal.channel.market if signal.channel else settings.market_type,
         }
         pair = signal.parsed_pair
 

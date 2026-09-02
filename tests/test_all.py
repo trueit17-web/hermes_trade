@@ -4836,7 +4836,8 @@ class TestChannelQualitySettings(unittest.IsolatedAsyncioTestCase):
         async with get_session() as session:
             channel = TelegramChannel(
                 channel_id="@channelsettings_unittest", channel_title="X",
-                quality_threshold=0.85, auto_execute=True, position_size_pct=7.5, active=True,
+                quality_threshold=0.85, auto_execute=True, position_size_pct=7.5,
+                market="futures", active=True,
             )
             session.add(channel)
             await session.commit()
@@ -4845,10 +4846,13 @@ class TestChannelQualitySettings(unittest.IsolatedAsyncioTestCase):
         bot = main_module.TradingBot()
         bot._telegram_channel_db_ids = {"@channelsettings_unittest": db_id}
 
-        threshold, auto_execute, position_size_pct = await bot._get_channel_settings("@channelsettings_unittest")
+        threshold, auto_execute, position_size_pct, market_type = await bot._get_channel_settings(
+            "@channelsettings_unittest"
+        )
         self.assertAlmostEqual(threshold, 0.85)
         self.assertTrue(auto_execute)
         self.assertAlmostEqual(position_size_pct, 7.5)
+        self.assertEqual(market_type, "futures")
 
     async def test_falls_back_to_global_settings_for_unknown_channel(self):
         try:
@@ -4859,10 +4863,13 @@ class TestChannelQualitySettings(unittest.IsolatedAsyncioTestCase):
         bot = main_module.TradingBot()
         bot._telegram_channel_db_ids = {}
 
-        threshold, auto_execute, position_size_pct = await bot._get_channel_settings("@unknown_channel_unittest")
+        threshold, auto_execute, position_size_pct, market_type = await bot._get_channel_settings(
+            "@unknown_channel_unittest"
+        )
         self.assertEqual(threshold, settings.telegram_signals_quality_threshold)
         self.assertEqual(auto_execute, settings.telegram_signals_auto_execute)
         self.assertEqual(position_size_pct, 5.0)
+        self.assertEqual(market_type, settings.market_type)
 
 
 class TestTelegramAutoExecuteIgnoresProtections(unittest.IsolatedAsyncioTestCase):
@@ -4965,6 +4972,37 @@ class TestUpdateTelegramChannel(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as ctx:
             await update_telegram_channel(999999999, TelegramChannelUpdate(quality_threshold=0.9))
         self.assertEqual(ctx.exception.status_code, 404)
+
+    async def test_update_market_field(self):
+        from src.db.models import TelegramChannel
+        from src.db.session import get_session
+        from src.web.api import TelegramChannelUpdate, update_telegram_channel
+
+        async with get_session() as session:
+            channel = TelegramChannel(
+                channel_id="@marketpatch_unittest", channel_title="X",
+                quality_threshold=0.5, auto_execute=False, market="spot", active=True,
+            )
+            session.add(channel)
+            await session.commit()
+            db_id = channel.id
+
+        result = await update_telegram_channel(db_id, TelegramChannelUpdate(market="futures"))
+        self.assertTrue(result["success"])
+        self.assertEqual(result["updated"], ["market"])
+
+        async with get_session() as session:
+            refreshed = await session.get(TelegramChannel, db_id)
+            self.assertEqual(refreshed.market, "futures")
+
+    async def test_update_invalid_market_raises_400(self):
+        from fastapi import HTTPException
+
+        from src.web.api import TelegramChannelUpdate, update_telegram_channel
+
+        with self.assertRaises(HTTPException) as ctx:
+            await update_telegram_channel(999999999, TelegramChannelUpdate(market="margin"))
+        self.assertEqual(ctx.exception.status_code, 400)
 
 
 class TestProtectionsLockTimestampFormat(unittest.IsolatedAsyncioTestCase):
@@ -7519,6 +7557,171 @@ class TestShortSignalAllowedOnFutures(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_engine.create_order.await_args.kwargs["side"], "sell")
 
 
+class TestPerChannelMarketTypeOverridesGlobalToggle(unittest.IsolatedAsyncioTestCase):
+    """
+    Различие типа торговли (спот/фьючерсы) по каналу, а не только по
+    глобальному тумблеру settings.market_type: сигналы конкретного канала
+    настроены на свой рынок (TelegramChannel.market, см. _get_channel_settings/
+    _on_telegram_signal) — _execute_telegram_signal должен решать по
+    signal_event["channel_market_type"], а не по текущему положению тумблера
+    в шапке дашборда.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        self._saved_market_type = settings.market_type
+        settings.trading_mode = "real"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+        settings.market_type = self._saved_market_type
+
+    async def test_futures_channel_allows_short_even_when_global_toggle_is_spot(self):
+        settings.market_type = "spot"
+        bot = self._make_bot()
+
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "CHANFUT1/USDT",
+                "parsed_side": "short",
+                "parsed_entry": 1.34,
+                "parsed_sl": 1.36,
+                "parsed_tp": 1.32,
+                "channel_id": "@futures_channel",
+                "channel_market_type": "futures",
+            })
+
+        mock_engine.create_order.assert_awaited_once()
+        self.assertEqual(mock_engine.create_order.await_args.kwargs["side"], "sell")
+        self.assertEqual(mock_engine.create_order.await_args.kwargs["market_type"], "futures")
+
+    async def test_spot_channel_rejects_short_even_when_global_toggle_is_futures(self):
+        settings.market_type = "futures"
+        bot = self._make_bot()
+
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            order = await bot._execute_telegram_signal({
+                "parsed_pair": "CHANSPOT1/USDT",
+                "parsed_side": "short",
+                "parsed_entry": 1.34,
+                "parsed_sl": 1.36,
+                "parsed_tp": 1.32,
+                "channel_id": "@spot_channel",
+                "channel_market_type": "spot",
+            })
+
+        self.assertIsNone(order)
+        mock_engine.create_order.assert_not_called()
+
+    async def test_signal_without_channel_market_type_falls_back_to_global_toggle(self):
+        """Регресс: ручное подтверждение старого сигнала без известного канала
+        (POST /telegram/signals/{id}/decide, канал удалён) — ведёт себя как раньше."""
+        settings.market_type = "futures"
+        bot = self._make_bot()
+
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "CHANFALLBACK1/USDT",
+                "parsed_side": "short",
+                "parsed_entry": 1.34,
+                "parsed_sl": 1.36,
+                "parsed_tp": 1.32,
+                "channel_id": "@no_channel_row",
+            })
+
+        mock_engine.create_order.assert_awaited_once()
+        self.assertEqual(mock_engine.create_order.await_args.kwargs["market_type"], "futures")
+
+
+class TestCreateOrderLazilyConnectsChannelMarket(unittest.IsolatedAsyncioTestCase):
+    """
+    execution_engine.create_order(market_type=...) должен уметь открыть
+    позицию на рынке, для которого ещё НЕТ подключённого ccxt-клиента —
+    например, тумблер и все текущие real-позиции на споте, но конкретный
+    Telegram-канал настроен на futures: initialize() поднимает второй
+    клиент лениво только для рынков, найденных среди позиций,
+    восстановленных при СТАРТЕ, а не по требованию при открытии новой.
+    _ensure_exchange_connected должен подключить его на лету.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+        self._saved_trading_mode = settings.trading_mode
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_opens_short_on_futures_via_lazily_connected_client(self):
+        settings.market_type = "spot"  # текущий тумблер — spot
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        spot_mock = AsyncMock()
+        futures_mock = AsyncMock()
+        self.engine._exchanges = {"spot": spot_mock}  # futures ещё не подключён вовсе
+        futures_mock.create_market_sell_order.return_value = {
+            "id": "chan-fut-short-1", "filled": 10.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+
+        def make_exchange(config):
+            options = config.get("options") or {}
+            return futures_mock if options.get("defaultType") == "swap" else spot_mock
+
+        with patch("src.execution.executor.ccxt.bybit", side_effect=make_exchange):
+            order = await self.engine.create_order(
+                symbol="CHANLAZY1/USDT", side="sell", amount=10.0, price=2.0,
+                order_type="market", market_type="futures",
+            )
+
+        self.assertIsNotNone(order)
+        futures_mock.create_market_sell_order.assert_awaited_once_with("CHANLAZY1/USDT", 10.0)
+        spot_mock.create_market_sell_order.assert_not_called()
+        self.assertIn("CHANLAZY1/USDT", self.engine.real_positions)
+        self.assertEqual(self.engine.real_positions["CHANLAZY1/USDT"]["market_type"], "futures")
+        self.assertEqual(self.engine.real_positions["CHANLAZY1/USDT"]["side"], "short")
+        self.assertIs(self.engine._exchanges.get("futures"), futures_mock)
+
+    async def test_market_type_none_still_uses_current_toggle(self):
+        """Регресс: без явного market_type (сигналы стратегий/ручные ордера) поведение не меняется."""
+        settings.market_type = "spot"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "chan-default-1", "filled": 10.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="CHANDEFAULT1/USDT", side="buy", amount=10.0, price=2.0, order_type="market",
+        )
+
+        self.assertIsNotNone(order)
+        self.assertEqual(self.engine.real_positions["CHANDEFAULT1/USDT"]["market_type"], "spot")
+
+
 class TestTradingSourceModeEndpoint(unittest.IsolatedAsyncioTestCase):
     """
     POST /trading-source-mode — переключатель "сигналы"/"алго" в шапке
@@ -7718,7 +7921,7 @@ class TestTradingSourceModeGatesTelegramSignals(unittest.IsolatedAsyncioTestCase
         settings.active_trading_mode = "algo"
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
         bot._save_telegram_signal = AsyncMock()
 
         with patch.object(bot, "_execute_telegram_signal", new=AsyncMock()) as exec_mock:
@@ -7738,7 +7941,7 @@ class TestTradingSourceModeGatesTelegramSignals(unittest.IsolatedAsyncioTestCase
         settings.active_trading_mode = "signals"
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -7784,7 +7987,7 @@ class TestTelegramSignalQualityScoringUsesCorrectShape(unittest.IsolatedAsyncioT
 
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(1.1, False, 5.0))  # порог недостижим — просто проверяем вызов
+        bot._get_channel_settings = AsyncMock(return_value=(1.1, False, 5.0, "spot"))  # порог недостижим — просто проверяем вызов
         bot._save_telegram_signal = AsyncMock()
 
         with patch.object(signal_quality_scorer, "score_signal", return_value=0.9) as score_mock:
@@ -7815,7 +8018,7 @@ class TestTelegramSignalQualityScoringUsesCorrectShape(unittest.IsolatedAsyncioT
 
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(1.1, False, 5.0))
+        bot._get_channel_settings = AsyncMock(return_value=(1.1, False, 5.0, "spot"))
         bot._save_telegram_signal = AsyncMock()
         signal_quality_scorer.channel_stats.pop("@quality_shape_test", None)
 

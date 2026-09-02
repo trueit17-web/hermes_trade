@@ -737,6 +737,10 @@
       <input type="text" id="channelTitleInput" placeholder="Название (опционально)">
       <input type="number" id="channelThresholdInput" placeholder="Порог качества" min="0" max="1" step="0.05" value="0.5">
       <input type="number" id="channelPositionSizeInput" placeholder="Размер позиции (%)" min="0" max="100" step="0.5" value="5">
+      <select id="channelMarketInput" title="Рынок, на котором исполняются сигналы этого канала">
+        <option value="spot">Спот</option>
+        <option value="futures">Фьючерсы</option>
+      </select>
       <label class="checkbox-label">
         <input type="checkbox" id="channelAutoExecuteInput">
         Автоисполнение
@@ -749,8 +753,8 @@
     </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Канал</th><th>ID</th><th>Порог</th><th>Размер (%)</th><th>Автоисполнение</th><th>Сигналов</th><th>Исполнено</th><th>Win rate</th><th>PnL</th><th>Sizing</th><th>Активен</th><th></th></tr></thead>
-        <tbody id="telegramBody"><tr class="empty-row"><td colspan="12">Загрузка…</td></tr></tbody>
+        <thead><tr><th>Канал</th><th>ID</th><th>Порог</th><th>Размер (%)</th><th>Рынок</th><th>Автоисполнение</th><th>Сигналов</th><th>Исполнено</th><th>Win rate</th><th>PnL</th><th>Sizing</th><th>Активен</th><th></th></tr></thead>
+        <tbody id="telegramBody"><tr class="empty-row"><td colspan="13">Загрузка…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -1735,7 +1739,7 @@ async function renderTelegram() {
     const statsById = Object.fromEntries((statsData.channels || []).map(s => [s.channel_id, s]));
 
     if (!channels.length) {
-      body.innerHTML = `<tr class="empty-row"><td colspan="12">Каналы не настроены</td></tr>`;
+      body.innerHTML = `<tr class="empty-row"><td colspan="13">Каналы не настроены</td></tr>`;
       return;
     }
     body.innerHTML = channels.map(c => {
@@ -1760,6 +1764,12 @@ async function renderTelegram() {
                  title="Базовый размер позиции (% от баланса) для сигналов этого канала">
         </td>
         <td>
+          <select class="channel-market-input" data-channel-id="${c.id}" title="Рынок, на котором исполняются сигналы этого канала">
+            <option value="spot" ${c.market === "spot" ? "selected" : ""}>Спот</option>
+            <option value="futures" ${c.market === "futures" ? "selected" : ""}>Фьючерсы</option>
+          </select>
+        </td>
+        <td>
           <label class="toggle">
             <input type="checkbox" class="channel-autoexec-input" data-channel-id="${c.id}" ${c.auto_execute ? "checked" : ""}>
             <span class="slider"></span>
@@ -1773,7 +1783,7 @@ async function renderTelegram() {
         <td>${c.active ? "✅" : "—"}</td>
         <td><button class="btn-icon-danger" data-delete-channel="${c.id}" title="Удалить">✕</button></td>
       </tr>
-      <tr class="channel-signals-row" data-channel-signals="${c.id}" style="display:none"><td colspan="12"></td></tr>
+      <tr class="channel-signals-row" data-channel-signals="${c.id}" style="display:none"><td colspan="13"></td></tr>
     `;
     }).join("");
 
@@ -1845,6 +1855,25 @@ async function renderTelegram() {
       });
     });
 
+    body.querySelectorAll(".channel-market-input").forEach(select => {
+      select.closest("td").classList.add("channel-editable");
+      select.addEventListener("click", (e) => e.stopPropagation());
+      select.addEventListener("change", async () => {
+        const id = select.dataset.channelId;
+        const value = select.value;
+        const previous = value === "spot" ? "futures" : "spot";
+        try {
+          await api(`/telegram/channels/${id}`, {
+            method: "PATCH", body: JSON.stringify({ market: value }),
+          });
+          showToast(value === "futures" ? "Рынок канала: фьючерсы" : "Рынок канала: спот");
+        } catch (err) {
+          select.value = previous;
+          showToast(`Ошибка: ${err.message}`, true);
+        }
+      });
+    });
+
     body.querySelectorAll(".channel-autoexec-input").forEach(input => {
       input.closest("td").classList.add("channel-editable");
       input.addEventListener("click", (e) => e.stopPropagation());
@@ -1863,7 +1892,7 @@ async function renderTelegram() {
       });
     });
   } catch (err) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="12">Ошибка загрузки: ${err.message}</td></tr>`;
+    body.innerHTML = `<tr class="empty-row"><td colspan="13">Ошибка загрузки: ${err.message}</td></tr>`;
   }
 }
 
@@ -2024,6 +2053,7 @@ document.getElementById("addChannelForm").addEventListener("submit", async (e) =
   const channelTitle = document.getElementById("channelTitleInput").value.trim();
   const qualityThreshold = parseFloat(document.getElementById("channelThresholdInput").value) || 0.5;
   const positionSizePct = parseFloat(document.getElementById("channelPositionSizeInput").value) || 5.0;
+  const market = document.getElementById("channelMarketInput").value;
   const autoExecute = document.getElementById("channelAutoExecuteInput").checked;
 
   if (!channelId) return;
@@ -2036,6 +2066,7 @@ document.getElementById("addChannelForm").addEventListener("submit", async (e) =
         channel_title: channelTitle || null,
         quality_threshold: qualityThreshold,
         position_size_pct: positionSizePct,
+        market: market,
         auto_execute: autoExecute,
       }),
     });
@@ -2048,6 +2079,7 @@ document.getElementById("addChannelForm").addEventListener("submit", async (e) =
     document.getElementById("addChannelForm").reset();
     document.getElementById("channelThresholdInput").value = "0.5";
     document.getElementById("channelPositionSizeInput").value = "5";
+    document.getElementById("channelMarketInput").value = "spot";
     await renderTelegram();
   } catch (err) {
     showToast(`Ошибка: ${err.message}`, true);
