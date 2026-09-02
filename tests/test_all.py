@@ -6149,6 +6149,58 @@ class TestReconcileRealPositionsSkipsFutures(unittest.IsolatedAsyncioTestCase):
         self.engine.exchange.fetch_balance.assert_awaited_once()
 
 
+class TestSyncStopLossOrderSkipsFutures(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент (прод, demo-фьючерсы, ENA/USDT): восстановление
+    short-позиции после рестарта бота поставило СПОТОВЫЙ "sell"-стоп на
+    короткую позицию — семантически неверно (SL шорта должен быть buy
+    выше входа, а не sell) и происходит от _rearm_stop_loss_orders_after_restart
+    -> sync_stop_loss_order, которую я гейтил только в _execute_real_order,
+    но не саму по себе — из-за чего этот и другие вызовы (resync после
+    partial close/trailing stop, POST /positions/edit) остались дырой.
+    Фикс — гейт внутри sync_stop_loss_order самой, единая точка правды для
+    всех вызывающих: на фьючерсах новый биржевой SL не ставится нигде.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+
+    async def test_does_not_place_sl_order_on_futures(self):
+        settings.market_type = "futures"
+        self.engine.exchange = AsyncMock()
+        self.engine.real_positions["FUTSL1/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "short", "sl_order_id": None,
+        }
+
+        await self.engine.sync_stop_loss_order("FUTSL1/USDT", 10.0, 2.2)
+
+        self.engine.exchange.create_market_sell_order.assert_not_called()
+        self.engine.exchange.create_market_buy_order.assert_not_called()
+        self.assertIsNone(self.engine.real_positions["FUTSL1/USDT"]["sl_order_id"])
+
+    async def test_still_places_sl_order_on_spot(self):
+        settings.market_type = "spot"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "spot-sl-1"}
+        self.engine.real_positions["SPOTSL1/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long", "sl_order_id": None,
+        }
+
+        await self.engine.sync_stop_loss_order("SPOTSL1/USDT", 10.0, 1.8)
+
+        self.engine.exchange.create_market_sell_order.assert_awaited_once()
+        self.assertEqual(self.engine.real_positions["SPOTSL1/USDT"]["sl_order_id"], "spot-sl-1")
+
+
 class TestOkxTradePermissionCheck(unittest.IsolatedAsyncioTestCase):
     """
     OKX отдаёт реально выданные API-ключу права прямо в GET /account/config

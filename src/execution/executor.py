@@ -1202,13 +1202,26 @@ class ExecutionEngine:
         неверной, уже неактуальной цене. Отменяет прежний отслеживаемый
         SL-ордер (если был) и, если задан stop_loss_price и остаток > 0,
         ставит новый.
+
+        На фьючерсах (market_type=="futures") новый SL-ордер НЕ ставится —
+        _place_stop_loss_order всегда шлёт спотовый conditional sell (годится
+        только для long, а на фьючерсах может быть и short — sell в этом
+        случае был бы попыткой продать несуществующий на кошельке актив на
+        рынке, где позиция вообще не выражается остатком монеты). Реальный
+        инцидент: восстановление short-позиции ENA/USDT после рестарта на
+        фьючерсах поставило "sell"-стоп на короткую позицию — семантически
+        неверно (SL шорта должен быть buy выше входа, а не sell). Фьючерсный
+        SL — отдельный, следующий этап; пока позиция под защитой только
+        внутреннего поллинга цены (_check_position_exit в main.py). Прежний
+        отслеживаемый ордер всё равно отменяем — на случай, если он остался
+        от вызова ДО этого фикса.
         """
         pos = self.real_positions.get(symbol)
         if pos is None:
             return
         await self._cancel_order_safe(symbol, pos.get("sl_order_id"))
         pos["sl_order_id"] = None
-        if stop_loss_price and amount > 0:
+        if stop_loss_price and amount > 0 and settings.market_type != "futures":
             pos["sl_order_id"] = await self._place_stop_loss_order(symbol, amount, stop_loss_price)
 
     async def _confirm_fill_via_balance(
