@@ -312,7 +312,10 @@ class ExecutionEngine:
             # реконструируем такую позицию заново при каждом рестарте —
             # сам факт её появления уже исправлен, а восстановление только
             # заново засоряло бы логи той же неустранимой ошибкой закрытия.
-            if position_side == "short" and not is_paper:
+            # На фьючерсах (ЭТАП 2, market_type=="futures") short — штатная
+            # открытая позиция, и её нужно восстанавливать точно так же,
+            # как long, иначе она "теряется" при каждом рестарте бота.
+            if position_side == "short" and not is_paper and settings.market_type == "spot":
                 logger.warning(
                     f"⚠️ Пропущен осиротевший short-ордер {symbol} (id={o.id}) при восстановлении "
                     f"real-позиций — на споте шорт не поддерживается, закрыть такую 'позицию' всё "
@@ -1249,21 +1252,7 @@ class ExecutionEngine:
         amount = order_data["amount"]
         price = order_data["price"]
 
-        # ЭТАП 1 перехода на фьючерсы (см. settings.market_type): переключатель
-        # в шапке дашборда уже подключает execution_engine к linear-swap рынку
-        # (initialize() выше), но модель позиции/закрытия/SL здесь и в
-        # close_real_position/reconcile_real_positions всё ещё завязана на
-        # спот (amount = буквально монета на кошельке, а не контракт с
-        # плечом/маржой) — исполнение ордера на фьючерсах этой логикой дало
-        # бы неверные результаты. Пока явно отказываем, чтобы не рисковать
-        # реальным исполнением на недоделанном пути — следующий этап уберёт
-        # эту заглушку вместе с фьючерсно-осознанной логикой открытия/закрытия.
-        if settings.market_type == "futures":
-            logger.warning(
-                f"⚠️ Реальный ордер {symbol} пропущен: подключён рынок фьючерсов (этап 1 перехода), "
-                f"но исполнение ордеров на фьючерсах ещё не реализовано — пока поддерживается только спот."
-            )
-            return None
+        is_futures = settings.market_type == "futures"
 
         # На споте нет встроенного шорта — этот метод вызывается ТОЛЬКО для
         # ОТКРЫТИЯ новой позиции (create_order -> _execute_real_order);
@@ -1279,8 +1268,11 @@ class ExecutionEngine:
         # _load_open_positions_from_db), которую close_real_position
         # принципиально не умеет закрыть (там уже стоит отдельная защита
         # "side != long"), и позиция намертво зависала, засоряя логи той
-        # же ошибкой на каждой попытке закрытия.
-        if side != "buy":
+        # же ошибкой на каждой попытке закрытия. На фьючерсах (ЭТАП 2)
+        # side=="sell" — это штатное открытие короткой позиции, а не
+        # продажа несуществующего актива, поэтому защита теперь только
+        # спотовая.
+        if not is_futures and side != "buy":
             logger.error(
                 f"❌ Реальный ордер {symbol} отклонён: сторона '{side}' (шорт) не поддерживается "
                 f"на споте — на споте нет встроенного шорта, а продажа при наличии баланса актива "
@@ -1288,6 +1280,17 @@ class ExecutionEngine:
                 f"'позицию' обратно."
             )
             return None
+
+        if is_futures:
+            # Плечо — глобальная настройка (см. settings.futures_leverage),
+            # не per-позиция. best-effort: некоторые биржи/версии ccxt
+            # бросают исключение, если плечо уже установлено в то же
+            # значение ("leverage not modified") — это не ошибка, ордер
+            # всё равно можно размещать с уже действующим плечом.
+            try:
+                await self.exchange.set_leverage(int(settings.futures_leverage), symbol)
+            except Exception as e:
+                logger.debug(f"Не удалось установить плечо {settings.futures_leverage}x для {symbol}: {e}")
 
         below_min = self._below_exchange_minimum(symbol, amount, price)
         if below_min:
@@ -1297,12 +1300,18 @@ class ExecutionEngine:
             )
             return None
 
+        # Баланс базовой валюты на СПОТОВОМ кошельке (для фолбэк-подтверждения
+        # исполнения по изменению баланса ниже) не имеет смысла на фьючерсах —
+        # там позиция это отдельная сущность (fetch_positions), а не остаток
+        # монеты на кошельке; открытие/закрытие меняет маржу в USDT, а не
+        # баланс базовой валюты. На фьючерсах фолбэк просто не пробуем.
         balance_before = None
-        try:
-            snapshot = await self.exchange.fetch_balance()
-            balance_before = self._extract_currency_balance(snapshot, symbol.split("/")[0])
-        except Exception as e:
-            logger.debug(f"Не удалось снять баланс {symbol} до отправки ордера: {e}")
+        if not is_futures:
+            try:
+                snapshot = await self.exchange.fetch_balance()
+                balance_before = self._extract_currency_balance(snapshot, symbol.split("/")[0])
+            except Exception as e:
+                logger.debug(f"Не удалось снять баланс {symbol} до отправки ордера: {e}")
 
         try:
             if order_data["type"] == "market":
@@ -1421,21 +1430,28 @@ class ExecutionEngine:
             # закрыть её вручную из дашборда было бы нельзя. "amount" —
             # именно net_amount (за вычетом комиссии из base-валюты, если
             # применимо), т.к. это реально доступный к продаже остаток.
-            if side == "buy":
-                self.real_positions[symbol] = {
-                    "amount": net_amount,
-                    "entry_price": fill_price,
-                    "side": "long",
-                    "strategy_id": order_data.get("strategy_id"),
-                    "stop_loss": order_data.get("stop_loss"),
-                    "take_profit": order_data.get("take_profit"),
-                    "order_id": order_id,
-                    "entry_fee": fill_fee,
-                    "opened_at": utcnow(),
-                    "sl_order_id": None,
-                }
-                if order_data.get("stop_loss"):
-                    await self.sync_stop_loss_order(symbol, net_amount, order_data["stop_loss"])
+            # На спот сюда доходит только side=="buy" (short отклонён выше),
+            # на фьючерсах — обе стороны: "sell" здесь означает открытие
+            # короткой позиции, а не продажу существующего актива.
+            self.real_positions[symbol] = {
+                "amount": net_amount,
+                "entry_price": fill_price,
+                "side": "long" if side == "buy" else "short",
+                "strategy_id": order_data.get("strategy_id"),
+                "stop_loss": order_data.get("stop_loss"),
+                "take_profit": order_data.get("take_profit"),
+                "order_id": order_id,
+                "entry_fee": fill_fee,
+                "opened_at": utcnow(),
+                "sl_order_id": None,
+            }
+            # Биржевой SL — спот-специфичный путь (_place_stop_loss_order
+            # всегда продаёт, защищает только long): фьючерсный SL —
+            # следующий этап. На фьючерсах позиция пока защищена только
+            # внутренним поллингом цены в _check_position_exit (main.py),
+            # как и спот-позиции с отклонённым биржей SL.
+            if not is_futures and order_data.get("stop_loss"):
+                await self.sync_stop_loss_order(symbol, net_amount, order_data["stop_loss"])
 
             trade_event = TradeEvent(
                 type="trade_event",
@@ -1479,14 +1495,20 @@ class ExecutionEngine:
         опубликовать закрывающий TradeEvent. Возвращает {"pnl", "pnl_pct",
         "outcome", "trade_id"} или None при ошибке.
 
-        Только long: на споте нет встроенного шорта, а _execute_real_order
-        уже не позволяет открыть short-позицию (create_market_sell_order без
-        имеющегося актива на споте просто упадёт с ошибкой недостатка
-        баланса — исполнение вернёт None и позиция никогда не будет создана).
+        На споте — только long: там нет встроенного шорта, а
+        _execute_real_order уже не позволяет открыть short-позицию
+        (create_market_sell_order без имеющегося актива на споте просто
+        упадёт с ошибкой недостатка баланса — исполнение вернёт None и
+        позиция никогда не будет создана). На фьючерсах (market_type=="futures",
+        ЭТАП 2) поддержаны обе стороны: long закрывается продажей, short —
+        покупкой (buy to cover), обе — с reduceOnly, чтобы рассинхрон объёма
+        не открыл встречную позицию вместо закрытия текущей.
         """
-        if side != "long":
+        is_futures = settings.market_type == "futures"
+        if not is_futures and side != "long":
             logger.error(f"close_real_position: закрытие {side}-позиции не поддерживается на споте: {symbol}")
             return None
+        closing_side = "sell" if side == "long" else "buy"
 
         # Отслеживаемый объём уже 0 (или отрицательный из-за накопленной
         # погрешности) — продавать нечего, а create_market_sell_order с
@@ -1517,23 +1539,36 @@ class ExecutionEngine:
         # без подстраховки продажа "полного" объёма падает на бирже с
         # "Insufficient balance", и позиция навсегда зависает открытой,
         # хотя реально продать почти всё, что есть, всё равно можно.
-        sell_amount = amount
+        # Спот-специфично: на фьючерсах не нужно "владеть" монетой, чтобы
+        # закрыть контракт — сверять тут нечего, closing_amount = amount.
+        closing_amount = amount
         available = None
-        try:
-            base_currency = symbol.split("/")[0]
-            balance = await self.exchange.fetch_balance()
-            available = self._extract_currency_balance(balance, base_currency)
-            if 0 < available < amount:
-                logger.warning(
-                    f"⚠️ Доступный баланс {base_currency} ({available:.8f}) меньше отслеживаемого "
-                    f"объёма позиции {symbol} ({amount:.8f}) — продаём доступный остаток."
-                )
-                sell_amount = available
-        except Exception as e:
-            logger.debug(f"Не удалось сверить доступный баланс перед закрытием {symbol}: {e}")
+        if not is_futures:
+            try:
+                base_currency = symbol.split("/")[0]
+                balance = await self.exchange.fetch_balance()
+                available = self._extract_currency_balance(balance, base_currency)
+                if 0 < available < amount:
+                    logger.warning(
+                        f"⚠️ Доступный баланс {base_currency} ({available:.8f}) меньше отслеживаемого "
+                        f"объёма позиции {symbol} ({amount:.8f}) — продаём доступный остаток."
+                    )
+                    closing_amount = available
+            except Exception as e:
+                logger.debug(f"Не удалось сверить доступный баланс перед закрытием {symbol}: {e}")
 
         try:
-            order = await self.exchange.create_market_sell_order(symbol, sell_amount)
+            if is_futures:
+                # reduceOnly — защита от переворота позиции вместо закрытия,
+                # если объём вдруг разошёлся с тем, что реально открыто на бирже.
+                params = {"reduceOnly": True}
+                order = (
+                    await self.exchange.create_market_sell_order(symbol, closing_amount, params=params)
+                    if closing_side == "sell"
+                    else await self.exchange.create_market_buy_order(symbol, closing_amount, params=params)
+                )
+            else:
+                order = await self.exchange.create_market_sell_order(symbol, closing_amount)
         except Exception as e:
             # available логируется прямо здесь (а не только по debug выше) —
             # без этого "Insufficient balance" от биржи ни разу не говорил,
@@ -1569,7 +1604,13 @@ class ExecutionEngine:
             #    одна и та же ошибка каждые ~70с). Деление позиции на более
             #    мелкие ордера её не решает, наоборот, ещё уменьшает
             #    стоимость каждого.
-            unsellable_dust = (
+            # Дуст-списание (_reconcile_phantom_position) — спот-специфичная
+            # концепция (биржевые лимиты на минимальный ОБЪЁМ базовой
+            # валюты на кошельке), на фьючерсах контрактов "пыль" в этом
+            # смысле не бывает. Для фьючерсов просто оставляем позицию
+            # отслеживаемой — следующая проверка SL/TP (main.py) попробует
+            # закрыть её снова, вместо необратимого списания без PnL.
+            unsellable_dust = not is_futures and (
                 available == 0
                 or any(kw in str(e).lower() for kw in ("precision", "minimum"))
                 or "lower limit" in str(e).lower()
@@ -1598,7 +1639,7 @@ class ExecutionEngine:
             # снят с биржи чуть выше (до отправки sell), так что здесь не
             # нужен ещё один запрос баланса "до".
             confirmed_amount = (
-                await self._confirm_fill_via_balance(symbol, "sell", available, sell_amount)
+                await self._confirm_fill_via_balance(symbol, closing_side, available, closing_amount)
                 if available is not None else None
             )
             if confirmed_amount is None:
@@ -1619,7 +1660,7 @@ class ExecutionEngine:
         exit_price = order.get("average") or order.get("price") or entry_price
         exit_filled_amount = order["filled"] or amount
         exit_fee, exit_fee_currency = self._resolve_fee(
-            order.get("fee"), exit_filled_amount, exit_price, "sell", symbol, amount_requested=sell_amount,
+            order.get("fee"), exit_filled_amount, exit_price, closing_side, symbol, amount_requested=closing_amount,
         )
 
         # Комиссия ОТКРЫТИЯ на споте обычно удерживается в BASE-валюте
@@ -1642,7 +1683,15 @@ class ExecutionEngine:
             except Exception as e:
                 logger.debug(f"Не удалось определить валюту комиссии открытия для {symbol}: {e}")
 
-        pnl = (exit_price - entry_price) * amount - entry_fee_quote - exit_fee
+        # Для linear USDT-perp плечо не входит в формулу PnL напрямую (оно
+        # влияет только на требуемую маржу под позицию, не на сам PnL) —
+        # эта же формула (с точностью до знака по стороне) верна и для
+        # фьючерсов. Ветка для short зеркальна paper-версии
+        # (close_paper_position: pnl = (entry - exit) * amount - fees).
+        if side == "long":
+            pnl = (exit_price - entry_price) * amount - entry_fee_quote - exit_fee
+        else:
+            pnl = (entry_price - exit_price) * amount - entry_fee_quote - exit_fee
         pnl_pct = (pnl / (entry_price * amount) * 100) if entry_price and amount else 0.0
         outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "break-even")
 
@@ -1675,7 +1724,7 @@ class ExecutionEngine:
                 exchange_id=exchange_id,
                 symbol_id=symbol_id,
                 strategy_id=strategy_db_id,
-                side="sell",
+                side=closing_side,
                 order_type="market",
                 amount=amount,
                 price=exit_price,
@@ -1963,6 +2012,17 @@ class ExecutionEngine:
         except Exception as e:
             logger.error(f"Ошибка получения баланса: {e}")
             return None
+
+        if settings.market_type == "futures":
+            # Весь цикл сверки ниже спот-специфичен: сравнивает отслеживаемый
+            # объём позиции с ОСТАТКОМ БАЗОВОЙ ВАЛЮТЫ НА КОШЕЛЬКЕ — на
+            # фьючерсах позиция не выражается остатком монеты на кошельке
+            # (это контракт, маржа в USDT, сверяется через fetch_positions(),
+            # а не fetch_balance()). Прогонять эту логику для фьючерсов
+            # значило бы сравнивать несравнимое и ошибочно списывать реально
+            # открытые позиции. Фьючерсная сверка позиций — отдельный,
+            # более поздний этап; пока просто возвращаем баланс без неё.
+            return self._extract_usdt_balance(balance)
 
         for symbol, pos in list(self.real_positions.items()):
             tracked_amount = pos.get("amount") or 0

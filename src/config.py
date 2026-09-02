@@ -42,14 +42,19 @@ class Settings(BaseSettings):
     use_exchange_sandbox: bool = True
     # Тип рынка для real-режима: "spot" (обычный спот — шорт не
     # поддерживается, см. _execute_real_order) или "futures" (USDT-perpetual,
-    # linear swap). ЭТАП 1 перехода на фьючерсы: переключатель подключает
-    # execution_engine к нужному рынку ccxt (defaultType), но исполнение
-    # ордеров на фьючерсах ЕЩЁ НЕ реализовано — _execute_real_order
-    # сознательно отказывает в открытии позиций при market_type=="futures",
-    # пока не появится фьючерсно-осознанная логика открытия/закрытия/SL/
-    # риска (следующие этапы). Переключается кнопкой в шапке дашборда
-    # (POST /market-type).
+    # linear swap). ЭТАП 2 перехода на фьючерсы: открытие/закрытие long и
+    # short на фьючерсах уже реализовано (_execute_real_order/
+    # close_real_position), но SL/TP как биржевой ордер и дуст-сверка
+    # позиций для фьючерсов — ещё нет (следующие этапы); позиция на
+    # фьючерсах защищена только внутренним поллингом цены в
+    # _check_position_exit (main.py), как и споt-позиции с отклонённым
+    # биржевым SL. Переключается кнопкой в шапке дашборда (POST /market-type).
     market_type: str = "spot"
+    # Плечо для фьючерсных ордеров (market_type=="futures") — глобальное,
+    # не per-позиция (в БД/UI для этого пока нет полей — полноценный
+    # риск-guard по ликвидации/плечу это отдельный, более поздний этап).
+    # Дефолт 1.0 — без усиления, безопасная отправная точка.
+    futures_leverage: float = 1.0
     binance_api_key: str | None = None
     binance_api_secret: str | None = None
     bybit_api_key: str | None = None

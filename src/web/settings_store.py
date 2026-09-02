@@ -168,10 +168,13 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "use_exchange_sandbox", "label": "Демо-счёт (sandbox/testnet)", "group": "Биржи", "type": "bool",
      "description": "Торговать на демо/testnet-счету биржи вместо реальных денег, тем же API-ключом. Рекомендуется держать включённым, пока не проверили бота вживую."},
     {"key": "market_type", "label": "Тип рынка (real-режим)", "group": "Биржи", "type": "select", "options": ["spot", "futures"],
-     "description": "spot — обычный спот-рынок (шорт не поддерживается). futures — USDT-перпетуалы (linear swap). "
-                     "ЭТАП 1 перехода: переключатель подключает бота к нужному рынку биржи, но открытие ордеров на "
-                     "фьючерсах пока не реализовано — бот только подключается и наблюдает. "
+     "description": "spot — обычный спот-рынок (шорт не поддерживается). futures — USDT-перпетуалы (linear swap), "
+                     "открытие/закрытие long и short уже работает. SL/TP как биржевой ордер на фьючерсах пока не "
+                     "реализован — позиция защищена только внутренним поллингом цены. "
                      "Тот же переключатель есть в шапке дашборда."},
+    {"key": "futures_leverage", "label": "Плечо (фьючерсы)", "group": "Биржи", "type": "float",
+     "description": "Плечо для фьючерсных ордеров при market_type=futures. Глобальное для всех пар, не per-позиция. "
+                     "1.0 — без усиления. Применяется через set_leverage перед каждым открытием позиции."},
     {"key": "binance_api_key", "label": "Binance API key", "group": "Биржи", "type": "secret",
      "description": "Ключ API Binance для торговли в real-режиме. Выдавайте права только на торговлю, без вывода средств."},
     {"key": "binance_api_secret", "label": "Binance API secret", "group": "Биржи", "type": "secret",

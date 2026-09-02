@@ -2389,6 +2389,42 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ORPHANSHORT1/USDT", paper_positions)
         self.assertEqual(paper_positions["ORPHANSHORT1/USDT"]["side"], "short")
 
+    async def test_restore_real_positions_reconstructs_short_on_futures(self):
+        """
+        ЭТАП 2: на фьючерсах (market_type=="futures") short — штатная
+        позиция, а не осиротевший баг-артефакт (как на споте) — при
+        рестарте бота она должна восстанавливаться так же, как long, а не
+        пропускаться (см. test_restore_real_positions_skips_orphaned_short_order
+        для спота — там пропуск остаётся верным поведением).
+        """
+        from src.db.session import get_session
+        from src.db.models import Order
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        saved_market_type = settings.market_type
+        settings.market_type = "futures"
+        try:
+            async with get_session() as session:
+                exchange_id, symbol_id = await self.engine._resolve_symbol_id(session, "FUTSHORTRESTORE1/USDT")
+                fut_short = Order(
+                    exchange_id=exchange_id, symbol_id=symbol_id,
+                    side="sell", order_type="market", amount=10.0, price=2.0,
+                    status="filled", filled_amount=10.0, filled_price=2.0,
+                    fee=0.01, order_id_exchange="fut-short-restore-1", client_order_id="futshortrestore1",
+                )
+                session.add(fut_short)
+                await session.commit()
+
+            real_positions, _, _ = await self.engine._load_open_positions_from_db(is_paper=False)
+        finally:
+            settings.market_type = saved_market_type
+
+        self.assertIsNotNone(real_positions)
+        self.assertIn("FUTSHORTRESTORE1/USDT", real_positions)
+        self.assertEqual(real_positions["FUTSHORTRESTORE1/USDT"]["side"], "short")
+
     async def test_real_buy_with_base_currency_fee_reduces_tracked_amount(self):
         """
         На споте комиссия обычно списывается из полученного актива: купили
@@ -5838,13 +5874,12 @@ class TestMarketTypeFuturesConnection(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(called_config["options"], {"defaultType": "spot"})
 
 
-class TestExecuteRealOrderRefusesOnFuturesMarketType(unittest.IsolatedAsyncioTestCase):
+class TestExecuteRealOrderOpensLongAndShortOnFutures(unittest.IsolatedAsyncioTestCase):
     """
-    Рынок фьючерсов уже можно подключить (market_type=futures), но модель
-    позиции/закрытия/риска в executor.py всё ещё завязана на спот (amount —
-    буквально монета на кошельке спота, а не контракт с плечом/маржой) —
-    _execute_real_order должен явно отказывать в исполнении, а не молча
-    прогонять ордер недоделанной спот-логикой.
+    ЭТАП 2 перехода на фьючерсы: _execute_real_order теперь реально
+    открывает long И short на фьючерсах (market_type=="futures"), а не
+    заглушка-отказ (этап 1). На споте поведение не меняется — short
+    по-прежнему отклоняется.
     """
 
     async def asyncSetUp(self):
@@ -5855,23 +5890,84 @@ class TestExecuteRealOrderRefusesOnFuturesMarketType(unittest.IsolatedAsyncioTes
 
     def setUp(self):
         self._saved_market_type = settings.market_type
+        self._saved_trading_mode = settings.trading_mode
 
     def tearDown(self):
         settings.market_type = self._saved_market_type
+        settings.trading_mode = self._saved_trading_mode
 
-    async def test_refuses_order_when_market_type_is_futures(self):
+    async def test_opens_long_on_futures_and_sets_leverage(self):
         settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "fut-long-1", "filled": 10.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="FUTLONG1/USDT", side="buy", amount=10.0, price=2.0, order_type="market",
+        )
+
+        self.assertIsNotNone(order)
+        self.engine.exchange.set_leverage.assert_awaited_once_with(1, "FUTLONG1/USDT")
+        self.assertIn("FUTLONG1/USDT", self.engine.real_positions)
+        self.assertEqual(self.engine.real_positions["FUTLONG1/USDT"]["side"], "long")
+
+    async def test_opens_short_on_futures(self):
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_sell_order.return_value = {
+            "id": "fut-short-1", "filled": 10.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="FUTSHORT1/USDT", side="sell", amount=10.0, price=2.0, order_type="market",
+        )
+
+        self.assertIsNotNone(order)
+        self.engine.exchange.create_market_buy_order.assert_not_called()
+        self.assertIn("FUTSHORT1/USDT", self.engine.real_positions)
+        self.assertEqual(self.engine.real_positions["FUTSHORT1/USDT"]["side"], "short")
+
+    async def test_leverage_setting_error_does_not_block_order(self):
+        """best-effort: биржа может бросить "leverage not modified" — не должно ронять ордер."""
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.set_leverage = AsyncMock(side_effect=Exception("leverage not modified"))
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "fut-long-2", "filled": 5.0, "average": 3.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="FUTLEVERR1/USDT", side="buy", amount=5.0, price=3.0, order_type="market",
+        )
+
+        self.assertIsNotNone(order)
+
+    async def test_spot_market_type_still_rejects_short(self):
+        settings.market_type = "spot"
         settings.trading_mode = "real"
         self.engine.is_paper = False
         self.engine.exchange_id = "bybit"
         self.engine.exchange = AsyncMock()
 
         order = await self.engine.create_order(
-            symbol="FUTGUARD1/USDT", side="buy", amount=10.0, price=2.0, order_type="market",
+            symbol="FUTGUARD1/USDT", side="sell", amount=10.0, price=2.0, order_type="market",
         )
 
         self.assertIsNone(order)
-        self.engine.exchange.create_market_buy_order.assert_not_called()
+        self.engine.exchange.create_market_sell_order.assert_not_called()
 
     async def test_spot_market_type_still_executes_normally(self):
         settings.market_type = "spot"
@@ -5892,6 +5988,165 @@ class TestExecuteRealOrderRefusesOnFuturesMarketType(unittest.IsolatedAsyncioTes
         )
 
         self.assertIsNotNone(order)
+        self.engine.exchange.set_leverage.assert_not_called()
+
+
+class TestCloseRealPositionOnFutures(unittest.IsolatedAsyncioTestCase):
+    """
+    ЭТАП 2 перехода на фьючерсы: close_real_position закрывает и long
+    (продажей), и short (покупкой) на фьючерсах, с reduceOnly — раньше
+    метод работал только для long и всегда безусловно продавал.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+        self._saved_trading_mode = settings.trading_mode
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_closes_long_via_sell_with_reduce_only(self):
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_sell_order.return_value = {
+            "id": "fut-close-long-1", "filled": 10.0, "price": None, "average": 3.0,
+            "fee": {"cost": 0.1, "currency": "USDT"},
+        }
+
+        result = await self.engine.close_real_position(
+            symbol="FUTCLOSE1/USDT", side="long", entry_price=2.0, amount=10.0,
+            reason="take_profit", entry_fee=0.05, holding_seconds=60,
+        )
+
+        self.assertIsNotNone(result)
+        self.engine.exchange.create_market_sell_order.assert_awaited_once_with(
+            "FUTCLOSE1/USDT", 10.0, params={"reduceOnly": True},
+        )
+        expected_pnl = (3.0 - 2.0) * 10.0 - 0.05 - 0.1
+        self.assertAlmostEqual(result["pnl"], expected_pnl, places=6)
+
+    async def test_closes_short_via_buy_with_reduce_only_and_correct_pnl(self):
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "fut-close-short-1", "filled": 10.0, "price": None, "average": 1.5,
+            "fee": {"cost": 0.05, "currency": "USDT"},
+        }
+
+        result = await self.engine.close_real_position(
+            symbol="FUTCLOSE2/USDT", side="short", entry_price=2.0, amount=10.0,
+            reason="take_profit", entry_fee=0.05, holding_seconds=60,
+        )
+
+        self.assertIsNotNone(result)
+        self.engine.exchange.create_market_buy_order.assert_awaited_once_with(
+            "FUTCLOSE2/USDT", 10.0, params={"reduceOnly": True},
+        )
+        self.engine.exchange.create_market_sell_order.assert_not_called()
+        # short: цена упала 2.0 -> 1.5, значит прибыль.
+        expected_pnl = (2.0 - 1.5) * 10.0 - 0.05 - 0.05
+        self.assertAlmostEqual(result["pnl"], expected_pnl, places=6)
+
+    async def test_spot_still_rejects_short_close(self):
+        settings.market_type = "spot"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+
+        result = await self.engine.close_real_position(
+            symbol="FUTCLOSE3/USDT", side="short", entry_price=2.0, amount=10.0,
+            reason="stop_loss", entry_fee=0.0, holding_seconds=10,
+        )
+
+        self.assertIsNone(result)
+        self.engine.exchange.create_market_buy_order.assert_not_called()
+        self.engine.exchange.create_market_sell_order.assert_not_called()
+
+    async def test_futures_close_failure_does_not_reconcile_phantom(self):
+        """
+        Неудачное закрытие на фьючерсах НЕ должно списывать позицию как
+        "дуст" (это спот-концепция, читающая кошелёк) — просто ошибка,
+        позиция остаётся отслеживаемой для следующей попытки закрытия.
+        """
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_sell_order = AsyncMock(
+            side_effect=Exception('bybit {"retCode":170140,"retMsg":"Order value exceeded lower limit."}')
+        )
+        self.engine.real_positions["FUTCLOSE4/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long", "sl_order_id": None,
+        }
+
+        result = await self.engine.close_real_position(
+            symbol="FUTCLOSE4/USDT", side="long", entry_price=2.0, amount=10.0,
+            reason="stop_loss", entry_fee=0.0, holding_seconds=10,
+        )
+
+        self.assertIsNone(result)
+        self.assertIn("FUTCLOSE4/USDT", self.engine.real_positions)
+
+
+class TestReconcileRealPositionsSkipsFutures(unittest.IsolatedAsyncioTestCase):
+    """
+    ЭТАП 2: reconcile_real_positions() сверяет отслеживаемый объём позиции
+    с остатком БАЗОВОЙ ВАЛЮТЫ НА СПОТОВОМ КОШЕЛЬКЕ — на фьючерсах это
+    сравнение бессмысленно (позиция не выражается остатком монеты).
+    Для market_type=="futures" функция не должна трогать real_positions,
+    только вернуть свежий USDT-баланс.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+        self._saved_trading_mode = settings.trading_mode
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_does_not_touch_positions_on_futures(self):
+        from src.utils.timeutils import utcnow
+
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.real_positions["FUTRECON1/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long",
+            "opened_at": utcnow() - timedelta(hours=1), "sl_order_id": None, "order_id": None,
+        }
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0},
+        })
+
+        balance = await self.engine.reconcile_real_positions()
+
+        self.assertAlmostEqual(balance, 500.0)
+        self.assertIn("FUTRECON1/USDT", self.engine.real_positions)
+        self.engine.exchange.fetch_balance.assert_awaited_once()
 
 
 class TestOkxTradePermissionCheck(unittest.IsolatedAsyncioTestCase):
@@ -6119,6 +6374,27 @@ class TestManualTrading(unittest.IsolatedAsyncioTestCase):
                 symbol="MANUALREAL1/USDT", side="sell", amount=1.0, price=100.0,
             ))
         self.assertEqual(ctx.exception.status_code, 400)
+
+    async def test_create_manual_order_allows_short_on_futures_real_mode(self):
+        """ЭТАП 2: ручной short на фьючерсах в real-режиме больше не блокируется — только на споте."""
+        engine, bot = await self._install_engine_and_bot(exchange_id="bybit", is_paper=False)
+        saved_market_type = settings.market_type
+        settings.market_type = "futures"
+        engine.exchange = AsyncMock()
+        engine.exchange.create_market_sell_order.return_value = {
+            "id": "manual-fut-short-1", "filled": 1.0, "average": 100.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+        try:
+            result = await self.api_module.create_manual_order(self.api_module.ManualOrderCreate(
+                symbol="MANUALFUTSHORT1/USDT", side="sell", amount=1.0, price=100.0,
+            ))
+        finally:
+            settings.market_type = saved_market_type
+
+        self.assertTrue(result["success"])
+        self.assertIn("MANUALFUTSHORT1/USDT", bot.open_positions)
+        self.assertEqual(bot.open_positions["MANUALFUTSHORT1/USDT"]["side"], "short")
 
     async def test_create_manual_order_rejects_duplicate_position(self):
         await self._install_engine_and_bot(is_paper=True)
@@ -6649,6 +6925,99 @@ class TestTelegramSignalShortRejectedInRealMode(unittest.IsolatedAsyncioTestCase
 
         mock_engine.create_order.assert_awaited_once()
         self.assertEqual(mock_engine.create_order.await_args.kwargs["side"], "buy")
+
+
+class TestShortSignalAllowedOnFutures(unittest.IsolatedAsyncioTestCase):
+    """
+    ЭТАП 2 перехода на фьючерсы: short-сигналы больше не отклоняются
+    безусловно в реальном режиме — только на споте (см.
+    TestShortSignalRejectedBeforeExecutionInRealMode/
+    TestTelegramSignalShortRejectedInRealMode, где отклонение на споте
+    остаётся верным поведением). При market_type=="futures" short должен
+    доходить до execution_engine.create_order(side="sell").
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    @staticmethod
+    def _make_candles_df():
+        return pd.DataFrame({
+            "open": [1.0] * 60, "high": [1.0] * 60, "low": [1.0] * 60,
+            "close": [1.0] * 60, "volume": [1.0] * 60,
+        })
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        self._saved_active_trading_mode = settings.active_trading_mode
+        self._saved_market_type = settings.market_type
+        settings.trading_mode = "real"
+        settings.market_type = "futures"
+        settings.active_trading_mode = "algo"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+        settings.active_trading_mode = self._saved_active_trading_mode
+        settings.market_type = self._saved_market_type
+
+    async def test_short_strategy_signal_reaches_execution_engine_on_futures(self):
+        from src.strategy import StrategySignal
+
+        bot = self._make_bot()
+        bot.feature_engine = MagicMock()
+        bot.ml_inference = None
+        bot._refresh_symbol_candles = AsyncMock(return_value=self._make_candles_df())
+
+        fake_strategy = MagicMock()
+        fake_strategy.strategy_id = "ml_direction"
+        fake_strategy.name = "ML"
+        fake_strategy.weight = 1.0
+        fake_strategy.generate_signal.return_value = StrategySignal(
+            strategy_id="ml_direction", symbol="FUTSHORTSIG1/USDT", side="short", confidence=0.66,
+            entry_price=100.0,
+        )
+
+        with patch("src.main.strategy_registry.get_active", return_value=[fake_strategy]), \
+                patch("src.main.strategy_registry.get", return_value=None), \
+                patch("src.main.execution_engine") as mock_engine, \
+                patch("src.main.risk_manager") as mock_risk, \
+                patch("src.main.protection_manager") as mock_protections, \
+                patch("src.main.expectancy_sizing") as mock_sizing:
+            mock_engine.paper_positions = {}
+            mock_engine.real_positions = {}
+            mock_engine.last_prices = {}
+            mock_engine.create_order = AsyncMock(return_value=None)
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_risk.check_signal.return_value = (True, "")
+            mock_protections.locked_reason = AsyncMock(return_value=None)
+            mock_sizing.size_multiplier = AsyncMock(return_value=1.0)
+
+            await bot._process_symbol("FUTSHORTSIG1/USDT")
+
+        mock_engine.create_order.assert_awaited_once()
+        self.assertEqual(mock_engine.create_order.await_args.kwargs["side"], "sell")
+
+    async def test_short_telegram_signal_reaches_execution_engine_on_futures(self):
+        bot = self._make_bot()
+
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "FUTSHORTSIG2/USDT",
+                "parsed_side": "short",
+                "parsed_entry": 1.34,
+                "parsed_sl": 1.36,
+                "parsed_tp": 1.32,
+                "channel_id": "@test_channel",
+            })
+
+        mock_engine.create_order.assert_awaited_once()
+        self.assertEqual(mock_engine.create_order.await_args.kwargs["side"], "sell")
 
 
 class TestTradingSourceModeEndpoint(unittest.IsolatedAsyncioTestCase):

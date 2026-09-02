@@ -647,12 +647,14 @@ class TradingBot:
                 f"{settings.telegram_signals_default_sl_pct:.1f}% ({sl:.6f})"
             )
 
-        if not settings.is_paper and side == "short":
+        if not settings.is_paper and settings.market_type == "spot" and side == "short":
             # Тот же случай, что и для стратегийных сигналов (см.
             # _trading_iteration): на споте в реальном режиме шорт
             # неисполним, execution_engine._execute_real_order() всё равно
             # отклонит такой ордер — отклоняем сразу, не тратя запрос
-            # баланса и не оставляя ERROR в логах на ровном месте.
+            # баланса и не оставляя ERROR в логах на ровном месте. На
+            # фьючерсах (market_type=="futures") short реализован — см.
+            # executor._execute_real_order/close_real_position (ЭТАП 2).
             logger.info(f"🚫 Сигнал по {pair} отклонён: short — на споте (реальный режим) шорт не поддерживается")
             return None
 
@@ -1099,7 +1101,7 @@ class TradingBot:
                 logger.info(f"🚫 Сигнал отклонён (risk): {symbol} {signal.side} — {reason}")
                 continue
 
-            if not settings.is_paper and signal.side == "short":
+            if not settings.is_paper and settings.market_type == "spot" and signal.side == "short":
                 # На споте (реальный режим) шорта не существует —
                 # _execute_real_order() в executor.py всё равно отклонит
                 # такой ордер (см. защиту там, добавленную после инцидента
@@ -1108,7 +1110,8 @@ class TradingBot:
                 # пока ML/ансамбль продолжает считать пару "шортовой"
                 # (реальный инцидент: GRAM/USDT, ERROR повторялся ~раз в
                 # минуту непрерывно). Итог был предрешён ещё здесь — короче
-                # отклонить сразу, не тратя вызов к бирже.
+                # отклонить сразу, не тратя вызов к бирже. На фьючерсах
+                # (market_type=="futures") short реализован (ЭТАП 2).
                 logger.info(f"🚫 Сигнал отклонён: {symbol} short — на споте (реальный режим) шорт не поддерживается")
                 continue
 

@@ -533,7 +533,7 @@ async def create_manual_order(request: ManualOrderCreate):
     side = request.side.strip().lower()
     if side not in ("buy", "sell"):
         raise HTTPException(status_code=400, detail="side должен быть 'buy' или 'sell'")
-    if not settings.is_paper and side == "sell":
+    if not settings.is_paper and settings.market_type == "spot" and side == "sell":
         raise HTTPException(
             status_code=400,
             detail="На реальном споте нет встроенного шорта — открыть можно только long (buy)",
