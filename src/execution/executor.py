@@ -539,10 +539,17 @@ class ExecutionEngine:
         уже выставленным на бирже условным SL-ордером теряется — БД хранит
         только сам stop_loss (цену в Order.stop_loss), а не ID биржевого
         ордера. Чтобы не накапливать дубликаты условных ордеров при каждом
-        рестарте, сначала отменяем ВСЕ незакрытые условные ('tpslOrder')
-        ордера по символу, затем ставим один новый под актуальный
-        остаток/цену. Best-effort, как и вся остальная работа с биржевыми
-        SL-ордерами в этом классе — сбой здесь не должен мешать запуску.
+        рестарте, сначала отменяем ВСЕ незакрытые условные ордера по
+        символу, затем ставим один новый под актуальный остаток/цену.
+        Best-effort, как и вся остальная работа с биржевыми SL-ордерами в
+        этом классе — сбой здесь не должен мешать запуску.
+
+        orderFilter зависит от рынка позиции: 'tpslOrder' — для спота
+        (ccxt/bybit.py: create_order/cancel_order явно документируют его
+        как "Valid for spot only"), 'StopOrder' — для фьючерсов (то же
+        значение, которое ccxt сам подставляет по умолчанию для
+        триггерных ордеров вне зависимости от рынка — без "spot only"
+        оговорки для fetch_open_orders).
         """
         for symbol, pos in list(self.real_positions.items()):
             stop_loss = pos.get("stop_loss")
@@ -552,8 +559,9 @@ class ExecutionEngine:
             exchange = self._exchange_for(pos)
             if exchange is None:
                 continue
+            order_filter = "StopOrder" if pos.get("market_type", "spot") == "futures" else "tpslOrder"
             try:
-                open_orders = await exchange.fetch_open_orders(symbol, params={"orderFilter": "tpslOrder"})
+                open_orders = await exchange.fetch_open_orders(symbol, params={"orderFilter": order_filter})
                 for o in (open_orders or []):
                     await self._cancel_order_safe(symbol, o.get("id"), exchange)
             except Exception as e:
@@ -1239,21 +1247,32 @@ class ExecutionEngine:
         return estimated, quote_currency
 
     async def _place_stop_loss_order(
-        self, symbol: str, amount: float, stop_loss_price: float, exchange: ccxt.Exchange | None = None,
+        self, symbol: str, amount: float, stop_loss_price: float,
+        exchange: ccxt.Exchange | None = None, side: str = "long", is_futures: bool = False,
     ) -> str | None:
         """
-        Разместить биржевой стоп-ордер (Bybit spot: условный 'tpslOrder' —
-        рыночная продажа по достижении stop_loss_price), чтобы защита
-        позиции не зависела от того, жив ли процесс бота и успевает ли
-        внутренний поллинг цены (_check_position_exit в main.py) её
-        отследить. Тейк-профиты (TP1/TP2/TP3) сознательно остаются только
-        во внутренней логике: у Bybit spot нет родного OCO-механизма
+        Разместить биржевой стоп-ордер — условный reduceOnly-ордер
+        (params={"stopLossPrice": ...}), рыночный по достижении
+        stop_loss_price — чтобы защита позиции не зависела от того, жив ли
+        процесс бота и успевает ли внутренний поллинг цены
+        (_check_position_exit в main.py) её отследить. Тейк-профиты
+        (TP1/TP2/TP3) сознательно остаются только во внутренней логике —
+        ни на споте, ни на фьючерсах: у Bybit нет родного OCO-механизма
         частичного выхода по нескольким уровням, один статичный биржевой
         TP-ордер такому сценарию не соответствует, а SL — соответствует
         (единственный уровень, который в момент установки актуален всегда).
 
-        ВАЖНО: Bybit spot НЕ поддерживает stopLoss/takeProfit, прикреплённые
-        к самому маркет-ордеру (ccxt бросает InvalidOrder) — это ОТДЕЛЬНЫЙ
+        Направление зависит от side: "long" защищается sell-стопом (спот и
+        фьючерсы одинаково — единственный вариант на споте), "short" —
+        buy-стопом (только фьючерсы, обратный к открытию). ccxt сам
+        вычисляет triggerDirection из side+stopLossPrice (подтверждено
+        чтением ccxt/bybit.py create_order_request: side="sell" даёт
+        triggerDirection=2/fall — верно для long, side="buy" даёт
+        triggerDirection=1/rise — верно для short), явно его передавать не
+        нужно.
+
+        ВАЖНО: Bybit НЕ поддерживает stopLoss/takeProfit, прикреплённые к
+        самому маркет-ордеру (ccxt бросает InvalidOrder) — это ОТДЕЛЬНЫЙ
         условный ордер, размещаемый уже после того, как позиция открыта.
 
         Best-effort: любая ошибка (биржа отклонила триггер-цену, не
@@ -1266,34 +1285,48 @@ class ExecutionEngine:
         ex = exchange if exchange is not None else self.exchange
         if ex is None:
             return None
-        # Отслеживаемый объём позиции мог немного разойтись с реальным
-        # остатком на бирже — та же причина, что и в close_real_position
-        # (комиссии, округление лота, накопленный дрейф за несколько
-        # частичных закрытий или рестартов процесса): условный SL-ордер на
-        # биржевой остаток, а не на устаревший расчётный объём — иначе
-        # биржа отклоняет ЕГО ЦЕЛИКОМ с "Insufficient balance", и позиция
-        # остаётся вовсе без биржевой защиты (реальный инцидент: XAUT/USDT,
-        # LINK/USDT после нескольких частичных TP).
+        # Проверка доступного остатка на кошельке — спот-специфична (на
+        # фьючерсах позиция не выражается остатком монеты на кошельке, там
+        # нечего сверять). Отслеживаемый объём позиции мог немного
+        # разойтись с реальным остатком на бирже — та же причина, что и в
+        # close_real_position (комиссии, округление лота, накопленный
+        # дрейф за несколько частичных закрытий или рестартов процесса):
+        # условный SL-ордер на биржевой остаток, а не на устаревший
+        # расчётный объём — иначе биржа отклоняет ЕГО ЦЕЛИКОМ с
+        # "Insufficient balance", и позиция остаётся вовсе без биржевой
+        # защиты (реальный инцидент: XAUT/USDT, LINK/USDT после нескольких
+        # частичных TP).
+        if not is_futures:
+            try:
+                base_currency = symbol.split("/")[0]
+                balance = await ex.fetch_balance()
+                available = self._extract_currency_balance(balance, base_currency)
+                if 0 < available < amount:
+                    logger.debug(
+                        f"SL {symbol}: доступно {available:.8f} {base_currency} < отслеживаемого "
+                        f"{amount:.8f} — выставляем на доступный остаток."
+                    )
+                    amount = available
+            except Exception as e:
+                logger.debug(f"Не удалось сверить баланс перед выставлением SL {symbol}: {e}")
         try:
-            base_currency = symbol.split("/")[0]
-            balance = await ex.fetch_balance()
-            available = self._extract_currency_balance(balance, base_currency)
-            if 0 < available < amount:
-                logger.debug(
-                    f"SL {symbol}: доступно {available:.8f} {base_currency} < отслеживаемого "
-                    f"{amount:.8f} — выставляем на доступный остаток."
-                )
-                amount = available
-        except Exception as e:
-            logger.debug(f"Не удалось сверить баланс перед выставлением SL {symbol}: {e}")
-        try:
-            order = await ex.create_market_sell_order(
-                symbol, amount, params={"stopLossPrice": stop_loss_price},
+            params: dict = {"stopLossPrice": stop_loss_price}
+            if is_futures:
+                # reduceOnly — та же защита от переворота позиции, что и в
+                # close_real_position (ccxt и так проставляет его сам в
+                # этой ветке, см. докстринг выше, но передаём явно — тот
+                # же стиль, что и там).
+                params["reduceOnly"] = True
+            closing_side = "sell" if side == "long" else "buy"
+            order = (
+                await ex.create_market_sell_order(symbol, amount, params=params)
+                if closing_side == "sell"
+                else await ex.create_market_buy_order(symbol, amount, params=params)
             )
             order_id = order.get("id") if order else None
             if order_id:
                 logger.info(
-                    f"🛡️ Биржевой SL выставлен: {symbol} sell {amount:.8f} @ триггер "
+                    f"🛡️ Биржевой SL выставлен: {symbol} {closing_side} {amount:.8f} @ триггер "
                     f"{stop_loss_price} (ордер {order_id})"
                 )
             return order_id
@@ -1330,18 +1363,14 @@ class ExecutionEngine:
         (_exchange_for), а не по текущему тумблеру settings.market_type —
         позиция могла быть открыта на рынке, отличном от текущего.
 
-        На фьючерсах (позиция с market_type=="futures") новый SL-ордер НЕ
-        ставится — _place_stop_loss_order всегда шлёт спотовый conditional
-        sell (годится только для long, а на фьючерсах может быть и short —
-        sell в этом случае был бы попыткой продать несуществующий на
-        кошельке актив на рынке, где позиция вообще не выражается остатком
-        монеты). Реальный инцидент: восстановление short-позиции ENA/USDT
-        после рестарта на фьючерсах поставило "sell"-стоп на короткую
-        позицию — семантически неверно (SL шорта должен быть buy выше
-        входа, а не sell). Фьючерсный SL — отдельный, следующий этап; пока
-        позиция под защитой только внутреннего поллинга цены
-        (_check_position_exit в main.py). Прежний отслеживаемый ордер всё
-        равно отменяем — на случай, если он остался от вызова ДО этого фикса.
+        На фьючерсах SL теперь тоже ставится — _place_stop_loss_order сам
+        выбирает направление ордера по side позиции (sell для long, buy
+        для short), симметрично споту (см. докстринг _place_stop_loss_order).
+        Раньше здесь была защита от реального инцидента (восстановление
+        short-позиции ENA/USDT после рестарта на фьючерсах получало
+        спотовый "sell"-стоп — семантически неверно для шорта); теперь
+        направление определяется явно по side, а не всегда sell, так что
+        сама причина того инцидента устранена в _place_stop_loss_order.
         """
         pos = self.real_positions.get(symbol)
         if pos is None:
@@ -1349,8 +1378,12 @@ class ExecutionEngine:
         exchange = self._exchange_for(pos)
         await self._cancel_order_safe(symbol, pos.get("sl_order_id"), exchange)
         pos["sl_order_id"] = None
-        if stop_loss_price and amount > 0 and pos.get("market_type", "spot") != "futures":
-            pos["sl_order_id"] = await self._place_stop_loss_order(symbol, amount, stop_loss_price, exchange)
+        if stop_loss_price and amount > 0:
+            pos["sl_order_id"] = await self._place_stop_loss_order(
+                symbol, amount, stop_loss_price, exchange,
+                side=pos.get("side", "long"),
+                is_futures=pos.get("market_type", "spot") == "futures",
+            )
 
     async def _confirm_fill_via_balance(
         self, symbol: str, side: str, balance_before: float, expected_amount: float,
@@ -1595,12 +1628,10 @@ class ExecutionEngine:
                 # если тумблер потом переключат на другой рынок.
                 "market_type": settings.market_type,
             }
-            # Биржевой SL — спот-специфичный путь (_place_stop_loss_order
-            # всегда продаёт, защищает только long): фьючерсный SL —
-            # следующий этап. На фьючерсах позиция пока защищена только
-            # внутренним поллингом цены в _check_position_exit (main.py),
-            # как и спот-позиции с отклонённым биржей SL.
-            if not is_futures and order_data.get("stop_loss"):
+            # Биржевой SL теперь ставится для обоих рынков —
+            # sync_stop_loss_order сама выбирает направление ордера по
+            # side позиции (уже зарегистрирована выше).
+            if order_data.get("stop_loss"):
                 await self.sync_stop_loss_order(symbol, net_amount, order_data["stop_loss"])
 
             trade_event = TradeEvent(

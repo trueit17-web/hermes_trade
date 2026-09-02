@@ -6391,17 +6391,17 @@ class TestReconcileRealPositionsSkipsFutures(unittest.IsolatedAsyncioTestCase):
         self.engine.exchange.fetch_balance.assert_awaited_once()
 
 
-class TestSyncStopLossOrderSkipsFutures(unittest.IsolatedAsyncioTestCase):
+class TestSyncStopLossOrderOnFutures(unittest.IsolatedAsyncioTestCase):
     """
-    Реальный инцидент (прод, demo-фьючерсы, ENA/USDT): восстановление
-    short-позиции после рестарта бота поставило СПОТОВЫЙ "sell"-стоп на
-    короткую позицию — семантически неверно (SL шорта должен быть buy
-    выше входа, а не sell) и происходит от _rearm_stop_loss_orders_after_restart
-    -> sync_stop_loss_order, которую я гейтил только в _execute_real_order,
-    но не саму по себе — из-за чего этот и другие вызовы (resync после
-    partial close/trailing stop, POST /positions/edit) остались дырой.
-    Фикс — гейт внутри sync_stop_loss_order самой, единая точка правды для
-    всех вызывающих: на фьючерсах новый биржевой SL не ставится нигде.
+    ЭТАП 4 перехода на фьючерсы: биржевой SL теперь ставится и на
+    фьючерсах, симметрично споту — _place_stop_loss_order сам выбирает
+    направление ордера по стороне позиции (sell для long, buy для short),
+    вместо прежнего безусловного пропуска. Это заодно устраняет причину
+    более раннего реального инцидента (прод, demo-фьючерсы, ENA/USDT):
+    восстановление short-позиции после рестарта раньше могло получить
+    СПОТОВЫЙ "sell"-стоп на короткую позицию (неверно — SL шорта должен
+    быть buy выше входа) — теперь направление определяется явно по side,
+    а не всегда sell.
     """
 
     async def asyncSetUp(self):
@@ -6416,19 +6416,53 @@ class TestSyncStopLossOrderSkipsFutures(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         settings.market_type = self._saved_market_type
 
-    async def test_does_not_place_sl_order_on_futures(self):
+    async def test_places_sl_sell_order_for_long_position_on_futures(self):
         settings.market_type = "futures"
         self.engine.exchange = AsyncMock()
-        self.engine.real_positions["FUTSL1/USDT"] = {
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "fut-sl-long-1"}
+        self.engine.real_positions["FUTSLLONG1/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long", "sl_order_id": None,
+            "market_type": "futures",
+        }
+
+        await self.engine.sync_stop_loss_order("FUTSLLONG1/USDT", 10.0, 1.8)
+
+        self.engine.exchange.create_market_sell_order.assert_awaited_once_with(
+            "FUTSLLONG1/USDT", 10.0, params={"stopLossPrice": 1.8, "reduceOnly": True},
+        )
+        self.engine.exchange.create_market_buy_order.assert_not_called()
+        self.assertEqual(self.engine.real_positions["FUTSLLONG1/USDT"]["sl_order_id"], "fut-sl-long-1")
+
+    async def test_places_sl_buy_order_for_short_position_on_futures(self):
+        settings.market_type = "futures"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {"id": "fut-sl-short-1"}
+        self.engine.real_positions["FUTSLSHORT1/USDT"] = {
             "amount": 10.0, "entry_price": 2.0, "side": "short", "sl_order_id": None,
             "market_type": "futures",
         }
 
-        await self.engine.sync_stop_loss_order("FUTSL1/USDT", 10.0, 2.2)
+        await self.engine.sync_stop_loss_order("FUTSLSHORT1/USDT", 10.0, 2.2)
 
+        self.engine.exchange.create_market_buy_order.assert_awaited_once_with(
+            "FUTSLSHORT1/USDT", 10.0, params={"stopLossPrice": 2.2, "reduceOnly": True},
+        )
         self.engine.exchange.create_market_sell_order.assert_not_called()
-        self.engine.exchange.create_market_buy_order.assert_not_called()
-        self.assertIsNone(self.engine.real_positions["FUTSL1/USDT"]["sl_order_id"])
+        self.assertEqual(self.engine.real_positions["FUTSLSHORT1/USDT"]["sl_order_id"], "fut-sl-short-1")
+
+    async def test_futures_sl_does_not_check_wallet_balance(self):
+        """Спотовая сверка доступного остатка на кошельке бессмысленна для фьючерсов — не должна вызываться."""
+        settings.market_type = "futures"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "fut-sl-nobalance-1"}
+        self.engine.real_positions["FUTSLNOBAL1/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long", "sl_order_id": None,
+            "market_type": "futures",
+        }
+
+        await self.engine.sync_stop_loss_order("FUTSLNOBAL1/USDT", 10.0, 1.8)
+
+        self.engine.exchange.fetch_balance.assert_not_called()
 
     async def test_still_places_sl_order_on_spot(self):
         settings.market_type = "spot"
@@ -6440,8 +6474,63 @@ class TestSyncStopLossOrderSkipsFutures(unittest.IsolatedAsyncioTestCase):
 
         await self.engine.sync_stop_loss_order("SPOTSL1/USDT", 10.0, 1.8)
 
-        self.engine.exchange.create_market_sell_order.assert_awaited_once()
+        self.engine.exchange.create_market_sell_order.assert_awaited_once_with(
+            "SPOTSL1/USDT", 10.0, params={"stopLossPrice": 1.8},
+        )
         self.assertEqual(self.engine.real_positions["SPOTSL1/USDT"]["sl_order_id"], "spot-sl-1")
+
+
+class TestRearmStopLossOrdersFilterByMarketType(unittest.IsolatedAsyncioTestCase):
+    """
+    _rearm_stop_loss_orders_after_restart чистит старые условные ордера
+    перед переустановкой SL — orderFilter для этого запроса зависит от
+    рынка позиции: 'tpslOrder' (спот) документирован в ccxt/bybit.py как
+    "Valid for spot only", для фьючерсов (linear) нужен 'StopOrder'.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+
+    async def test_uses_stop_order_filter_for_futures_position(self):
+        settings.market_type = "futures"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_open_orders.return_value = []
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "rearm-fut-sl-1"}
+        self.engine.real_positions["REARMFUT1/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long", "sl_order_id": None,
+            "stop_loss": 1.8, "market_type": "futures",
+        }
+
+        await self.engine._rearm_stop_loss_orders_after_restart()
+
+        self.engine.exchange.fetch_open_orders.assert_awaited_once_with(
+            "REARMFUT1/USDT", params={"orderFilter": "StopOrder"},
+        )
+
+    async def test_uses_tpsl_order_filter_for_spot_position(self):
+        settings.market_type = "spot"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_open_orders.return_value = []
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "rearm-spot-sl-1"}
+        self.engine.real_positions["REARMSPOT1/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long", "sl_order_id": None,
+            "stop_loss": 1.8, "market_type": "spot",
+        }
+
+        await self.engine._rearm_stop_loss_orders_after_restart()
+
+        self.engine.exchange.fetch_open_orders.assert_awaited_once_with(
+            "REARMSPOT1/USDT", params={"orderFilter": "tpslOrder"},
+        )
 
 
 class TestOkxTradePermissionCheck(unittest.IsolatedAsyncioTestCase):
