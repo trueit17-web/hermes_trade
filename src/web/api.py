@@ -1199,12 +1199,14 @@ async def set_trading_source_mode(mode: str):
 async def set_market_type(market_type: str):
     """
     Переключить тип рынка для real-режима: spot (обычный спот, шорт не
-    поддерживается) или futures (USDT-perpetual/linear swap). ЭТАП 1
-    перехода на фьючерсы — переключатель подключает execution_engine к
-    нужному рынку ccxt (см. apply_settings_update/executor.initialize), но
-    исполнение ордеров на фьючерсах ещё не реализовано (см.
-    _execute_real_order) — бот при market_type=="futures" пока только
-    подключается к рынку и наблюдает, новые real-позиции не открывает.
+    поддерживается) или futures (USDT-perpetual/linear swap, long и short —
+    см. _execute_real_order). Переключатель — только дефолт для НОВЫХ
+    позиций (встроенные стратегии и Telegram-каналы без своей настройки
+    рынка, см. TelegramChannel.market); execution_engine держит клиентов
+    ОБОИХ рынков одновременно (см. ExecutionEngine._exchanges/
+    _ensure_exchange_connected), поэтому уже открытые позиции любого
+    рынка продолжают вестись (SL, закрытие, дуст-сверка) независимо от
+    текущего положения этого тумблера.
     """
     if market_type not in ("spot", "futures"):
         raise HTTPException(status_code=400, detail="Тип рынка должен быть spot или futures")
