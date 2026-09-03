@@ -126,6 +126,12 @@ async def _handler(event: events.NewMessage.Event):
             # уровня линейной интерполяцией вместо использования того,
             # что канал реально указал.
             "parsed_take_profits": parsed.get("take_profits", []),
+            # Кредитное плечо, явно указанное каналом ("Кредитное плечо:
+            # х35") — актуально только для фьючерсных сигналов, см.
+            # _execute_telegram_signal (main.py) и _execute_real_order
+            # (executor.py): применяется через set_leverage вместо
+            # глобальной settings.futures_leverage, когда указано.
+            "parsed_leverage": parsed.get("leverage"),
             "parsed_rationale": parsed.get("rationale", ""),
             "parsed_raw": parsed.get("raw", ""),
             # Регэксп-парсер (parse_with_regex) не оценивает уверенность —
@@ -373,6 +379,7 @@ def parse_with_regex(text: str) -> dict | None:
     # _tp_levels() в main.py: take_profits[0] — ближайшая цель).
     take_profits = extract_all_prices(text, *tp_keywords)
     tp = take_profits[-1] if take_profits else extract_price(text, side, *tp_keywords)
+    leverage = extract_leverage(text)
 
     if entry is None:
         # Формат без ключевого слова: "BTCUSDT LONG 1.85 SL 1.70 TP 2.10" —
@@ -394,6 +401,7 @@ def parse_with_regex(text: str) -> dict | None:
         "sl": sl,
         "tp": tp,
         "take_profits": take_profits,
+        "leverage": leverage,
         "raw": text,
     }
 
@@ -467,3 +475,31 @@ def extract_all_prices(text: str, *keywords) -> list[float]:
         if values:
             return values
     return []
+
+
+# "Кредитное плечо: х35" (кириллическая "х"), "Leverage: 20x", "плечо x10",
+# "leverage 10X" — число может стоять и до, и после множителя x/х, ключевое
+# слово (рус./англ.) обязательно, чтобы не путать плечо со случайным "35x"
+# где-нибудь ещё в тексте сигнала.
+_LEVERAGE_PATTERN = re.compile(
+    r"(?:кредитн\w*\s+плечо|плечо|leverage)\s*[:\-–—]?\s*[xXхХ]?\s*(\d+(?:\.\d+)?)\s*[xXхХ]?",
+    re.IGNORECASE,
+)
+
+
+def extract_leverage(text: str) -> float | None:
+    """
+    Извлечь кредитное плечо, явно указанное каналом (не все каналы его
+    пишут — актуально в основном для фьючерсных сигналов). Применяется
+    при открытии ордера (_execute_real_order) вместо глобальной
+    settings.futures_leverage, когда указано, и отображается в
+    информации о сделке.
+    """
+    match = _LEVERAGE_PATTERN.search(text)
+    if not match:
+        return None
+    try:
+        value = float(match.group(1))
+    except ValueError:
+        return None
+    return value if value > 0 else None

@@ -30,6 +30,8 @@ Rules:
 - entry: the entry price (a zone -> pick the near/first number). null = unstated.
 - take_profits: list of target prices, ascending.
 - stop_loss: single number or null.
+- leverage: the leverage multiplier if explicitly stated (e.g. "Leverage: 20x", \
+"плечо x10" -> 20, 10). null if unstated.
 - confidence: your 0..1 confidence this is a clean, tradeable signal."""
 
 _RESPONSE_SCHEMA = {
@@ -42,6 +44,7 @@ _RESPONSE_SCHEMA = {
         "entry": {"type": ["number", "null"]},
         "take_profits": {"type": "array", "items": {"type": "number"}},
         "stop_loss": {"type": ["number", "null"]},
+        "leverage": {"type": ["number", "null"]},
         "confidence": {"type": "number"},
     },
     "required": ["is_signal", "confidence"],
@@ -133,6 +136,7 @@ async def parse_with_gemini(text: str, channel_config: dict | None = None) -> di
         take_profits.reverse()
     tp = take_profits[-1] if take_profits else None
     sl = data.get("stop_loss")
+    leverage = data.get("leverage")
 
     return {
         "pair": pair,
@@ -141,6 +145,7 @@ async def parse_with_gemini(text: str, channel_config: dict | None = None) -> di
         "sl": float(sl) if sl is not None else None,
         "tp": float(tp) if tp is not None else None,
         "take_profits": take_profits,
+        "leverage": float(leverage) if leverage else None,
         "confidence": float(data.get("confidence", _MIN_CONFIDENCE)),
         "raw": text,
     }

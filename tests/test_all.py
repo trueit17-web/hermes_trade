@@ -2624,6 +2624,27 @@ class TestTelegramSignalParser(unittest.TestCase):
         self.assertEqual(result["take_profits"], [72000.0])
         self.assertEqual(result["tp"], 72000.0)
 
+    def test_leverage_absent_when_not_mentioned(self):
+        result = self.parse("BTC/USDT Long 69000 SL 68000 TP 72000")
+        self.assertIsNotNone(result)
+        self.assertIsNone(result["leverage"])
+
+    def test_leverage_parsed_cyrillic_prefix_x(self):
+        """Пример из прод-запроса: "Кредитное плечо: х35" (кириллическая х)."""
+        result = self.parse("BTC/USDT Long 69000 SL 68000 TP 72000 Кредитное плечо: х35")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["leverage"], 35.0)
+
+    def test_leverage_parsed_english_suffix_x(self):
+        result = self.parse("BTCUSDT LONG 69000 SL 68000 TP 72000 Leverage: 20x")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["leverage"], 20.0)
+
+    def test_leverage_keyword_plecho_without_kreditnoe(self):
+        result = self.parse("BTC/USDT Long 69000 SL 68000 TP 72000 плечо x10")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["leverage"], 10.0)
+
 
 class TestLlmSignalParser(unittest.IsolatedAsyncioTestCase):
     """
@@ -6271,6 +6292,98 @@ class TestExecuteRealOrderOpensLongAndShortOnFutures(unittest.IsolatedAsyncioTes
         self.engine.exchange.set_leverage.assert_not_called()
 
 
+class TestExecuteRealOrderAppliesPerSignalLeverage(unittest.IsolatedAsyncioTestCase):
+    """
+    Некоторые Telegram-каналы указывают плечо прямо в тексте сигнала
+    ("Кредитное плечо: х35" — см. extract_leverage в channel_monitor.py).
+    create_order(leverage=...) должен применить ЕГО через set_leverage
+    вместо глобальной settings.futures_leverage, и сохранить фактически
+    применённое значение на real_positions[symbol]["leverage"] — иначе
+    бейдж плеча в дашборде показывал бы либо ничего (до первой сверки),
+    либо неверное глобальное значение.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+        self._saved_trading_mode = settings.trading_mode
+        self._saved_futures_leverage = settings.futures_leverage
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+        settings.trading_mode = self._saved_trading_mode
+        settings.futures_leverage = self._saved_futures_leverage
+
+    async def test_per_order_leverage_overrides_global_setting(self):
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        settings.futures_leverage = 1.0
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "fut-lev-1", "filled": 10.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="FUTLEV1/USDT", side="buy", amount=10.0, price=2.0, order_type="market",
+            leverage=35.0,
+        )
+
+        self.assertIsNotNone(order)
+        self.engine.exchange.set_leverage.assert_awaited_once_with(35, "FUTLEV1/USDT")
+        self.assertEqual(self.engine.real_positions["FUTLEV1/USDT"]["leverage"], 35.0)
+
+    async def test_no_per_order_leverage_falls_back_to_global_setting(self):
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        settings.futures_leverage = 5.0
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "fut-lev-2", "filled": 10.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="FUTLEV2/USDT", side="buy", amount=10.0, price=2.0, order_type="market",
+        )
+
+        self.assertIsNotNone(order)
+        self.engine.exchange.set_leverage.assert_awaited_once_with(5, "FUTLEV2/USDT")
+        self.assertEqual(self.engine.real_positions["FUTLEV2/USDT"]["leverage"], 5.0)
+
+    async def test_leverage_ignored_on_spot(self):
+        settings.market_type = "spot"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"FUTLEV3": 0.0}, "FUTLEV3": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "fut-lev-3", "filled": 10.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="FUTLEV3/USDT", side="buy", amount=10.0, price=2.0, order_type="market",
+            leverage=35.0,
+        )
+
+        self.assertIsNotNone(order)
+        self.engine.exchange.set_leverage.assert_not_called()
+        self.assertIsNone(self.engine.real_positions["FUTLEV3/USDT"]["leverage"])
+
+
 class TestCloseRealPositionOnFutures(unittest.IsolatedAsyncioTestCase):
     """
     ЭТАП 2 перехода на фьючерсы: close_real_position закрывает и long
@@ -8277,6 +8390,61 @@ class TestExecuteTelegramSignalStoresRealTakeProfits(unittest.IsolatedAsyncioTes
             })
 
         self.assertEqual(bot.open_positions["BTC/USDT"]["take_profits"], [])
+
+
+class TestExecuteTelegramSignalPassesParsedLeverage(unittest.IsolatedAsyncioTestCase):
+    """Плечо, указанное каналом в тексте сигнала (parsed_leverage — см.
+    extract_leverage в channel_monitor.py), должно доходить до
+    execution_engine.create_order(leverage=...), а не теряться на пути."""
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "real"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_parsed_leverage_forwarded_to_create_order(self):
+        bot = self._make_bot()
+        bot._refresh_symbol_candles = AsyncMock()
+        fake_order = MagicMock(id=1, fee=0.0)
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=fake_order)
+            mock_engine.get_open_positions = MagicMock(return_value={})
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 53000.0,
+                "parsed_leverage": 35.0,
+                "channel_id": "@test_channel", "channel_market_type": "futures",
+            })
+
+        mock_engine.create_order.assert_awaited_once()
+        self.assertEqual(mock_engine.create_order.await_args.kwargs["leverage"], 35.0)
+
+    async def test_missing_parsed_leverage_forwards_none(self):
+        bot = self._make_bot()
+        bot._refresh_symbol_candles = AsyncMock()
+        fake_order = MagicMock(id=1, fee=0.0)
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=fake_order)
+            mock_engine.get_open_positions = MagicMock(return_value={})
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 53000.0,
+                "channel_id": "@test_channel",
+            })
+
+        mock_engine.create_order.assert_awaited_once()
+        self.assertIsNone(mock_engine.create_order.await_args.kwargs["leverage"])
 
 
 class TestOpenPositionAmountUsesExecutionEngineTrackedValue(unittest.IsolatedAsyncioTestCase):

@@ -747,6 +747,7 @@ class ExecutionEngine:
         strategy_id: int | None = None,
         signal_data: dict | None = None,
         market_type: str | None = None,
+        leverage: float | None = None,
     ) -> Order | None:
         """
         Создать ордер.
@@ -757,6 +758,13 @@ class ExecutionEngine:
         _execute_telegram_signal в main.py) — по умолчанию (None) берётся
         settings.market_type (текущий тумблер в шапке дашборда), как и
         раньше для сигналов стратегий/ручных ордеров.
+
+        leverage — плечо ИМЕННО для этого ордера (например, канал явно
+        указал его в тексте сигнала — см. _execute_telegram_signal), если
+        задано И рынок фьючерсный — используется вместо глобальной
+        settings.futures_leverage (см. _execute_real_order). Игнорируется
+        на споте (там плеча не существует) и в paper-режиме (там нет
+        реального маржинального механизма — см. _execute_paper_order).
         """
         if risk_manager.state.kill_switch_active:
             logger.warning(f"❌ Попытка создать ордер при активном kill switch: {symbol}")
@@ -811,6 +819,7 @@ class ExecutionEngine:
             "strategy_id": strategy_id,
             "signal_data": signal_data,
             "market_type": order_market_type,
+            "leverage": leverage,
         }
 
         sl_str = f"{stop_loss:.2f}" if stop_loss is not None else "—"
@@ -1532,16 +1541,22 @@ class ExecutionEngine:
             )
             return None
 
+        leverage_to_set = settings.futures_leverage
         if is_futures:
-            # Плечо — глобальная настройка (см. settings.futures_leverage),
-            # не per-позиция. best-effort: некоторые биржи/версии ccxt
-            # бросают исключение, если плечо уже установлено в то же
-            # значение ("leverage not modified") — это не ошибка, ордер
-            # всё равно можно размещать с уже действующим плечом.
+            # Плечо ПО УМОЛЧАНИЮ — глобальная настройка (settings.
+            # futures_leverage), но конкретный сигнал (например,
+            # Telegram-канал, явно указавший "Кредитное плечо: х35" в
+            # тексте — см. _execute_telegram_signal) может задать своё,
+            # per-ордерное — используем его, если есть. best-effort:
+            # некоторые биржи/версии ccxt бросают исключение, если плечо
+            # уже установлено в то же значение ("leverage not modified") —
+            # это не ошибка, ордер всё равно можно размещать с уже
+            # действующим плечом.
+            leverage_to_set = order_data.get("leverage") or settings.futures_leverage
             try:
-                await exchange.set_leverage(int(settings.futures_leverage), symbol)
+                await exchange.set_leverage(int(leverage_to_set), symbol)
             except Exception as e:
-                logger.debug(f"Не удалось установить плечо {settings.futures_leverage}x для {symbol}: {e}")
+                logger.debug(f"Не удалось установить плечо {leverage_to_set}x для {symbol}: {e}")
 
         below_min = self._below_exchange_minimum(symbol, amount, price, exchange)
         if below_min:
@@ -1704,6 +1719,13 @@ class ExecutionEngine:
                 # именно это поле через _exchange_for(pos), даже если
                 # тумблер потом переключат на другой рынок.
                 "market_type": order_market_type,
+                # Плечо, реально запрошенное у биржи для ЭТОГО ордера (см.
+                # leverage_to_set выше — per-сигнал или глобальный дефолт).
+                # Только для отображения сразу после открытия — следующий
+                # цикл сверки (_reconcile_futures_position) перезапишет
+                # его подтверждённым биржей значением из fetch_position();
+                # на споте плеча не бывает, оставляем None.
+                "leverage": leverage_to_set if is_futures else None,
             }
             # Биржевой SL теперь ставится для обоих рынков —
             # sync_stop_loss_order сама выбирает направление ордера по

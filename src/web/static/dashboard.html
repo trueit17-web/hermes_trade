@@ -2022,6 +2022,14 @@ function renderChannelSignalsTable(signals) {
             const tpDisplay = s.parsed_take_profits && s.parsed_take_profits.length > 1
               ? s.parsed_take_profits.map(v => fmtPrice(v)).join(" → ")
               : (s.parsed_tp !== null ? fmtPrice(s.parsed_tp) : "—");
+            // Кредитное плечо, явно указанное каналом в тексте сигнала
+            // (см. extract_leverage в channel_monitor.py) — применяется
+            // при открытии фьючерсного ордера вместо глобального
+            // futures_leverage; показываем прямо тут, у сигнала, а не
+            // только у уже открытой позиции.
+            const leverageBadge = s.parsed_leverage
+              ? ` <span class="muted" title="Плечо, указанное каналом">⚡${s.parsed_leverage}x</span>`
+              : "";
             const decisionCell = s.decision === "pending"
               ? `<button type="button" class="btn-icon signal-decide-btn" data-signal-id="${s.id}" data-action="execute" title="Исполнить">✅</button>
                  <button type="button" class="btn-icon signal-decide-btn" data-signal-id="${s.id}" data-action="reject" title="Отклонить">🚫</button>`
@@ -2029,7 +2037,7 @@ function renderChannelSignalsTable(signals) {
             return `
             <tr>
               <td class="muted">${s.created_at ? new Date(s.created_at).toLocaleString("ru-RU") : "—"}</td>
-              <td>${s.parsed_pair || "—"}</td>
+              <td>${s.parsed_pair || "—"}${leverageBadge}</td>
               <td class="side-${s.parsed_side === 'long' ? 'long' : 'short'}">${(s.parsed_side || "—").toUpperCase()}</td>
               <td>${s.parsed_entry !== null ? fmtPrice(s.parsed_entry) : "—"}</td>
               <td>${s.parsed_sl !== null ? fmtPrice(s.parsed_sl) : "—"}</td>

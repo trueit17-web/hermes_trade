@@ -620,6 +620,7 @@ class TradingBot:
                     parsed_sl=signal_event.get("parsed_sl"),
                     parsed_tp=signal_event.get("parsed_tp"),
                     parsed_take_profits=signal_event.get("parsed_take_profits") or None,
+                    parsed_leverage=signal_event.get("parsed_leverage"),
                     quality_score=quality,
                     decision=decision,
                     executed_order_id=order.id if order else None,
@@ -636,6 +637,13 @@ class TradingBot:
         sl = signal_event.get("parsed_sl")
         tp = signal_event.get("parsed_tp")
         take_profits = signal_event.get("parsed_take_profits") or []
+        # Кредитное плечо, явно указанное каналом в тексте сигнала
+        # ("Кредитное плечо: х35") — актуально только на фьючерсах,
+        # применяется вместо глобальной settings.futures_leverage (см.
+        # _execute_real_order). На споте плеча не существует — игнорируется
+        # там же (не здесь), чтобы поведение оставалось единообразным с
+        # тем, как рынок сигнала (market_type) резолвится ниже.
+        leverage = signal_event.get("parsed_leverage")
 
         symbol = pair
         order_side = "buy" if side == "long" else "sell"
@@ -703,6 +711,7 @@ class TradingBot:
             take_profit=tp,
             strategy_id="telegram_signal",
             market_type=market_type,
+            leverage=leverage,
         )
         if order:
             logger.info(f"✅ Ордер исполнен: {order.client_order_id}")

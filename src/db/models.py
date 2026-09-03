@@ -277,6 +277,13 @@ class TelegramSignal(Base):
     # теряло бы многоуровневый TP — сообщение, из которого он был разобран,
     # к моменту подтверждения уже недоступно.
     parsed_take_profits: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Кредитное плечо, явно указанное каналом в тексте сигнала (например
+    # "Кредитное плечо: х35") — некоторые фьючерсные каналы задают его
+    # per-сигнал, отдельно от глобальной настройки settings.futures_leverage.
+    # См. _execute_telegram_signal/executor._execute_real_order: если
+    # указано, применяется через set_leverage ИМЕННО для этого ордера
+    # вместо глобального значения.
+    parsed_leverage: Mapped[float | None] = mapped_column(DECIMAL)
     quality_score: Mapped[float | None] = mapped_column(Float)
     decision: Mapped[str] = mapped_column(
         String(30), default="pending"

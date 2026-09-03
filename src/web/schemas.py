@@ -138,6 +138,7 @@ class TelegramSignalResponse(BaseModel):
     parsed_entry: float | None = None
     parsed_sl: float | None = None
     parsed_tp: float | None = None
+    parsed_leverage: float | None = None
     quality_score: float | None = None
     decision: str
     created_at: datetime | None = None

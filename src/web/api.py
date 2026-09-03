@@ -1579,6 +1579,7 @@ async def list_telegram_signals(channel_id: int | None = None, limit: int = 100)
                     "parsed_sl": float(s.parsed_sl) if s.parsed_sl else None,
                     "parsed_tp": float(s.parsed_tp) if s.parsed_tp else None,
                     "parsed_take_profits": s.parsed_take_profits,
+                    "parsed_leverage": float(s.parsed_leverage) if s.parsed_leverage else None,
                     "quality_score": s.quality_score,
                     "decision": s.decision,
                     "order": _order_data(s.executed_order),
@@ -1644,6 +1645,7 @@ async def decide_telegram_signal(signal_id: int, decision: TelegramSignalDecisio
             "parsed_sl": float(signal.parsed_sl) if signal.parsed_sl else None,
             "parsed_tp": float(signal.parsed_tp) if signal.parsed_tp else None,
             "parsed_take_profits": signal.parsed_take_profits or [],
+            "parsed_leverage": float(signal.parsed_leverage) if signal.parsed_leverage else None,
             "channel_position_size_pct": signal.channel.position_size_pct if signal.channel else 5.0,
             "channel_market_type": signal.channel.market if signal.channel else settings.market_type,
         }
