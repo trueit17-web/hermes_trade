@@ -1244,6 +1244,54 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(trade.is_open)
         self.assertEqual(close_order.order_id_exchange, "closed-manually-1")
 
+    async def test_external_close_via_trade_history_cancels_leftover_sl_order(self):
+        """
+        Регресс на прод-инцидент: ASTER/QTUM/TIA годами держали часть
+        баланса заблокированной ("used" в /balances) — позиция закрылась
+        ЧУЖИМ путём (найдено по истории сделок биржи, _record_external_close),
+        а биржевой SL-ордер, выставленный под неё, никогда не отменялся
+        (в отличие от _reconcile_phantom_position, где отмена уже была).
+        Сам ордер продолжал резервировать актив на бирже бессрочно.
+        """
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Symbol
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        opened_at = datetime.now() - timedelta(hours=1)
+        self.engine.real_positions["TRSLLEAK1/USDT"] = {
+            "amount": 100.0, "entry_price": 2.0, "side": "long",
+            "strategy_id": None, "entry_fee": 0.02, "order_id": None,
+            "opened_at": opened_at, "sl_order_id": "sl-leftover-1",
+        }
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"TRSLLEAK1": 0.0}, "TRSLLEAK1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        # fetch_order (использует _finalize_externally_closed_position) —
+        # SL-ордер ещё НЕ исполнен (open), поэтому этот путь возвращает
+        # False и сверка падает дальше на _finalize_via_recent_trade_history.
+        self.engine.exchange.fetch_order = AsyncMock(
+            return_value={"id": "sl-leftover-1", "status": "open", "filled": 0.0}
+        )
+        recent_ts_ms = int((opened_at + timedelta(minutes=30)).timestamp() * 1000)
+        self.engine.exchange.fetch_my_trades = AsyncMock(return_value=[
+            {"id": "closed-manually-2", "side": "sell", "amount": 100.0, "price": 2.1,
+             "cost": 210.0, "timestamp": recent_ts_ms, "fee": {"cost": 0.05, "currency": "USDT"}},
+        ])
+
+        await self.engine.reconcile_real_positions()
+
+        self.assertNotIn("TRSLLEAK1/USDT", self.engine.real_positions)
+        self.engine.exchange.cancel_order.assert_called_once_with("sl-leftover-1", "TRSLLEAK1/USDT")
+        async with get_session() as session:
+            symbol_row = (
+                await session.execute(select(Symbol).where(Symbol.symbol == "TRSLLEAK1/USDT"))
+            ).scalar_one_or_none()
+        self.assertIsNotNone(symbol_row)
+
     async def test_reconcile_real_positions_does_not_misattribute_unrelated_trade(self):
         """
         Если недавние продажи по символу сильно расходятся по объёму с
@@ -6549,6 +6597,122 @@ class TestGetReferencePrice(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(price)
 
 
+class TestSweepBalancesToUsdt(unittest.IsolatedAsyncioTestCase):
+    """
+    ExecutionEngine.sweep_balances_to_usdt() — ручная конвертация ВСЕХ
+    ненулевых остатков в USDT по кнопке дашборда. Реальный прод-инцидент:
+    десятки валют скопились на аккаунте (демо-счёт Bybit) за время работы
+    бота, часть балансов заблокирована в осиротевших ордерах ("used" в
+    /balances) от давно закрытых позиций — см. фикс _record_external_close
+    выше (теперь отменяет sl_order_id).
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+
+    async def test_sells_free_balances_skips_dust_and_unmarketed_currencies(self):
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.markets = {
+            "ARB/USDT": {"limits": {"amount": {"min": 1.0}, "cost": {"min": 5.0}}},
+            "MON/USDT": {"limits": {"amount": {"min": 1.0}}},
+        }
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"ARB": 100.0, "MON": 0.0001, "GHOST": 5.0, "USDT": 500.0},
+            "used": {"ARB": 0.0, "MON": 0.0, "GHOST": 0.0, "USDT": 0.0},
+            "total": {"ARB": 100.0, "MON": 0.0001, "GHOST": 5.0, "USDT": 500.0},
+        })
+        self.engine.exchange.fetch_ticker = AsyncMock(side_effect=lambda symbol: {"last": 10.0})
+        self.engine.exchange.create_market_sell_order = AsyncMock(return_value={"id": "sell-arb-1"})
+
+        result = await self.engine.sweep_balances_to_usdt()
+
+        self.assertEqual(len(result["sold"]), 1)
+        self.assertEqual(result["sold"][0]["currency"], "ARB")
+        self.assertEqual(result["sold"][0]["amount"], 100.0)
+        skipped_currencies = {s["currency"] for s in result["skipped"]}
+        self.assertEqual(skipped_currencies, {"MON", "GHOST"})
+        self.assertEqual(result["errors"], [])
+        self.engine.exchange.create_market_sell_order.assert_called_once_with("ARB/USDT", 100.0)
+
+    async def test_cancels_open_orders_before_selling_locked_balance(self):
+        """Тот самый прод-сценарий ASTER/QTUM/TIA: часть баланса
+        заблокирована в открытых ордерах — сначала отменяем их, потом
+        продаём освободившийся остаток."""
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.markets = {"LOCKED/USDT": {"limits": {}}}
+        self.engine.exchange.fetch_balance = AsyncMock(side_effect=[
+            {
+                "free": {"LOCKED": 0.0, "USDT": 500.0},
+                "used": {"LOCKED": 50.0, "USDT": 0.0},
+                "total": {"LOCKED": 50.0, "USDT": 500.0},
+            },
+            {
+                "free": {"LOCKED": 50.0, "USDT": 500.0},
+                "used": {"LOCKED": 0.0, "USDT": 0.0},
+                "total": {"LOCKED": 50.0, "USDT": 500.0},
+            },
+        ])
+        self.engine.exchange.fetch_open_orders = AsyncMock(return_value=[{"id": "orphaned-order-1"}])
+        self.engine.exchange.fetch_ticker = AsyncMock(return_value={"last": 2.0})
+        self.engine.exchange.create_market_sell_order = AsyncMock(return_value={"id": "sell-locked-1"})
+
+        result = await self.engine.sweep_balances_to_usdt()
+
+        self.engine.exchange.cancel_order.assert_any_call("orphaned-order-1", "LOCKED/USDT")
+        self.assertEqual(len(result["sold"]), 1)
+        self.assertEqual(result["sold"][0], {"currency": "LOCKED", "amount": 50.0, "order_id": "sell-locked-1"})
+
+    async def test_sell_order_error_recorded_without_blocking_others(self):
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.markets = {
+            "FAIL/USDT": {"limits": {}}, "OK/USDT": {"limits": {}},
+        }
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"FAIL": 1.0, "OK": 1.0, "USDT": 100.0},
+            "used": {"FAIL": 0.0, "OK": 0.0, "USDT": 0.0},
+            "total": {"FAIL": 1.0, "OK": 1.0, "USDT": 100.0},
+        })
+        self.engine.exchange.fetch_ticker = AsyncMock(return_value={"last": 1.0})
+
+        async def _sell(symbol, amount):
+            if symbol == "FAIL/USDT":
+                raise Exception("exchange rejected order")
+            return {"id": "sell-ok-1"}
+
+        self.engine.exchange.create_market_sell_order = AsyncMock(side_effect=_sell)
+
+        result = await self.engine.sweep_balances_to_usdt()
+
+        self.assertEqual(len(result["sold"]), 1)
+        self.assertEqual(result["sold"][0]["currency"], "OK")
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["errors"][0]["currency"], "FAIL")
+
+    async def test_no_exchange_connected_returns_error(self):
+        self.engine.is_paper = False
+        self.engine.exchange_id = None
+
+        result = await self.engine.sweep_balances_to_usdt()
+
+        self.assertEqual(result["sold"], [])
+        self.assertEqual(len(result["errors"]), 1)
+
+
 class TestCloseRealPositionOnFutures(unittest.IsolatedAsyncioTestCase):
     """
     ЭТАП 2 перехода на фьючерсы: close_real_position закрывает и long
@@ -7300,6 +7464,46 @@ class TestManualTrading(unittest.IsolatedAsyncioTestCase):
         result_other = await self.api_module.list_trades(limit=200, offset=0, strategy_id="telegram_signal")
         symbols_other = {t["symbol"] for t in result_other["trades"]}
         self.assertNotIn("MANUALLIST1/USDT", symbols_other)
+
+
+class TestSellBalancesToUsdtEndpoint(unittest.IsolatedAsyncioTestCase):
+    """POST /balances/sell-to-usdt — кнопка дашборда "Продать все остатки
+    в USDT" (см. ExecutionEngine.sweep_balances_to_usdt)."""
+
+    def setUp(self):
+        import src.web.api as api_module
+        from fastapi import HTTPException
+
+        self.api_module = api_module
+        self.HTTPException = HTTPException
+        self._saved_trading_mode = settings.trading_mode
+        self._saved_engine = api_module.execution_engine
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+        self.api_module.execution_engine = self._saved_engine
+
+    async def test_rejected_in_paper_mode(self):
+        settings.trading_mode = "paper"
+
+        with self.assertRaises(self.HTTPException) as ctx:
+            await self.api_module.sell_balances_to_usdt()
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    async def test_real_mode_delegates_to_execution_engine(self):
+        settings.trading_mode = "real"
+        mock_engine = MagicMock()
+        mock_engine.sweep_balances_to_usdt = AsyncMock(return_value={
+            "sold": [{"currency": "ARB", "amount": 100.0, "order_id": "1"}],
+            "skipped": [], "errors": [],
+        })
+        self.api_module.execution_engine = mock_engine
+
+        result = await self.api_module.sell_balances_to_usdt()
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["sold"][0]["currency"], "ARB")
+        mock_engine.sweep_balances_to_usdt.assert_awaited_once()
 
 
 class TestSystemRedeploy(unittest.IsolatedAsyncioTestCase):

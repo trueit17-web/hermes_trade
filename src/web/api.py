@@ -410,6 +410,28 @@ async def get_balances():
     return {"balances": balances or [], "trading_mode": settings.trading_mode}
 
 
+@app.post("/balances/sell-to-usdt")
+async def sell_balances_to_usdt():
+    """
+    Продать ВСЕ ненулевые остатки на бирже (кроме самого USDT) по рынку
+    обратно в USDT — ручная операция по кнопке в дашборде (см.
+    ExecutionEngine.sweep_balances_to_usdt), не автоматическое действие
+    бота. Перед продажей каждой валюты с заблокированным ("used")
+    остатком сначала отменяет её открытые ордера на бирже (в т.ч.
+    осиротевшие условные SL-ордера от давно закрытых позиций).
+    Недоступно в paper-режиме — там нет реальных биржевых балансов.
+    """
+    if settings.is_paper:
+        raise HTTPException(status_code=400, detail="Недоступно в paper-режиме — нет реальных биржевых балансов")
+
+    result = await execution_engine.sweep_balances_to_usdt()
+    logger.warning(
+        f"💱 Конвертация остатков в USDT через дашборд: продано {len(result['sold'])}, "
+        f"пропущено {len(result['skipped'])}, ошибок {len(result['errors'])}"
+    )
+    return {"success": True, **result}
+
+
 @app.post("/paper/reset")
 async def reset_paper_account():
     """

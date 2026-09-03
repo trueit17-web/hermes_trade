@@ -2640,6 +2640,15 @@ class ExecutionEngine:
         order_open_id = pos.get("order_id")
 
         self.real_positions.pop(symbol, None)
+        # Позиция закрылась ЧУЖИМ путём (сработал сам SL/найдено по истории
+        # сделок), а не через close_real_position — тот отменяет
+        # sl_order_id ДО своей продажи, здесь этого шага никогда не было.
+        # Реальный симптом (прод): ASTER/QTUM/TIA годами держали часть
+        # баланса заблокированной ("used" в /balances) — осиротевший
+        # условный SL-ордер от давно закрытой (этим путём) позиции никогда
+        # не отменялся, продолжая резервировать актив на бирже. Та же
+        # отмена, что уже сделана для _reconcile_phantom_position.
+        await self._cancel_order_safe(symbol, pos.get("sl_order_id"), self._exchange_for(pos))
 
         async with get_session() as session:
             exchange_id, symbol_id = await self._resolve_symbol_id(session, symbol)
@@ -2783,6 +2792,116 @@ class ExecutionEngine:
         await asyncio.gather(*(_fill_usdt_value(item) for item in result))
         result.sort(key=lambda b: b["currency"])
         return result
+
+    async def sweep_balances_to_usdt(self) -> dict:
+        """
+        Продать по рынку ВСЕ ненулевые остатки (кроме самого USDT) обратно
+        в USDT — ручная разовая операция через дашборд (кнопка "Продать
+        все остатки в USDT" рядом с /balances), а не автоматическое
+        действие бота. Всегда через СПОТОВЫЙ клиент независимо от текущего
+        тумблера market_type — это обычные держания базовой валюты на
+        аккаунте (в т.ч. пыль, оставшаяся после _reconcile_phantom_position/
+        _record_external_close), а не фьючерсные контракты.
+
+        Перед продажей КАЖДОЙ валюты, у которой есть заблокированный
+        ("used") остаток, сначала отменяет любые открытые ордера по её
+        паре к USDT (обычные и условные/tpsl — тип заранее не известен) —
+        иначе такой остаток не попадёт в fetch_balance()["free"] и его
+        нельзя будет продать. Реальный симптом (прод): у ASTER/QTUM/TIA
+        часть баланса годами оставалась в used — осиротевшие условные
+        SL-ордера, ни разу не отменённые (см. фикс в _record_external_close).
+
+        Best-effort по каждой валюте отдельно — ошибка по одной не должна
+        прерывать обработку остальных. Возвращает
+        {"sold": [...], "skipped": [...], "errors": [...]}.
+        """
+        exchange = await self._ensure_exchange_connected("spot")
+        if exchange is None:
+            return {
+                "sold": [], "skipped": [],
+                "errors": [{"currency": None, "reason": "нет подключения к спотовому рынку"}],
+            }
+
+        try:
+            balance = await exchange.fetch_balance()
+        except Exception as e:
+            return {
+                "sold": [], "skipped": [],
+                "errors": [{"currency": None, "reason": f"не удалось получить баланс: {e}"}],
+            }
+
+        reserved_keys = {"info", "timestamp", "datetime", "free", "used", "total"}
+        currencies = set(balance.get("free") or {}) | set(balance.get("used") or {}) | set(balance.get("total") or {})
+        currencies |= {k for k, v in balance.items() if k not in reserved_keys and isinstance(v, dict)}
+
+        sold: list[dict] = []
+        skipped: list[dict] = []
+        errors: list[dict] = []
+
+        for currency in sorted(currencies):
+            if currency == "USDT":
+                continue
+            total = self._extract_currency_balance(balance, currency, "total")
+            if total <= 0:
+                continue
+            symbol = f"{currency}/USDT"
+
+            if symbol not in (exchange.markets or {}):
+                skipped.append({"currency": currency, "reason": f"нет пары {symbol} на бирже"})
+                continue
+
+            used = self._extract_currency_balance(balance, currency, "used")
+            if used > 0:
+                for order_filter in (None, "tpslOrder", "StopOrder"):
+                    try:
+                        params = {"orderFilter": order_filter} if order_filter else {}
+                        open_orders = await exchange.fetch_open_orders(symbol, params=params)
+                        for o in (open_orders or []):
+                            await self._cancel_order_safe(symbol, o.get("id"), exchange)
+                    except Exception as e:
+                        logger.debug(
+                            f"Не удалось получить/отменить открытые ордера {symbol} ({order_filter}): {e}"
+                        )
+
+            try:
+                fresh_balance = await exchange.fetch_balance()
+                free = self._extract_currency_balance(fresh_balance, currency, "free")
+            except Exception as e:
+                errors.append({"currency": currency, "reason": f"не удалось перепроверить баланс: {e}"})
+                continue
+
+            if free <= 0:
+                skipped.append({
+                    "currency": currency,
+                    "reason": "нет доступного остатка после отмены ордеров" if used > 0 else "нет свободного остатка",
+                })
+                continue
+
+            try:
+                ticker = await exchange.fetch_ticker(symbol)
+                price = ticker.get("last") or ticker.get("bid") or ticker.get("ask")
+            except Exception as e:
+                errors.append({"currency": currency, "reason": f"не удалось получить цену {symbol}: {e}"})
+                continue
+
+            below_min = self._below_exchange_minimum(symbol, free, price, exchange)
+            if below_min:
+                skipped.append({"currency": currency, "reason": f"пыль — {below_min}"})
+                continue
+
+            try:
+                order = await exchange.create_market_sell_order(symbol, free)
+            except Exception as e:
+                errors.append({"currency": currency, "reason": str(e)})
+                continue
+
+            sold.append({
+                "currency": currency, "amount": free,
+                "order_id": order.get("id") if isinstance(order, dict) else None,
+            })
+            logger.warning(f"💱 Продано {free:.8f} {currency} -> USDT (ручная конвертация остатков через дашборд)")
+
+        return {"sold": sold, "skipped": skipped, "errors": errors}
 
     async def _fetch_confirmed_order(
         self, order: dict, symbol: str, exchange: ccxt.Exchange | None = None,

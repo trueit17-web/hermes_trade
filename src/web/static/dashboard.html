@@ -662,7 +662,7 @@
   </section>
 
   <section id="balancesSection" style="display:none;">
-    <h2>💰 Балансы на бирже <button type="button" id="balancesToggleBtn" class="section-toggle-btn">▸ Развернуть</button></h2>
+    <h2>💰 Балансы на бирже <button type="button" id="balancesToggleBtn" class="section-toggle-btn">▸ Развернуть</button> <button type="button" id="sellAllToUsdtBtn" class="section-toggle-btn">💱 Продать все остатки в USDT</button></h2>
     <div class="table-wrap" id="balancesWrap" style="display:none;">
       <table>
         <thead><tr>
@@ -2598,6 +2598,41 @@ document.getElementById("balancesToggleBtn").addEventListener("click", () => {
   const collapsed = wrap.style.display === "none";
   wrap.style.display = collapsed ? "" : "none";
   document.getElementById("balancesToggleBtn").textContent = collapsed ? "▾ Свернуть" : "▸ Развернуть";
+});
+
+document.getElementById("sellAllToUsdtBtn").addEventListener("click", async () => {
+  if (!confirm(
+    "Продать ВСЕ ненулевые остатки на бирже (кроме USDT) по рынку обратно в USDT?\n\n" +
+    "Перед продажей каждой валюты с заблокированным остатком ('в ордерах') бот сначала " +
+    "отменит её открытые ордера на бирже. Пыль ниже биржевого минимума и валюты без пары " +
+    "к USDT будут пропущены."
+  )) return;
+  const btn = document.getElementById("sellAllToUsdtBtn");
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = "💱 Продаём...";
+  try {
+    const result = await api("/balances/sell-to-usdt", { method: "POST" });
+    const lines = [`Продано: ${result.sold.length}`, `Пропущено: ${result.skipped.length}`, `Ошибок: ${result.errors.length}`];
+    if (result.sold.length) {
+      lines.push("", "Продано:", ...result.sold.map(s => `  ${s.currency}: ${fmt(s.amount, 8)}`));
+    }
+    if (result.skipped.length) {
+      lines.push("", "Пропущено:", ...result.skipped.map(s => `  ${s.currency}: ${s.reason}`));
+    }
+    if (result.errors.length) {
+      lines.push("", "Ошибки:", ...result.errors.map(s => `  ${s.currency ?? "—"}: ${s.reason}`));
+    }
+    alert(lines.join("\n"));
+    showToast(`Конвертация в USDT: продано ${result.sold.length}, пропущено ${result.skipped.length}, ошибок ${result.errors.length}`);
+    await renderBalances();
+    await refreshAll();
+  } catch (err) {
+    showToast(`Ошибка: ${err.message}`, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalText;
+  }
 });
 
 async function refreshAll() {
