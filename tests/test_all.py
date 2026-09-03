@@ -6712,6 +6712,67 @@ class TestSweepBalancesToUsdt(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["sold"], [])
         self.assertEqual(len(result["errors"]), 1)
 
+    async def test_rebases_risk_baseline_after_selling(self):
+        """
+        Регресс на прод-инцидент: после продажи ~20 монет реальный баланс
+        USDT резко вырос (одноразовая консолидация ранее НЕотслеживаемых
+        остатков, а не торговая прибыль) — total_drawdown_pct показал
+        -1943%, потому что risk_manager.state.start_balance остался
+        устаревшим (маленьким) числом с последнего рестарта. sweep должен
+        пересчитать базу так же, как reset_for_real_account() при
+        подключении к реальному аккаунту.
+        """
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+
+        saved_start = global_risk_manager.state.start_balance
+        saved_current = global_risk_manager.state.current_balance
+        try:
+            global_risk_manager.state.start_balance = 9243.73
+            global_risk_manager.state.current_balance = 9243.73
+
+            self.engine.is_paper = False
+            self.engine.exchange_id = "bybit"
+            self.engine.exchange = AsyncMock()
+            self.engine.exchange.markets = {"ARB/USDT": {"limits": {}}}
+            self.engine.exchange.fetch_balance = AsyncMock(return_value={
+                "free": {"ARB": 100.0, "USDT": 500.0},
+                "used": {"ARB": 0.0, "USDT": 0.0},
+                "total": {"ARB": 100.0, "USDT": 188744.43},
+            })
+            self.engine.exchange.fetch_ticker = AsyncMock(return_value={"last": 10.0})
+            self.engine.exchange.create_market_sell_order = AsyncMock(return_value={"id": "sell-arb-1"})
+
+            await self.engine.sweep_balances_to_usdt()
+
+            self.assertAlmostEqual(global_risk_manager.state.start_balance, 188744.43, places=2)
+        finally:
+            global_risk_manager.state.start_balance = saved_start
+            global_risk_manager.state.current_balance = saved_current
+
+    async def test_does_not_rebase_when_nothing_sold(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+
+        saved_start = global_risk_manager.state.start_balance
+        try:
+            global_risk_manager.state.start_balance = 9243.73
+
+            self.engine.is_paper = False
+            self.engine.exchange_id = "bybit"
+            self.engine.exchange = AsyncMock()
+            self.engine.exchange.markets = {}
+            self.engine.exchange.fetch_balance = AsyncMock(return_value={
+                "free": {"GHOST": 5.0, "USDT": 500.0},
+                "used": {"GHOST": 0.0, "USDT": 0.0},
+                "total": {"GHOST": 5.0, "USDT": 500.0},
+            })
+
+            result = await self.engine.sweep_balances_to_usdt()
+
+            self.assertEqual(result["sold"], [])
+            self.assertEqual(global_risk_manager.state.start_balance, 9243.73)
+        finally:
+            global_risk_manager.state.start_balance = saved_start
+
 
 class TestCloseRealPositionOnFutures(unittest.IsolatedAsyncioTestCase):
     """

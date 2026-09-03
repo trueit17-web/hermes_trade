@@ -2901,6 +2901,35 @@ class ExecutionEngine:
             })
             logger.warning(f"💱 Продано {free:.8f} {currency} -> USDT (ручная конвертация остатков через дашборд)")
 
+        if sold:
+            # Продажа сразу многих валют резко меняет реальный баланс USDT,
+            # никак не отражая торговый результат — это одноразовая
+            # консолидация РАНЕЕ НЕотслеживаемых остатков (в т.ч. пыль
+            # после _reconcile_phantom_position/_record_external_close), а
+            # не прибыль/убыток от сделок. Без пересчёта базы
+            # risk_manager.state.start_balance остаётся устаревшим (маленьким)
+            # числом с последнего рестарта, и просадка считается против
+            # резко выросшего текущего баланса — реальный симптом (прод):
+            # total_drawdown_pct показал -1943% ("прибыль" по текущему
+            # знаку, но по факту защита от РЕАЛЬНОЙ будущей просадки
+            # (max_drawdown_pct) в таком состоянии становится
+            # нечувствительной — даже 90%-й убыток от НОВОГО баланса ещё
+            # долго не приблизит просадку к порогу, посчитанному от старой
+            # заниженной базы). Пересчитываем базу так же, как это делает
+            # initialize() при подключении к реальному аккаунту (см.
+            # reset_for_real_account).
+            try:
+                final_balance = await exchange.fetch_balance()
+                total_usdt = self._extract_currency_balance(final_balance, "USDT", "total")
+                positions_value = sum(
+                    pos["amount"] * pos["entry_price"]
+                    for pos in self.real_positions.values()
+                    if pos.get("side") == "long"
+                )
+                risk_manager.reset_for_real_account(total_usdt + positions_value)
+            except Exception as e:
+                logger.warning(f"Не удалось пересчитать базу просадки после конвертации остатков: {e}")
+
         return {"sold": sold, "skipped": skipped, "errors": errors}
 
     async def _fetch_confirmed_order(
