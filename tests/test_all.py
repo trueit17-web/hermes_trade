@@ -1190,6 +1190,146 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(float(trade.pnl), -20.2, places=4)
         self.assertFalse(trade.is_open)
 
+    async def test_finalize_externally_closed_position_converts_base_currency_fees(self):
+        """
+        Регресс на прод-баг ("неправильно считается pnl - в формуле
+        количество выражается в разных монетах, а итог в usdt не
+        пересчитывается относительно usdt"): entry_fee/exit_fee, снятые
+        БИРЖЕЙ в BASE-валюте (не USDT), вычитались из PnL как есть в
+        закрытии "вне цикла бота" (сработал сам биржевой SL) — тот же
+        класс бага, что уже исправлен в close_real_position (см. её
+        комментарий про инцидент "105.4915 TAC" вместо USDT), но
+        _record_external_close его не унаследовал вообще никак.
+        """
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Order, Trade
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+
+        symbol = "FEECONV1/USDT"
+        async with get_session() as session:
+            exchange_id, symbol_id = await self.engine._resolve_symbol_id(session, symbol)
+            opening_order = Order(
+                exchange_id=exchange_id, symbol_id=symbol_id,
+                side="buy", order_type="market", amount=1000.0, price=1.0,
+                status="filled", filled_amount=1000.0, filled_price=1.0,
+                fee=10.0, fee_currency="FEECONV1",
+                client_order_id="feeconv1-open",
+            )
+            session.add(opening_order)
+            await session.commit()
+            opening_order_id = opening_order.id
+
+        self.engine.real_positions[symbol] = {
+            "amount": 990.0, "entry_price": 1.0, "side": "long",
+            "strategy_id": None, "entry_fee": 10.0, "order_id": opening_order_id,
+            "opened_at": datetime.now(), "sl_order_id": "sl-feeconv-1",
+        }
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"FEECONV1": 0.0}, "FEECONV1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        self.engine.exchange.fetch_order = AsyncMock(
+            return_value={"id": "sl-feeconv-1", "status": "closed", "filled": 990.0, "average": 1.2}
+        )
+        self.engine.exchange.fetch_order_trades = AsyncMock(return_value=[
+            {"id": "exec-feeconv-1", "amount": 990.0, "price": 1.2, "cost": 1188.0,
+             "fee": {"cost": 5.0, "currency": "FEECONV1"}},
+        ])
+
+        await self.engine.reconcile_real_positions()
+
+        self.assertNotIn(symbol, self.engine.real_positions)
+        async with get_session() as session:
+            trade = (
+                await session.execute(select(Trade).where(Trade.order_open_id == opening_order_id))
+            ).scalar_one()
+        # entry_fee_quote = 10.0 FEECONV1 * entry_price(1.0) = 10.0 USDT
+        # exit_fee_quote = 5.0 FEECONV1 * exit_price(1.2) = 6.0 USDT
+        # pnl = (1.2 - 1.0) * 990 - 10.0 - 6.0 = 182.0
+        self.assertAlmostEqual(float(trade.pnl), 182.0, places=4)
+
+    async def test_finalize_via_trade_history_converts_mixed_currency_exit_fees(self):
+        """Та же конвертация, но для пути без известного order id (найдено
+        по истории сделок биржи) — несколько закрывающих сделок могут быть
+        с РАЗНОЙ валютой комиссии (часть в USDT, часть в base)."""
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Trade, Symbol
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        opened_at = datetime.now() - timedelta(hours=1)
+        self.engine.real_positions["MIXEDFEE1/USDT"] = {
+            "amount": 100.0, "entry_price": 2.0, "side": "long",
+            "strategy_id": None, "entry_fee": 0.02, "order_id": None,
+            "opened_at": opened_at, "sl_order_id": None,
+        }
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"MIXEDFEE1": 0.0}, "MIXEDFEE1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        recent_ts_ms = int((opened_at + timedelta(minutes=30)).timestamp() * 1000)
+        self.engine.exchange.fetch_my_trades = AsyncMock(return_value=[
+            {"id": "mixed-1", "side": "sell", "amount": 50.0, "price": 2.1, "cost": 105.0,
+             "timestamp": recent_ts_ms, "fee": {"cost": 0.5, "currency": "USDT"}},
+            {"id": "mixed-2", "side": "sell", "amount": 50.0, "price": 2.1, "cost": 105.0,
+             "timestamp": recent_ts_ms, "fee": {"cost": 1.0, "currency": "MIXEDFEE1"}},
+        ])
+
+        await self.engine.reconcile_real_positions()
+
+        self.assertNotIn("MIXEDFEE1/USDT", self.engine.real_positions)
+        async with get_session() as session:
+            symbol_row = (
+                await session.execute(select(Symbol).where(Symbol.symbol == "MIXEDFEE1/USDT"))
+            ).scalar_one()
+            trade = (
+                await session.execute(select(Trade).where(Trade.symbol_id == symbol_row.id))
+            ).scalar_one()
+        # exit_fee = 0.5 USDT (уже в quote) + 1.0 MIXEDFEE1 * price(2.1) = 2.1 USDT -> 2.6 USDT total
+        # pnl = (2.1 - 2.0) * 100 - entry_fee(0.02) - exit_fee(2.6) = 10.0 - 0.02 - 2.6 = 7.38
+        self.assertAlmostEqual(float(trade.pnl), 7.38, places=4)
+
+    async def test_record_external_close_uses_short_formula_for_futures_short(self):
+        """_record_external_close раньше всегда считала long-формулу и
+        direction="long", даже для фьючерсного short, закрытого вне цикла
+        бота — знак PnL был бы перевёрнут."""
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Trade, Symbol
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        symbol = "EXTSHORT1/USDT"
+        self.engine.real_positions[symbol] = {
+            "amount": 10.0, "entry_price": 100.0, "side": "short",
+            "strategy_id": None, "entry_fee": 0.0, "order_id": None,
+            "opened_at": datetime.now(), "sl_order_id": None, "market_type": "futures",
+        }
+
+        # Short: цена упала со 100 до 90 -> прибыль (entry - exit) * amount = 100.
+        await self.engine._record_external_close(
+            symbol, self.engine.real_positions[symbol], exit_price=90.0, amount=10.0, exit_fee=0.0,
+            order_id_exchange="ext-short-1", log_note="test",
+        )
+
+        async with get_session() as session:
+            symbol_row = (
+                await session.execute(select(Symbol).where(Symbol.symbol == symbol))
+            ).scalar_one()
+            trade = (
+                await session.execute(select(Trade).where(Trade.symbol_id == symbol_row.id))
+            ).scalar_one()
+        self.assertEqual(trade.direction, "short")
+        self.assertAlmostEqual(float(trade.pnl), 100.0, places=4)
+
     async def test_reconcile_real_positions_finds_close_via_trade_history_without_sl_order(self):
         """
         Позиция без выставленного биржевого SL-ордера (например, SL не был

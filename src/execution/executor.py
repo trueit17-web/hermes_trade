@@ -2519,14 +2519,17 @@ class ExecutionEngine:
             exit_price = trade_fill["average"]
             amount = trade_fill["amount"]
             exit_fee = trade_fill["fee"].get("cost") or 0
+            exit_fee_currency = trade_fill["fee"].get("currency")
         else:
             exit_price = order.get("average") or order.get("price")
             if not exit_price:
                 return False
-            exit_fee, _ = self._resolve_fee(order.get("fee"), amount, exit_price, "sell", symbol)
+            closing_side = "sell" if pos.get("side", "long") == "long" else "buy"
+            exit_fee, exit_fee_currency = self._resolve_fee(order.get("fee"), amount, exit_price, closing_side, symbol)
 
         await self._record_external_close(
             symbol, pos, exit_price=exit_price, amount=amount, exit_fee=exit_fee,
+            exit_fee_currency=exit_fee_currency,
             order_id_exchange=str(sl_order_id),
             log_note=f"🛡️ Биржевой SL сработал сам по себе (вне цикла бота): {symbol}",
         )
@@ -2604,12 +2607,26 @@ class ExecutionEngine:
         exit_price = total_cost / total_amount if total_amount else 0
         if not exit_price:
             return False
+        # Несколько сделок закрытия могут быть с РАЗНОЙ валютой комиссии
+        # (например, часть — в USDT, часть — в base-валюте, если бирже
+        # хватило базового актива не на весь объём) — суммировать "как
+        # есть" означало бы складывать разноразмерные числа. Конвертируем
+        # base-валютную комиссию каждой сделки в USDT по её же цене
+        # исполнения (передаём итоговую валюту как None — валюта после
+        # суммирования уже смешанная/нормализованная в quote, а не одна
+        # известная валюта конкретной сделки).
+        base_currency = symbol.split("/")[0]
         exit_fee = 0.0
         for t in sells:
             fee = t.get("fee") or {}
             cost = fee.get("cost")
-            if cost:
-                exit_fee += float(cost)
+            if not cost:
+                continue
+            cost = float(cost)
+            if fee.get("currency") == base_currency:
+                fill_price = float(t.get("price") or exit_price)
+                cost *= fill_price
+            exit_fee += cost
         trade_ids = [str(t["id"]) for t in sells if t.get("id")]
 
         await self._record_external_close(
@@ -2622,6 +2639,7 @@ class ExecutionEngine:
     async def _record_external_close(
         self, symbol: str, pos: dict, *, exit_price: float, amount: float, exit_fee: float,
         order_id_exchange: str | None, log_note: str,
+        exit_fee_currency: str | None = None,
     ) -> None:
         """
         Общий хвост записи закрытия, обнаруженного вне обычного цикла бота
@@ -2632,12 +2650,45 @@ class ExecutionEngine:
         """
         entry_price = pos.get("entry_price") or 0
         entry_fee = pos.get("entry_fee") or 0
-        pnl = (exit_price - entry_price) * amount - entry_fee - exit_fee
+        side = pos.get("side", "long")
+        order_open_id = pos.get("order_id")
+
+        # Комиссии часто удержаны в BASE-валюте, а не в USDT (см. _resolve_fee
+        # — на споте комиссия покупки обычно списывается из полученного
+        # актива). Вычитать такую комиссию из PnL как есть означало бы
+        # принять, например, "105.4915 TAC" за "105.4915 USDT" — искажение
+        # на порядки (тот же класс бага, что уже исправлен в
+        # close_real_position — см. её комментарий про инцидент HYPE/USDT).
+        # Этот путь (закрытие ВНЕ цикла бота) раньше вообще не делал такую
+        # конвертацию — считал entry_fee/exit_fee уже в USDT независимо от
+        # реальной валюты списания.
+        entry_fee_quote = entry_fee
+        exit_fee_quote = exit_fee
+        base_currency = symbol.split("/")[0]
+        if order_open_id is not None:
+            try:
+                async with get_session() as session:
+                    opening_order = (
+                        await session.execute(select(Order).where(Order.id == order_open_id))
+                    ).scalar_one_or_none()
+                if opening_order is not None and opening_order.fee_currency == base_currency:
+                    entry_fee_quote = entry_fee * entry_price
+            except Exception as e:
+                logger.debug(f"Не удалось определить валюту комиссии открытия для {symbol}: {e}")
+        if exit_fee_currency == base_currency:
+            exit_fee_quote = exit_fee * exit_price
+
+        # Фьючерсная позиция, закрытая ВНЕ цикла бота, могла быть short —
+        # раньше здесь всегда считалась long-формула и direction="long"
+        # (правильно только для спота, где short не бывает).
+        if side == "long":
+            pnl = (exit_price - entry_price) * amount - entry_fee_quote - exit_fee_quote
+        else:
+            pnl = (entry_price - exit_price) * amount - entry_fee_quote - exit_fee_quote
         pnl_pct = (pnl / (entry_price * amount) * 100) if entry_price and amount else 0.0
         outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "break-even")
         opened_at = pos.get("opened_at")
         holding_seconds = int((utcnow() - opened_at).total_seconds()) if opened_at else 0
-        order_open_id = pos.get("order_id")
 
         self.real_positions.pop(symbol, None)
         # Позиция закрылась ЧУЖИМ путём (сработал сам SL/найдено по истории
@@ -2657,7 +2708,7 @@ class ExecutionEngine:
                 exchange_id=exchange_id,
                 symbol_id=symbol_id,
                 strategy_id=strategy_db_id,
-                side="sell",
+                side="sell" if side == "long" else "buy",
                 order_type="market",
                 amount=amount,
                 price=exit_price,
@@ -2665,6 +2716,7 @@ class ExecutionEngine:
                 filled_amount=amount,
                 filled_price=exit_price,
                 fee=exit_fee,
+                fee_currency=exit_fee_currency,
                 order_id_exchange=order_id_exchange,
                 client_order_id=str(uuid.uuid4())[:12],
                 notes="Real close (exchange-triggered, outside bot cycle)",
@@ -2677,7 +2729,7 @@ class ExecutionEngine:
                 strategy_id=strategy_db_id,
                 order_open_id=order_open_id,
                 order_close_id=close_order.id,
-                direction="long",
+                direction=side,
                 entry_price=entry_price,
                 exit_price=exit_price,
                 amount=amount,
@@ -2700,7 +2752,7 @@ class ExecutionEngine:
             type="trade_event",
             trade_id=trade_id,
             symbol=symbol,
-            direction="long",
+            direction=side,
             entry_price=entry_price,
             exit_price=exit_price,
             amount=amount,
