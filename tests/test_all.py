@@ -2645,6 +2645,65 @@ class TestTelegramSignalParser(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["leverage"], 10.0)
 
+    def test_real_world_wif_short_market_entry_signal(self):
+        """
+        Реальный формат сигнала из прод-запроса: хэштег-тикер без quote
+        ("#WIF"), диапазон плеча ("25-30х"), вход "по рынку" (без числа),
+        цели одной строкой через пробел под русским "Тейки:", и стоп под
+        кириллическим "Стоп:" (не матчится с латинским "stop" даже при
+        IGNORECASE — это разные символы Unicode).
+        """
+        text = (
+            "#WIF SHORT \n"
+            "Плечо: 25-30х  \n"
+            "Диапазон входа: по рынку   \n"
+            "Тейки: 0.1962 0.1933 0.1853\n"
+            "Стоп: 0.2091"
+        )
+        result = self.parse(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "WIF/USDT")
+        self.assertEqual(result["side"], "short")
+        self.assertIsNone(result["entry"])
+        self.assertEqual(result["sl"], 0.2091)
+        self.assertEqual(result["take_profits"], [0.1962, 0.1933, 0.1853])
+        self.assertEqual(result["tp"], 0.1853)
+        self.assertEqual(result["leverage"], 25.0)
+
+    def test_message_without_entry_or_market_phrase_is_not_a_signal(self):
+        """Без числовой цены И без явного "по рынку"/"market" — не сигнал,
+        а не молчаливый маркет-ордер по любому шуму."""
+        result = self.parse("BTC/USDT Long SL 68000 TP 72000")
+        self.assertIsNone(result)
+
+    def test_cyrillic_stop_keyword_matches(self):
+        result = self.parse("BTC/USDT Long 69000 Стоп: 68000 TP 72000")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["sl"], 68000.0)
+
+    def test_space_separated_targets_after_single_keyword(self):
+        result = self.parse("BTC/USDT Long по рынку Тейки: 70000 71000 72000 Стоп: 68000")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["take_profits"], [70000.0, 71000.0, 72000.0])
+
+
+class TestMarketEntryDetection(unittest.TestCase):
+    def setUp(self):
+        from src.telegram.channel_monitor import is_market_entry
+        self.is_market_entry = is_market_entry
+
+    def test_russian_market_phrase(self):
+        self.assertTrue(self.is_market_entry("Диапазон входа: по рынку"))
+
+    def test_english_market_phrase(self):
+        self.assertTrue(self.is_market_entry("Entry: at market"))
+
+    def test_bare_market_word(self):
+        self.assertTrue(self.is_market_entry("Entry: Market"))
+
+    def test_regular_price_text_is_not_market(self):
+        self.assertFalse(self.is_market_entry("BTC/USDT Long 69000 SL 68000 TP 72000"))
+
 
 class TestLlmSignalParser(unittest.IsolatedAsyncioTestCase):
     """
@@ -6384,6 +6443,83 @@ class TestExecuteRealOrderAppliesPerSignalLeverage(unittest.IsolatedAsyncioTestC
         self.assertIsNone(self.engine.real_positions["FUTLEV3/USDT"]["leverage"])
 
 
+class TestGetReferencePrice(unittest.IsolatedAsyncioTestCase):
+    """
+    execution_engine.get_reference_price() — резолвит текущую рыночную
+    цену для сигналов "по рынку" (см. is_market_entry в
+    channel_monitor.py и _on_telegram_signal в main.py), которым нужно
+    конкретное число ДО открытия ордера (расчёт объёма позиции), а не
+    только в момент самого исполнения.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+
+    async def test_real_mode_fetches_ticker_from_target_market(self):
+        settings.market_type = "spot"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        futures_exchange = AsyncMock()
+        futures_exchange.fetch_ticker = AsyncMock(return_value={"last": 0.2034, "bid": 0.2033, "ask": 0.2035})
+        self.engine._exchanges["futures"] = futures_exchange
+
+        price = await self.engine.get_reference_price("WIF/USDT", "futures")
+
+        self.assertEqual(price, 0.2034)
+        futures_exchange.fetch_ticker.assert_awaited_once_with("WIF/USDT")
+        self.engine.exchange.fetch_ticker.assert_not_called()
+
+    async def test_real_mode_falls_back_to_bid_ask_when_last_missing(self):
+        settings.market_type = "spot"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_ticker = AsyncMock(return_value={"last": None, "bid": 1.23, "ask": 1.25})
+
+        price = await self.engine.get_reference_price("BTC/USDT")
+
+        self.assertEqual(price, 1.23)
+
+    async def test_returns_none_when_no_exchange_connected(self):
+        settings.market_type = "spot"
+        self.engine.is_paper = False
+        self.engine.exchange_id = None
+
+        price = await self.engine.get_reference_price("BTC/USDT", "futures")
+
+        self.assertIsNone(price)
+
+    async def test_paper_mode_uses_current_exchange(self):
+        self.engine.is_paper = True
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_ticker = AsyncMock(return_value={"last": 100.0})
+
+        price = await self.engine.get_reference_price("BTC/USDT")
+
+        self.assertEqual(price, 100.0)
+
+    async def test_ticker_error_returns_none(self):
+        settings.market_type = "spot"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_ticker = AsyncMock(side_effect=Exception("network error"))
+
+        price = await self.engine.get_reference_price("BTC/USDT")
+
+        self.assertIsNone(price)
+
+
 class TestCloseRealPositionOnFutures(unittest.IsolatedAsyncioTestCase):
     """
     ЭТАП 2 перехода на фьючерсы: close_real_position закрывает и long
@@ -8070,6 +8206,105 @@ class TestTradingSourceModeGatesTelegramSignals(unittest.IsolatedAsyncioTestCase
 
         exec_mock.assert_awaited_once()
         self.assertEqual(bot._save_telegram_signal.await_args.args[2], "executed")
+
+
+class TestTelegramSignalMarketEntryResolution(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный формат сигнала без фиксированной цены входа ("Диапазон входа:
+    по рынку" — см. is_market_entry в channel_monitor.py). Раньше
+    _on_telegram_signal() отклонял ЛЮБОЙ сигнал без parsed_entry — до
+    этого изменения parse_with_regex вообще не возвращал такой сигнал, а
+    entry<=0 сравнение упало бы с TypeError на None. Канал явно попросил
+    маркет-исполнение, а не забыл цену — сигнал должен резолвить текущую
+    рыночную цену (execution_engine.get_reference_price) и продолжить
+    как обычно.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved_mode = settings.active_trading_mode
+        settings.active_trading_mode = "signals"
+
+    def tearDown(self):
+        settings.active_trading_mode = self._saved_mode
+
+    async def test_market_entry_resolved_via_reference_price(self):
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures"))
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        fake_order = MagicMock(id=1)
+        with patch("src.main.execution_engine") as mock_engine, \
+                patch.object(bot, "_execute_telegram_signal", new=AsyncMock(return_value=fake_order)) as exec_mock:
+            mock_engine.get_reference_price = AsyncMock(return_value=0.2034)
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "WIF/USDT",
+                "parsed_side": "short",
+                "parsed_entry": None,
+                "parsed_sl": 0.2091,
+                "parsed_tp": 0.1853,
+                "raw_message": "test",
+            })
+
+        mock_engine.get_reference_price.assert_awaited_once_with("WIF/USDT", "futures")
+        exec_mock.assert_awaited_once()
+        passed_event = exec_mock.await_args.args[0]
+        self.assertEqual(passed_event["parsed_entry"], 0.2034)
+
+    async def test_market_entry_rejected_when_reference_price_unavailable(self):
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures"))
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        with patch("src.main.execution_engine") as mock_engine, \
+                patch.object(bot, "_execute_telegram_signal", new=AsyncMock()) as exec_mock:
+            mock_engine.get_reference_price = AsyncMock(return_value=None)
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "WIF/USDT",
+                "parsed_side": "short",
+                "parsed_entry": None,
+                "raw_message": "test",
+            })
+
+        exec_mock.assert_not_awaited()
+        bot._save_telegram_signal.assert_not_awaited()
+
+    async def test_explicit_entry_does_not_trigger_reference_price_lookup(self):
+        """Регресс: обычный сигнал с явной ценой не должен обращаться к
+        execution_engine.get_reference_price вообще (уже есть число)."""
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        fake_order = MagicMock(id=1)
+        with patch("src.main.execution_engine") as mock_engine, \
+                patch.object(bot, "_execute_telegram_signal", new=AsyncMock(return_value=fake_order)) as exec_mock:
+            mock_engine.get_reference_price = AsyncMock(return_value=999.0)
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "BTC/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 50000.0,
+                "raw_message": "test",
+            })
+
+        mock_engine.get_reference_price.assert_not_awaited()
+        exec_mock.assert_awaited_once()
+        self.assertEqual(exec_mock.await_args.args[0]["parsed_entry"], 50000.0)
 
 
 class TestTelegramSignalQualityScoringUsesCorrectShape(unittest.IsolatedAsyncioTestCase):

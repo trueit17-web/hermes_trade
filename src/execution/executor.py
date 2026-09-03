@@ -82,6 +82,32 @@ class ExecutionEngine:
         """Открытые позиции для текущего режима (paper или real)."""
         return dict(self.paper_positions if self.is_paper else self.real_positions)
 
+    async def get_reference_price(self, symbol: str, market_type: str | None = None) -> float | None:
+        """
+        Текущая рыночная цена symbol — для сигналов без явной цены входа
+        ("Диапазон входа: по рынку" — см. is_market_entry в
+        channel_monitor.py и _on_telegram_signal в main.py), которым всё
+        равно нужно конкретное число ДО открытия ордера: расчёт объёма
+        (position_value / entry) и оценка качества сигнала (score_signal)
+        сами по себе требуют цену раньше, чем create_order() успевает
+        получить её самостоятельно для маркет-ордера без явной цены (см.
+        тот же приём в create_order — здесь вынесен наружу, чтобы
+        вызывающий код мог получить цену РАНЬШЕ, чем нужно посчитать amount).
+        """
+        try:
+            if self.is_paper:
+                ticker = await self.exchange.fetch_ticker(symbol)
+            else:
+                order_market_type = market_type or settings.market_type
+                exchange = await self._ensure_exchange_connected(order_market_type)
+                if exchange is None:
+                    return None
+                ticker = await exchange.fetch_ticker(symbol)
+            return ticker["last"] or ticker["bid"] or ticker["ask"]
+        except Exception as e:
+            logger.warning(f"Не удалось получить рыночную цену {symbol}: {e}")
+            return None
+
     async def initialize(self, exchange_id: str = "binance"):
         """Инициализация подключения к бирже."""
         self.exchange_id = exchange_id

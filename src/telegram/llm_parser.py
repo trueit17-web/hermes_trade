@@ -29,11 +29,15 @@ ambiguous to trade safely.
 Rules:
 - side: "long" for long/buy, "short" for short/sell.
 - base: the coin ticker, uppercase (e.g. BTC). quote: default USDT if unstated.
-- entry: the entry price (a zone -> pick the near/first number). null = unstated.
+- entry: the entry price (a zone -> pick the near/first number). null = unstated \
+OR the message says to enter at the current market price ("по рынку", "at market", \
+no fixed price given).
+- is_market_entry: true when the message explicitly asks for market execution \
+(no fixed entry price) rather than just omitting the entry by accident/ambiguity.
 - take_profits: list of target prices, ascending.
 - stop_loss: single number or null.
 - leverage: the leverage multiplier if explicitly stated (e.g. "Leverage: 20x", \
-"плечо x10" -> 20, 10). null if unstated.
+"плечо x10" -> 20, 10; a range like "25-30x" -> the lower bound, 25). null if unstated.
 - confidence: your 0..1 confidence this is a clean, tradeable signal."""
 
 _TOOL = {
@@ -47,6 +51,7 @@ _TOOL = {
             "quote": {"type": ["string", "null"]},
             "side": {"type": ["string", "null"], "enum": ["long", "short", None]},
             "entry": {"type": ["number", "null"]},
+            "is_market_entry": {"type": "boolean"},
             "take_profits": {"type": "array", "items": {"type": "number"}},
             "stop_loss": {"type": ["number", "null"]},
             "leverage": {"type": ["number", "null"]},
@@ -107,7 +112,10 @@ async def parse_with_llm(text: str, channel_config: dict | None = None) -> dict 
     base = data.get("base")
     side = data.get("side")
     entry = data.get("entry")
-    if not base or side not in ("long", "short") or entry is None:
+    # entry=None допустим ТОЛЬКО как явный маркет-вход (see is_market_entry
+    # в промпте/схеме) — иначе (просто не смогла определить цену) сигнал
+    # остаётся отклонённым, как и раньше.
+    if not base or side not in ("long", "short") or (entry is None and not data.get("is_market_entry")):
         return None
 
     quote = data.get("quote") or "USDT"
@@ -129,7 +137,7 @@ async def parse_with_llm(text: str, channel_config: dict | None = None) -> dict 
     return {
         "pair": pair,
         "side": side,
-        "entry": float(entry),
+        "entry": float(entry) if entry is not None else None,
         "sl": float(sl) if sl is not None else None,
         "tp": float(tp) if tp is not None else None,
         "take_profits": take_profits,

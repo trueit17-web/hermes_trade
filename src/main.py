@@ -523,11 +523,35 @@ class TradingBot:
         channel_id = signal_event.get("channel_id", "")
         pair = signal_event.get("parsed_pair", "")
         side = signal_event.get("parsed_side", "")
-        entry = signal_event.get("parsed_entry", 0)
+        entry = signal_event.get("parsed_entry")
         sl = signal_event.get("parsed_sl")
         tp = signal_event.get("parsed_tp")
 
-        if not pair or not side or entry <= 0:
+        if not pair or not side:
+            return
+
+        quality_threshold, auto_execute, position_size_pct, market_type = await self._get_channel_settings(channel_id)
+        signal_event["channel_position_size_pct"] = position_size_pct
+        signal_event["channel_market_type"] = market_type
+
+        if entry is None:
+            # Сигнал "по рынку" ("Диапазон входа: по рынку" — см.
+            # is_market_entry в channel_monitor.py): канал не дал
+            # фиксированную цену, но она всё равно нужна ЗДЕСЬ — и для
+            # оценки качества (score_signal — RR по entry/sl/tp), и как
+            # position_value / entry в _execute_telegram_signal, а не
+            # только в момент реального исполнения ордера. Резолвим текущую
+            # цену ОДИН раз, на рынке ИМЕННО этого канала (market_type), и
+            # сохраняем в signal_event — дальше по пути (включая запись в
+            # БД, см. _save_telegram_signal) entry уже обычное число, как
+            # если бы канал указал его сам.
+            entry = await execution_engine.get_reference_price(pair, market_type)
+            if not entry:
+                logger.warning(f"🚫 Сигнал по {pair} (маркет-вход) отклонён: не удалось получить текущую цену")
+                return
+            signal_event["parsed_entry"] = entry
+
+        if entry <= 0:
             return
 
         from src.telegram.quality_scorer import signal_quality_scorer
@@ -552,9 +576,6 @@ class TradingBot:
             },
             channel_id,
         )
-        quality_threshold, auto_execute, position_size_pct, market_type = await self._get_channel_settings(channel_id)
-        signal_event["channel_position_size_pct"] = position_size_pct
-        signal_event["channel_market_type"] = market_type
         logger.info(
             f"📲 Telegram сигнал: {pair} {side.upper()} | quality={quality:.2f} (порог канала {quality_threshold:.2f})"
         )

@@ -269,7 +269,10 @@ def normalize_pair(pair: str) -> str:
     for quote in _KNOWN_QUOTES:
         if pair.endswith(quote) and len(pair) > len(quote):
             return f"{pair[:-len(quote)]}/{quote}"
-    return pair
+    # Просто тикер без указанной quote-валюты ("#WIF" — см. pair_patterns
+    # в parse_with_regex) — USDT тот же дефолт, что уже используют
+    # LLM-фолбэки (quote = data.get("quote") or "USDT").
+    return f"{pair}/USDT"
 
 
 async def parse_telegram_signal(text: str, channel_config: dict | None = None) -> dict | None:
@@ -315,6 +318,10 @@ def parse_with_regex(text: str) -> dict | None:
     - "ETH/USDT - Short | Entry: 3500 | Stop: 3600 | Target: 3200"
     - "XRPUSDT LONG 1.85 SL 1.70 TP 2.10"
     - "BTCUSDT short 68500 sl 67500 tp 65000"
+    - "#WIF SHORT / Плечо: 25-30х / Диапазон входа: по рынку /
+      Тейки: 0.1962 0.1933 0.1853 / Стоп: 0.2091" — хэштег-тикер без
+      quote-валюты, диапазон плеча, маркет-вход, цели одной строкой,
+      кириллические ключевые слова.
     """
     text = text.strip()
 
@@ -328,6 +335,12 @@ def parse_with_regex(text: str) -> dict | None:
         r"([A-Z]{2,10}USDT)",  # BTCUSDT
         r"([A-Z]{2,10}USD)",  # BTCUSD
         r"([A-Z]{2,10}/USDT)",  # BTC/USDT
+        # "#WIF SHORT" — канал указал только базовый тикер через хэштег,
+        # без quote-валюты вообще (частый формат). "#" — достаточно
+        # надёжный маркер именно тикера, чтобы не путать его с случайным
+        # коротким словом в тексте; quote по умолчанию USDT (см.
+        # normalize_pair) — тот же дефолт, что уже используют LLM-фолбэки.
+        r"#([A-Z]{2,10})\b",
     ]
 
     pair = None
@@ -371,8 +384,18 @@ def parse_with_regex(text: str) -> dict | None:
 
     # Ищем entry, SL, TP
     entry = extract_price(text, side, "entry", "price", "entry_price")
-    sl = extract_price(text, side, "sl", "stop", "stop_loss", "stop loss")
-    tp_keywords = ("tp", "target", "take_profit", "take profit", "profit")
+    # "стоп"/"стоп-лосс" — кириллица, НЕ матчится с латинским "stop" даже
+    # при IGNORECASE (это разные символы Unicode, а не регистр одного и
+    # того же алфавита) — без этого "Стоп: 0.2091" терялся полностью.
+    sl = extract_price(text, side, "sl", "stop", "stop_loss", "stop loss", "стоп", "стоп-лосс")
+    tp_keywords = (
+        "tp", "target", "take_profit", "take profit", "profit",
+        # "Тейки"/"тейк", "цель"/"цели", "таргет"/"таргеты" — русские
+        # варианты, которыми каналы называют TP-уровни (см. пример
+        # "Тейки: 0.1962 0.1933 0.1853" — тоже кириллица, не матчится с
+        # латинскими ключевыми словами выше).
+        "тейки", "тейк", "цель", "цели", "таргет", "таргеты",
+    )
     # Несколько целей ("TP1: 51000 TP2: 52000 TP3: 53000") — канал обычно
     # перечисляет их от ближайшей к самой дальней, порядок появления в
     # тексте сохраняется как есть (то же соглашение, которого придерживается
@@ -391,12 +414,21 @@ def parse_with_regex(text: str) -> dict | None:
             except ValueError:
                 entry = None
 
-    if entry is None:
+    if entry is None and not is_market_entry(text):
+        # Ни числа, ни явного "по рынку" — не похоже на исполнимый сигнал,
+        # а не просто маркет-ордер без указанной цены (см. is_market_entry
+        # ниже: без этого различия любое сообщение без числовой цены
+        # молча превратилось бы в маркет-сигнал, включая явный мусор).
         return None
 
     return {
         "pair": pair,
         "side": side,
+        # entry=None здесь означает ИМЕННО маркет-вход ("Диапазон входа:
+        # по рынку") — вызывающий код (main.py._on_telegram_signal)
+        # обязан подставить текущую рыночную цену перед использованием
+        # (position sizing, оценка качества), а не считать сигнал
+        # невалидным.
         "entry": entry,
         "sl": sl,
         "tp": tp,
@@ -462,6 +494,19 @@ def extract_all_prices(text: str, *keywords) -> list[float]:
     for keyword in keywords:
         pattern = rf"{keyword}\d*\s*[:\-–—]?\s*([\d.]+)"
         matches = re.findall(pattern, text, re.IGNORECASE)
+        # "Тейки: 0.1962 0.1933 0.1853" — ОДНО вхождение ключевого слова
+        # (без номеров TP1/TP2/TP3), за которым через пробел идёт весь
+        # список целей на той же строке. Пробуем, только если предыдущий
+        # (нумерованный) шаблон нашёл 0 или 1 число — иначе это уже
+        # реальный формат "TPn: ..." и трогать его не нужно.
+        if len(matches) <= 1:
+            line_match = re.search(
+                rf"{keyword}\s*[:\-–—]?\s*((?:[\d.]+\s*)+)", text, re.IGNORECASE,
+            )
+            if line_match:
+                line_numbers = re.findall(r"[\d.]+", line_match.group(1))
+                if len(line_numbers) > len(matches):
+                    matches = line_numbers
         if not matches:
             continue
         values: list[float] = []
@@ -475,6 +520,22 @@ def extract_all_prices(text: str, *keywords) -> list[float]:
         if values:
             return values
     return []
+
+
+# "Диапазон входа: по рынку", "Entry: market", "at market price" — канал
+# явно говорит "исполняй по текущей цене", а не забыл указать число.
+_MARKET_ENTRY_PATTERN = re.compile(
+    r"по\s+рынку|рыночн\w*\s+(?:вход|цен\w*|ордер)|at\s+market|market\s*(?:price|order|entry)?",
+    re.IGNORECASE,
+)
+
+
+def is_market_entry(text: str) -> bool:
+    """Сигнал явно просит вход по текущей рыночной цене, без фиксированной
+    цифры — main.py._on_telegram_signal должен подставить актуальную цену
+    (execution_engine.get_reference_price) вместо того, чтобы отклонить
+    сигнал как "нет entry"."""
+    return bool(_MARKET_ENTRY_PATTERN.search(text))
 
 
 # "Кредитное плечо: х35" (кириллическая "х"), "Leverage: 20x", "плечо x10",
