@@ -2763,6 +2763,47 @@ class TestTelegramSignalParser(unittest.TestCase):
         self.assertIsNone(result["entry"])
         self.assertEqual(result["leverage"], 25.0)
 
+    def test_bare_leverage_number_before_x(self):
+        """"20Х" (число, потом множитель) — тот же формат плеча, что и
+        "x25" (множитель, потом число), просто в обратном порядке."""
+        result = self.parse("ARB SHORT 25х по рынку SL 1.30 TP 1.05")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["leverage"], 25.0)
+
+    def test_real_world_sand_long_market_entry_with_leverage_and_promo_link(self):
+        """
+        Реальный прод-инцидент: канал прислал "SAND LONG 20Х" (плечо без
+        разделителя сразу после стороны) с рекламной партнёрской ссылкой
+        где-то в тексте (не показана здесь дословно, но воспроизводится
+        похожей структурой) — старый паттерн пары матчил "com/partner"
+        РАНЬШЕ, чем очередь доходила до настоящего "SAND" (более общий
+        паттерн стоял раньше в списке и матчил вообще что угодно вида
+        "буквы/буквы"), а "20" из "20Х" по ошибке принимался за цену
+        входа. Итог был: distorted "[TG SIGNAL] COM/PARTNER LONG |
+        Entry: 20.0 | SL: 0.0375 | TP: 0.04078".
+        """
+        text = (
+            "🚀**Заходим SAND LONG 20Х\n\n"
+            "Вход: по рынку \n"
+            "Тейк: 0.04078, 0.0418, 0.0435\n"
+            "Стоп: 0.0375**\n\n"
+            "**Подробнее на нашем сайте: crypto-signals.com/partner"
+        )
+        result = self.parse(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "SAND/USDT")
+        self.assertEqual(result["side"], "long")
+        self.assertIsNone(result["entry"])
+        self.assertEqual(result["sl"], 0.0375)
+        self.assertEqual(result["take_profits"], [0.04078, 0.0418, 0.0435])
+        self.assertEqual(result["tp"], 0.0435)
+        self.assertEqual(result["leverage"], 20.0)
+
+    def test_comma_separated_targets_after_single_keyword(self):
+        result = self.parse("BTC/USDT Long по рынку Тейк: 70000, 71000, 72000 Стоп: 68000")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["take_profits"], [70000.0, 71000.0, 72000.0])
+
 
 class TestMarketEntryDetection(unittest.TestCase):
     def setUp(self):

@@ -331,10 +331,19 @@ def parse_with_regex(text: str) -> dict | None:
 
     # Ищем пару (BTC/USDT, ETH/USDT и т.д.)
     pair_patterns = [
-        r"([A-Z]{2,10}/[A-Z]{2,10})",  # BTC/USDT
+        # BTC/USDT — quote ОГРАНИЧЕН известными валютами (_KNOWN_QUOTES), а
+        # не любым словом из 2-10 букв. Реальный инцидент (прод): канал
+        # прислал "SAND LONG 20Х ... " с рекламной ссылкой на партнёрку
+        # где-то ниже в тексте ("...com/partner...") — старый паттерн
+        # `[A-Z]{2,10}/[A-Z]{2,10}` матчил её (IGNORECASE не различает
+        # регистр URL) РАНЬШЕ, чем очередь доходила до настоящего "SAND"
+        # (см. паттерн с хэштегом/словом-перед-стороной ниже) — re.search
+        # берёт первый ПОДОШЕДШИЙ ПАТТЕРН из списка, не первое совпадение
+        # по позиции в тексте, так что более специфичный паттерн, стоящий
+        # позже, не получал шанса, пока более общий выше матчил хоть что-то.
+        rf"([A-Z]{{2,10}}/(?:{'|'.join(_KNOWN_QUOTES)}))",
         r"([A-Z]{2,10}USDT)",  # BTCUSDT
         r"([A-Z]{2,10}USD)",  # BTCUSD
-        r"([A-Z]{2,10}/USDT)",  # BTC/USDT
         # "#WIF SHORT" — канал указал только базовый тикер через хэштег,
         # без quote-валюты вообще (частый формат). "#" — достаточно
         # надёжный маркер именно тикера, чтобы не путать его с случайным
@@ -418,8 +427,18 @@ def parse_with_regex(text: str) -> dict | None:
 
     if entry is None:
         # Формат без ключевого слова: "BTCUSDT LONG 1.85 SL 1.70 TP 2.10" —
-        # цена входа идёт сразу после направления
-        match = re.search(r"\b(?:long|short|buy|sell)\b\s*[:\-–—]?\s*([\d.]+)", text, re.IGNORECASE)
+        # цена входа идёт сразу после направления. Замыкающий \b (а не
+        # просто "конец числа") исключает "SAND LONG 20Х" (реальный
+        # инцидент, прод): "х" (как и латинская "x") — \w-символ что для
+        # ASCII, что под Unicode (re по умолчанию), значит между "20" и
+        # "Х" НЕТ границы слова — \b проваливается на любой длине захвата
+        # (жадный "20" и его укорочения "2" тоже упираются в отсутствие
+        # границы между соседними цифрами) — вся попытка совпадения здесь
+        # проваливается целиком, а не откатывается к "2" как случайно
+        # похожей на цену цифре. "20Х" — это плечо (20x), а не цена;
+        # настоящая цена в этом сообщении не указана вовсе ("Вход: по
+        # рынку" — см. is_market_entry ниже).
+        match = re.search(r"\b(?:long|short|buy|sell)\b\s*[:\-–—]?\s*([\d.]+)\b", text, re.IGNORECASE)
         if match:
             try:
                 entry = float(match.group(1))
@@ -512,8 +531,11 @@ def extract_all_prices(text: str, *keywords) -> list[float]:
         # (нумерованный) шаблон нашёл 0 или 1 число — иначе это уже
         # реальный формат "TPn: ..." и трогать его не нужно.
         if len(matches) <= 1:
+            # [,\s]* (не только \s*) между числами — каналы разделяют
+            # список целей и запятой ("Тейк: 0.04078, 0.0418, 0.0435"), и
+            # просто пробелом ("Тейки: 0.1962 0.1933 0.1853").
             line_match = re.search(
-                rf"{keyword}\s*[:\-–—]?\s*((?:[\d.]+\s*)+)", text, re.IGNORECASE,
+                rf"{keyword}\s*[:\-–—]?\s*((?:[\d.]+[,\s]*)+)", text, re.IGNORECASE,
             )
             if line_match:
                 line_numbers = re.findall(r"[\d.]+", line_match.group(1))
@@ -561,9 +583,15 @@ _LEVERAGE_PATTERN = re.compile(
 # "ARB SHORT x25" — плечо без КАКОГО-ЛИБО ключевого слова, просто "xNN"
 # отдельным токеном сразу после направления сделки. Ограничено позицией
 # сразу после LONG/SHORT/BUY/SELL (с необязательной запятой/пробелами),
-# чтобы не путать со случайным "x" где-то ещё в тексте сигнала.
+# чтобы не путать со случайным "x" где-то ещё в тексте сигнала. Число
+# может стоять и до, и после множителя ("SHORT x25" и "LONG 20Х" — оба
+# реальных формата, см. тот же порядок в _LEVERAGE_PATTERN выше).
 _BARE_LEVERAGE_PATTERN = re.compile(
     r"\b(?:long|short|buy|sell)\b[\s,]*[xXхХ]\s*(\d+(?:\.\d+)?)\b",
+    re.IGNORECASE,
+)
+_BARE_LEVERAGE_PATTERN_SUFFIX = re.compile(
+    r"\b(?:long|short|buy|sell)\b[\s,]*(\d+(?:\.\d+)?)\s*[xXхХ]\b",
     re.IGNORECASE,
 )
 
@@ -576,7 +604,11 @@ def extract_leverage(text: str) -> float | None:
     settings.futures_leverage, когда указано, и отображается в
     информации о сделке.
     """
-    match = _LEVERAGE_PATTERN.search(text) or _BARE_LEVERAGE_PATTERN.search(text)
+    match = (
+        _LEVERAGE_PATTERN.search(text)
+        or _BARE_LEVERAGE_PATTERN.search(text)
+        or _BARE_LEVERAGE_PATTERN_SUFFIX.search(text)
+    )
     if not match:
         return None
     try:
