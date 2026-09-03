@@ -351,6 +351,18 @@ def parse_with_regex(text: str) -> dict | None:
             break
 
     if not pair:
+        # "ARB SHORT x25" — просто тикер, БЕЗ хэштега и БЕЗ quote-валюты,
+        # прямо перед словом стороны сделки. IGNORECASE здесь намеренно
+        # НЕ используется (в отличие от остальных pair_patterns выше):
+        # обычный текст чата ("Watch LONG on this one") почти никогда не
+        # пишется капсом целиком, а тикеры каналы почти всегда пишут
+        # заглавными — без этого ограничения любое слово перед
+        # LONG/SHORT/BUY/SELL сходило бы за тикер.
+        match = re.search(r"\b([A-Z]{2,10})\s+(?:LONG|SHORT|BUY|SELL)\b", text)
+        if match:
+            pair = match.group(1)
+
+    if not pair:
         return None
 
     pair = normalize_pair(pair)
@@ -546,6 +558,14 @@ _LEVERAGE_PATTERN = re.compile(
     r"(?:кредитн\w*\s+плечо|плечо|leverage)\s*[:\-–—]?\s*[xXхХ]?\s*(\d+(?:\.\d+)?)\s*[xXхХ]?",
     re.IGNORECASE,
 )
+# "ARB SHORT x25" — плечо без КАКОГО-ЛИБО ключевого слова, просто "xNN"
+# отдельным токеном сразу после направления сделки. Ограничено позицией
+# сразу после LONG/SHORT/BUY/SELL (с необязательной запятой/пробелами),
+# чтобы не путать со случайным "x" где-то ещё в тексте сигнала.
+_BARE_LEVERAGE_PATTERN = re.compile(
+    r"\b(?:long|short|buy|sell)\b[\s,]*[xXхХ]\s*(\d+(?:\.\d+)?)\b",
+    re.IGNORECASE,
+)
 
 
 def extract_leverage(text: str) -> float | None:
@@ -556,7 +576,7 @@ def extract_leverage(text: str) -> float | None:
     settings.futures_leverage, когда указано, и отображается в
     информации о сделке.
     """
-    match = _LEVERAGE_PATTERN.search(text)
+    match = _LEVERAGE_PATTERN.search(text) or _BARE_LEVERAGE_PATTERN.search(text)
     if not match:
         return None
     try:

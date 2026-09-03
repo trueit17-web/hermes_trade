@@ -2686,6 +2686,35 @@ class TestTelegramSignalParser(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["take_profits"], [70000.0, 71000.0, 72000.0])
 
+    def test_bare_ticker_before_side_without_hashtag(self):
+        """"ARB SHORT x25" — просто тикер заглавными, без "#" и без quote-
+        валюты, прямо перед словом стороны сделки."""
+        result = self.parse("ARB SHORT x25 Entry 1.20 SL 1.30 TP 1.05")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "ARB/USDT")
+        self.assertEqual(result["side"], "short")
+        self.assertEqual(result["leverage"], 25.0)
+
+    def test_bare_ticker_lowercase_word_before_side_not_matched(self):
+        """Обычный текст ("watch LONG on this one") не капсом — не должен
+        сходить за тикер, иначе любое слово перед LONG/SHORT стало бы
+        "сигналом"."""
+        result = self.parse("watch LONG on this one, no price yet")
+        self.assertIsNone(result)
+
+    def test_bare_leverage_without_keyword(self):
+        """"ARB SHORT x25" — плечо без какого-либо ключевого слова
+        ("плечо"/"leverage"), просто "xNN" сразу после направления сделки."""
+        from src.telegram.channel_monitor import extract_leverage
+        self.assertEqual(extract_leverage("ARB SHORT x25"), 25.0)
+
+    def test_bare_leverage_full_signal(self):
+        result = self.parse("ARB SHORT x25 по рынку SL 1.30 TP 1.05")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "ARB/USDT")
+        self.assertIsNone(result["entry"])
+        self.assertEqual(result["leverage"], 25.0)
+
 
 class TestMarketEntryDetection(unittest.TestCase):
     def setUp(self):
