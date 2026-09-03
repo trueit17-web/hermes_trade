@@ -8279,6 +8279,128 @@ class TestExecuteTelegramSignalStoresRealTakeProfits(unittest.IsolatedAsyncioTes
         self.assertEqual(bot.open_positions["BTC/USDT"]["take_profits"], [])
 
 
+class TestOpenPositionAmountUsesExecutionEngineTrackedValue(unittest.IsolatedAsyncioTestCase):
+    """
+    Регресс на прод-инцидент: BCH/USDT (фьючерсы, реальный режим) — после
+    открытия позиции bot.open_positions[symbol]["amount"] хранил ДО-ордерную
+    оценку (position_value / entry), а не реально учтённый
+    execution_engine объём (net_amount из _execute_real_order: filled
+    минус комиссия, если она удержана в базовой валюте). Оба счётчика
+    уменьшались на один и тот же close_amount при каждом частичном
+    TP-закрытии, поэтому расхождение (~размер комиссии) сохранялось
+    константным — пока попытка закрыть остаток целиком не начала
+    систематически (каждый цикл, без остановки) падать на бирже с
+    "Insufficient balance": бот пытался продать чуть больше, чем реально
+    было открыто. Фикс — брать amount из execution_engine.get_open_positions()
+    сразу после успешного create_order(), а не из локальной ДО-ордерной
+    переменной.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        self._saved_active_trading_mode = settings.active_trading_mode
+        settings.trading_mode = "real"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+        settings.active_trading_mode = self._saved_active_trading_mode
+
+    async def test_telegram_signal_uses_tracked_amount_not_pre_order_estimate(self):
+        bot = self._make_bot()
+        bot._refresh_symbol_candles = AsyncMock()
+        fake_order = MagicMock(id=1, fee=0.0018392)
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=fake_order)
+            # Реально учтённый execution_engine объём (net_amount) —
+            # заведомо меньше, чем то, что посчитает локальная
+            # ДО-ордерная оценка (position_value / entry) ниже.
+            mock_engine.get_open_positions = MagicMock(
+                return_value={"BCH/USDT": {"amount": 0.457943102416035, "entry_price": 244.4}}
+            )
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BCH/USDT", "parsed_side": "long",
+                "parsed_entry": 244.4, "parsed_sl": 241.2108, "parsed_tp": 251.62303,
+                "channel_id": "@test_channel", "channel_market_type": "futures",
+            })
+
+        self.assertEqual(bot.open_positions["BCH/USDT"]["amount"], 0.457943102416035)
+
+    async def test_telegram_signal_falls_back_to_estimate_if_not_tracked(self):
+        """Если по какой-то причине execution_engine не знает об этой
+        позиции (не должно происходить в норме) — не падаем, используем
+        локальную ДО-ордерную оценку, как раньше."""
+        bot = self._make_bot()
+        bot._refresh_symbol_candles = AsyncMock()
+        fake_order = MagicMock(id=1, fee=0.0)
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=fake_order)
+            mock_engine.get_open_positions = MagicMock(return_value={})
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 53000.0,
+                "channel_id": "@test_channel",
+            })
+
+        expected_amount = (10000.0 * (5.0 / 100)) / 50000.0
+        self.assertEqual(bot.open_positions["BTC/USDT"]["amount"], expected_amount)
+
+    async def test_strategy_signal_uses_tracked_amount_not_pre_order_estimate(self):
+        from src.strategy import StrategySignal
+
+        settings.active_trading_mode = "algo"
+        bot = self._make_bot()
+        bot.feature_engine = MagicMock()
+        bot.ml_inference = None
+        candles_df = pd.DataFrame({
+            "open": [1.0] * 60, "high": [1.0] * 60, "low": [1.0] * 60,
+            "close": [1.0] * 60, "volume": [1.0] * 60,
+        })
+        bot._refresh_symbol_candles = AsyncMock(return_value=candles_df)
+
+        fake_strategy = MagicMock()
+        fake_strategy.strategy_id = "ml_direction"
+        fake_strategy.name = "ML"
+        fake_strategy.weight = 1.0
+        fake_strategy.generate_signal.return_value = StrategySignal(
+            strategy_id="ml_direction", symbol="BTC/USDT", side="long", confidence=0.66,
+            entry_price=100.0,
+        )
+        fake_order = MagicMock(id=1, fee=0.0, client_order_id="abc")
+
+        with patch("src.main.strategy_registry.get_active", return_value=[fake_strategy]), \
+                patch("src.main.strategy_registry.get", return_value=None), \
+                patch("src.main.execution_engine") as mock_engine, \
+                patch("src.main.risk_manager") as mock_risk, \
+                patch("src.main.protection_manager") as mock_protections, \
+                patch("src.main.expectancy_sizing") as mock_sizing:
+            mock_engine.paper_positions = {}
+            mock_engine.real_positions = {}
+            mock_engine.last_prices = {}
+            mock_engine.create_order = AsyncMock(return_value=fake_order)
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            # Реально учтённый объём меньше локальной ДО-ордерной оценки —
+            # именно он должен попасть в bot.open_positions.
+            mock_engine.get_open_positions = MagicMock(
+                return_value={"BTC/USDT": {"amount": 0.4, "entry_price": 100.0}}
+            )
+            mock_risk.check_signal.return_value = (True, "")
+            mock_protections.locked_reason = AsyncMock(return_value=None)
+            mock_sizing.size_multiplier = AsyncMock(return_value=1.0)
+
+            await bot._process_symbol("BTC/USDT")
+
+        self.assertEqual(bot.open_positions["BTC/USDT"]["amount"], 0.4)
+
+
 class TestDecideTelegramSignal(unittest.IsolatedAsyncioTestCase):
     """
     POST /telegram/signals/{id}/decide — раньше "⏳ Ожидает подтверждения"

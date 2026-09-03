@@ -710,9 +710,22 @@ class TradingBot:
             # иначе _check_position_exit никогда её не увидит, SL/TP не
             # сработают и позиция не закроется (а значит, executed_trade_id
             # у сигнала никогда не проставится).
+            #
+            # amount — берём РЕАЛЬНО учтённый execution_engine объём
+            # (net_amount из _execute_real_order: filled минус комиссия,
+            # если она удержана в базовой валюте), а не локально
+            # рассчитанный ДО отправки ордера amount = position_value / entry.
+            # Реальный инцидент: BCH/USDT — расхождение в размер комиссии
+            # (~0.0018 BCH) сохранялось константным через все частичные
+            # TP-закрытия (оба счётчика уменьшались на один и тот же
+            # close_amount), пока попытка закрыть остаток целиком не начала
+            # раз за разом падать на бирже с "Insufficient balance" —
+            # бот пытался продать чуть больше, чем реально было открыто.
+            tracked = execution_engine.get_open_positions().get(symbol)
+            actual_amount = tracked["amount"] if tracked else amount
             self.open_positions[symbol] = {
                 "side": side, "entry_price": entry,
-                "amount": amount, "strategy_id": "telegram_signal",
+                "amount": actual_amount, "strategy_id": "telegram_signal",
                 "rationale": "Telegram сигнал", "sl": sl, "tp": tp,
                 # Реальные цели канала (если их несколько) — _tp_levels()
                 # использует их напрямую вместо интерполяции между entry и
@@ -1201,9 +1214,17 @@ class TradingBot:
                     amount=amount, price=entry_price, status="filled", fee=order.fee,
                 )
                 decision_logger.attach_to_order(order.id)
+                # amount — как и в _execute_telegram_signal, берём реально
+                # учтённый execution_engine объём вместо локальной
+                # ДО-ордерной оценки — иначе для реальной торговли
+                # накапливается тот же дрейф (комиссия в базовой валюте),
+                # что привёл к неустранимой "Insufficient balance" на
+                # закрытии остатка позиции.
+                tracked = execution_engine.get_open_positions().get(symbol)
+                actual_amount = tracked["amount"] if tracked else amount
                 self.open_positions[symbol] = {
                     "side": signal.side, "entry_price": entry_price,
-                    "amount": amount, "strategy_id": signal.strategy_id,
+                    "amount": actual_amount, "strategy_id": signal.strategy_id,
                     "rationale": signal.rationale, "sl": stop_loss,
                     "tp": take_profit, "tp_hit_count": 0,
                     "opened_at": utcnow(),
