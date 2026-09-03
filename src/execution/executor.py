@@ -1436,17 +1436,29 @@ class ExecutionEngine:
 
     async def _cancel_order_safe(
         self, symbol: str, order_id: str | None, exchange: ccxt.Exchange | None = None,
-    ) -> None:
-        """Best-effort отмена ордера — он мог уже исполниться или быть отменённым, это не ошибка."""
+    ) -> bool:
+        """
+        Best-effort отмена ордера — он мог уже исполниться или быть отменённым,
+        это не ошибка. Возвращает True, если на бирже ордера точно больше нет
+        (отмена прошла, или биржа говорит "не найден" — OrderNotFound), и False
+        при любой ДРУГОЙ ошибке — тогда ордер мог остаться живым на бирже, и
+        вызывающему коду нельзя считать его order_id безопасным для сброса
+        (см. sync_stop_loss_order — забыть ID в этом случае значит осиротить
+        реальный условный ордер на бирже).
+        """
         if not order_id:
-            return
+            return True
         ex = exchange if exchange is not None else self.exchange
         if ex is None:
-            return
+            return False
         try:
             await ex.cancel_order(order_id, symbol)
+            return True
+        except ccxt.OrderNotFound:
+            return True
         except Exception as e:
             logger.debug(f"Не удалось отменить ордер {order_id} ({symbol}) — возможно, уже неактивен: {e}")
+            return False
 
     async def sync_stop_loss_order(self, symbol: str, amount: float, stop_loss_price: float | None) -> None:
         """
@@ -1473,7 +1485,26 @@ class ExecutionEngine:
         if pos is None:
             return
         exchange = self._exchange_for(pos)
-        await self._cancel_order_safe(symbol, pos.get("sl_order_id"), exchange)
+        old_sl_order_id = pos.get("sl_order_id")
+        if old_sl_order_id and not await self._cancel_order_safe(symbol, old_sl_order_id, exchange):
+            # Отмена не подтверждена — старый условный SL-ордер мог остаться
+            # живым на бирже. Забыть его ID здесь (как раньше) означало бы
+            # осиротить реальный ордер: он продолжает резервировать
+            # объём/маржу на бирже, но бот больше не знает о его
+            # существовании и не может ни отменить его, ни обнаружить его
+            # срабатывание через _finalize_externally_closed_position.
+            # Реальный инцидент (прод): именно так осиротели SL-ордера
+            # BCH/USDT и HYPE/USDT после первого же частичного TP — после
+            # этого КАЖДАЯ попытка переставить SL или закрыть остаток
+            # позиции стабильно падала с "insufficient balance" (Bybit
+            # резервирует объём под уже существующий условный ордер), а
+            # реконсиляция не могла подобрать позицию, потому что не знала
+            # order_id, по которому нужно проверять исполнение.
+            logger.warning(
+                f"⚠️ Не удалось подтвердить отмену старого SL-ордера {old_sl_order_id} ({symbol}) — "
+                f"оставляем его отслеживаемым и не выставляем новый в этом цикле, чтобы не осиротить его."
+            )
+            return
         pos["sl_order_id"] = None
         if stop_loss_price and amount > 0:
             pos["sl_order_id"] = await self._place_stop_loss_order(

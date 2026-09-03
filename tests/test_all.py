@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, AsyncMock, PropertyMock, patch
 
+import ccxt.async_support as ccxt
 import numpy as np
 import pandas as pd
 
@@ -7315,6 +7316,79 @@ class TestSyncStopLossOrderOnFutures(unittest.IsolatedAsyncioTestCase):
             "SPOTSL1/USDT", 10.0, params={"stopLossPrice": 1.8},
         )
         self.assertEqual(self.engine.real_positions["SPOTSL1/USDT"]["sl_order_id"], "spot-sl-1")
+
+
+class TestSyncStopLossOrderDoesNotOrphanUnconfirmedCancel(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент (прод, BCH/USDT и HYPE/USDT): sync_stop_loss_order
+    раньше безусловно сбрасывал pos["sl_order_id"] в None ДО того, как
+    убеждался, что отмена старого условного SL-ордера реально прошла на
+    бирже (_cancel_order_safe глотает любую ошибку молча). Если cancel_order
+    падал с неоднозначной ошибкой (не "ордера уже нет", а что-то другое —
+    в проде это был тот же 170131 Insufficient balance), старый ордер
+    оставался живым на бирже, но бот забывал его order_id — ордер
+    осиротевал навсегда: не отменяем его повторно, не видим его
+    исполнение через _finalize_externally_closed_position, а каждая
+    следующая попытка переставить SL или закрыть остаток позиции стабильно
+    падает "insufficient balance", потому что биржа резервирует объём под
+    этот забытый ордер.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+        settings.market_type = "futures"
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+
+    async def test_keeps_old_sl_order_id_when_cancel_fails_ambiguously(self):
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.cancel_order.side_effect = Exception("bybit 170131 Insufficient balance")
+        self.engine.real_positions["ORPHANSL1/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long",
+            "sl_order_id": "old-sl-order-1", "market_type": "futures",
+        }
+
+        await self.engine.sync_stop_loss_order("ORPHANSL1/USDT", 5.0, 1.9)
+
+        self.engine.exchange.cancel_order.assert_awaited_once_with("old-sl-order-1", "ORPHANSL1/USDT")
+        self.engine.exchange.create_market_sell_order.assert_not_called()
+        self.assertEqual(self.engine.real_positions["ORPHANSL1/USDT"]["sl_order_id"], "old-sl-order-1")
+
+    async def test_replaces_sl_order_id_when_cancel_succeeds(self):
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "new-sl-order-1"}
+        self.engine.real_positions["ORPHANSL2/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long",
+            "sl_order_id": "old-sl-order-2", "market_type": "futures",
+        }
+
+        await self.engine.sync_stop_loss_order("ORPHANSL2/USDT", 5.0, 1.9)
+
+        self.engine.exchange.cancel_order.assert_awaited_once_with("old-sl-order-2", "ORPHANSL2/USDT")
+        self.engine.exchange.create_market_sell_order.assert_awaited_once()
+        self.assertEqual(self.engine.real_positions["ORPHANSL2/USDT"]["sl_order_id"], "new-sl-order-1")
+
+    async def test_replaces_sl_order_id_when_old_order_already_gone(self):
+        """OrderNotFound (ордер уже отменён/исполнен биржей) — безопасно считать слот свободным."""
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.cancel_order.side_effect = ccxt.OrderNotFound("no such order")
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "new-sl-order-3"}
+        self.engine.real_positions["ORPHANSL3/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long",
+            "sl_order_id": "old-sl-order-3", "market_type": "futures",
+        }
+
+        await self.engine.sync_stop_loss_order("ORPHANSL3/USDT", 5.0, 1.9)
+
+        self.engine.exchange.create_market_sell_order.assert_awaited_once()
+        self.assertEqual(self.engine.real_positions["ORPHANSL3/USDT"]["sl_order_id"], "new-sl-order-3")
 
 
 class TestRearmStopLossOrdersFilterByMarketType(unittest.IsolatedAsyncioTestCase):
