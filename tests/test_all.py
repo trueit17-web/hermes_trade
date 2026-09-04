@@ -8764,6 +8764,7 @@ class TestTradingSourceModeGatesTelegramSignals(unittest.IsolatedAsyncioTestCase
         exec_mock.assert_not_awaited()
         bot._save_telegram_signal.assert_awaited_once()
         self.assertEqual(bot._save_telegram_signal.await_args.args[2], "rejected")
+        self.assertIn("алго", bot._save_telegram_signal.await_args.args[0]["reject_reason"])
 
     async def test_signals_mode_still_auto_executes_telegram_signal(self):
         settings.active_trading_mode = "signals"
@@ -8840,6 +8841,12 @@ class TestTelegramSignalMarketEntryResolution(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(passed_event["parsed_entry"], 0.2034)
 
     async def test_market_entry_rejected_when_reference_price_unavailable(self):
+        """
+        Раньше этот случай отклонял сигнал через голый return — сигнал не
+        попадал в БД вообще, и "Итог сделки" для него в дашборде было
+        невозможно ни увидеть, ни объяснить задним числом. Теперь такой
+        отказ тоже сохраняется как decision="rejected" с понятной причиной.
+        """
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
         bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures"))
@@ -8858,7 +8865,11 @@ class TestTelegramSignalMarketEntryResolution(unittest.IsolatedAsyncioTestCase):
             })
 
         exec_mock.assert_not_awaited()
-        bot._save_telegram_signal.assert_not_awaited()
+        bot._save_telegram_signal.assert_awaited_once()
+        saved_event, quality, decision, order = bot._save_telegram_signal.await_args.args
+        self.assertEqual(decision, "rejected")
+        self.assertIsNone(order)
+        self.assertIn("цену", saved_event["reject_reason"])
 
     async def test_explicit_entry_does_not_trigger_reference_price_lookup(self):
         """Регресс: обычный сигнал с явной ценой не должен обращаться к
@@ -9471,7 +9482,34 @@ class TestDecideTelegramSignal(unittest.IsolatedAsyncioTestCase):
         async with get_session() as session:
             signal = await session.get(TelegramSignal, signal_id)
             self.assertEqual(signal.decision, "rejected")
+            self.assertEqual(signal.reject_reason, "отклонён вручную")
         self.assertNotIn("BTC/USDT", self.main_module.current_bot.open_positions)
+
+    async def test_execute_failure_persists_reject_reason(self):
+        """
+        Ручное исполнение через дашборд, которое не проходит на бирже
+        (короткая позиция на споте — единственный детерминированный способ
+        гарантированно провалить исполнение без реального обращения к
+        бирже), должно записать конкретную причину в reject_reason, а не
+        оставить её пустой — иначе "Итог сделки" для такого сигнала в
+        дашборде снова был бы неотличим от простого "—".
+        """
+        from src.web.api import TelegramSignalDecision, decide_telegram_signal
+        from src.db.models import TelegramSignal
+        from src.db.session import get_session
+
+        engine, bot = await self._install_engine_and_bot()
+        engine.is_paper = False
+        settings.trading_mode = "real"
+        signal_id = await self._make_pending_signal(parsed_pair="SPOTSHORT1/USDT", parsed_side="short")
+
+        with self.assertRaises(Exception):
+            await decide_telegram_signal(signal_id, TelegramSignalDecision(action="execute"))
+
+        async with get_session() as session:
+            signal = await session.get(TelegramSignal, signal_id)
+            self.assertEqual(signal.decision, "rejected")
+            self.assertIn("шорт", signal.reject_reason)
 
     async def test_execute_opens_position_with_real_take_profits(self):
         from src.web.api import TelegramSignalDecision, decide_telegram_signal
@@ -9612,6 +9650,24 @@ class TestDynamicChannelMonitoring(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.cm._monitored[-100999]["channel_id"], "@newchan")
         client.add_event_handler.assert_called_once()
         self.assertTrue(self.cm._handler_registered)
+
+    async def test_add_channel_by_numeric_id_resolves_via_int(self):
+        """
+        Реальный инцидент: поле в дашборде подсказывает вводить и числовой
+        ID канала ("-100123456789"), но get_entity() у Telethon трактует
+        str-аргумент как username и никогда не резолвит числовую строку —
+        добавление канала по ID выглядело рабочим, но реально никогда не
+        подключало канал. get_entity должен получить именно int.
+        """
+        client = self._install_fake_client(entity_chat_id=-100777)
+
+        added = await self.cm.add_channel_to_monitoring(
+            {"channel_id": "-100123456789", "channel_title": "ById", "parser_config": {}}
+        )
+
+        self.assertTrue(added)
+        client.get_entity.assert_awaited_once_with(-100123456789)
+        self.assertIn(-100777, self.cm._monitored)
 
     async def test_add_channel_returns_false_without_client(self):
         self.cm._telegram_client = None

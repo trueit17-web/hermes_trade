@@ -548,10 +548,14 @@ class TradingBot:
             entry = await execution_engine.get_reference_price(pair, market_type)
             if not entry:
                 logger.warning(f"🚫 Сигнал по {pair} (маркет-вход) отклонён: не удалось получить текущую цену")
+                signal_event["reject_reason"] = "маркет-вход: не удалось получить текущую цену с биржи"
+                await self._save_telegram_signal(signal_event, None, "rejected", None)
                 return
             signal_event["parsed_entry"] = entry
 
         if entry <= 0:
+            signal_event["reject_reason"] = "некорректная цена входа (entry <= 0)"
+            await self._save_telegram_signal(signal_event, None, "rejected", None)
             return
 
         from src.telegram.quality_scorer import signal_quality_scorer
@@ -589,9 +593,11 @@ class TradingBot:
             # не должны прерываться из-за переключения режима), просто не
             # исполняем, пока активен алго-режим.
             decision = "rejected"
+            signal_event["reject_reason"] = "активен режим «алго» — сигнальная торговля выключена"
             logger.info(f"🚫 Сигнал по {pair} отклонён: активен режим 'алго' — сигнальная торговля выключена")
         elif quality < quality_threshold:
             decision = "rejected"
+            signal_event["reject_reason"] = f"низкое качество сигнала ({quality:.2f} < порог {quality_threshold:.2f})"
             logger.info(f"🚫 Сигнал отклонён (quality={quality:.2f} < {quality_threshold:.2f})")
         elif auto_execute:
             if pair in self.open_positions:
@@ -603,6 +609,7 @@ class TradingBot:
                 # существующего long тихо превращался бы в его закрытие
                 # вместо открытия short. Проще и безопаснее отклонить.
                 decision = "rejected"
+                signal_event["reject_reason"] = f"по {pair} уже есть открытая позиция"
                 logger.info(f"🚫 Сигнал по {pair} отклонён: уже есть открытая позиция")
             else:
                 # Protections (кулдаун источника после закрытия, StoplossGuard,
@@ -617,13 +624,21 @@ class TradingBot:
                 logger.info("🤖 Автоматическое исполнение")
                 order = await self._execute_telegram_signal(signal_event)
                 decision = "executed" if order else "rejected"
+                if not order and not signal_event.get("reject_reason"):
+                    # _execute_telegram_signal сам проставляет reject_reason
+                    # на своих собственных ранних выходах (шорт на споте,
+                    # отрицательное матожидание канала) — этот fallback на
+                    # случай, если ордер не прошёл уже на самой бирже
+                    # (execution_engine.create_order() вернул None по другой
+                    # причине, видной только в логах execution_engine).
+                    signal_event["reject_reason"] = "не удалось исполнить ордер на бирже — см. логи"
         else:
             logger.info("⏳ Сигнал ожидает подтверждения")
 
         await self._save_telegram_signal(signal_event, quality, decision, order)
 
     async def _save_telegram_signal(
-        self, signal_event: dict, quality: float, decision: str, order,
+        self, signal_event: dict, quality: float | None, decision: str, order,
     ):
         """Сохранить сигнал в БД (для статистики по каналам)."""
         db_channel_id = self._telegram_channel_db_ids.get(signal_event.get("channel_id", ""))
@@ -644,6 +659,7 @@ class TradingBot:
                     parsed_leverage=signal_event.get("parsed_leverage"),
                     quality_score=quality,
                     decision=decision,
+                    reject_reason=signal_event.get("reject_reason") if decision == "rejected" else None,
                     executed_order_id=order.id if order else None,
                 ))
                 await session.commit()
@@ -702,6 +718,7 @@ class TradingBot:
             # executor._execute_real_order/close_real_position (ЭТАП 2).
             # market_type здесь — рынок ЭТОГО КАНАЛА, не глобальный тумблер.
             logger.info(f"🚫 Сигнал по {pair} отклонён: short — на споте (реальный режим) шорт не поддерживается")
+            signal_event["reject_reason"] = "шорт не поддерживается на споте в реальном режиме"
             return None
 
         if settings.is_paper:
@@ -715,6 +732,7 @@ class TradingBot:
         mult = await expectancy_sizing.size_multiplier(channel_key(channel_id))
         if mult <= 0:
             logger.info(f"🚫 Сигнал по {pair} отклонён: канал в минусе по мат. ожиданию (expectancy sizing)")
+            signal_event["reject_reason"] = "канал в минусе по матожиданию (expectancy sizing отключил канал)"
             return None
         base_size_pct = signal_event.get("channel_position_size_pct", 5.0)
         size_pct = base_size_pct * mult

@@ -288,6 +288,11 @@ class TelegramSignal(Base):
     decision: Mapped[str] = mapped_column(
         String(30), default="pending"
     )  # executed, rejected, pending
+    # Человекочитаемая причина отклонения (только при decision="rejected") —
+    # для отображения в "Итоге сделки" на дашборде. None и для "executed"/
+    # "pending", и для "rejected" сигналов, отклонённых до появления этого
+    # поля (старые записи).
+    reject_reason: Mapped[str | None] = mapped_column(String(255))
     # order, открытый по этому сигналу (проставляется сразу при исполнении);
     # executed_trade_id проставляется позже, когда позиция закрывается и
     # известен итоговый исход (нужен для расчёта win rate по каналу).

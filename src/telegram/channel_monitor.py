@@ -190,6 +190,23 @@ async def monitor_channels(channels: list[dict]):
     logger.info(f"Мониторинг каналов запущен: {[c['channel_id'] for c in _monitored.values()]}")
 
 
+def _resolve_channel_id_input(channel_id: str) -> str | int:
+    """
+    Telethon.get_entity() трактует str-аргумент как username/телефон/
+    инвайт-ссылку — числовая строка вида "-100123456789" (Telegram-ID
+    канала, как раз то, что подсказывает плейсхолдер поля в дашборде)
+    молча не резолвится: Telethon не пытается интерпретировать её как ID,
+    для этого аргумент должен быть именно int. Без этой конвертации
+    "добавить канал по ID" в дашборде выглядело рабочим (поле принимает
+    любую строку), но реально никогда не подключало канал — get_entity()
+    просто падал с ошибкой резолва на любой числовой строке.
+    """
+    try:
+        return int(channel_id)
+    except (TypeError, ValueError):
+        return channel_id
+
+
 async def add_channel_to_monitoring(channel: dict) -> bool:
     """
     Добавить один канал в live-мониторинг без рестарта бота — резолвит
@@ -212,7 +229,7 @@ async def add_channel_to_monitoring(channel: dict) -> bool:
         return False
     _ensure_handler_registered(_telegram_client)
     try:
-        entity = await _telegram_client.get_entity(channel["channel_id"])
+        entity = await _telegram_client.get_entity(_resolve_channel_id_input(channel["channel_id"]))
         chat_id = get_peer_id(entity)
     except Exception as e:
         logger.error(f"Telegram: не удалось найти канал {channel['channel_id']}: {e}")

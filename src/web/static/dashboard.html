@@ -187,7 +187,12 @@
     padding: 14px 16px 10px;
   }
   table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 8px 16px; font-size: 13px; white-space: nowrap; }
+  /* Ячейка не растягивает колонку/таблицу под самый длинный текст — вместо
+     этого обрезается многоточием, полный текст доступен в подсказке при
+     наведении (см. applyCellTooltip в скрипте ниже). Сама таблица по-прежнему
+     может быть шире контейнера из-за числа колонок — .table-wrap скроллит её
+     целиком (наведением курсора на край, см. edge-scroll в скрипте). */
+  th, td { text-align: left; padding: 8px 16px; font-size: 13px; white-space: nowrap; max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
   thead th { color: var(--text-dim); font-weight: 600; border-bottom: 1px solid var(--panel-border); }
   tbody tr { border-bottom: 1px solid var(--panel-border); }
   tbody tr:last-child { border-bottom: none; }
@@ -254,7 +259,7 @@
   }
   .channel-signals-row td { background: rgba(0,0,0,.15); padding: 0; }
   .nested-table { width: 100%; border-collapse: collapse; }
-  .nested-table th, .nested-table td { padding: 6px 14px; font-size: 12px; white-space: nowrap; }
+  .nested-table th, .nested-table td { padding: 6px 14px; font-size: 12px; white-space: nowrap; max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
   .nested-table thead th { color: var(--text-dim); font-weight: 600; border-bottom: 1px solid var(--panel-border); }
   .nested-table tbody tr { border-bottom: 1px solid rgba(255,255,255,.03); }
   .nested-table tbody tr:last-child { border-bottom: none; }
@@ -936,6 +941,99 @@ function escapeHtml(s) {
   div.textContent = s ?? "";
   return div.innerHTML;
 }
+
+// Ячейки таблиц обрезаются CSS (max-width + ellipsis, см. th/td стили) —
+// вместо того чтобы растягивать всю колонку/таблицу под самый длинный
+// текст (например причину отклонения сигнала или сырое сообщение канала).
+// Полный текст при этом не должен теряться — подводим нативный тултип
+// (title) на любую ячейку, где реально произошло усечение (scrollWidth >
+// clientWidth), не трогая ячейки, которым title уже явно назначен вручную
+// (например бейдж плеча — там своя, более специфичная подсказка).
+function applyCellTooltip(cell) {
+  if (cell.title) return;
+  const text = cell.textContent.trim();
+  if (!text) return;
+  if (cell.scrollWidth > cell.clientWidth + 1) {
+    cell.title = text;
+  }
+}
+
+function applyCellTooltips(root) {
+  root.querySelectorAll("td, th").forEach(applyCellTooltip);
+}
+
+// Таблицы перестраиваются целиком (innerHTML) на каждый периодический
+// рефреш и по клику (разворачивание истории сигналов канала, переключение
+// вкладок) — вместо того чтобы звать applyCellTooltips() из каждой из
+// полутора десятков функций renderXxx() по отдельности, один
+// MutationObserver на весь документ ловит любые новые/пересозданные
+// td/th, в любой таблице, включая те, что появятся в будущем.
+const cellTooltipObserver = new MutationObserver((mutations) => {
+  for (const m of mutations) {
+    m.addedNodes.forEach(node => {
+      if (node.nodeType !== 1) return;
+      if (node.matches && (node.matches("td") || node.matches("th"))) applyCellTooltip(node);
+      else if (node.querySelectorAll) applyCellTooltips(node);
+    });
+  }
+});
+cellTooltipObserver.observe(document.body, { childList: true, subtree: true });
+
+// Таблица могла перестроиться, пока её вкладка была display:none (Ручной
+// режим/Настройки) — scrollWidth/clientWidth там в момент вставки нулевые,
+// усечения не видно, тултип не назначился. Досчитываем при показе вкладки.
+function recheckCellTooltips() {
+  applyCellTooltips(document);
+}
+
+// Горизонтальная прокрутка широких таблиц (.table-wrap) — наведением
+// курсора на край контейнера, без необходимости цеплять скроллбар/крутить
+// колесо с Shift. Работает через делегирование на document, а не отдельные
+// слушатели на каждый .table-wrap — те пересоздаются при каждом
+// перерендере таблицы вместе с остальным innerHTML.
+const EDGE_SCROLL_ZONE = 48;
+const EDGE_SCROLL_SPEED = 14;
+let edgeScrollEl = null;
+let edgeScrollDir = 0;
+let edgeScrollRAF = null;
+
+function stopEdgeScroll() {
+  if (edgeScrollRAF) cancelAnimationFrame(edgeScrollRAF);
+  edgeScrollRAF = null;
+  edgeScrollEl = null;
+  edgeScrollDir = 0;
+}
+
+function startEdgeScroll(el, dir) {
+  if (edgeScrollEl === el && edgeScrollDir === dir) return;
+  stopEdgeScroll();
+  edgeScrollEl = el;
+  edgeScrollDir = dir;
+  const step = () => {
+    if (!edgeScrollEl) return;
+    edgeScrollEl.scrollLeft += edgeScrollDir * EDGE_SCROLL_SPEED;
+    edgeScrollRAF = requestAnimationFrame(step);
+  };
+  edgeScrollRAF = requestAnimationFrame(step);
+}
+
+document.addEventListener("mousemove", (e) => {
+  const wrap = e.target.closest ? e.target.closest(".table-wrap") : null;
+  if (!wrap || wrap.scrollWidth <= wrap.clientWidth) {
+    stopEdgeScroll();
+    return;
+  }
+  const rect = wrap.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  if (x < EDGE_SCROLL_ZONE && wrap.scrollLeft > 0) {
+    startEdgeScroll(wrap, -1);
+  } else if (x > rect.width - EDGE_SCROLL_ZONE && wrap.scrollLeft < wrap.scrollWidth - wrap.clientWidth) {
+    startEdgeScroll(wrap, 1);
+  } else {
+    stopEdgeScroll();
+  }
+});
+document.addEventListener("mouseleave", stopEdgeScroll);
 
 // На бирже ID сделки в истории показывается коротким (~8 символов) — тот
 // же формат в дашборде, а не длинный технический ID. order_id_exchange
@@ -2018,6 +2116,8 @@ function renderChannelSignalsTable(signals) {
               outcome = `<span class="muted">снята с учёта (не продать на бирже)</span>`;
             } else if (s.order) {
               outcome = "открыта";
+            } else if (s.decision === "rejected") {
+              outcome = `<span class="muted">🚫 ${escapeHtml(s.reject_reason || "причина не записана")}</span>`;
             }
             const tpDisplay = s.parsed_take_profits && s.parsed_take_profits.length > 1
               ? s.parsed_take_profits.map(v => fmtPrice(v)).join(" → ")
@@ -2114,6 +2214,10 @@ function switchTab(tab) {
     if (lastStatus) renderManualPositions(lastStatus);
     renderManualTrades();
   }
+  // Таблицы во вкладке, которая была display:none, перестраивались "вслепую"
+  // (scrollWidth/clientWidth нулевые у скрытого элемента) — тултипы усечения
+  // на них не назначились при рендере, досчитываем теперь, когда вкладка видна.
+  recheckCellTooltips();
 }
 
 document.querySelectorAll(".tab-btn").forEach(b => b.addEventListener("click", () => switchTab(b.dataset.tab)));

@@ -1606,6 +1606,7 @@ async def list_telegram_signals(channel_id: int | None = None, limit: int = 100)
                     "parsed_leverage": float(s.parsed_leverage) if s.parsed_leverage else None,
                     "quality_score": s.quality_score,
                     "decision": s.decision,
+                    "reject_reason": s.reject_reason,
                     "order": _order_data(s.executed_order),
                     "trade": _trade_data(s.executed_trade),
                     "created_at": s.created_at.isoformat() + "Z" if s.created_at else None,
@@ -1652,6 +1653,7 @@ async def decide_telegram_signal(signal_id: int, decision: TelegramSignalDecisio
 
         if decision.action == "reject":
             signal.decision = "rejected"
+            signal.reject_reason = "отклонён вручную"
             await session.commit()
             logger.info(f"Telegram-сигнал #{signal_id} отклонён вручную")
             return {"success": True, "decision": "rejected"}
@@ -1691,6 +1693,8 @@ async def decide_telegram_signal(signal_id: int, decision: TelegramSignalDecisio
         signal.decision = "executed" if order else "rejected"
         if order:
             signal.executed_order_id = order.id
+        else:
+            signal.reject_reason = signal_event.get("reject_reason") or "не удалось исполнить ордер на бирже — см. логи"
         await session.commit()
 
     if not order:
