@@ -7502,6 +7502,195 @@ class TestReconcileFuturesPositions(unittest.IsolatedAsyncioTestCase):
         self.assertIn("MON/USDT", self.engine.real_positions)
 
 
+class TestCcxtSymbolTranslationForFutures(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент (прод, месяцами): у ccxt спотовый и linear-swap
+    (наш "futures"/USDT-perpetual) рынки одной и той же пары — это ДВА
+    РАЗНЫХ unified-символа: "BCH/USDT" (спот) и "BCH/USDT:USDT" (swap,
+    суффикс — расчётная валюта через двоеточие; см. parse_market в
+    ccxt/bybit.py). exchange.market(symbol) резолвит ПО БУКВАЛЬНОМУ
+    СОВПАДЕНИЮ СТРОКИ в self.markets и не учитывает options.defaultType —
+    раз "BCH/USDT" уже есть как ключ (спотовый рынок), он и возвращается
+    ВСЕГДА, что бы ни было в defaultType. Весь код в этом файле годами
+    обращался к "futures"-клиенту голым "BASE/QUOTE" без суффикса — а
+    значит КАЖДЫЙ вызов (create_order, fetch_position, cancel_order,
+    set_leverage, fetch_open_orders...) на деле резолвился в СПОТОВЫЙ
+    рынок. Отсюда и retCode 181001 "category only support linear or
+    option" на fetch_position() (у спота нет позиций), и стабильный
+    170131 "Insufficient balance" на закрытии/SL (не reduceOnly-закрытие
+    фьючерсного контракта, а спотовая/маржинальная продажа с другой
+    семантикой баланса).
+
+    _ccxt_symbol(exchange, symbol) — единая точка перевода: добавляет
+    суффикс ":QUOTE" только когда exchange.options["defaultType"] == "swap"
+    (так его выставляет _connect_exchange для futures-клиента), и НЕ
+    трогает наш собственный канонический "BASE/QUOTE", которым everywhere
+    else (БД, real_positions, main.py, дашборд) обозначается символ —
+    перевод происходит непосредственно перед вызовом ccxt.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+        self._saved_trading_mode = settings.trading_mode
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+        settings.trading_mode = self._saved_trading_mode
+
+    def _futures_exchange(self) -> AsyncMock:
+        ex = AsyncMock()
+        ex.options = {"defaultType": "swap", "defaultSubType": "linear"}
+        return ex
+
+    def _spot_exchange(self) -> AsyncMock:
+        ex = AsyncMock()
+        ex.options = {"defaultType": "spot"}
+        return ex
+
+    def test_ccxt_symbol_suffixes_quote_for_futures_exchange(self):
+        futures_exchange = self._futures_exchange()
+        self.assertEqual(
+            self.engine._ccxt_symbol(futures_exchange, "BCH/USDT"), "BCH/USDT:USDT",
+        )
+
+    def test_ccxt_symbol_unchanged_for_spot_exchange(self):
+        spot_exchange = self._spot_exchange()
+        self.assertEqual(
+            self.engine._ccxt_symbol(spot_exchange, "BCH/USDT"), "BCH/USDT",
+        )
+
+    def test_ccxt_symbol_idempotent_if_already_suffixed(self):
+        futures_exchange = self._futures_exchange()
+        self.assertEqual(
+            self.engine._ccxt_symbol(futures_exchange, "BCH/USDT:USDT"), "BCH/USDT:USDT",
+        )
+
+    def test_ccxt_symbol_safe_against_mock_without_real_options_dict(self):
+        """
+        AsyncMock() без явного .options — сам .options становится AsyncMock,
+        а не dict (см. unittest.mock: атрибуты AsyncMock рекурсивно тоже
+        AsyncMock) — .get(...) на нём вернул бы корутину, а не значение.
+        _ccxt_symbol должен безопасно вернуть символ как есть, а не упасть
+        и не оставить незаявленную корутину.
+        """
+        bare_mock = AsyncMock()
+        self.assertEqual(self.engine._ccxt_symbol(bare_mock, "BCH/USDT"), "BCH/USDT")
+
+    def test_ccxt_symbol_safe_with_none_exchange(self):
+        self.assertEqual(self.engine._ccxt_symbol(None, "BCH/USDT"), "BCH/USDT")
+
+    async def test_execute_real_order_uses_suffixed_symbol_on_futures(self):
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        futures_exchange = self._futures_exchange()
+        futures_exchange.create_market_buy_order.return_value = {
+            "id": "ccxtfix-open-1", "filled": 10.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+        self.engine.exchange = futures_exchange
+
+        order = await self.engine.create_order(
+            symbol="CCXTFIX1/USDT", side="buy", amount=10.0, price=2.0, order_type="market",
+        )
+
+        self.assertIsNotNone(order)
+        futures_exchange.create_market_buy_order.assert_awaited_once_with("CCXTFIX1/USDT:USDT", 10.0)
+        futures_exchange.set_leverage.assert_awaited_once()
+        self.assertEqual(futures_exchange.set_leverage.await_args.args[1], "CCXTFIX1/USDT:USDT")
+
+    async def test_execute_real_order_symbol_unchanged_on_spot(self):
+        """Регресс: то же самое на споте символ НЕ должен получать суффикс."""
+        settings.market_type = "spot"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        spot_exchange = self._spot_exchange()
+        spot_exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"CCXTFIX2": 0.0}, "CCXTFIX2": {"free": 0.0, "used": 0, "total": 0.0},
+        })
+        spot_exchange.create_market_buy_order.return_value = {
+            "id": "ccxtfix-open-2", "filled": 10.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+        self.engine.exchange = spot_exchange
+
+        order = await self.engine.create_order(
+            symbol="CCXTFIX2/USDT", side="buy", amount=10.0, price=2.0, order_type="market",
+        )
+
+        self.assertIsNotNone(order)
+        spot_exchange.create_market_buy_order.assert_awaited_once_with("CCXTFIX2/USDT", 10.0)
+
+    async def test_close_real_position_uses_suffixed_symbol_on_futures(self):
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        futures_exchange = self._futures_exchange()
+        futures_exchange.create_market_sell_order.return_value = {
+            "id": "ccxtfix-close-1", "filled": 10.0, "average": 2.1, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+        self.engine._exchanges = {"futures": futures_exchange}
+        self.engine.real_positions["CCXTFIX3/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long",
+            "sl_order_id": None, "market_type": "futures",
+        }
+
+        result = await self.engine.close_real_position(
+            symbol="CCXTFIX3/USDT", side="long", entry_price=2.0, amount=10.0, reason="test",
+        )
+
+        self.assertIsNotNone(result)
+        futures_exchange.create_market_sell_order.assert_awaited_once_with(
+            "CCXTFIX3/USDT:USDT", 10.0, params={"reduceOnly": True},
+        )
+
+    async def test_place_stop_loss_order_uses_suffixed_symbol_on_futures(self):
+        futures_exchange = self._futures_exchange()
+        futures_exchange.create_market_sell_order.return_value = {"id": "ccxtfix-sl-1"}
+
+        order_id = await self.engine._place_stop_loss_order(
+            "CCXTFIX4/USDT", 10.0, 1.8, futures_exchange, side="long", is_futures=True,
+        )
+
+        self.assertEqual(order_id, "ccxtfix-sl-1")
+        futures_exchange.create_market_sell_order.assert_awaited_once_with(
+            "CCXTFIX4/USDT:USDT", 10.0, params={"stopLossPrice": 1.8, "reduceOnly": True},
+        )
+
+    async def test_reconcile_futures_position_fetches_suffixed_symbol(self):
+        from src.utils.timeutils import utcnow
+
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        futures_exchange = self._futures_exchange()
+        futures_exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0},
+        })
+        futures_exchange.fetch_position.return_value = {"contracts": 10.0, "leverage": 5.0}
+        self.engine.exchange = futures_exchange
+        self.engine.real_positions["CCXTFIX5/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long",
+            "opened_at": utcnow() - timedelta(hours=1), "sl_order_id": None, "order_id": None,
+            "market_type": "futures",
+        }
+
+        await self.engine.reconcile_real_positions()
+
+        futures_exchange.fetch_position.assert_awaited_once_with("CCXTFIX5/USDT:USDT")
+        self.assertEqual(self.engine.real_positions["CCXTFIX5/USDT"]["leverage"], 5.0)
+
+
 class TestSyncStopLossOrderOnFutures(unittest.IsolatedAsyncioTestCase):
     """
     ЭТАП 4 перехода на фьючерсы: биржевой SL теперь ставится и на

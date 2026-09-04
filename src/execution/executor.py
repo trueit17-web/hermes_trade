@@ -78,6 +78,56 @@ class ExecutionEngine:
             return self.exchange
         return self._exchanges.get(pos.get("market_type", "spot"))
 
+    @staticmethod
+    def _ccxt_symbol(exchange: ccxt.Exchange | None, symbol: str) -> str:
+        """
+        Unified-символ ДЛЯ ПРЯМЫХ ВЫЗОВОВ К CCXT (create_order/
+        fetch_position/cancel_order/fetch_ticker/...) — НЕ путать с нашим
+        собственным каноническим "BASE/QUOTE", которым everywhere else в
+        этом классе (real_positions, БД, main.py, дашборд) обозначается
+        символ — тот менять не нужно, только то, что летит В exchange.*().
+
+        Реальный инцидент (прод, месяцами): у ccxt спотовый и linear-swap
+        (то, что мы называем "futures"/USDT-perpetual) рынки одной и той
+        же пары — это ДВА РАЗНЫХ unified-символа: "BCH/USDT" (спот) и
+        "BCH/USDT:USDT" (linear swap, суффикс — расчётная валюта через
+        двоеточие; см. parse_market в ccxt/bybit.py — `symbol = symbol +
+        ':' + settle`). exchange.market(symbol) matches ПО БУКВАЛЬНОМУ
+        СОВПАДЕНИЮ СТРОКИ В self.markets — если "BCH/USDT" уже есть как
+        ключ (а он есть — это спотовый рынок), метод возвращает СПОТОВЫЙ
+        рынок ВСЕГДА, что бы ни было выставлено в options.defaultType/
+        defaultSubType. Раз весь код в этом файле годами обращался к
+        "futures"-клиенту голым "BASE/QUOTE" (без суффикса), КАЖДЫЙ вызов
+        (create_order, fetch_position, cancel_order, set_leverage,
+        fetch_open_orders...) на самом деле резолвился в СПОТОВЫЙ рынок —
+        отсюда и fetch_position(), падающий retCode 181001 "category only
+        support linear or option" (у спота нет позиций), и стабильный
+        170131 "Insufficient balance" на закрытии/SL (это не reduceOnly
+        закрытие фьючерсного контракта, а спотовая/маржинальная продажа с
+        другой семантикой баланса), и висящие на бирже "условные ордера" —
+        всё это были спотовые/маржинальные операции, а не настоящие
+        linear-perpetual фьючерсы.
+
+        options.defaultType уже корректно проставлен ПРИ ПОДКЛЮЧЕНИИ
+        клиента (см. _connect_exchange: "swap" для futures, "spot" для
+        spot) — читаем его отсюда же, а не заводим отдельный market_type
+        параметр в каждой сигнатуре: то же самое отличие клиента, просто
+        доступное напрямую через сам ccxt-объект.
+        """
+        if exchange is None or ":" in symbol or "/" not in symbol:
+            return symbol
+        options = exchange.options
+        # exchange.options — обычный dict у реального ccxt.Exchange; защитная
+        # проверка типа — не только на случай неожиданной биржи без options,
+        # но и на тестовые AsyncMock()-заглушки без спека, у которых
+        # exchange.options САМ становится AsyncMock (см. unittest.mock:
+        # атрибуты AsyncMock по умолчанию рекурсивно тоже AsyncMock) — без
+        # неё .get(...) вернул бы корутину вместо значения.
+        if not isinstance(options, dict) or options.get("defaultType") != "swap":
+            return symbol
+        quote = symbol.split("/")[-1]
+        return f"{symbol}:{quote}"
+
     def get_open_positions(self) -> dict:
         """Открытые позиции для текущего режима (paper или real)."""
         return dict(self.paper_positions if self.is_paper else self.real_positions)
@@ -96,13 +146,13 @@ class ExecutionEngine:
         """
         try:
             if self.is_paper:
-                ticker = await self.exchange.fetch_ticker(symbol)
+                ticker = await self.exchange.fetch_ticker(self._ccxt_symbol(self.exchange, symbol))
             else:
                 order_market_type = market_type or settings.market_type
                 exchange = await self._ensure_exchange_connected(order_market_type)
                 if exchange is None:
                     return None
-                ticker = await exchange.fetch_ticker(symbol)
+                ticker = await exchange.fetch_ticker(self._ccxt_symbol(exchange, symbol))
             return ticker["last"] or ticker["bid"] or ticker["ask"]
         except Exception as e:
             logger.warning(f"Не удалось получить рыночную цену {symbol}: {e}")
@@ -615,7 +665,9 @@ class ExecutionEngine:
                 continue
             order_filter = "StopOrder" if pos.get("market_type", "spot") == "futures" else "tpslOrder"
             try:
-                open_orders = await exchange.fetch_open_orders(symbol, params={"orderFilter": order_filter})
+                open_orders = await exchange.fetch_open_orders(
+                    self._ccxt_symbol(exchange, symbol), params={"orderFilter": order_filter}
+                )
                 for o in (open_orders or []):
                     await self._cancel_order_safe(symbol, o.get("id"), exchange)
             except Exception as e:
@@ -808,7 +860,7 @@ class ExecutionEngine:
         if order_type == "market" and execution_price is None:
             try:
                 if self.is_paper:
-                    ticker = await self.exchange.fetch_ticker(symbol)
+                    ticker = await self.exchange.fetch_ticker(self._ccxt_symbol(self.exchange, symbol))
                 else:
                     # Тикер снимаем с клиента ЦЕЛЕВОГО рынка ордера, а не
                     # текущего тумблера — иначе для канала с market_type,
@@ -817,7 +869,7 @@ class ExecutionEngine:
                     ticker_exchange = await self._ensure_exchange_connected(order_market_type)
                     if ticker_exchange is None:
                         raise RuntimeError(f"нет подключения к бирже для рынка '{order_market_type}'")
-                    ticker = await ticker_exchange.fetch_ticker(symbol)
+                    ticker = await ticker_exchange.fetch_ticker(self._ccxt_symbol(ticker_exchange, symbol))
                 execution_price = ticker["last"] or ticker["bid"] or ticker["ask"]
             except Exception as e:
                 logger.warning(f"Не удалось получить цену для {symbol}: {e}")
@@ -1148,7 +1200,7 @@ class ExecutionEngine:
             markets = ex.markets if ex else None
             if not isinstance(markets, dict):
                 return None
-            market = markets.get(symbol)
+            market = markets.get(self._ccxt_symbol(ex, symbol))
             if not isinstance(market, dict):
                 return None
             limits = market.get("limits")
@@ -1244,14 +1296,15 @@ class ExecutionEngine:
         self, order_id: str, symbol: str, exchange: ccxt.Exchange | None = None,
     ) -> dict | None:
         ex = exchange if exchange is not None else self.exchange
+        ccxt_symbol = self._ccxt_symbol(ex, symbol)
         try:
             trades = None
             try:
-                trades = await ex.fetch_order_trades(order_id, symbol)
+                trades = await ex.fetch_order_trades(order_id, ccxt_symbol)
             except Exception:
                 trades = None
             if not trades:
-                recent = await ex.fetch_my_trades(symbol, limit=10)
+                recent = await ex.fetch_my_trades(ccxt_symbol, limit=10)
                 trades = [t for t in (recent or []) if t.get("order") == order_id]
             if not trades:
                 return None
@@ -1415,10 +1468,11 @@ class ExecutionEngine:
                 # же стиль, что и там).
                 params["reduceOnly"] = True
             closing_side = "sell" if side == "long" else "buy"
+            ccxt_symbol = self._ccxt_symbol(ex, symbol)
             order = (
-                await ex.create_market_sell_order(symbol, amount, params=params)
+                await ex.create_market_sell_order(ccxt_symbol, amount, params=params)
                 if closing_side == "sell"
-                else await ex.create_market_buy_order(symbol, amount, params=params)
+                else await ex.create_market_buy_order(ccxt_symbol, amount, params=params)
             )
             order_id = order.get("id") if order else None
             if order_id:
@@ -1452,7 +1506,7 @@ class ExecutionEngine:
         if ex is None:
             return False
         try:
-            await ex.cancel_order(order_id, symbol)
+            await ex.cancel_order(order_id, self._ccxt_symbol(ex, symbol))
             return True
         except ccxt.OrderNotFound:
             return True
@@ -1611,7 +1665,7 @@ class ExecutionEngine:
             # действующим плечом.
             leverage_to_set = order_data.get("leverage") or settings.futures_leverage
             try:
-                await exchange.set_leverage(int(leverage_to_set), symbol)
+                await exchange.set_leverage(int(leverage_to_set), self._ccxt_symbol(exchange, symbol))
             except Exception as e:
                 logger.debug(f"Не удалось установить плечо {leverage_to_set}x для {symbol}: {e}")
 
@@ -1637,16 +1691,17 @@ class ExecutionEngine:
                 logger.debug(f"Не удалось снять баланс {symbol} до отправки ордера: {e}")
 
         try:
+            ccxt_symbol = self._ccxt_symbol(exchange, symbol)
             if order_data["type"] == "market":
                 if side == "buy":
-                    order = await exchange.create_market_buy_order(symbol, amount)
+                    order = await exchange.create_market_buy_order(ccxt_symbol, amount)
                 else:
-                    order = await exchange.create_market_sell_order(symbol, amount)
+                    order = await exchange.create_market_sell_order(ccxt_symbol, amount)
             elif order_data["type"] == "limit":
                 if side == "buy":
-                    order = await exchange.create_limit_buy_order(symbol, price, amount)
+                    order = await exchange.create_limit_buy_order(ccxt_symbol, price, amount)
                 else:
-                    order = await exchange.create_limit_sell_order(symbol, price, amount)
+                    order = await exchange.create_limit_sell_order(ccxt_symbol, price, amount)
             else:
                 logger.error(f"Неизвестный тип ордера: {order_data['type']}")
                 return None
@@ -1928,17 +1983,18 @@ class ExecutionEngine:
                 logger.debug(f"Не удалось сверить доступный баланс перед закрытием {symbol}: {e}")
 
         try:
+            ccxt_symbol = self._ccxt_symbol(exchange, symbol)
             if is_futures:
                 # reduceOnly — защита от переворота позиции вместо закрытия,
                 # если объём вдруг разошёлся с тем, что реально открыто на бирже.
                 params = {"reduceOnly": True}
                 order = (
-                    await exchange.create_market_sell_order(symbol, closing_amount, params=params)
+                    await exchange.create_market_sell_order(ccxt_symbol, closing_amount, params=params)
                     if closing_side == "sell"
-                    else await exchange.create_market_buy_order(symbol, closing_amount, params=params)
+                    else await exchange.create_market_buy_order(ccxt_symbol, closing_amount, params=params)
                 )
             else:
-                order = await exchange.create_market_sell_order(symbol, closing_amount)
+                order = await exchange.create_market_sell_order(ccxt_symbol, closing_amount)
         except Exception as e:
             # available логируется прямо здесь (а не только по debug выше) —
             # без этого "Insufficient balance" от биржи ни разу не говорил,
@@ -2496,7 +2552,7 @@ class ExecutionEngine:
         if exchange is None:
             return
         try:
-            position = await exchange.fetch_position(symbol)
+            position = await exchange.fetch_position(self._ccxt_symbol(exchange, symbol))
             actual_amount = float(position.get("contracts") or 0)
         except Exception as e:
             # Поднято с debug до warning намеренно, временно (диагностика):
@@ -2560,7 +2616,7 @@ class ExecutionEngine:
         if exchange is None:
             return False
         try:
-            order = await exchange.fetch_order(sl_order_id, symbol)
+            order = await exchange.fetch_order(sl_order_id, self._ccxt_symbol(exchange, symbol))
         except Exception as e:
             logger.debug(f"Не удалось проверить биржевой SL-ордер {sl_order_id} ({symbol}): {e}")
             return False
@@ -2629,7 +2685,7 @@ class ExecutionEngine:
         # должен просто означать "сверить не удалось", а не ронять весь
         # reconcile_real_positions.
         try:
-            recent = await exchange.fetch_my_trades(symbol, limit=20)
+            recent = await exchange.fetch_my_trades(self._ccxt_symbol(exchange, symbol), limit=20)
             if not recent:
                 return False
 
@@ -2890,7 +2946,8 @@ class ExecutionEngine:
                 item["usdt_value"] = item["total"]
                 return
             try:
-                ticker = await self.exchange.fetch_ticker(f"{item['currency']}/USDT")
+                pair = f"{item['currency']}/USDT"
+                ticker = await self.exchange.fetch_ticker(self._ccxt_symbol(self.exchange, pair))
                 price = ticker.get("last") or ticker.get("bid") or ticker.get("ask")
                 item["usdt_value"] = item["total"] * price if price else None
             except Exception:
@@ -3082,11 +3139,12 @@ class ExecutionEngine:
         if not order_id:
             return order
         ex = exchange if exchange is not None else self.exchange
+        ccxt_symbol = self._ccxt_symbol(ex, symbol)
         latest = order
         for _ in range(attempts):
             await asyncio.sleep(delay)
             try:
-                fetched = await ex.fetch_order(order_id, symbol)
+                fetched = await ex.fetch_order(order_id, ccxt_symbol)
             except Exception as e:
                 logger.debug(f"Не удалось уточнить исполнение ордера {order_id} ({symbol}): {e}")
                 break
