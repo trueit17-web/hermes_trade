@@ -2551,8 +2551,28 @@ class ExecutionEngine:
         exchange = self._exchange_for(pos)
         if exchange is None:
             return
+        # Расширенная диагностика (временно): _ccxt_symbol (см. коммит про
+        # суффикс :QUOTE для linear-swap) не решил проблему — 181001
+        # "category only support linear or option" продолжает падать даже
+        # на позиции, открытой УЖЕ ПОСЛЕ этого фикса. Логируем сам
+        # запрашиваемый ccxt_symbol и то, что exchange.market() реально о
+        # нём думает (type/linear/inverse/id) — ДО вызова fetch_position,
+        # чтобы это попало в лог даже если сам fetch_position упадёт:
+        # без этого невозможно отличить "market() резолвит не тот рынок"
+        # от "запрос вообще ушёл с другим набором параметров".
+        ccxt_symbol = self._ccxt_symbol(exchange, symbol)
         try:
-            position = await exchange.fetch_position(self._ccxt_symbol(exchange, symbol))
+            resolved = exchange.market(ccxt_symbol)
+            market_info = (
+                f"market={resolved.get('symbol')!r} type={resolved.get('type')!r} "
+                f"linear={resolved.get('linear')!r} inverse={resolved.get('inverse')!r} "
+                f"id={resolved.get('id')!r}"
+            )
+        except Exception as market_err:
+            market_info = f"exchange.market({ccxt_symbol!r}) упал: {type(market_err).__name__}: {market_err}"
+        options_info = exchange.options if isinstance(exchange.options, dict) else repr(exchange.options)
+        try:
+            position = await exchange.fetch_position(ccxt_symbol)
             actual_amount = float(position.get("contracts") or 0)
         except Exception as e:
             # Поднято с debug до warning намеренно, временно (диагностика):
@@ -2564,7 +2584,9 @@ class ExecutionEngine:
             # debug-уровне через /logs дашборда. type(e).__name__ — на
             # случай, если текст исключения сам по себе неинформативен.
             logger.warning(
-                f"⚠️ Не удалось сверить фьючерсную позицию {symbol}: {type(e).__name__}: {e}"
+                f"⚠️ Не удалось сверить фьючерсную позицию {symbol}: {type(e).__name__}: {e} | "
+                f"ccxt_symbol={ccxt_symbol!r} | {market_info} | "
+                f"exchange.options.defaultType={options_info.get('defaultType') if isinstance(options_info, dict) else options_info!r}"
             )
             return
         pos["leverage"] = position.get("leverage")
