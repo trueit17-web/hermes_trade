@@ -315,10 +315,20 @@ async def parse_telegram_signal(text: str, channel_config: dict | None = None) -
     if parsed:
         return parsed
 
-    # Попытка 3: LLM-фолбэк через Gemini — второй уровень, пробуется если
-    # Anthropic не настроен (нет ключа) или тоже не смог разобрать. Gemini
-    # выбран как бесплатный по тарифу вариант — та же логика и промпт, что
-    # и у Anthropic-фолбэка (см. gemini_parser.py).
+    # Попытка 3: LLM-фолбэк через Groq — второй уровень, пробуется если
+    # Anthropic не настроен (нет ключа) или тоже не смог разобрать. Groq
+    # хостит открытые модели на бесплатном тарифе, заметно быстрее и
+    # щедрее по rate-limit'ам, чем Gemini (см. groq_parser.py) — та же
+    # логика и промпт, что и у остальных фолбэков.
+    from src.telegram.groq_parser import parse_with_groq
+    parsed = await parse_with_groq(text, channel_config)
+    if parsed:
+        return parsed
+
+    # Попытка 4: LLM-фолбэк через Gemini — третий, последний уровень,
+    # пробуется если ни Anthropic, ни Groq не настроены/не смогли. Gemini
+    # выбран как ещё один бесплатный по тарифу вариант — та же логика и
+    # промпт, что и у остальных фолбэков (см. gemini_parser.py).
     from src.telegram.gemini_parser import parse_with_gemini
     parsed = await parse_with_gemini(text, channel_config)
     if parsed:

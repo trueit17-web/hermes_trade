@@ -181,11 +181,16 @@ class Settings(BaseSettings):
     telegram_signals_default_sl_pct: float = 3.0
     # LLM-фолбэк парсинга: когда регулярки не смогли распознать сообщение,
     # пробуем через Anthropic API (перенос из clonerbot: parser/llm_parser.py),
-    # а если он не настроен/не смог — через Gemini API (второй уровень,
-    # бесплатный по тарифу вариант, см. src/telegram/gemini_parser.py).
+    # а если он не настроен/не смог — через Groq (второй уровень, открытые
+    # модели на бесплатном тарифе, заметно быстрее и щедрее по rate-limit'ам,
+    # чем Gemini — см. src/telegram/groq_parser.py), а если и он не смог —
+    # через Gemini API (третий уровень, тоже бесплатный по тарифу вариант,
+    # см. src/telegram/gemini_parser.py).
     telegram_llm_fallback_enabled: bool = False
     anthropic_api_key: str | None = None
     anthropic_model: str = "claude-haiku-4-5-20251001"
+    groq_api_key: str | None = None
+    groq_model: str = "llama-3.3-70b-versatile"
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.6-flash"
 

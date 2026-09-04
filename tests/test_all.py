@@ -3142,9 +3142,9 @@ class TestLlmSignalParser(unittest.IsolatedAsyncioTestCase):
 
 class TestGeminiSignalParser(unittest.IsolatedAsyncioTestCase):
     """
-    Gemini LLM-фолбэк парсинга — второй уровень, после Anthropic (см.
-    src/telegram/gemini_parser.py и TestLlmSignalParser выше). Мокаем
-    google-genai клиент, чтобы не делать реальных сетевых запросов.
+    Gemini LLM-фолбэк парсинга — третий, последний уровень, после Anthropic
+    и Groq (см. src/telegram/gemini_parser.py и TestLlmSignalParser выше).
+    Мокаем google-genai клиент, чтобы не делать реальных сетевых запросов.
     """
 
     def setUp(self):
@@ -3327,12 +3327,15 @@ class TestGeminiSignalParser(unittest.IsolatedAsyncioTestCase):
     async def test_parse_telegram_signal_falls_back_to_gemini_when_anthropic_not_configured(self):
         """
         Anthropic не настроен (нет ключа) — цепочка должна дойти до
-        Gemini как второго, резервного уровня фолбэка.
+        Gemini. Groq тоже явно не настроен (None) — цепочка проходит его
+        (parse_with_groq молча возвращает None без ключа) и доходит до
+        Gemini как последнего, третьего уровня фолбэка.
         """
         import src.telegram.gemini_parser as gemini_parser_module
         from src.telegram.channel_monitor import parse_telegram_signal
         settings.telegram_llm_fallback_enabled = True
         settings.anthropic_api_key = None
+        settings.groq_api_key = None
         settings.gemini_api_key = "test-key"
 
         mock_client = MagicMock()
@@ -3348,6 +3351,246 @@ class TestGeminiSignalParser(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["pair"], "ETH/USDT")
         self.assertEqual(result["side"], "short")
         self.assertEqual(result["tp"], 3200.0)  # short -> минимальный TP
+
+
+class TestGroqSignalParser(unittest.IsolatedAsyncioTestCase):
+    """
+    Groq LLM-фолбэк парсинга — второй уровень, между Anthropic и Gemini
+    (см. src/telegram/groq_parser.py). Открытые модели на бесплатном
+    тарифе, добавлен как менее склонный к rate-limit'ам вариант, чем
+    Gemini. Мокаем groq-клиент (OpenAI-совместимый chat.completions с
+    forced tool-call), чтобы не делать реальных сетевых запросов.
+    """
+
+    def setUp(self):
+        self._saved = {
+            "telegram_llm_fallback_enabled": settings.telegram_llm_fallback_enabled,
+            "anthropic_api_key": settings.anthropic_api_key,
+            "groq_api_key": settings.groq_api_key,
+            "gemini_api_key": settings.gemini_api_key,
+        }
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            setattr(settings, key, value)
+        import src.telegram.groq_parser as groq_parser_module
+        groq_parser_module._client = None
+        import src.telegram.gemini_parser as gemini_parser_module
+        gemini_parser_module._client = None
+
+    def _mock_response(self, data: dict):
+        import json
+        tool_call = MagicMock()
+        tool_call.function.arguments = json.dumps(data)
+        message = MagicMock()
+        message.tool_calls = [tool_call]
+        choice = MagicMock()
+        choice.message = message
+        resp = MagicMock()
+        resp.choices = [choice]
+        return resp
+
+    async def test_disabled_returns_none_without_calling_api(self):
+        from src.telegram.groq_parser import parse_with_groq
+        settings.telegram_llm_fallback_enabled = False
+        settings.groq_api_key = "test-key"
+        result = await parse_with_groq("BTC to the moon, going long soon maybe")
+        self.assertIsNone(result)
+
+    async def test_no_api_key_returns_none_without_calling_api(self):
+        from src.telegram.groq_parser import parse_with_groq
+        settings.telegram_llm_fallback_enabled = True
+        settings.groq_api_key = None
+        result = await parse_with_groq("покупаем биток в районе 69к, стоп 68к")
+        self.assertIsNone(result)
+
+    async def test_parses_valid_signal(self):
+        import src.telegram.groq_parser as groq_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.groq_api_key = "test-key"
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=self._mock_response({
+            "is_signal": True, "base": "BTC", "quote": "USDT", "side": "long",
+            "entry": 69000.0, "take_profits": [70000.0, 72000.0], "stop_loss": 68000.0,
+            "confidence": 0.9,
+        }))
+        groq_parser_module._client = mock_client
+
+        result = await groq_parser_module.parse_with_groq("покупаем биток в районе 69к, стоп 68к")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "BTC/USDT")
+        self.assertEqual(result["side"], "long")
+        self.assertEqual(result["entry"], 69000.0)
+        self.assertEqual(result["sl"], 68000.0)
+        self.assertEqual(result["tp"], 72000.0)  # long -> максимальный TP
+        self.assertEqual(result["take_profits"], [70000.0, 72000.0])
+
+    async def test_take_profits_reversed_for_short_to_stay_nearest_first(self):
+        import src.telegram.groq_parser as groq_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.groq_api_key = "test-key"
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=self._mock_response({
+            "is_signal": True, "base": "ETH", "quote": "USDT", "side": "short",
+            "entry": 3500.0, "take_profits": [3200.0, 3300.0], "stop_loss": 3600.0,
+            "confidence": 0.9,
+        }))
+        groq_parser_module._client = mock_client
+
+        result = await groq_parser_module.parse_with_groq("шортим эфир")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["take_profits"], [3300.0, 3200.0])
+        self.assertEqual(result["tp"], 3200.0)
+
+    async def test_low_confidence_is_rejected(self):
+        import src.telegram.groq_parser as groq_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.groq_api_key = "test-key"
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=self._mock_response({
+            "is_signal": True, "base": "BTC", "side": "long", "entry": 69000.0,
+            "take_profits": [], "stop_loss": None, "confidence": 0.2,
+        }))
+        groq_parser_module._client = mock_client
+
+        result = await groq_parser_module.parse_with_groq("может быть покупать биток?")
+        self.assertIsNone(result)
+
+    async def test_not_a_signal_returns_none(self):
+        import src.telegram.groq_parser as groq_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.groq_api_key = "test-key"
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=self._mock_response({
+            "is_signal": False, "confidence": 0.95,
+        }))
+        groq_parser_module._client = mock_client
+
+        result = await groq_parser_module.parse_with_groq("сегодня биток вырос на 3%, отличный день")
+        self.assertIsNone(result)
+
+    async def test_api_error_returns_none_not_raises(self):
+        import src.telegram.groq_parser as groq_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.groq_api_key = "test-key"
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(side_effect=RuntimeError("network down"))
+        groq_parser_module._client = mock_client
+
+        result = await groq_parser_module.parse_with_groq("покупаем биток в районе 69к, стоп 68к")
+        self.assertIsNone(result)
+
+    async def test_missing_tool_call_returns_none_not_raises(self):
+        """Модель ответила текстом вместо forced tool-call — не должно падать."""
+        import src.telegram.groq_parser as groq_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.groq_api_key = "test-key"
+
+        message = MagicMock()
+        message.tool_calls = None
+        choice = MagicMock()
+        choice.message = message
+        bad_resp = MagicMock()
+        bad_resp.choices = [choice]
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=bad_resp)
+        groq_parser_module._client = mock_client
+
+        result = await groq_parser_module.parse_with_groq("покупаем биток в районе 69к, стоп 68к")
+        self.assertIsNone(result)
+
+    async def test_invalid_json_arguments_returns_none_not_raises(self):
+        import src.telegram.groq_parser as groq_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.groq_api_key = "test-key"
+
+        tool_call = MagicMock()
+        tool_call.function.arguments = "не json вообще"
+        message = MagicMock()
+        message.tool_calls = [tool_call]
+        choice = MagicMock()
+        choice.message = message
+        bad_resp = MagicMock()
+        bad_resp.choices = [choice]
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=bad_resp)
+        groq_parser_module._client = mock_client
+
+        result = await groq_parser_module.parse_with_groq("покупаем биток в районе 69к, стоп 68к")
+        self.assertIsNone(result)
+
+    async def test_parse_telegram_signal_falls_back_to_groq_when_anthropic_not_configured(self):
+        """
+        Anthropic не настроен (нет ключа), Groq настроен — цепочка должна
+        остановиться на Groq и НЕ доходить до Gemini.
+        """
+        import src.telegram.groq_parser as groq_parser_module
+        from src.telegram.channel_monitor import parse_telegram_signal
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = None
+        settings.groq_api_key = "test-key"
+        settings.gemini_api_key = "test-key"
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=self._mock_response({
+            "is_signal": True, "base": "ETH", "quote": "USDT", "side": "short",
+            "entry": 3500.0, "take_profits": [3300.0, 3200.0], "stop_loss": 3600.0,
+            "confidence": 0.8,
+        }))
+        groq_parser_module._client = mock_client
+
+        import src.telegram.gemini_parser as gemini_parser_module
+        gemini_mock = MagicMock()
+        gemini_mock.aio.models.generate_content = AsyncMock(
+            side_effect=AssertionError("Gemini не должен вызываться, если Groq уже распознал сигнал")
+        )
+        gemini_parser_module._client = gemini_mock
+
+        result = await parse_telegram_signal("шортим эфир около 3500, стоп 3600, цели 3300 и 3200")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "ETH/USDT")
+        self.assertEqual(result["side"], "short")
+        self.assertEqual(result["tp"], 3200.0)  # short -> минимальный TP
+        gemini_mock.aio.models.generate_content.assert_not_called()
+
+    async def test_parse_telegram_signal_falls_back_to_gemini_when_groq_also_fails(self):
+        """Groq настроен, но не смог разобрать (низкая уверенность) — цепочка идёт дальше к Gemini."""
+        import json
+
+        import src.telegram.groq_parser as groq_parser_module
+        import src.telegram.gemini_parser as gemini_parser_module
+        from src.telegram.channel_monitor import parse_telegram_signal
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = None
+        settings.groq_api_key = "test-key"
+        settings.gemini_api_key = "test-key"
+
+        groq_mock = MagicMock()
+        groq_mock.chat.completions.create = AsyncMock(return_value=self._mock_response({
+            "is_signal": False, "confidence": 0.9,
+        }))
+        groq_parser_module._client = groq_mock
+
+        gemini_resp = MagicMock()
+        gemini_resp.text = json.dumps({
+            "is_signal": True, "base": "ETH", "quote": "USDT", "side": "short",
+            "entry": 3500.0, "take_profits": [3300.0, 3200.0], "stop_loss": 3600.0,
+            "confidence": 0.8,
+        })
+        gemini_mock = MagicMock()
+        gemini_mock.aio.models.generate_content = AsyncMock(return_value=gemini_resp)
+        gemini_parser_module._client = gemini_mock
+
+        result = await parse_telegram_signal("шортим эфир около 3500, стоп 3600, цели 3300 и 3200")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "ETH/USDT")
 
 
 class TestQualificationScorer(unittest.TestCase):
