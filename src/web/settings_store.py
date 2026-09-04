@@ -147,7 +147,7 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "groq_api_key", "label": "Groq API key", "group": "LLM-фолбэк парсинга", "type": "secret", "depends_on": "telegram_llm_fallback_enabled",
      "description": "Ключ Groq API — второй вариант LLM-фолбэка (пробуется, если Anthropic не настроен или не смог разобрать сообщение). Открытые модели (Llama и т.п.) на бесплатном тарифе, заметно быстрее и щедрее по rate-limit'ам, чем Gemini."},
     {"key": "groq_model", "label": "Groq модель", "group": "LLM-фолбэк парсинга", "type": "str", "depends_on": "telegram_llm_fallback_enabled",
-     "description": "Идентификатор модели на Groq, используемой для разбора сигналов (например llama-3.3-70b-versatile)."},
+     "description": "Идентификатор модели на Groq, используемой для разбора сигналов (например llama-3.1-8b-instant)."},
     {"key": "gemini_api_key", "label": "Gemini API key", "group": "LLM-фолбэк парсинга", "type": "secret", "depends_on": "telegram_llm_fallback_enabled",
      "description": "Ключ Google Gemini API — третий, последний резервный вариант LLM-фолбэка (пробуется, если ни Anthropic, ни Groq не настроены или не смогли разобрать сообщение). Бесплатный тариф Gemini обычно достаточен для этой задачи."},
     {"key": "gemini_model", "label": "Gemini модель", "group": "LLM-фолбэк парсинга", "type": "str", "depends_on": "telegram_llm_fallback_enabled",

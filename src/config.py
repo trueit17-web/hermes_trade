@@ -190,7 +190,13 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = None
     anthropic_model: str = "claude-haiku-4-5-20251001"
     groq_api_key: str | None = None
-    groq_model: str = "llama-3.3-70b-versatile"
+    # llama-3.3-70b-versatile (первый выбор дефолта) на практике вернул
+    # 404 "model_not_found" — реальный инцидент (прод): доступность модели
+    # на бесплатном тарифе Groq у конкретного аккаунта не совпадает со
+    # списком типов groq-python. llama-3.1-8b-instant — самая массовая,
+    # флагманская модель бесплатного тарифа Groq, наименее вероятная
+    # кандидатка на такие ограничения доступа.
+    groq_model: str = "llama-3.1-8b-instant"
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.6-flash"
 
