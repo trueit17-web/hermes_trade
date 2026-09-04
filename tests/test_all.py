@@ -1142,6 +1142,36 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result)
         self.engine.exchange.cancel_order.assert_called_once_with("sl-order-to-cancel-1", "SLCANCEL1/USDT")
 
+    async def test_close_real_position_skips_sell_when_sl_cancel_unconfirmed(self):
+        """
+        Реальный инцидент (прод, CHIP/USDT): если отмена старого SL-ордера
+        падает с неоднозначной ошибкой (не "ордера уже нет", а что-то
+        другое — тот же 170131 Insufficient balance), собственная продажа
+        всё равно неизбежно конфликтует за тот же объём с ещё живым
+        SL-ордером и падает той же ошибкой — КАЖДЫЙ раз, без исключения.
+        close_real_position должен пропустить попытку продажи в этом
+        цикле, а не штамповать заведомо провальный ордер.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.cancel_order.side_effect = Exception("bybit 170131 Insufficient balance")
+        self.engine.real_positions["SLCANCELFAIL1/USDT"] = {
+            "amount": 100.0, "entry_price": 2.0, "side": "long",
+            "sl_order_id": "sl-order-still-live-1",
+        }
+
+        result = await self.engine.close_real_position(
+            symbol="SLCANCELFAIL1/USDT", side="long", entry_price=2.0, amount=100.0,
+            reason="take_profit_3", entry_fee=0.02, holding_seconds=60,
+        )
+
+        self.assertIsNone(result)
+        self.engine.exchange.cancel_order.assert_called_once_with("sl-order-still-live-1", "SLCANCELFAIL1/USDT")
+        self.engine.exchange.create_market_sell_order.assert_not_called()
+        self.assertIn("SLCANCELFAIL1/USDT", self.engine.real_positions)
+
     async def test_reconcile_real_positions_finalizes_externally_triggered_stop_loss(self):
         """
         Если позиция пропала с баланса биржи (available ~0) и на неё был
