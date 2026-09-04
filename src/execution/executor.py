@@ -2499,7 +2499,17 @@ class ExecutionEngine:
             position = await exchange.fetch_position(symbol)
             actual_amount = float(position.get("contracts") or 0)
         except Exception as e:
-            logger.debug(f"Не удалось сверить фьючерсную позицию {symbol}: {e}")
+            # Поднято с debug до warning намеренно, временно (диагностика):
+            # реальный инцидент (прод) — эта ветка стабильно проваливается
+            # часами подряд на нескольких символах, из-за чего leverage/
+            # margin_usdt никогда не подтягиваются и реконсиляция ни разу
+            # не может поймать реально исчезнувшую/осиротевшую позицию
+            # (BCH/USDT, HYPE/USDT) — но САМА причина невидима на
+            # debug-уровне через /logs дашборда. type(e).__name__ — на
+            # случай, если текст исключения сам по себе неинформативен.
+            logger.warning(
+                f"⚠️ Не удалось сверить фьючерсную позицию {symbol}: {type(e).__name__}: {e}"
+            )
             return
         pos["leverage"] = position.get("leverage")
         pos["margin_usdt"] = position.get("initialMargin")
