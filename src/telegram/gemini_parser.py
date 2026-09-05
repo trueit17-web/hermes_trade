@@ -71,17 +71,33 @@ def _get_client():
     return _client
 
 
-async def parse_with_gemini(text: str, channel_config: dict | None = None) -> dict | None:
+async def parse_with_gemini(
+    text: str, channel_config: dict | None = None, image_bytes: bytes | None = None,
+) -> dict | None:
     """Распарсить сигнал через Gemini. Возвращает тот же формат, что и
-    parse_with_regex/parse_with_llm (pair/side/entry/sl/tp/raw), или None."""
+    parse_with_regex/parse_with_llm (pair/side/entry/sl/tp/raw), или None.
+
+    image_bytes — скриншот сигнала (см. docstring parse_with_llm/
+    parse_telegram_signal) — Gemini мультимодален "из коробки", контент
+    просто становится списком частей (картинка + опциональный текст-
+    подпись) вместо голой строки."""
     if not settings.telegram_llm_fallback_enabled or not settings.gemini_api_key:
         return None
+
+    if image_bytes:
+        from google.genai import types
+
+        contents: list = [types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")]
+        if text:
+            contents.append(text[:4000])
+    else:
+        contents = text[:4000]
 
     try:
         client = _get_client()
         resp = await client.aio.models.generate_content(
             model=settings.gemini_model,
-            contents=text[:4000],
+            contents=contents,
             config={
                 "system_instruction": _SYSTEM,
                 "response_mime_type": "application/json",

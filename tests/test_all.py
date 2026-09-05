@@ -3139,6 +3139,60 @@ class TestLlmSignalParser(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["side"], "short")
         self.assertEqual(result["tp"], 3200.0)  # short -> минимальный TP
 
+    async def test_image_signal_builds_multimodal_content_block(self):
+        """
+        Регресс на реальную дыру: сигналы-скриншоты (график с размеченными
+        entry/SL/TP) без подписи раньше были невидимы боту целиком (пустой
+        text -> сигнал отбрасывается ДО любого парсера). image_bytes должен
+        стать content-блоком image ПЕРЕД текстовым, а не потеряться.
+        """
+        import src.telegram.llm_parser as llm_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = "test-key"
+
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=self._mock_tool_use_response({
+            "is_signal": True, "base": "BTC", "quote": "USDT", "side": "long",
+            "entry": 69000.0, "take_profits": [72000.0], "stop_loss": 68000.0,
+            "confidence": 0.9,
+        }))
+        llm_parser_module._client = mock_client
+
+        result = await llm_parser_module.parse_with_llm(
+            "", image_bytes=b"\xff\xd8\xff\xe0fake-jpeg-bytes",
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "BTC/USDT")
+
+        call_kwargs = mock_client.messages.create.await_args.kwargs
+        content = call_kwargs["messages"][0]["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual(content[0]["type"], "image")
+        self.assertEqual(content[0]["source"]["media_type"], "image/jpeg")
+        # Пустая подпись (text="") -> текстовый блок не добавляется вовсе.
+        self.assertEqual(len(content), 1)
+
+    async def test_image_signal_with_caption_appends_text_block(self):
+        import src.telegram.llm_parser as llm_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = "test-key"
+
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=self._mock_tool_use_response({
+            "is_signal": True, "base": "BTC", "quote": "USDT", "side": "long",
+            "entry": 69000.0, "take_profits": [72000.0], "stop_loss": 68000.0,
+            "confidence": 0.9,
+        }))
+        llm_parser_module._client = mock_client
+
+        await llm_parser_module.parse_with_llm(
+            "плечо x10", image_bytes=b"\xff\xd8\xff\xe0fake-jpeg-bytes",
+        )
+
+        content = mock_client.messages.create.await_args.kwargs["messages"][0]["content"]
+        self.assertEqual(len(content), 2)
+        self.assertEqual(content[1], {"type": "text", "text": "плечо x10"})
+
 
 class TestGeminiSignalParser(unittest.IsolatedAsyncioTestCase):
     """
@@ -3324,6 +3378,58 @@ class TestGeminiSignalParser(unittest.IsolatedAsyncioTestCase):
         _, kwargs = mock_client.aio.models.generate_content.call_args
         self.assertGreaterEqual(kwargs["config"]["max_output_tokens"], 2048)
 
+    async def test_image_signal_builds_multimodal_contents_list(self):
+        """См. аналогичный тест в TestLlmSignalParser — тот же регресс
+        (сигнал-скриншот без подписи раньше был невидим целиком), только
+        для Gemini: contents становится списком [image_part, text?]
+        вместо голой строки."""
+        import src.telegram.gemini_parser as gemini_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.gemini_api_key = "test-key"
+
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(return_value=self._mock_response({
+            "is_signal": True, "base": "BTC", "quote": "USDT", "side": "long",
+            "entry": 69000.0, "take_profits": [72000.0], "stop_loss": 68000.0,
+            "confidence": 0.9,
+        }))
+        gemini_parser_module._client = mock_client
+
+        result = await gemini_parser_module.parse_with_gemini(
+            "", image_bytes=b"\xff\xd8\xff\xe0fake-jpeg-bytes",
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "BTC/USDT")
+
+        _, kwargs = mock_client.aio.models.generate_content.call_args
+        contents = kwargs["contents"]
+        self.assertIsInstance(contents, list)
+        self.assertEqual(contents[0].inline_data.mime_type, "image/jpeg")
+        # Пустая подпись (text="") -> текстовая часть не добавляется вовсе.
+        self.assertEqual(len(contents), 1)
+
+    async def test_image_signal_with_caption_appends_text_part(self):
+        import src.telegram.gemini_parser as gemini_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.gemini_api_key = "test-key"
+
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content = AsyncMock(return_value=self._mock_response({
+            "is_signal": True, "base": "BTC", "quote": "USDT", "side": "long",
+            "entry": 69000.0, "take_profits": [72000.0], "stop_loss": 68000.0,
+            "confidence": 0.9,
+        }))
+        gemini_parser_module._client = mock_client
+
+        await gemini_parser_module.parse_with_gemini(
+            "плечо x10", image_bytes=b"\xff\xd8\xff\xe0fake-jpeg-bytes",
+        )
+
+        _, kwargs = mock_client.aio.models.generate_content.call_args
+        contents = kwargs["contents"]
+        self.assertEqual(len(contents), 2)
+        self.assertEqual(contents[1], "плечо x10")
+
     async def test_parse_telegram_signal_falls_back_to_gemini_when_anthropic_not_configured(self):
         """
         Anthropic не настроен (нет ключа) — цепочка должна дойти до
@@ -3351,6 +3457,142 @@ class TestGeminiSignalParser(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["pair"], "ETH/USDT")
         self.assertEqual(result["side"], "short")
         self.assertEqual(result["tp"], 3200.0)  # short -> минимальный TP
+
+
+class TestParseTelegramSignalImageRouting(unittest.IsolatedAsyncioTestCase):
+    """
+    Регресс на реальную дыру: канал прислал сигнал скриншотом (график с
+    размеченными entry/SL/TP) без подписи — раньше raw_text был пустой
+    строкой, и parse_telegram_signal отбрасывал сигнал ДО любого парсера
+    (regex и все LLM-фолбэки работали только с текстом). Теперь при
+    image_bytes пробуются ТОЛЬКО vision-способные фолбэки (Anthropic,
+    затем Gemini) — Groq/Cerebras (текстовые модели) намеренно
+    пропускаются целиком.
+    """
+
+    def setUp(self):
+        self._saved = {
+            "telegram_llm_fallback_enabled": settings.telegram_llm_fallback_enabled,
+            "anthropic_api_key": settings.anthropic_api_key,
+            "gemini_api_key": settings.gemini_api_key,
+            "groq_api_key": settings.groq_api_key,
+            "cerebras_api_key": settings.cerebras_api_key,
+        }
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            setattr(settings, key, value)
+        import src.telegram.llm_parser as llm_parser_module
+        llm_parser_module._client = None
+        import src.telegram.gemini_parser as gemini_parser_module
+        gemini_parser_module._client = None
+        import src.telegram.groq_parser as groq_parser_module
+        groq_parser_module._client = None
+        import src.telegram.cerebras_parser as cerebras_parser_module
+        cerebras_parser_module._client = None
+
+    def _anthropic_response(self, data: dict):
+        block = MagicMock()
+        block.type = "tool_use"
+        block.name = "emit_signal"
+        block.input = data
+        resp = MagicMock()
+        resp.content = [block]
+        return resp
+
+    def _gemini_response(self, data: dict):
+        import json
+        resp = MagicMock()
+        resp.text = json.dumps(data)
+        return resp
+
+    async def test_caption_less_photo_is_not_dropped_before_reaching_llm(self):
+        """Пустой text (message.text or "" для фото без подписи) больше НЕ
+        отбрасывается на входе, если есть image_bytes."""
+        import src.telegram.llm_parser as llm_parser_module
+        from src.telegram.channel_monitor import parse_telegram_signal
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = "test-key"
+
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=self._anthropic_response({
+            "is_signal": True, "base": "BTC", "quote": "USDT", "side": "long",
+            "entry": 69000.0, "take_profits": [72000.0], "stop_loss": 68000.0,
+            "confidence": 0.9,
+        }))
+        llm_parser_module._client = mock_client
+
+        result = await parse_telegram_signal("", image_bytes=b"\xff\xd8\xff\xe0fake-jpeg-bytes")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "BTC/USDT")
+
+    async def test_no_text_no_image_returns_none(self):
+        from src.telegram.channel_monitor import parse_telegram_signal
+        result = await parse_telegram_signal("", image_bytes=None)
+        self.assertIsNone(result)
+
+    async def test_image_signal_skips_groq_and_cerebras_entirely(self):
+        """Groq/Cerebras — текстовые модели без vision, для картинки их
+        вызывать бессмысленно (заведомо не увидят сигнал) — цепочка с
+        картинкой должна идти сразу Anthropic -> Gemini, минуя их."""
+        import src.telegram.llm_parser as llm_parser_module
+        import src.telegram.groq_parser as groq_parser_module
+        import src.telegram.cerebras_parser as cerebras_parser_module
+        from src.telegram.channel_monitor import parse_telegram_signal
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = None  # Anthropic не настроен -> идём к Gemini
+        settings.groq_api_key = "test-key"
+        settings.cerebras_api_key = "test-key"
+        settings.gemini_api_key = "test-key"
+
+        groq_mock = MagicMock()
+        groq_mock.chat.completions.create = AsyncMock(
+            side_effect=AssertionError("Groq не умеет vision, не должен вызываться для картинки")
+        )
+        groq_parser_module._client = groq_mock
+        cerebras_mock = MagicMock()
+        cerebras_mock.chat.completions.create = AsyncMock(
+            side_effect=AssertionError("Cerebras (текстовая модель) не должен вызываться для картинки")
+        )
+        cerebras_parser_module._client = cerebras_mock
+
+        import src.telegram.gemini_parser as gemini_parser_module
+        gemini_mock = MagicMock()
+        gemini_mock.aio.models.generate_content = AsyncMock(return_value=self._gemini_response({
+            "is_signal": True, "base": "BTC", "quote": "USDT", "side": "long",
+            "entry": 69000.0, "take_profits": [72000.0], "stop_loss": 68000.0,
+            "confidence": 0.9,
+        }))
+        gemini_parser_module._client = gemini_mock
+
+        result = await parse_telegram_signal("", image_bytes=b"\xff\xd8\xff\xe0fake-jpeg-bytes")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "BTC/USDT")
+        groq_mock.chat.completions.create.assert_not_called()
+        cerebras_mock.chat.completions.create.assert_not_called()
+
+    async def test_both_vision_fallbacks_fail_returns_none(self):
+        import src.telegram.llm_parser as llm_parser_module
+        import src.telegram.gemini_parser as gemini_parser_module
+        from src.telegram.channel_monitor import parse_telegram_signal
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = "test-key"
+        settings.gemini_api_key = "test-key"
+
+        anthropic_mock = AsyncMock()
+        anthropic_mock.messages.create = AsyncMock(return_value=self._anthropic_response({
+            "is_signal": False, "confidence": 0.9,
+        }))
+        llm_parser_module._client = anthropic_mock
+
+        gemini_mock = MagicMock()
+        gemini_mock.aio.models.generate_content = AsyncMock(return_value=self._gemini_response({
+            "is_signal": False, "confidence": 0.9,
+        }))
+        gemini_parser_module._client = gemini_mock
+
+        result = await parse_telegram_signal("", image_bytes=b"\xff\xd8\xff\xe0fake-jpeg-bytes")
+        self.assertIsNone(result)
 
 
 class TestGroqSignalParser(unittest.IsolatedAsyncioTestCase):

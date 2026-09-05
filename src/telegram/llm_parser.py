@@ -11,6 +11,7 @@ LLM возвращает строгий JSON через forced tool-call (ник
 """
 from __future__ import annotations
 
+import base64
 import json
 
 from src.config import settings
@@ -77,11 +78,36 @@ def _get_client():
     return _client
 
 
-async def parse_with_llm(text: str, channel_config: dict | None = None) -> dict | None:
+async def parse_with_llm(
+    text: str, channel_config: dict | None = None, image_bytes: bytes | None = None,
+) -> dict | None:
     """Распарсить сигнал через LLM. Возвращает тот же формат, что и
-    parse_with_regex (pair/side/entry/sl/tp/raw), или None."""
+    parse_with_regex (pair/side/entry/sl/tp/raw), или None.
+
+    image_bytes — скриншот сигнала (график с размеченными entry/SL/TP,
+    карточка сигнала и т.п.), когда канал прислал картинку вместо/вместе с
+    текстом (см. parse_telegram_signal в channel_monitor.py) — Claude умеет
+    смотреть на изображения "из коробки", тот же tool-use контракт, что и
+    для чистого текста, просто с картинкой первым content-блоком."""
     if not settings.telegram_llm_fallback_enabled or not settings.anthropic_api_key:
         return None
+
+    if image_bytes:
+        content: list = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": base64.b64encode(image_bytes).decode("ascii"),
+                },
+            },
+        ]
+        if text:
+            content.append({"type": "text", "text": text[:4000]})
+        user_message = content
+    else:
+        user_message = text[:4000]
 
     try:
         client = _get_client()
@@ -91,7 +117,7 @@ async def parse_with_llm(text: str, channel_config: dict | None = None) -> dict 
             system=_SYSTEM,
             tools=[_TOOL],
             tool_choice={"type": "tool", "name": "emit_signal"},
-            messages=[{"role": "user", "content": text[:4000]}],
+            messages=[{"role": "user", "content": user_message}],
         )
     except Exception as e:
         logger.warning(f"LLM-парсер сигнала: ошибка запроса — {e}")

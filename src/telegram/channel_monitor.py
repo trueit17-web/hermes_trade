@@ -103,9 +103,28 @@ async def _handler(event: events.NewMessage.Event):
         return
 
     raw_text = message.text or ""
-    logger.debug(f"[TG] Получено сообщение из {channel['channel_id']}: {raw_text[:100]}...")
 
-    parsed = await parse_telegram_signal(raw_text, channel)
+    # Некоторые каналы шлют сигнал скриншотом (график с размеченными
+    # entry/SL/TP, карточка сигнала) без подписи или с минимальной
+    # подписью — без скачивания самой картинки raw_text был бы пустой
+    # строкой, и сигнал молча терялся бы целиком (parse_telegram_signal
+    # отбрасывает пустой text). Скачиваем, только если LLM-фолбэк вообще
+    # включён — иначе тратить трафик/API Telethon не на что: без него
+    # картинку всё равно некому разобрать (регулярки текст с картинки не
+    # читают).
+    image_bytes = None
+    if message.photo and settings.telegram_llm_fallback_enabled:
+        try:
+            image_bytes = await message.download_media(bytes)
+        except Exception as e:
+            logger.warning(f"[TG] Не удалось скачать изображение сигнала из {channel['channel_id']}: {e}")
+
+    logger.debug(
+        f"[TG] Получено сообщение из {channel['channel_id']}: {raw_text[:100]}..."
+        + (" [+изображение]" if image_bytes else "")
+    )
+
+    parsed = await parse_telegram_signal(raw_text, channel, image_bytes=image_bytes)
 
     if parsed:
         signal_event = {
@@ -292,13 +311,37 @@ def normalize_pair(pair: str) -> str:
     return f"{pair}/USDT"
 
 
-async def parse_telegram_signal(text: str, channel_config: dict | None = None) -> dict | None:
+async def parse_telegram_signal(
+    text: str, channel_config: dict | None = None, image_bytes: bytes | None = None,
+) -> dict | None:
     """
-    Попытаться распарсить торговый сигнал из текста сообщения.
+    Попытаться распарсить торговый сигнал из текста сообщения (и/или
+    приложенного изображения — скриншот графика с размеченными entry/SL/TP,
+    карточка сигнала и т.п.).
     Возвращает dict с полями: pair, side, entry, sl, tp, rationale, raw.
     Или None если сигнал не распознан.
     """
-    if not text:
+    if not text and not image_bytes:
+        return None
+
+    if image_bytes:
+        # Сигнал прислан картинкой — регулярки и Groq/Cerebras текст с неё
+        # не читают (их модели без vision), пробуем ТОЛЬКО провайдеров,
+        # умеющих смотреть на изображение (Anthropic, затем Gemini) — text
+        # передаётся как дополнительный контекст (подпись к фото), если она
+        # вообще была. Групповой уровень с Groq/Cerebras здесь намеренно
+        # пропускается целиком, а не "молча ничего не находит" — они
+        # получили бы только текст (обычно пустой у сигналов-скриншотов)
+        # и заведомо не смогли бы распознать сигнал, отправленный именно
+        # ради экономии на этом запросе впустую.
+        from src.telegram.llm_parser import parse_with_llm
+        parsed = await parse_with_llm(text, channel_config, image_bytes=image_bytes)
+        if parsed:
+            return parsed
+        from src.telegram.gemini_parser import parse_with_gemini
+        parsed = await parse_with_gemini(text, channel_config, image_bytes=image_bytes)
+        if parsed:
+            return parsed
         return None
 
     # Попытка 1: регулярки для стандартных форматов
