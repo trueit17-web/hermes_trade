@@ -8549,6 +8549,129 @@ class TestSyncStopLossOrderDoesNotOrphanUnconfirmedCancel(unittest.IsolatedAsync
         self.assertEqual(self.engine.real_positions["ORPHANSL3/USDT"]["sl_order_id"], "new-sl-order-3")
 
 
+class TestSyncStopLossOrderAmend(unittest.IsolatedAsyncioTestCase):
+    """
+    Фаза B (Bybit MCP): sync_stop_loss_order сначала пробует переставить
+    СУЩЕСТВУЮЩИЙ SL-ордер на месте через ccxt unified edit_order (Bybit
+    POST /v5/order/amend) — убирает короткое окно без биржевой защиты
+    между cancel и create. Требует exchange.has["editOrder"] (тот же
+    паттерн защиты от «голых» AsyncMock(), что и watchOrders в Фазе A) —
+    при отсутствии этого флага или при любой ошибке амендинга падает на
+    проверенный cancel+recreate путь без изменений.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+        settings.market_type = "futures"
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+
+    def _amend_capable_exchange(self) -> AsyncMock:
+        exchange = AsyncMock()
+        exchange.has = {"editOrder": True}
+        return exchange
+
+    async def test_amends_existing_sl_order_in_place_on_futures(self):
+        self.engine.exchange = self._amend_capable_exchange()
+        self.engine.exchange.edit_order.return_value = {"id": "amend-sl-1"}
+        self.engine.real_positions["AMENDSL1/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long",
+            "sl_order_id": "old-amend-sl-1", "market_type": "futures",
+        }
+
+        await self.engine.sync_stop_loss_order("AMENDSL1/USDT", 8.0, 1.85)
+
+        self.engine.exchange.edit_order.assert_awaited_once_with(
+            "old-amend-sl-1", "AMENDSL1/USDT", "market", "sell", 8.0,
+            params={"stopLossPrice": 1.85, "reduceOnly": True},
+        )
+        self.engine.exchange.cancel_order.assert_not_called()
+        self.engine.exchange.create_market_sell_order.assert_not_called()
+        self.engine.exchange.create_market_buy_order.assert_not_called()
+        self.assertEqual(self.engine.real_positions["AMENDSL1/USDT"]["sl_order_id"], "amend-sl-1")
+
+    async def test_amend_uses_buy_side_for_short_position(self):
+        self.engine.exchange = self._amend_capable_exchange()
+        self.engine.exchange.edit_order.return_value = {"id": "amend-sl-2"}
+        self.engine.real_positions["AMENDSL2/USDT"] = {
+            "amount": 8.0, "entry_price": 2.0, "side": "short",
+            "sl_order_id": "old-amend-sl-2", "market_type": "futures",
+        }
+
+        await self.engine.sync_stop_loss_order("AMENDSL2/USDT", 8.0, 2.15)
+
+        self.engine.exchange.edit_order.assert_awaited_once_with(
+            "old-amend-sl-2", "AMENDSL2/USDT", "market", "buy", 8.0,
+            params={"stopLossPrice": 2.15, "reduceOnly": True},
+        )
+        self.engine.exchange.cancel_order.assert_not_called()
+
+    async def test_amend_falls_back_to_original_order_id_when_response_has_no_id(self):
+        self.engine.exchange = self._amend_capable_exchange()
+        self.engine.exchange.edit_order.return_value = {}
+        self.engine.real_positions["AMENDSL3/USDT"] = {
+            "amount": 8.0, "entry_price": 2.0, "side": "long",
+            "sl_order_id": "old-amend-sl-3", "market_type": "futures",
+        }
+
+        await self.engine.sync_stop_loss_order("AMENDSL3/USDT", 8.0, 1.85)
+
+        self.assertEqual(self.engine.real_positions["AMENDSL3/USDT"]["sl_order_id"], "old-amend-sl-3")
+        self.engine.exchange.cancel_order.assert_not_called()
+
+    async def test_falls_back_to_cancel_recreate_when_amend_raises(self):
+        self.engine.exchange = self._amend_capable_exchange()
+        self.engine.exchange.edit_order.side_effect = Exception("bybit amend rejected")
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "recreated-sl-1"}
+        self.engine.real_positions["AMENDFAIL1/USDT"] = {
+            "amount": 8.0, "entry_price": 2.0, "side": "long",
+            "sl_order_id": "old-amendfail-1", "market_type": "futures",
+        }
+
+        await self.engine.sync_stop_loss_order("AMENDFAIL1/USDT", 8.0, 1.85)
+
+        self.engine.exchange.edit_order.assert_awaited_once()
+        self.engine.exchange.cancel_order.assert_awaited_once_with("old-amendfail-1", "AMENDFAIL1/USDT")
+        self.engine.exchange.create_market_sell_order.assert_awaited_once()
+        self.assertEqual(self.engine.real_positions["AMENDFAIL1/USDT"]["sl_order_id"], "recreated-sl-1")
+
+    async def test_does_not_attempt_amend_when_exchange_lacks_capability(self):
+        """Без exchange.has["editOrder"] (в т.ч. «голый» AsyncMock() в остальных тестах) — сразу cancel+recreate."""
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "no-amend-recreated-1"}
+        self.engine.real_positions["NOAMEND1/USDT"] = {
+            "amount": 8.0, "entry_price": 2.0, "side": "long",
+            "sl_order_id": "old-noamend-1", "market_type": "futures",
+        }
+
+        await self.engine.sync_stop_loss_order("NOAMEND1/USDT", 8.0, 1.85)
+
+        self.engine.exchange.edit_order.assert_not_called()
+        self.engine.exchange.cancel_order.assert_awaited_once_with("old-noamend-1", "NOAMEND1/USDT")
+        self.engine.exchange.create_market_sell_order.assert_awaited_once()
+        self.assertEqual(self.engine.real_positions["NOAMEND1/USDT"]["sl_order_id"], "no-amend-recreated-1")
+
+    async def test_does_not_attempt_amend_when_no_old_sl_order_id(self):
+        self.engine.exchange = self._amend_capable_exchange()
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "fresh-sl-1"}
+        self.engine.real_positions["NOAMEND2/USDT"] = {
+            "amount": 8.0, "entry_price": 2.0, "side": "long",
+            "sl_order_id": None, "market_type": "futures",
+        }
+
+        await self.engine.sync_stop_loss_order("NOAMEND2/USDT", 8.0, 1.85)
+
+        self.engine.exchange.edit_order.assert_not_called()
+        self.engine.exchange.create_market_sell_order.assert_awaited_once()
+
+
 class TestRearmStopLossOrdersFilterByMarketType(unittest.IsolatedAsyncioTestCase):
     """
     _rearm_stop_loss_orders_after_restart чистит старые условные ордера

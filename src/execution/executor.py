@@ -1663,17 +1663,69 @@ class ExecutionEngine:
             logger.debug(f"Не удалось отменить ордер {order_id} ({symbol}) — возможно, уже неактивен: {e}")
             return False
 
+    async def _amend_stop_loss_order(
+        self, exchange: ccxt.Exchange, symbol: str, order_id: str, amount: float,
+        stop_loss_price: float, side: str, is_futures: bool,
+    ) -> str | None:
+        """
+        Попытаться переставить существующий SL-ордер НА МЕСТЕ (Bybit
+        POST /v5/order/amend через unified ccxt edit_order) вместо
+        cancel+recreate в sync_stop_loss_order — убирает короткое окно,
+        где позиция остаётся вообще без биржевой защиты между отменой
+        старого условного ордера и успешным размещением нового (сеть/
+        биржа могли отклонить именно ВТОРОЙ шаг, оставив позицию голой).
+        ccxt/bybit поддерживает амендинг stopLossPrice/triggerPrice
+        условного ордера, не только цены/объёма обычного лимитника
+        (подтверждено чтением ccxt/bybit.py edit_order_request) — type/
+        side в сигнатуре edit_order обязательны (ArgumentsRequired без
+        них), но самим запросом амендинга не используются, передаём
+        текущие значения ордера.
+
+        Возвращает None, если амендинг не удался (не поддерживается для
+        этой пары/биржи, сетевая ошибка и т.п.) — вызывающий код падает
+        на проверенный cancel+recreate путь, поведение при сбое не
+        меняется. При успехе возвращает id ордера (обычно тот же —
+        амендинг меняет ордер на месте, а не создаёт новый).
+
+        exchange.has["editOrder"]-проверка (тот же паттерн, что и
+        _start_watch_task для watchOrders) — не только корректное
+        поведение на биржах без амендинга, но и защита от «голых»
+        AsyncMock()-клиентов в сотнях существующих тестов, у которых
+        edit_order иначе авто-«успешно» отвечает MagicMock-ом и меняет
+        проверяемое поведение cancel+recreate тестов.
+        """
+        has = getattr(exchange, "has", None)
+        if not isinstance(has, dict) or not has.get("editOrder"):
+            return None
+        closing_side = "sell" if side == "long" else "buy"
+        ccxt_symbol = self._ccxt_symbol(exchange, symbol)
+        params: dict = {"stopLossPrice": stop_loss_price}
+        if is_futures:
+            params["reduceOnly"] = True
+        try:
+            updated = await exchange.edit_order(
+                order_id, ccxt_symbol, "market", closing_side, amount, params=params,
+            )
+        except Exception as e:
+            logger.debug(f"Amend SL {order_id} ({symbol}) не удался — используем cancel+recreate: {e}")
+            return None
+        new_id = (updated.get("id") if updated else None) or order_id
+        logger.info(f"🛡️ Биржевой SL переставлен на месте: {symbol} @ триггер {stop_loss_price} (ордер {new_id})")
+        return new_id
+
     async def sync_stop_loss_order(self, symbol: str, amount: float, stop_loss_price: float | None) -> None:
         """
         Пересоздать биржевой SL-ордер под текущий остаток/цену позиции —
         нужно после частичного закрытия (TP1/TP2 уменьшают объём) и после
         переноса SL в безубыток (см. _check_position_exit в main.py):
         старый биржевой ордер продавал бы либо неверный объём, либо по
-        неверной, уже неактуальной цене. Отменяет прежний отслеживаемый
-        SL-ордер (если был) и, если задан stop_loss_price и остаток > 0,
-        ставит новый. Клиент резолвится по СОБСТВЕННОМУ market_type позиции
-        (_exchange_for), а не по текущему тумблеру settings.market_type —
-        позиция могла быть открыта на рынке, отличном от текущего.
+        неверной, уже неактуальной цене. Сначала пробует переставить
+        СУЩЕСТВУЮЩИЙ ордер на месте (_amend_stop_loss_order) — при неудаче
+        отменяет прежний отслеживаемый SL-ордер (если был) и, если задан
+        stop_loss_price и остаток > 0, ставит новый. Клиент резолвится по
+        СОБСТВЕННОМУ market_type позиции (_exchange_for), а не по текущему
+        тумблеру settings.market_type — позиция могла быть открыта на
+        рынке, отличном от текущего.
 
         На фьючерсах SL теперь тоже ставится — _place_stop_loss_order сам
         выбирает направление ордера по side позиции (sell для long, buy
@@ -1689,6 +1741,17 @@ class ExecutionEngine:
             return
         exchange = self._exchange_for(pos)
         old_sl_order_id = pos.get("sl_order_id")
+
+        if old_sl_order_id and exchange is not None and stop_loss_price and amount > 0:
+            amended_id = await self._amend_stop_loss_order(
+                exchange, symbol, old_sl_order_id, amount, stop_loss_price,
+                side=pos.get("side", "long"),
+                is_futures=pos.get("market_type", "spot") == "futures",
+            )
+            if amended_id is not None:
+                pos["sl_order_id"] = amended_id
+                return
+
         if old_sl_order_id and not await self._cancel_order_safe(symbol, old_sl_order_id, exchange):
             # Отмена не подтверждена — старый условный SL-ордер мог остаться
             # живым на бирже. Забыть его ID здесь (как раньше) означало бы
