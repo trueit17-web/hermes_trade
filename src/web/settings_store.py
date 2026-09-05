@@ -137,9 +137,9 @@ SETTINGS_SCHEMA: list[dict] = [
 
     # Собственная группа, а не часть "Telegram сигналы" — это отдельный,
     # опциональный слой разбора текста (регулярки не справились), со своими
-    # 4 полями, осмысленными только пока переключатель включён.
+    # полями, осмысленными только пока переключатель включён.
     {"key": "telegram_llm_fallback_enabled", "label": "LLM-фолбэк парсинга (если регулярки не распознали)", "group": "LLM-фолбэк парсинга", "type": "bool",
-     "description": "Если регулярки не смогли разобрать сообщение канала — пробовать распознать его через Anthropic API, а если он не настроен/не смог — через Groq, а если и он не смог — через Gemini API. Требует хотя бы один из ключей ниже."},
+     "description": "Если регулярки не смогли разобрать сообщение канала — пробовать распознать его через Anthropic API, а если он не настроен/не смог — через Groq, а если и он не смог — через Gemini, а если и он не смог — через Cerebras. Требует хотя бы один из ключей ниже."},
     {"key": "anthropic_api_key", "label": "Anthropic API key", "group": "LLM-фолбэк парсинга", "type": "secret", "depends_on": "telegram_llm_fallback_enabled",
      "description": "Ключ Anthropic API для LLM-фолбэка парсинга сигналов (первый, приоритетный вариант)."},
     {"key": "anthropic_model", "label": "Anthropic модель", "group": "LLM-фолбэк парсинга", "type": "str", "depends_on": "telegram_llm_fallback_enabled",
@@ -149,9 +149,13 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "groq_model", "label": "Groq модель", "group": "LLM-фолбэк парсинга", "type": "str", "depends_on": "telegram_llm_fallback_enabled",
      "description": "Идентификатор модели на Groq, используемой для разбора сигналов (например llama-3.1-8b-instant)."},
     {"key": "gemini_api_key", "label": "Gemini API key", "group": "LLM-фолбэк парсинга", "type": "secret", "depends_on": "telegram_llm_fallback_enabled",
-     "description": "Ключ Google Gemini API — третий, последний резервный вариант LLM-фолбэка (пробуется, если ни Anthropic, ни Groq не настроены или не смогли разобрать сообщение). Бесплатный тариф Gemini обычно достаточен для этой задачи."},
+     "description": "Ключ Google Gemini API — третий вариант LLM-фолбэка (пробуется, если ни Anthropic, ни Groq не настроены или не смогли разобрать сообщение)."},
     {"key": "gemini_model", "label": "Gemini модель", "group": "LLM-фолбэк парсинга", "type": "str", "depends_on": "telegram_llm_fallback_enabled",
      "description": "Идентификатор модели Gemini, используемой для разбора сигналов (например gemini-3.6-flash)."},
+    {"key": "cerebras_api_key", "label": "Cerebras API key", "group": "LLM-фолбэк парсинга", "type": "secret", "depends_on": "telegram_llm_fallback_enabled",
+     "description": "Ключ Cerebras API — четвёртый, последний резервный вариант LLM-фолбэка (пробуется, если ни один из предыдущих трёх не настроен или не смог разобрать сообщение). Открытые модели на бесплатном тарифе, независимый от Groq/Gemini источник."},
+    {"key": "cerebras_model", "label": "Cerebras модель", "group": "LLM-фолбэк парсинга", "type": "str", "depends_on": "telegram_llm_fallback_enabled",
+     "description": "Идентификатор модели на Cerebras, используемой для разбора сигналов (например llama-3.3-70b)."},
 
     # Учётные данные Telegram-приложения — отдельно от "Telegram сигналы"
     # (это про доступ к API, а не про поведение исполнения сигналов).

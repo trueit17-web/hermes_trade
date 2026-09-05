@@ -325,12 +325,23 @@ async def parse_telegram_signal(text: str, channel_config: dict | None = None) -
     if parsed:
         return parsed
 
-    # Попытка 4: LLM-фолбэк через Gemini — третий, последний уровень,
-    # пробуется если ни Anthropic, ни Groq не настроены/не смогли. Gemini
-    # выбран как ещё один бесплатный по тарифу вариант — та же логика и
-    # промпт, что и у остальных фолбэков (см. gemini_parser.py).
+    # Попытка 4: LLM-фолбэк через Gemini — пробуется если ни Anthropic, ни
+    # Groq не настроены/не смогли. Gemini выбран как ещё один бесплатный по
+    # тарифу вариант — та же логика и промпт, что и у остальных фолбэков
+    # (см. gemini_parser.py).
     from src.telegram.gemini_parser import parse_with_gemini
     parsed = await parse_with_gemini(text, channel_config)
+    if parsed:
+        return parsed
+
+    # Попытка 5: LLM-фолбэк через Cerebras — последний уровень, пробуется
+    # если ни один из предыдущих трёх не настроен/не смог. Независимый
+    # четвёртый бесплатный источник — реальный инцидент: у Groq и Gemini
+    # одновременно кончалась доступность (недоступная модель на ключе Groq
+    # + исчерпанная дневная квота Gemini), оставляя сигнал вообще без
+    # LLM-разбора (см. cerebras_parser.py).
+    from src.telegram.cerebras_parser import parse_with_cerebras
+    parsed = await parse_with_cerebras(text, channel_config)
     if parsed:
         return parsed
 

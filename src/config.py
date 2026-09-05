@@ -185,7 +185,12 @@ class Settings(BaseSettings):
     # модели на бесплатном тарифе, заметно быстрее и щедрее по rate-limit'ам,
     # чем Gemini — см. src/telegram/groq_parser.py), а если и он не смог —
     # через Gemini API (третий уровень, тоже бесплатный по тарифу вариант,
-    # см. src/telegram/gemini_parser.py).
+    # см. src/telegram/gemini_parser.py), а если и он не смог — через
+    # Cerebras (четвёртый, последний уровень — ещё один независимый
+    # бесплатный источник, см. src/telegram/cerebras_parser.py; реальный
+    # инцидент — Groq и Gemini одновременно оказывались недоступны:
+    # неверная/недоступная ключу модель у Groq плюс исчерпанная дневная
+    # квота у Gemini, оставляя сигнал вообще без LLM-разбора).
     telegram_llm_fallback_enabled: bool = False
     anthropic_api_key: str | None = None
     anthropic_model: str = "claude-haiku-4-5-20251001"
@@ -199,6 +204,12 @@ class Settings(BaseSettings):
     groq_model: str = "llama-3.1-8b-instant"
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.6-flash"
+    cerebras_api_key: str | None = None
+    # Как и с Groq выше — доступность конкретной модели на бесплатном
+    # тарифе у конкретного ключа не гарантирована документацией; если этот
+    # дефолт вернёт 404/model_not_found, поправьте через настройку в
+    # дашборде (Groq модель — тот же паттерн, уже переживший этот инцидент).
+    cerebras_model: str = "llama-3.3-70b"
 
     # === Веб сервер ===
     web_host: str = "0.0.0.0"

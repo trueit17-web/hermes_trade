@@ -3368,6 +3368,7 @@ class TestGroqSignalParser(unittest.IsolatedAsyncioTestCase):
             "anthropic_api_key": settings.anthropic_api_key,
             "groq_api_key": settings.groq_api_key,
             "gemini_api_key": settings.gemini_api_key,
+            "cerebras_api_key": settings.cerebras_api_key,
         }
 
     def tearDown(self):
@@ -3377,6 +3378,8 @@ class TestGroqSignalParser(unittest.IsolatedAsyncioTestCase):
         groq_parser_module._client = None
         import src.telegram.gemini_parser as gemini_parser_module
         gemini_parser_module._client = None
+        import src.telegram.cerebras_parser as cerebras_parser_module
+        cerebras_parser_module._client = None
 
     def _mock_response(self, data: dict):
         import json
@@ -3566,11 +3569,13 @@ class TestGroqSignalParser(unittest.IsolatedAsyncioTestCase):
 
         import src.telegram.groq_parser as groq_parser_module
         import src.telegram.gemini_parser as gemini_parser_module
+        import src.telegram.cerebras_parser as cerebras_parser_module
         from src.telegram.channel_monitor import parse_telegram_signal
         settings.telegram_llm_fallback_enabled = True
         settings.anthropic_api_key = None
         settings.groq_api_key = "test-key"
         settings.gemini_api_key = "test-key"
+        settings.cerebras_api_key = "test-key"
 
         groq_mock = MagicMock()
         groq_mock.chat.completions.create = AsyncMock(return_value=self._mock_response({
@@ -3588,9 +3593,225 @@ class TestGroqSignalParser(unittest.IsolatedAsyncioTestCase):
         gemini_mock.aio.models.generate_content = AsyncMock(return_value=gemini_resp)
         gemini_parser_module._client = gemini_mock
 
+        cerebras_mock = MagicMock()
+        cerebras_mock.chat.completions.create = AsyncMock(
+            side_effect=AssertionError("Cerebras не должен вызываться, если Gemini уже распознал сигнал")
+        )
+        cerebras_parser_module._client = cerebras_mock
+
         result = await parse_telegram_signal("шортим эфир около 3500, стоп 3600, цели 3300 и 3200")
         self.assertIsNotNone(result)
         self.assertEqual(result["pair"], "ETH/USDT")
+        cerebras_mock.chat.completions.create.assert_not_called()
+
+    async def test_parse_telegram_signal_falls_back_to_cerebras_when_gemini_also_fails(self):
+        """Groq и Gemini оба не смогли разобрать — цепочка идёт дальше к Cerebras (последний уровень)."""
+        import json
+
+        import src.telegram.groq_parser as groq_parser_module
+        import src.telegram.gemini_parser as gemini_parser_module
+        import src.telegram.cerebras_parser as cerebras_parser_module
+        from src.telegram.channel_monitor import parse_telegram_signal
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = None
+        settings.groq_api_key = "test-key"
+        settings.gemini_api_key = "test-key"
+        settings.cerebras_api_key = "test-key"
+
+        groq_mock = MagicMock()
+        groq_mock.chat.completions.create = AsyncMock(return_value=self._mock_response({
+            "is_signal": False, "confidence": 0.9,
+        }))
+        groq_parser_module._client = groq_mock
+
+        gemini_resp = MagicMock()
+        gemini_resp.text = json.dumps({"is_signal": False, "confidence": 0.9})
+        gemini_mock = MagicMock()
+        gemini_mock.aio.models.generate_content = AsyncMock(return_value=gemini_resp)
+        gemini_parser_module._client = gemini_mock
+
+        cerebras_mock = MagicMock()
+        cerebras_mock.chat.completions.create = AsyncMock(return_value=self._mock_response({
+            "is_signal": True, "base": "ETH", "quote": "USDT", "side": "short",
+            "entry": 3500.0, "take_profits": [3300.0, 3200.0], "stop_loss": 3600.0,
+            "confidence": 0.8,
+        }))
+        cerebras_parser_module._client = cerebras_mock
+
+        result = await parse_telegram_signal("шортим эфир около 3500, стоп 3600, цели 3300 и 3200")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "ETH/USDT")
+        self.assertEqual(result["side"], "short")
+        self.assertEqual(result["tp"], 3200.0)
+
+
+class TestCerebrasSignalParser(unittest.IsolatedAsyncioTestCase):
+    """
+    Cerebras LLM-фолбэк парсинга — четвёртый, последний уровень, после
+    Anthropic/Groq/Gemini (см. src/telegram/cerebras_parser.py). Тот же
+    OpenAI-совместимый chat.completions с forced tool-call, что и у Groq —
+    мокаем клиент так же, без реальных сетевых запросов.
+    """
+
+    def setUp(self):
+        self._saved = {
+            "telegram_llm_fallback_enabled": settings.telegram_llm_fallback_enabled,
+            "cerebras_api_key": settings.cerebras_api_key,
+        }
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            setattr(settings, key, value)
+        import src.telegram.cerebras_parser as cerebras_parser_module
+        cerebras_parser_module._client = None
+
+    def _mock_response(self, data: dict):
+        import json
+        tool_call = MagicMock()
+        tool_call.function.arguments = json.dumps(data)
+        message = MagicMock()
+        message.tool_calls = [tool_call]
+        choice = MagicMock()
+        choice.message = message
+        resp = MagicMock()
+        resp.choices = [choice]
+        return resp
+
+    async def test_disabled_returns_none_without_calling_api(self):
+        from src.telegram.cerebras_parser import parse_with_cerebras
+        settings.telegram_llm_fallback_enabled = False
+        settings.cerebras_api_key = "test-key"
+        result = await parse_with_cerebras("BTC to the moon, going long soon maybe")
+        self.assertIsNone(result)
+
+    async def test_no_api_key_returns_none_without_calling_api(self):
+        from src.telegram.cerebras_parser import parse_with_cerebras
+        settings.telegram_llm_fallback_enabled = True
+        settings.cerebras_api_key = None
+        result = await parse_with_cerebras("покупаем биток в районе 69к, стоп 68к")
+        self.assertIsNone(result)
+
+    async def test_parses_valid_signal(self):
+        import src.telegram.cerebras_parser as cerebras_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.cerebras_api_key = "test-key"
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=self._mock_response({
+            "is_signal": True, "base": "BTC", "quote": "USDT", "side": "long",
+            "entry": 69000.0, "take_profits": [70000.0, 72000.0], "stop_loss": 68000.0,
+            "confidence": 0.9,
+        }))
+        cerebras_parser_module._client = mock_client
+
+        result = await cerebras_parser_module.parse_with_cerebras("покупаем биток в районе 69к, стоп 68к")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "BTC/USDT")
+        self.assertEqual(result["side"], "long")
+        self.assertEqual(result["entry"], 69000.0)
+        self.assertEqual(result["sl"], 68000.0)
+        self.assertEqual(result["tp"], 72000.0)  # long -> максимальный TP
+        self.assertEqual(result["take_profits"], [70000.0, 72000.0])
+
+    async def test_take_profits_reversed_for_short_to_stay_nearest_first(self):
+        import src.telegram.cerebras_parser as cerebras_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.cerebras_api_key = "test-key"
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=self._mock_response({
+            "is_signal": True, "base": "ETH", "quote": "USDT", "side": "short",
+            "entry": 3500.0, "take_profits": [3200.0, 3300.0], "stop_loss": 3600.0,
+            "confidence": 0.9,
+        }))
+        cerebras_parser_module._client = mock_client
+
+        result = await cerebras_parser_module.parse_with_cerebras("шортим эфир")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["take_profits"], [3300.0, 3200.0])
+        self.assertEqual(result["tp"], 3200.0)
+
+    async def test_low_confidence_is_rejected(self):
+        import src.telegram.cerebras_parser as cerebras_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.cerebras_api_key = "test-key"
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=self._mock_response({
+            "is_signal": True, "base": "BTC", "side": "long", "entry": 69000.0,
+            "take_profits": [], "stop_loss": None, "confidence": 0.2,
+        }))
+        cerebras_parser_module._client = mock_client
+
+        result = await cerebras_parser_module.parse_with_cerebras("может быть покупать биток?")
+        self.assertIsNone(result)
+
+    async def test_not_a_signal_returns_none(self):
+        import src.telegram.cerebras_parser as cerebras_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.cerebras_api_key = "test-key"
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=self._mock_response({
+            "is_signal": False, "confidence": 0.95,
+        }))
+        cerebras_parser_module._client = mock_client
+
+        result = await cerebras_parser_module.parse_with_cerebras("сегодня биток вырос на 3%, отличный день")
+        self.assertIsNone(result)
+
+    async def test_api_error_returns_none_not_raises(self):
+        import src.telegram.cerebras_parser as cerebras_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.cerebras_api_key = "test-key"
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(side_effect=RuntimeError("network down"))
+        cerebras_parser_module._client = mock_client
+
+        result = await cerebras_parser_module.parse_with_cerebras("покупаем биток в районе 69к, стоп 68к")
+        self.assertIsNone(result)
+
+    async def test_missing_tool_call_returns_none_not_raises(self):
+        """Модель ответила текстом вместо forced tool-call — не должно падать."""
+        import src.telegram.cerebras_parser as cerebras_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.cerebras_api_key = "test-key"
+
+        message = MagicMock()
+        message.tool_calls = None
+        choice = MagicMock()
+        choice.message = message
+        bad_resp = MagicMock()
+        bad_resp.choices = [choice]
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=bad_resp)
+        cerebras_parser_module._client = mock_client
+
+        result = await cerebras_parser_module.parse_with_cerebras("покупаем биток в районе 69к, стоп 68к")
+        self.assertIsNone(result)
+
+    async def test_invalid_json_arguments_returns_none_not_raises(self):
+        import src.telegram.cerebras_parser as cerebras_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.cerebras_api_key = "test-key"
+
+        tool_call = MagicMock()
+        tool_call.function.arguments = "не json вообще"
+        message = MagicMock()
+        message.tool_calls = [tool_call]
+        choice = MagicMock()
+        choice.message = message
+        bad_resp = MagicMock()
+        bad_resp.choices = [choice]
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=bad_resp)
+        cerebras_parser_module._client = mock_client
+
+        result = await cerebras_parser_module.parse_with_cerebras("покупаем биток в районе 69к, стоп 68к")
+        self.assertIsNone(result)
 
 
 class TestQualificationScorer(unittest.TestCase):
