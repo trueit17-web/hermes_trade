@@ -70,6 +70,12 @@ class ExecutionEngine:
         # следующего события и должен вызываться из СВОЕГО цикла — отсюда
         # отдельная asyncio-задача на каждый подключённый рынок.
         self._watch_tasks: dict[str, asyncio.Task] = {}
+        # Кэш тиров risk-limit биржи (fetch_market_leverage_tiers) по
+        # (id(exchange), symbol) — см. _leverage_tiers: в отличие от
+        # markets (грузятся один раз при коннекте и живут на самом
+        # exchange-объекте), это отдельный сетевой запрос без встроенного
+        # кэша в ccxt, а тиры не меняются в течение жизни процесса.
+        self._leverage_tiers_cache: dict[tuple[int, str], list | None] = {}
         self.exchange_id: str | None = None
         self.is_paper: bool = settings.is_paper
         self.paper_balance: float = settings.startup_capital_usdt
@@ -1357,6 +1363,61 @@ class ExecutionEngine:
         except Exception:
             return None
 
+    async def _leverage_tiers(self, symbol: str, exchange: ccxt.Exchange | None = None) -> list | None:
+        """
+        Тиры risk-limit биржи (см. fetch_market_leverage_tiers) для symbol —
+        каждый тир ограничивает МАКСИМАЛЬНОЕ плечо (maxLeverage) диапазоном
+        объёма позиции (minNotional..maxNotional): чем крупнее позиция, тем
+        ниже позволенное плечо. Без этой проверки set_leverage вслепую
+        выставляет запрошенное плечо — на крупной позиции биржа может тихо
+        урезать/отклонить его (ошибка сейчас глотается на debug и
+        игнорируется).
+
+        Кэшируется в self._leverage_tiers_cache по (id(exchange), symbol) —
+        тиры не меняются в течение жизни процесса, тот же расчёт, что и у
+        exchange.markets, загружаемых один раз при коннекте. None на любой
+        сбой (биржа не поддерживает метод, сетевая ошибка, тестовый мок без
+        реализации) — вызывающий код тогда ведёт себя как раньше, эта
+        проверка строго дополняет, а не заменяет существующее поведение.
+        """
+        ex = exchange if exchange is not None else self.exchange
+        if ex is None:
+            return None
+        cache_key = (id(ex), symbol)
+        if cache_key in self._leverage_tiers_cache:
+            return self._leverage_tiers_cache[cache_key]
+        try:
+            tiers = await ex.fetch_market_leverage_tiers(self._ccxt_symbol(ex, symbol))
+        except Exception as e:
+            logger.debug(f"Не удалось получить risk-limit тиры биржи для {symbol}: {e}")
+            tiers = None
+        tiers = tiers if isinstance(tiers, list) else None
+        self._leverage_tiers_cache[cache_key] = tiers
+        return tiers
+
+    def _capped_leverage(self, tiers: list, notional: float, requested_leverage: float) -> float:
+        """
+        Найти тир, в диапазон [minNotional, maxNotional] которого попадает
+        notional, и вернуть min(requested_leverage, тир.maxLeverage) — или
+        сам requested_leverage без изменений, если подходящий тир не
+        найден (пустой/неожиданной формы список тиров) или его maxLeverage
+        нечисловой.
+        """
+        for tier in tiers:
+            if not isinstance(tier, dict):
+                continue
+            min_notional = tier.get("minNotional")
+            max_notional = tier.get("maxNotional")
+            max_leverage = tier.get("maxLeverage")
+            if not isinstance(min_notional, (int, float)) or not isinstance(max_notional, (int, float)):
+                continue
+            if not (min_notional <= notional <= max_notional):
+                continue
+            if isinstance(max_leverage, (int, float)) and max_leverage > 0:
+                return min(requested_leverage, max_leverage)
+            break
+        return requested_leverage
+
     def _market_min_amount(self, symbol: str, exchange: ccxt.Exchange | None = None) -> float | None:
         limits = self._market_limits(symbol, exchange)
         if not limits:
@@ -1876,6 +1937,16 @@ class ExecutionEngine:
             # это не ошибка, ордер всё равно можно размещать с уже
             # действующим плечом.
             leverage_to_set = order_data.get("leverage") or settings.futures_leverage
+            tiers = await self._leverage_tiers(symbol, exchange)
+            if tiers:
+                notional = amount * price
+                capped = self._capped_leverage(tiers, notional, leverage_to_set)
+                if capped < leverage_to_set:
+                    logger.warning(
+                        f"⚠️ Плечо {leverage_to_set}x превышает risk-limit биржи для объёма "
+                        f"{notional:.0f} USDT ({symbol}) — используем {capped}x."
+                    )
+                    leverage_to_set = capped
             try:
                 await exchange.set_leverage(int(leverage_to_set), self._ccxt_symbol(exchange, symbol))
             except Exception as e:

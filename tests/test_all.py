@@ -7436,6 +7436,103 @@ class TestExecuteRealOrderAppliesPerSignalLeverage(unittest.IsolatedAsyncioTestC
         self.assertIsNone(self.engine.real_positions["FUTLEV3/USDT"]["leverage"])
 
 
+class TestExecuteRealOrderLeverageTiers(unittest.IsolatedAsyncioTestCase):
+    """
+    Фаза C (Bybit MCP): _execute_real_order клампит запрошенное плечо по
+    risk-limit тирам биржи (fetch_market_leverage_tiers) ПЕРЕД set_leverage
+    — сейчас плечо выставляется вслепую, и на крупной позиции биржа может
+    тихо урезать/отклонить его (ошибка сейчас глотается на debug).
+    Тиры не удалось получить (метод не поддерживается/сетевая ошибка,
+    в т.ч. «голый» AsyncMock() без настроенного fetch_market_leverage_tiers
+    в остальных тестах) — поведение как раньше, запрошенное плечо
+    используется без изменений.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+        self._saved_trading_mode = settings.trading_mode
+        self._saved_futures_leverage = settings.futures_leverage
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+        settings.trading_mode = self._saved_trading_mode
+        settings.futures_leverage = self._saved_futures_leverage
+
+    async def test_clamps_leverage_to_risk_limit_tier_for_large_notional(self):
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_market_leverage_tiers.return_value = [
+            {"minNotional": 0, "maxNotional": 1_000_000, "maxLeverage": 10},
+        ]
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "fut-tier-1", "filled": 100.0, "average": 50.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="TIERCAP1/USDT", side="buy", amount=100.0, price=50.0, order_type="market",
+            leverage=35.0,
+        )
+
+        self.assertIsNotNone(order)
+        self.engine.exchange.set_leverage.assert_awaited_once_with(10, "TIERCAP1/USDT")
+        self.assertEqual(self.engine.real_positions["TIERCAP1/USDT"]["leverage"], 10)
+
+    async def test_leverage_within_tier_limit_passes_through_unchanged(self):
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_market_leverage_tiers.return_value = [
+            {"minNotional": 0, "maxNotional": 1_000_000, "maxLeverage": 50},
+        ]
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "fut-tier-2", "filled": 10.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="TIERCAP2/USDT", side="buy", amount=10.0, price=2.0, order_type="market",
+            leverage=5.0,
+        )
+
+        self.assertIsNotNone(order)
+        self.engine.exchange.set_leverage.assert_awaited_once_with(5, "TIERCAP2/USDT")
+        self.assertEqual(self.engine.real_positions["TIERCAP2/USDT"]["leverage"], 5.0)
+
+    async def test_unavailable_tiers_use_requested_leverage_as_before(self):
+        """fetch_market_leverage_tiers не поддерживается/падает — best-effort как раньше."""
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_market_leverage_tiers.side_effect = Exception("not supported")
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "fut-tier-3", "filled": 100.0, "average": 50.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="TIERCAP3/USDT", side="buy", amount=100.0, price=50.0, order_type="market",
+            leverage=35.0,
+        )
+
+        self.assertIsNotNone(order)
+        self.engine.exchange.set_leverage.assert_awaited_once_with(35, "TIERCAP3/USDT")
+        self.assertEqual(self.engine.real_positions["TIERCAP3/USDT"]["leverage"], 35.0)
+
+
 class TestGetReferencePrice(unittest.IsolatedAsyncioTestCase):
     """
     execution_engine.get_reference_price() — резолвит текущую рыночную
