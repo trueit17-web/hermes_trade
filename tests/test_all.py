@@ -756,6 +756,78 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
             ).scalar_one()
         self.assertEqual(close_order.order_id_exchange, "35242741")
 
+    async def test_close_real_position_persists_leverage_confirmed_by_exchange(self):
+        """
+        Trade.leverage — плечо, реально подтверждённое биржей на момент
+        закрытия (real_positions[symbol]["leverage"], проставляется
+        _reconcile_futures_position) — нужно дашборду, чтобы показать
+        PnL% от МАРЖИ рядом с "основным" pnl_pct (от полной номинальной
+        стоимости позиции). Реальный вопрос пользователя: почему канал
+        заявляет 21%+ прибыли, а бот показывает 0.66% — разница именно в
+        базе расчёта процента.
+        """
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Trade
+
+        saved_market_type = settings.market_type
+        settings.trading_mode = "real"
+        settings.market_type = "futures"
+        try:
+            self.engine.is_paper = False
+            self.engine.exchange_id = "bybit"
+            self.engine.exchange = AsyncMock()
+            self.engine.exchange.fetch_balance = AsyncMock(
+                return_value={"free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0}}
+            )
+            self.engine.exchange.create_market_sell_order.return_value = {
+                "id": "lev-close-1", "filled": 10.0, "average": 2.1, "price": None,
+                "fee": {"cost": 0.01, "currency": "USDT"},
+            }
+            self.engine.exchange.fetch_order_trades = AsyncMock(return_value=None)
+            self.engine.real_positions["LEVCLOSE1/USDT"] = {
+                "amount": 10.0, "entry_price": 2.0, "side": "long", "leverage": 25.0,
+                "market_type": "futures", "sl_order_id": None,
+            }
+
+            result = await self.engine.close_real_position(
+                symbol="LEVCLOSE1/USDT", side="long", entry_price=2.0, amount=10.0,
+                reason="take_profit_1", entry_fee=0.0, holding_seconds=60, order_open_id=None,
+            )
+        finally:
+            settings.market_type = saved_market_type
+        self.assertIsNotNone(result)
+
+        async with get_session() as session:
+            trade = (
+                await session.execute(select(Trade).where(Trade.id == result["trade_id"]))
+            ).scalar_one()
+        self.assertEqual(trade.leverage, 25.0)
+
+    async def test_close_paper_position_leaves_leverage_none(self):
+        """Paper-режим не торгует на реальной бирже — нет реального
+        биржевого плеча, Trade.leverage должен остаться None."""
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Trade
+
+        settings.trading_mode = "paper"
+        self.engine.paper_positions["LEVPAPER1/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long",
+        }
+
+        result = await self.engine.close_paper_position(
+            symbol="LEVPAPER1/USDT", side="long", entry_price=2.0, amount=10.0,
+            exit_price=2.1, reason="take_profit_1", entry_fee=0.0, holding_seconds=60,
+        )
+        self.assertIsNotNone(result)
+
+        async with get_session() as session:
+            trade = (
+                await session.execute(select(Trade).where(Trade.id == result["trade_id"]))
+            ).scalar_one()
+        self.assertIsNone(trade.leverage)
+
     async def test_execute_real_order_prefers_trade_history_fee_over_order_response(self):
         """
         Реальный инцидент (демо-счёт Bybit, TAC/USDT): комиссия покупки на
@@ -4797,6 +4869,78 @@ class TestTradesGrouping(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["created_at"], expected_opened_at)
         self.assertEqual(row["order_id_exchange_open"], "list-open-ex-1")
         self.assertEqual(row["order_id_exchange_close"], "list-close-ex-1")
+
+    async def test_exposes_leverage_and_margin_adjusted_pnl_pct(self):
+        """
+        Реальный вопрос пользователя: почему канал заявляет 21%+ прибыли, а
+        бот показывает 0.66% — разница в базе расчёта: pnl_pct у бота это
+        % от полной номинальной стоимости позиции, а не от маржи. GET
+        /trades должен отдавать и плечо (для бейджа рядом с символом), и
+        готовый pnl_pct_leveraged = pnl_pct * leverage (% от маржи) —
+        именно так обычно считает доходность сам канал/трейдер.
+        """
+        from src.execution.executor import ExecutionEngine
+        from src.web.api import list_trades
+
+        engine = ExecutionEngine()
+        saved_market_type = settings.market_type
+        settings.trading_mode = "real"
+        settings.market_type = "futures"
+        try:
+            engine.is_paper = False
+            engine.exchange_id = "bybit"
+            engine.exchange = AsyncMock()
+            engine.exchange.fetch_balance = AsyncMock(
+                return_value={"free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0}}
+            )
+            engine.exchange.create_market_sell_order.return_value = {
+                "id": "lev-list-close-1", "filled": 10.0, "average": 2.1, "price": None,
+                "fee": {"cost": 0.0, "currency": "USDT"},
+            }
+            engine.exchange.fetch_order_trades = AsyncMock(return_value=None)
+            symbol = "TRADESLEVLIST1/USDT"
+            engine.real_positions[symbol] = {
+                "amount": 10.0, "entry_price": 2.0, "side": "long", "leverage": 25.0,
+                "market_type": "futures", "sl_order_id": None,
+            }
+
+            result = await engine.close_real_position(
+                symbol=symbol, side="long", entry_price=2.0, amount=10.0,
+                reason="take_profit_1", entry_fee=0.0, holding_seconds=60, order_open_id=None,
+            )
+            self.assertIsNotNone(result)
+
+            listed = await list_trades(limit=200, offset=0)
+        finally:
+            settings.market_type = saved_market_type
+
+        row = next(t for t in listed["trades"] if t["symbol"] == symbol)
+        self.assertEqual(row["leverage"], 25.0)
+        self.assertAlmostEqual(row["pnl_pct_leveraged"], row["pnl_pct"] * 25.0)
+
+    async def test_leverage_and_leveraged_pnl_are_null_for_spot(self):
+        from src.execution.executor import ExecutionEngine
+        from src.web.api import list_trades
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "paper"
+        await engine.initialize("binance")
+
+        symbol = "TRADESNOLEVLIST1/USDT"
+        order = await engine.create_order(
+            symbol=symbol, side="buy", amount=10.0, price=200.0, order_type="market",
+        )
+        self.assertIsNotNone(order)
+        await engine.close_paper_position(
+            symbol=symbol, side="long", entry_price=200.0, amount=10.0,
+            exit_price=220.0, reason="take_profit_1", entry_fee=1.0,
+            holding_seconds=60, order_open_id=order.id,
+        )
+
+        listed = await list_trades(limit=200, offset=0)
+        row = next(t for t in listed["trades"] if t["symbol"] == symbol)
+        self.assertIsNone(row["leverage"])
+        self.assertIsNone(row["pnl_pct_leveraged"])
 
 
 class TestStatusExposesExchangeOrderId(unittest.IsolatedAsyncioTestCase):

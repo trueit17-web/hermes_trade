@@ -180,6 +180,16 @@ class Trade(Base):
     amount: Mapped[float] = mapped_column(DECIMAL, nullable=False)
     pnl: Mapped[float] = mapped_column(DECIMAL, default=0)
     pnl_pct: Mapped[float] = mapped_column(Float)
+    # Плечо, реально подтверждённое биржей на момент закрытия позиции (см.
+    # ExecutionEngine._reconcile_futures_position/real_positions[symbol]
+    # ["leverage"]) — None для спота и для paper-режима (там нет реального
+    # биржевого плеча). pnl_pct выше — это PnL относительно ПОЛНОЙ
+    # номинальной стоимости позиции (entry_price*amount), а не маржи;
+    # плечо нужно, чтобы дашборд мог показать рядом PnL% от МАРЖИ
+    # (pnl_pct*leverage) — именно так обычно считает доходность сам канал/
+    # трейдер, отсюда расхождение между "скромным" pnl_pct бота и куда
+    # более высоким процентом, которым хвастается канал.
+    leverage: Mapped[float | None] = mapped_column(Float)
     holding_seconds: Mapped[int] = mapped_column(Integer, default=0)
     features_at_open: Mapped[dict | None] = mapped_column(JSON)
     outcome: Mapped[str | None] = mapped_column(

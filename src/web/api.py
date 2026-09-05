@@ -844,6 +844,14 @@ async def list_trades(limit: int = 100, offset: int = 0, strategy_id: str | None
             )
             pnl_pct = (total_pnl / (entry_price * total_amount) * 100) if entry_price and total_amount else 0.0
             outcome = "win" if total_pnl > 0 else ("loss" if total_pnl < 0 else "break-even")
+            # Плечо — одно и то же для всех частей одной позиции (та же
+            # сделка, см. leverage на Trade). pnl_pct выше — от полной
+            # номинальной стоимости позиции; pnl_pct_leveraged — от маржи
+            # (то, как обычно считает доходность сам канал/трейдер) — см.
+            # docstring Trade.leverage про расхождение "скромного" pnl_pct
+            # бота и куда более высокого процента, которым хвастается канал.
+            leverage = float(last.leverage) if last.leverage else None
+            pnl_pct_leveraged = pnl_pct * leverage if leverage else None
             # Trade.created_at — это момент вставки строки Trade в БД, а
             # Trade создаётся только при ЗАКРЫТИИ позиции (в
             # close_paper_position/close_real_position) — то есть почти
@@ -861,6 +869,8 @@ async def list_trades(limit: int = 100, offset: int = 0, strategy_id: str | None
                 "amount": total_amount,
                 "pnl": total_pnl,
                 "pnl_pct": pnl_pct,
+                "leverage": leverage,
+                "pnl_pct_leveraged": pnl_pct_leveraged,
                 "holding_seconds": last.holding_seconds,
                 "outcome": outcome,
                 "is_open": last.is_open,

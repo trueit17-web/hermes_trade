@@ -1115,7 +1115,14 @@ function renderPositions(status) {
     if (cur !== null && cur !== undefined && pos.entry_price) {
       const dir = pos.side === "short" ? -1 : 1;
       const pnlPct = dir * (cur - pos.entry_price) / pos.entry_price * 100;
-      pnlHtml = `<span class="${pnlPct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${pnlPct >= 0 ? "+" : ""}${fmt(pnlPct, 2)}%</span>`;
+      // Плечо — реальное значение с биржи (pos.leverage, см. leverageBadge
+      // ниже) — pnlPct выше это % от полной номинальной стоимости позиции,
+      // pnlPctLeveraged — % от МАРЖИ (то, как обычно считает доходность
+      // сам канал/трейдер).
+      const leveragedSuffix = !status.is_paper && pos.market_type === "futures" && pos.leverage
+        ? ` (${(pnlPct * pos.leverage) >= 0 ? "+" : ""}${fmt(pnlPct * pos.leverage, 2)}% от маржи)`
+        : "";
+      pnlHtml = `<span class="${pnlPct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${pnlPct >= 0 ? "+" : ""}${fmt(pnlPct, 2)}%${leveragedSuffix}</span>`;
     }
     const tradeValue = pos.entry_price ? pos.amount * pos.entry_price : null;
     // В real-режиме SL дублируется отдельным условным ордером на самой
@@ -1188,7 +1195,14 @@ function renderManualPositions(status) {
     if (cur !== null && cur !== undefined && pos.entry_price) {
       const dir = pos.side === "short" ? -1 : 1;
       const pnlPct = dir * (cur - pos.entry_price) / pos.entry_price * 100;
-      pnlHtml = `<span class="${pnlPct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${pnlPct >= 0 ? "+" : ""}${fmt(pnlPct, 2)}%</span>`;
+      // Плечо — реальное значение с биржи (pos.leverage, см. leverageBadge
+      // ниже) — pnlPct выше это % от полной номинальной стоимости позиции,
+      // pnlPctLeveraged — % от МАРЖИ (то, как обычно считает доходность
+      // сам канал/трейдер).
+      const leveragedSuffix = !status.is_paper && pos.market_type === "futures" && pos.leverage
+        ? ` (${(pnlPct * pos.leverage) >= 0 ? "+" : ""}${fmt(pnlPct * pos.leverage, 2)}% от маржи)`
+        : "";
+      pnlHtml = `<span class="${pnlPct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${pnlPct >= 0 ? "+" : ""}${fmt(pnlPct, 2)}%${leveragedSuffix}</span>`;
     }
     const slBadge = !status.is_paper && pos.stop_loss
       ? (pos.sl_order_id ? ` <span title="SL выставлен на бирже">🛡️</span>` : ` <span title="SL НЕ подтверждён биржей — защита только внутри бота">⚠️</span>`)
@@ -1451,14 +1465,25 @@ async function renderTrades() {
     body.innerHTML = trades.map(t => {
       const tradeValue = t.amount && t.entry_price ? t.amount * t.entry_price : null;
       const orderId = fmtOrderId(t.order_id_exchange_open || t.order_id_exchange_close);
+      // Плечо, реально подтверждённое биржей на момент закрытия (см.
+      // Trade.leverage) — None для спота/paper. pnl_pct_leveraged — тот
+      // же PnL, но в % от МАРЖИ (pnl_pct*leverage), а не полной
+      // номинальной стоимости позиции — так обычно считает доходность
+      // сам канал/трейдер, отсюда и расхождение с "основным" pnl_pct.
+      const leverageBadge = t.leverage
+        ? ` <span class="muted" title="Плечо на бирже на момент закрытия">⚡${t.leverage}x</span>`
+        : "";
+      const leveragedPnl = t.pnl_pct_leveraged !== null && t.pnl_pct_leveraged !== undefined
+        ? ` (${t.pnl_pct_leveraged >= 0 ? "+" : ""}${fmt(t.pnl_pct_leveraged, 2)}% от маржи)`
+        : "";
       return `
       <tr class="trade-row" data-trade-id="${t.id}" title="Показать подробности сделки">
-        <td><span class="expand-arrow">▸</span>${t.symbol || ("#" + t.symbol_id)}</td>
+        <td><span class="expand-arrow">▸</span>${t.symbol || ("#" + t.symbol_id)}${leverageBadge}</td>
         <td class="side-${t.direction === 'long' ? 'long' : 'short'}">${(t.direction || '').toUpperCase()}</td>
         <td>${fmtPrice(t.entry_price)}</td>
         <td>${t.exit_price !== null ? fmtPrice(t.exit_price) : "—"}</td>
         <td>${tradeValue !== null ? "$" + fmt(tradeValue) : "—"}</td>
-        <td class="${t.pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${t.pnl >= 0 ? "+" : ""}${fmt(t.pnl)} (${fmt(t.pnl_pct, 2)}%)</td>
+        <td class="${t.pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${t.pnl >= 0 ? "+" : ""}${fmt(t.pnl)} (${fmt(t.pnl_pct, 2)}%)${leveragedPnl}</td>
         <td>${t.outcome || (t.is_open ? "открыта" : "—")}</td>
         <td class="muted">${t.source || "—"}</td>
         <td class="muted">${fmtDuration(t.holding_seconds)}</td>
