@@ -714,6 +714,7 @@ class ExecutionEngine:
                 "strategy_id": None, "stop_loss": None, "take_profit": None,
                 "order_id": None, "entry_fee": 0.0, "opened_at": None,
                 "tp_hit_count": 0, "market_type": order_market_type,
+                "notification_message_id": None,
             })
             pos["entry_price"] = (
                 (pos["entry_price"] * pos["amount"] + price * amount) / (pos["amount"] + amount)
@@ -728,6 +729,15 @@ class ExecutionEngine:
             pos["order_id"] = o.id
             pos["entry_fee"] = fee
             pos["tp_hit_count"] = max(pos["tp_hit_count"], hits_by_order.get(o.id, 0))
+            # См. Order.notification_message_id — id сообщения об открытии,
+            # чтобы уведомления о закрытии после рестарта процесса всё ещё
+            # отвечали на исходное сообщение о сигнале, а не начинали новую,
+            # не связанную с ним цепочку. Не перезаписываем уже найденное
+            # значение None-ом с последующей итерации (несколько ордеров на
+            # один символ — доливка), как и order_id парой строк выше не
+            # защищён от этого, но там перезапись всегда на актуальный ордер.
+            if o.notification_message_id is not None:
+                pos["notification_message_id"] = o.notification_message_id
             if pos["opened_at"] is None:
                 pos["opened_at"] = o.created_at
 
@@ -995,6 +1005,28 @@ class ExecutionEngine:
             await session.flush()
 
         return strategy_row.id
+
+    async def set_order_notification_message_id(self, order_id: int | None, message_id: int | None) -> None:
+        """
+        Сохранить id Telegram-сообщения об открытии позиции на её ордере —
+        см. Order.notification_message_id. Нужен для reply_to_message_id
+        последующих уведомлений по этой же сделке (закрытие по TP/SL,
+        ручное закрытие), в т.ч. после рестарта процесса (восстанавливается
+        обратно в _load_open_positions_from_db). Best-effort: сбой записи
+        не должен ронять уже отправленное и показанное пользователю
+        уведомление — просто следующие уведомления придут не связанными в
+        цепочку, а не сорвут открытие позиции.
+        """
+        if not order_id or not message_id:
+            return
+        try:
+            async with get_session() as session:
+                order = await session.get(Order, order_id)
+                if order is not None:
+                    order.notification_message_id = message_id
+                    await session.commit()
+        except Exception as e:
+            logger.debug(f"Не удалось сохранить id уведомления для ордера {order_id}: {e}")
 
     async def create_order(
         self,

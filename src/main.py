@@ -354,6 +354,7 @@ class TradingBot:
                 "opened_at": pos.get("opened_at") or utcnow(),
                 "order_id": pos.get("order_id"),
                 "entry_fee": pos.get("entry_fee", 0.0),
+                "notification_message_id": pos.get("notification_message_id"),
             }
             position_value = (pos.get("amount") or 0) * (pos.get("entry_price") or 0)
             size_pct = (position_value / balance * 100) if balance else 0.0
@@ -363,13 +364,104 @@ class TradingBot:
             logger.info(f"🔗 Синхронизировано {len(self.open_positions)} открытых позиций с риск-менеджером")
 
     async def _on_trade_event(self, event):
-        """Отправить Telegram-уведомление об открытой сделке."""
+        """
+        Отправить Telegram-уведомление об открытой сделке.
+
+        Раньше подписка не фильтровала event.is_opening — event_bus
+        публикует trade_event И на открытие, И на закрытие позиции (см.
+        executor.py), так что каждое закрытие ДОПОЛНИТЕЛЬНО отправляло это
+        "открывающее" сообщение (с entry_price, выданной как будто это
+        свежий вход) поверх настоящего уведомления о закрытии из
+        _check_position_exit/close_position_manually — два сообщения на
+        одно закрытие.
+
+        Telegram-сигналы (strategy_id=="telegram_signal") тоже пропускаются
+        здесь: для них отправляется отдельное, более информативное
+        уведомление (уровни TP/SL со статусом применения на бирже, канал и
+        его статистика) прямо из _execute_telegram_signal — это самое
+        обычное открытие используется только для сделок, не привязанных к
+        каналу (встроенные стратегии, ручной ордер).
+        """
+        if not event.is_opening:
+            return
+        tracked = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
+        pos = tracked.get(event.symbol)
+        if pos and pos.get("strategy_id") == "telegram_signal":
+            return
         side = "LONG 📈" if event.direction == "long" else "SHORT 📉"
         await send_notification(
             f"{side} {event.symbol}\n"
             f"Цена входа: {event.entry_price:.4f}\n"
             f"Объём: {event.amount:.6f}"
         )
+
+    async def _channel_notification_stats(self, channel_id: str) -> tuple[str, int, int] | None:
+        """
+        Название канала и статистика применённых им сигналов — (заголовок,
+        всего применено, закрыто в плюс) — для строки в уведомлении об
+        открытии позиции. None, если канал не резолвится (удалён из
+        мониторинга/не найден в БД).
+
+        Тот же расчёт, что и в GET /telegram/channels/stats (api.py) —
+        applied = сигналы с decision=="executed", closed = те из них, у
+        кого уже проставлен executed_trade, wins = сколько из закрытых
+        завершились outcome=="win". Считается ЖИВЫМ запросом к БД (не из
+        кэша) — статистика открытия должна отражать состояние на текущий
+        момент. Вызывается ДО _save_telegram_signal (см. _on_telegram_signal
+        порядок вызовов) — сама текущая сделка в БД ещё не сохранена,
+        поэтому applied увеличивается на 1 вручную вызывающим кодом.
+        """
+        db_channel_id = self._telegram_channel_db_ids.get(channel_id)
+        if db_channel_id is None:
+            return None
+        try:
+            async with get_session() as session:
+                channel = await session.get(TelegramChannel, db_channel_id)
+                if channel is None:
+                    return None
+                signals = (
+                    await session.execute(
+                        select(TelegramSignal)
+                        .options(selectinload(TelegramSignal.executed_trade))
+                        .where(TelegramSignal.channel_id == db_channel_id)
+                    )
+                ).scalars().all()
+                executed = [s for s in signals if s.decision == "executed"]
+                closed_trades = [s.executed_trade for s in executed if s.executed_trade is not None]
+                wins = sum(1 for t in closed_trades if t.outcome == "win")
+                return (channel.channel_title or channel.channel_id), len(executed), wins
+        except Exception as e:
+            logger.debug(f"Не удалось получить статистику канала {channel_id} для уведомления: {e}")
+            return None
+
+    def _sl_notification_line(self, symbol: str, sl: float | None) -> str:
+        """
+        Строка SL для уведомления об открытии — с явным статусом применения
+        НА БИРЖЕ (в отличие от TP, SL реально выставляется отдельным
+        условным ордером на бирже, см. sync_stop_loss_order/sl_order_id).
+        """
+        if not sl:
+            return "🛑 SL: не указан"
+        if settings.is_paper:
+            return f"🛑 SL: {sl:.6f} (бумажный режим — только внутренний контроль бота)"
+        pos = execution_engine.real_positions.get(symbol) or {}
+        if pos.get("sl_order_id"):
+            return f"🛑 SL: {sl:.6f} — ✅ выставлен на бирже"
+        return f"🛑 SL: {sl:.6f} — ⚠️ не подтверждён на бирже, только внутренний контроль"
+
+    def _tp_notification_lines(self, take_profits: list[float] | None, tp: float | None) -> str:
+        """
+        Строки TP-уровней для уведомления об открытии. TP сознательно
+        никогда не выставляется отдельным ордером на бирже (см. докстринг
+        _place_stop_loss_order — у Bybit нет нативного OCO для частичного
+        выхода по нескольким уровням) — статус здесь общий для всех
+        уровней, а не "на бирже: да/нет" по каждому отдельно, как для SL.
+        """
+        levels = list(take_profits) if take_profits else ([tp] if tp else [])
+        if not levels:
+            return "🎯 TP: не указан"
+        lines = "\n".join(f"🎯 TP{i + 1}: {level:.6f}" for i, level in enumerate(levels))
+        return lines + "\n(TP — внутренний контроль бота, нативного ордера на бирже нет)"
 
     async def _update_coinglass(self):
         """Обновление данных из CoinGlass."""
@@ -666,6 +758,53 @@ class TradingBot:
         except Exception as e:
             logger.warning(f"Не удалось сохранить Telegram-сигнал в БД: {e}")
 
+    async def _notify_signal_opened(
+        self, symbol: str, signal_event: dict, order, side: str,
+        entry: float, sl: float | None, tp: float | None, take_profits: list[float],
+    ) -> None:
+        """
+        Уведомление об открытии позиции по Telegram-сигналу — заменяет
+        общий "LONG/SHORT {symbol}" из _on_trade_event (тот теперь
+        специально пропускает strategy_id=="telegram_signal", см. его
+        докстринг) более информативным: уровни TP/SL со статусом
+        применения на бирже, канал-источник и его статистика (сколько
+        сигналов канала уже применено и сколько из них закрыто в плюс).
+
+        message_id отправленного сообщения сохраняется и в self.
+        open_positions[symbol], и на самом Order в БД (см.
+        set_order_notification_message_id) — на него ссылаются
+        (reply_to_message_id) все последующие уведомления по этой сделке
+        (частичное/полное закрытие, ручное закрытие через дашборд), в т.ч.
+        после рестарта процесса (см. _load_open_positions_from_db).
+        """
+        side_label = "LONG 📈" if side == "long" else "SHORT 📉"
+        lines = [f"📲 Сигнал: {side_label} {symbol}"]
+
+        channel_id = signal_event.get("channel_id")
+        if channel_id:
+            channel_stats = await self._channel_notification_stats(channel_id)
+            if channel_stats:
+                title, applied, wins = channel_stats
+                # +1 — эта сделка ещё не сохранена в БД на момент подсчёта
+                # (_save_telegram_signal вызывается ПОСЛЕ _execute_telegram_
+                # signal, см. _on_telegram_signal), но она уже применена.
+                lines.append(f"Канал: {title} (применено {applied + 1}, закрыто в плюс {wins})")
+            else:
+                lines.append(f"Канал: {channel_id}")
+
+        lines.append(f"Вход: {entry:.6f}")
+        lines.append(self._sl_notification_line(symbol, sl))
+        lines.append(self._tp_notification_lines(take_profits, tp))
+
+        message_id = await send_notification("\n".join(lines))
+        if message_id is None:
+            return
+        self.open_positions[symbol]["notification_message_id"] = message_id
+        tracked = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
+        if symbol in tracked:
+            tracked[symbol]["notification_message_id"] = message_id
+        await execution_engine.set_order_notification_message_id(order.id, message_id)
+
     async def _execute_telegram_signal(self, signal_event: dict):
         """Исполнение Telegram сигнала. Возвращает созданный Order или None."""
         pair = signal_event.get("parsed_pair", "")
@@ -789,6 +928,7 @@ class TradingBot:
                 "order_id": order.id, "entry_fee": order.fee,
                 "channel_id": signal_event.get("channel_id"),
             }
+            await self._notify_signal_opened(symbol, signal_event, order, side, entry, sl, tp, take_profits)
             risk_manager.on_position_added(symbol, size_pct)
             self.daily_pnl = getattr(risk_manager.state, "daily_pnl", 0.0)
 
@@ -1690,7 +1830,8 @@ class TradingBot:
         await send_notification(
             f"{emoji} {'Частично закрыта' if is_partial else 'Закрыта'} {side.upper()} {symbol}\n"
             f"Причина: {reason_ru}\n"
-            f"PnL: {result['pnl']:+.2f} USDT ({result['pnl_pct']:+.2f}%)"
+            f"PnL: {result['pnl']:+.2f} USDT ({result['pnl_pct']:+.2f}%)",
+            reply_to_message_id=position.get("notification_message_id"),
         )
         return not is_partial
 

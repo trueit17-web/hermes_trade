@@ -140,6 +140,12 @@ class Order(Base):
     market_type: Mapped[str] = mapped_column(String(10), default="spot", server_default="spot")
     order_id_exchange: Mapped[str | None] = mapped_column(String(100))
     client_order_id: Mapped[str | None] = mapped_column(String(100))
+    # id сообщения в Telegram-чате с уведомлением об открытии этой позиции
+    # (см. src/telegram/notifier.py) — последующие уведомления по этой же
+    # сделке (частичное/полное закрытие, ручное закрытие) отправляются
+    # ОТВЕТОМ на него (reply_to_message_id), чтобы в чате было видно, к
+    # какой именно позиции относится очередное уведомление.
+    notification_message_id: Mapped[int | None] = mapped_column(Integer)
     notes: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(

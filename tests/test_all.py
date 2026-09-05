@@ -1731,6 +1731,37 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         # После TP1 остаток должен восстановиться с SL в безубытке
         self.assertAlmostEqual(restored["stop_loss"], restored["entry_price"])
 
+    async def test_restore_carries_notification_message_id(self):
+        """
+        Order.notification_message_id (id уведомления об открытии в
+        Telegram — см. set_order_notification_message_id/main.py._notify_
+        signal_opened) должен восстанавливаться вместе с позицией при
+        рестарте процесса, иначе уведомления о её закрытии после рестарта
+        начинали бы новую, не связанную с открытием цепочку в чате.
+        """
+        settings.trading_mode = "paper"
+        await self.engine.initialize("binance")
+
+        order = await self.engine.create_order(
+            symbol="NOTIFRESTORE1/USDT", side="buy", amount=3.0, price=20.0,
+            order_type="market", stop_loss=18.0, take_profit=25.0,
+        )
+        self.assertIsNotNone(order)
+        await self.engine.set_order_notification_message_id(order.id, 4242)
+
+        positions, _, _ = await self.engine._load_open_positions_from_db(is_paper=True)
+        self.assertIsNotNone(positions)
+        self.assertEqual(positions["NOTIFRESTORE1/USDT"]["notification_message_id"], 4242)
+
+    async def test_set_order_notification_message_id_ignores_missing_order(self):
+        """Best-effort: несуществующий order_id не должен ронять вызывающий код."""
+        await self.engine.set_order_notification_message_id(999999999, 111)
+
+    async def test_set_order_notification_message_id_noop_without_ids(self):
+        await self.engine.set_order_notification_message_id(None, None)
+        await self.engine.set_order_notification_message_id(1, None)
+        await self.engine.set_order_notification_message_id(None, 1)
+
     async def test_restore_open_short_position(self):
         """
         _load_open_positions_from_db раньше запрашивал только Order.side ==
@@ -9347,6 +9378,45 @@ class TestManualTrading(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("MANUALLIST1/USDT", symbols_other)
 
 
+class TestManualCloseNotificationReplyThreading(unittest.IsolatedAsyncioTestCase):
+    """Ручное закрытие через дашборд (POST /positions/close) должно отвечать
+    на исходное сообщение об открытии позиции (reply_to_message_id), как и
+    автоматическое закрытие по SL/TP — см. _notify_signal_opened в main.py."""
+
+    def setUp(self):
+        import src.web.api as api_module
+
+        self.api_module = api_module
+        self._saved_trading_mode = settings.trading_mode
+        self._saved_engine = api_module.execution_engine
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+        self.api_module.execution_engine = self._saved_engine
+
+    async def test_manual_close_replies_to_open_notification(self):
+        from src.execution.executor import ExecutionEngine
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "paper"
+        engine.is_paper = True
+        engine.last_prices["MANUALREPLY1/USDT"] = 105.0
+        engine.paper_positions["MANUALREPLY1/USDT"] = {
+            "side": "long", "entry_price": 100.0, "amount": 1.0,
+            "strategy_id": "telegram_signal", "entry_fee": 0.0,
+            "notification_message_id": 888,
+        }
+        self.api_module.execution_engine = engine
+
+        with patch("src.web.api.send_notification", new=AsyncMock()) as mock_send:
+            await self.api_module.close_position_manually(
+                self.api_module.PositionCloseRequest(symbol="MANUALREPLY1/USDT"),
+            )
+
+        mock_send.assert_awaited_once()
+        self.assertEqual(mock_send.await_args.kwargs["reply_to_message_id"], 888)
+
+
 class TestSellBalancesToUsdtEndpoint(unittest.IsolatedAsyncioTestCase):
     """POST /balances/sell-to-usdt — кнопка дашборда "Продать все остатки
     в USDT" (см. ExecutionEngine.sweep_balances_to_usdt)."""
@@ -10696,6 +10766,459 @@ class TestTelegramChannelPositionSizePct(unittest.IsolatedAsyncioTestCase):
 
         passed_event = exec_mock.await_args.args[0]
         self.assertEqual(passed_event["channel_position_size_pct"], 9.0)
+
+
+class TestSendNotificationReplyThreading(unittest.IsolatedAsyncioTestCase):
+    """
+    send_notification теперь возвращает message_id отправленного сообщения
+    (не bool) и поддерживает reply_to_message_id — нужно, чтобы уведомление
+    об открытии позиции по Telegram-сигналу и последующие уведомления о её
+    закрытии были видны в чате как единая цепочка (см. _notify_signal_opened/
+    _check_position_exit в main.py).
+    """
+
+    def setUp(self):
+        self._saved_token = settings.telegram_bot_token
+        self._saved_chat_id = settings.telegram_chat_id
+        settings.telegram_bot_token = "test-token"
+        settings.telegram_chat_id = "12345"
+
+    def tearDown(self):
+        settings.telegram_bot_token = self._saved_token
+        settings.telegram_chat_id = self._saved_chat_id
+
+    @staticmethod
+    def _mock_response(status_code, json_data):
+        resp = MagicMock()
+        resp.status_code = status_code
+        resp.json.return_value = json_data
+        resp.text = str(json_data)
+        resp.raise_for_status.side_effect = None if status_code < 400 else Exception(f"HTTP {status_code}")
+        return resp
+
+    @staticmethod
+    def _mock_client_cm(responses):
+        client = MagicMock()
+        client.post = AsyncMock(side_effect=list(responses))
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=client)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        return cm, client
+
+    async def test_returns_message_id_on_success(self):
+        from src.telegram import notifier
+        response = self._mock_response(200, {"ok": True, "result": {"message_id": 555}})
+        cm, client = self._mock_client_cm([response])
+
+        with patch("src.telegram.notifier.httpx.AsyncClient", return_value=cm):
+            message_id = await notifier.send_notification("hello")
+
+        self.assertEqual(message_id, 555)
+        self.assertNotIn("reply_to_message_id", client.post.call_args.kwargs["json"])
+
+    async def test_includes_reply_to_message_id_when_given(self):
+        from src.telegram import notifier
+        response = self._mock_response(200, {"ok": True, "result": {"message_id": 556}})
+        cm, client = self._mock_client_cm([response])
+
+        with patch("src.telegram.notifier.httpx.AsyncClient", return_value=cm):
+            message_id = await notifier.send_notification("hello", reply_to_message_id=123)
+
+        self.assertEqual(message_id, 556)
+        self.assertEqual(client.post.call_args.kwargs["json"]["reply_to_message_id"], 123)
+
+    async def test_retries_without_reply_when_parent_message_missing(self):
+        """Родительское сообщение удалено — Telegram отвечает ошибкой на ВЕСЬ
+        запрос, а не игнорирует reply_to_message_id — без повтора без него
+        уведомление терялось бы целиком."""
+        from src.telegram import notifier
+        failed = self._mock_response(400, {"ok": False, "description": "message to be replied not found"})
+        retried = self._mock_response(200, {"ok": True, "result": {"message_id": 557}})
+        cm, client = self._mock_client_cm([failed, retried])
+
+        with patch("src.telegram.notifier.httpx.AsyncClient", return_value=cm):
+            message_id = await notifier.send_notification("hello", reply_to_message_id=999)
+
+        self.assertEqual(message_id, 557)
+        self.assertEqual(client.post.call_count, 2)
+        self.assertEqual(client.post.call_args_list[0].kwargs["json"]["reply_to_message_id"], 999)
+        self.assertNotIn("reply_to_message_id", client.post.call_args_list[1].kwargs["json"])
+
+    async def test_returns_none_when_not_configured(self):
+        from src.telegram import notifier
+        settings.telegram_bot_token = None
+        message_id = await notifier.send_notification("hello")
+        self.assertIsNone(message_id)
+
+    async def test_returns_none_on_persistent_failure(self):
+        from src.telegram import notifier
+        client = MagicMock()
+        client.post = AsyncMock(side_effect=Exception("network error"))
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=client)
+        cm.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("src.telegram.notifier.httpx.AsyncClient", return_value=cm):
+            message_id = await notifier.send_notification("hello")
+
+        self.assertIsNone(message_id)
+
+
+class TestOnTradeEventFiltering(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный баг: _on_trade_event была подписана на КАЖДОЕ trade_event, а
+    event_bus публикует его и на открытие, И на закрытие позиции (см.
+    executor.py) — каждое закрытие ДОПОЛНИТЕЛЬНО отправляло "открывающее"
+    сообщение (entry_price, выданный как будто это свежий вход) поверх
+    настоящего уведомления о закрытии. Плюс: открытия по Telegram-сигналам
+    теперь используют отдельное, более информативное уведомление (см.
+    _notify_signal_opened) — эта функция должна их пропускать, не дублируя.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "paper"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_skips_closing_events(self):
+        from src.event_bus import TradeEvent
+
+        bot = self._make_bot()
+        event = TradeEvent(symbol="BTC/USDT", direction="long", entry_price=100.0, amount=1.0, is_opening=False)
+
+        with patch("src.main.send_notification", new=AsyncMock()) as mock_send:
+            await bot._on_trade_event(event)
+
+        mock_send.assert_not_awaited()
+
+    async def test_skips_telegram_signal_sourced_opens(self):
+        from src.event_bus import TradeEvent
+        from src.execution.executor import execution_engine
+
+        bot = self._make_bot()
+        execution_engine.paper_positions["TGSKIP1/USDT"] = {"strategy_id": "telegram_signal"}
+        try:
+            event = TradeEvent(
+                symbol="TGSKIP1/USDT", direction="long", entry_price=100.0, amount=1.0, is_opening=True,
+            )
+            with patch("src.main.send_notification", new=AsyncMock()) as mock_send:
+                await bot._on_trade_event(event)
+            mock_send.assert_not_awaited()
+        finally:
+            execution_engine.paper_positions.pop("TGSKIP1/USDT", None)
+
+    async def test_still_notifies_non_telegram_opens(self):
+        from src.event_bus import TradeEvent
+        from src.execution.executor import execution_engine
+
+        bot = self._make_bot()
+        execution_engine.paper_positions["TGSKIP2/USDT"] = {"strategy_id": "rsi_mr"}
+        try:
+            event = TradeEvent(
+                symbol="TGSKIP2/USDT", direction="long", entry_price=100.0, amount=1.0, is_opening=True,
+            )
+            with patch("src.main.send_notification", new=AsyncMock()) as mock_send:
+                await bot._on_trade_event(event)
+            mock_send.assert_awaited_once()
+        finally:
+            execution_engine.paper_positions.pop("TGSKIP2/USDT", None)
+
+
+class TestChannelNotificationStats(unittest.IsolatedAsyncioTestCase):
+    """
+    _channel_notification_stats — название канала и (применено, закрыто в
+    плюс) для строки в уведомлении об открытии позиции. Тот же расчёт, что
+    и в GET /telegram/channels/stats (api.py): applied = decision=="executed",
+    closed = у кого уже проставлен executed_trade, wins = outcome=="win"
+    среди закрытых.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    async def test_computes_applied_and_win_counts(self):
+        from src.db.models import Exchange, Symbol, TelegramChannel, TelegramSignal, Trade
+        from src.db.session import get_session
+        from src.utils.timeutils import utcnow
+
+        async with get_session() as session:
+            exchange = Exchange(name="notif_stats_test_exchange", is_paper=True)
+            session.add(exchange)
+            await session.flush()
+            symbol = Symbol(
+                exchange_id=exchange.id, symbol="NOTIFSTATS/USDT",
+                base_asset="NOTIFSTATS", quote_asset="USDT",
+            )
+            session.add(symbol)
+            await session.flush()
+
+            channel = TelegramChannel(
+                channel_id="@notif_stats_channel", channel_title="Notif Stats Channel", active=True,
+            )
+            session.add(channel)
+            await session.flush()
+            db_channel_id = channel.id
+
+            for outcome, pnl in [("win", 10.0), ("win", 5.0), ("loss", -3.0)]:
+                trade = Trade(
+                    symbol_id=symbol.id, direction="long", entry_price=100.0, exit_price=101.0,
+                    amount=1.0, pnl=pnl, pnl_pct=1.0, outcome=outcome, is_open=False, closed_at=utcnow(),
+                )
+                session.add(trade)
+                await session.flush()
+                session.add(TelegramSignal(
+                    channel_id=db_channel_id, raw_message="test", message_date=utcnow(),
+                    parsed_pair="NOTIFSTATS/USDT", parsed_side="long", parsed_entry=100.0,
+                    decision="executed", executed_trade_id=trade.id,
+                ))
+            # Исполнена, но ещё не закрыта — считается в applied, не в closed/wins.
+            session.add(TelegramSignal(
+                channel_id=db_channel_id, raw_message="test", message_date=utcnow(),
+                parsed_pair="NOTIFSTATS/USDT", parsed_side="long", parsed_entry=100.0,
+                decision="executed",
+            ))
+            # Отклонена — не должна учитываться вовсе.
+            session.add(TelegramSignal(
+                channel_id=db_channel_id, raw_message="test", message_date=utcnow(),
+                parsed_pair="NOTIFSTATS/USDT", parsed_side="long", parsed_entry=100.0,
+                decision="rejected",
+            ))
+            await session.commit()
+
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {"@notif_stats_channel": db_channel_id}
+
+        result = await bot._channel_notification_stats("@notif_stats_channel")
+
+        self.assertIsNotNone(result)
+        title, applied, wins = result
+        self.assertEqual(title, "Notif Stats Channel")
+        self.assertEqual(applied, 4)
+        self.assertEqual(wins, 2)
+
+    async def test_unknown_channel_returns_none(self):
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+
+        result = await bot._channel_notification_stats("@does_not_exist")
+
+        self.assertIsNone(result)
+
+
+class TestNotifySignalOpened(unittest.IsolatedAsyncioTestCase):
+    """
+    _execute_telegram_signal должен отправлять обогащённое уведомление об
+    открытии (уровни TP/SL со статусом применения на бирже, канал-источник)
+    и сохранять id этого сообщения — на него ссылаются (reply_to_message_id)
+    все последующие уведомления по этой же сделке.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "real"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_message_includes_tp_sl_levels_and_reflects_exchange_sl_status(self):
+        bot = self._make_bot()
+        bot._refresh_symbol_candles = AsyncMock()
+        bot._telegram_channel_db_ids = {}
+        fake_order = MagicMock(id=42, fee=0.0)
+        with patch("src.main.execution_engine") as mock_engine, \
+             patch("src.main.send_notification", new=AsyncMock(return_value=555)) as mock_send:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=fake_order)
+            mock_engine.get_open_positions = MagicMock(
+                return_value={"NOTIFYSIG1/USDT": {"amount": 0.02, "entry_price": 50000.0}}
+            )
+            mock_engine.real_positions = {"NOTIFYSIG1/USDT": {"sl_order_id": "exch-sl-1"}}
+            mock_engine.paper_positions = {}
+            mock_engine.set_order_notification_message_id = AsyncMock()
+
+            await bot._execute_telegram_signal({
+                "parsed_pair": "NOTIFYSIG1/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 53000.0,
+                "parsed_take_profits": [51000.0, 52000.0, 53000.0],
+                "channel_id": "@no_such_channel",
+            })
+
+        mock_send.assert_awaited_once()
+        text = mock_send.await_args.args[0]
+        self.assertIn("TP1: 51000.000000", text)
+        self.assertIn("TP2: 52000.000000", text)
+        self.assertIn("TP3: 53000.000000", text)
+        self.assertIn("SL: 49000.000000", text)
+        self.assertIn("✅ выставлен на бирже", text)
+        self.assertEqual(bot.open_positions["NOTIFYSIG1/USDT"]["notification_message_id"], 555)
+        self.assertEqual(mock_engine.real_positions["NOTIFYSIG1/USDT"]["notification_message_id"], 555)
+        mock_engine.set_order_notification_message_id.assert_awaited_once_with(42, 555)
+
+    async def test_sl_shown_as_unconfirmed_when_no_exchange_sl_order(self):
+        bot = self._make_bot()
+        bot._refresh_symbol_candles = AsyncMock()
+        bot._telegram_channel_db_ids = {}
+        fake_order = MagicMock(id=43, fee=0.0)
+        with patch("src.main.execution_engine") as mock_engine, \
+             patch("src.main.send_notification", new=AsyncMock(return_value=556)) as mock_send:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=fake_order)
+            mock_engine.get_open_positions = MagicMock(
+                return_value={"NOTIFYSIG2/USDT": {"amount": 0.02, "entry_price": 50000.0}}
+            )
+            mock_engine.real_positions = {"NOTIFYSIG2/USDT": {"sl_order_id": None}}
+            mock_engine.paper_positions = {}
+            mock_engine.set_order_notification_message_id = AsyncMock()
+
+            await bot._execute_telegram_signal({
+                "parsed_pair": "NOTIFYSIG2/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 53000.0,
+                "channel_id": "@no_such_channel",
+            })
+
+        text = mock_send.await_args.args[0]
+        self.assertIn("⚠️ не подтверждён на бирже", text)
+
+    async def test_paper_mode_shows_internal_only_status(self):
+        bot = self._make_bot()
+        bot._refresh_symbol_candles = AsyncMock()
+        bot._telegram_channel_db_ids = {}
+        settings.trading_mode = "paper"
+        fake_order = MagicMock(id=44, fee=0.0)
+        with patch("src.main.execution_engine") as mock_engine, \
+             patch("src.main.send_notification", new=AsyncMock(return_value=557)) as mock_send:
+            mock_engine.get_paper_balance = MagicMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=fake_order)
+            mock_engine.get_open_positions = MagicMock(
+                return_value={"NOTIFYSIG3/USDT": {"amount": 0.02, "entry_price": 50000.0}}
+            )
+            mock_engine.real_positions = {}
+            mock_engine.paper_positions = {"NOTIFYSIG3/USDT": {}}
+            mock_engine.set_order_notification_message_id = AsyncMock()
+
+            await bot._execute_telegram_signal({
+                "parsed_pair": "NOTIFYSIG3/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 53000.0,
+                "channel_id": "@no_such_channel",
+            })
+
+        text = mock_send.await_args.args[0]
+        self.assertIn("бумажный режим", text)
+
+    async def test_no_state_mutation_when_notification_not_sent(self):
+        """send_notification вернул None (не настроен бот/сбой) — не должно
+        падать, id уведомления просто не сохраняется нигде."""
+        bot = self._make_bot()
+        bot._refresh_symbol_candles = AsyncMock()
+        bot._telegram_channel_db_ids = {}
+        fake_order = MagicMock(id=45, fee=0.0)
+        with patch("src.main.execution_engine") as mock_engine, \
+             patch("src.main.send_notification", new=AsyncMock(return_value=None)):
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=fake_order)
+            mock_engine.get_open_positions = MagicMock(
+                return_value={"NOTIFYSIG4/USDT": {"amount": 0.02, "entry_price": 50000.0}}
+            )
+            mock_engine.real_positions = {"NOTIFYSIG4/USDT": {"sl_order_id": None}}
+            mock_engine.paper_positions = {}
+            mock_engine.set_order_notification_message_id = AsyncMock()
+
+            await bot._execute_telegram_signal({
+                "parsed_pair": "NOTIFYSIG4/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 53000.0,
+                "channel_id": "@no_such_channel",
+            })
+
+        self.assertNotIn("notification_message_id", bot.open_positions["NOTIFYSIG4/USDT"])
+        mock_engine.set_order_notification_message_id.assert_not_awaited()
+
+
+class TestCheckPositionExitNotificationReplyThreading(unittest.IsolatedAsyncioTestCase):
+    """Уведомления о закрытии (полном/частичном) должны отвечать на исходное
+    сообщение об открытии позиции (reply_to_message_id), а не приходить
+    несвязанным сообщением — см. _notify_signal_opened."""
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot(), main_module.execution_engine
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "paper"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_close_notification_replies_to_open_notification(self):
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        symbol = "REPLYTHREAD1/USDT"
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": 100.0, "amount": 1.0}
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 100.0, "amount": 1.0,
+            "original_amount": 1.0, "strategy_id": "telegram_signal",
+            "sl": 90.0, "tp": 110.0, "take_profits": [110.0],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+            "notification_message_id": 777,
+        }
+
+        async def fake_close(**kwargs):
+            engine.paper_positions.pop(symbol, None)
+            return {"pnl": 1.0, "pnl_pct": 1.0, "outcome": "win", "trade_id": 1}
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close), \
+             patch("src.main.send_notification", new=AsyncMock()) as mock_send:
+            await bot._check_position_exit(symbol, 110.0)
+
+        mock_send.assert_awaited_once()
+        self.assertEqual(mock_send.await_args.kwargs["reply_to_message_id"], 777)
+
+    async def test_close_notification_without_original_message_id_passes_none(self):
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        symbol = "REPLYTHREAD2/USDT"
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": 100.0, "amount": 1.0}
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 100.0, "amount": 1.0,
+            "original_amount": 1.0, "strategy_id": "rsi_mr",
+            "sl": 90.0, "tp": 110.0, "take_profits": [110.0],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+        }
+
+        async def fake_close(**kwargs):
+            engine.paper_positions.pop(symbol, None)
+            return {"pnl": 1.0, "pnl_pct": 1.0, "outcome": "win", "trade_id": 1}
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close), \
+             patch("src.main.send_notification", new=AsyncMock()) as mock_send:
+            await bot._check_position_exit(symbol, 110.0)
+
+        self.assertIsNone(mock_send.await_args.kwargs["reply_to_message_id"])
 
 
 class TestExecuteTelegramSignalStoresRealTakeProfits(unittest.IsolatedAsyncioTestCase):

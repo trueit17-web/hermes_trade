@@ -538,7 +538,8 @@ async def close_position_manually(request: PositionCloseRequest):
     logger.info(f"Позиция {symbol} закрыта вручную через веб-панель | PnL: {result['pnl']:+.2f}")
     await send_notification(
         f"{emoji} Закрыта вручную {position['side'].upper()} {symbol}\n"
-        f"PnL: {result['pnl']:+.2f} USDT ({result['pnl_pct']:+.2f}%)"
+        f"PnL: {result['pnl']:+.2f} USDT ({result['pnl_pct']:+.2f}%)",
+        reply_to_message_id=position.get("notification_message_id"),
     )
 
     return {"success": True, **result}
