@@ -2902,7 +2902,30 @@ class ExecutionEngine:
             return
         pos["leverage"] = position.get("leverage")
         pos["margin_usdt"] = position.get("initialMargin")
-        if actual_amount >= tracked_amount:
+        if actual_amount > tracked_amount:
+            # Реальный инцидент (прод, SUI/USDT): ордер открытия не смог
+            # подтвердиться как исполненный в течение окна поллинга
+            # (fetch_order/история сделок не успели показать filled) —
+            # _execute_real_order логирует ERROR и НЕ регистрирует позицию
+            # (см. "не подтверждён как реально исполненный"), но на
+            # фьючерсах нет баланс-based фолбэка, аналогичного споту:
+            # если ордер ВСЁ ЖЕ исполнился на бирже, эта ветка раньше
+            # молча возвращалась (actual_amount >= tracked_amount
+            # покрывал и "больше", и "равно"), и излишек контрактов
+            # оставался полностью невидимым для бота — без SL/TP,
+            # без учёта в risk/PnL — до тех пор, пока кто-то не заметил
+            # бы вручную. Не корректируем tracked_amount автоматически
+            # (это меняет sizing/риск существующей позиции) — только
+            # флагируем для ручной проверки, симметрично предупреждению
+            # о недостаче ниже.
+            logger.warning(
+                f"⚠️ Периодическая сверка фьючерсных позиций: {symbol} — учтено {tracked_amount:.8f}, "
+                f"на бирже открыто {actual_amount:.8f} контрактов — на бирже БОЛЬШЕ, чем отслеживается "
+                f"ботом (вероятно, ордер, не подтверждённый как исполненный при открытии, всё же "
+                f"исполнился) — размер позиции НЕ корректируется автоматически, нужна ручная проверка."
+            )
+            return
+        if actual_amount == tracked_amount:
             return
         min_amount = self._market_min_amount(symbol, exchange)
         unsellable = actual_amount == 0 or (min_amount is not None and actual_amount < min_amount)

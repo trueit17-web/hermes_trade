@@ -8009,6 +8009,43 @@ class TestReconcileFuturesPositions(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(balance, 500.0)
         self.assertIn("FUTRECON2/USDT", self.engine.real_positions)
 
+    async def test_warns_when_exchange_shows_more_than_tracked(self):
+        """
+        Реальный инцидент (прод, SUI/USDT): ордер открытия не подтвердился
+        как исполненный в течение окна поллинга (на фьючерсах нет баланс-
+        based фолбэка, аналогичного споту) — позиция НЕ регистрируется, но
+        МОГЛА реально исполниться на бирже. Раньше "actual_amount >=
+        tracked_amount" молча покрывал и случай "больше" — излишек
+        контрактов оставался полностью невидимым (без SL/TP, без учёта в
+        risk/PnL). Теперь этот случай хотя бы флагируется предупреждением;
+        размер отслеживаемой позиции НЕ корректируется автоматически (это
+        решение о риске/sizing, не баг с очевидным фиксом).
+        """
+        from src.utils.timeutils import utcnow
+
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0},
+        })
+        self.engine.exchange.fetch_position = AsyncMock(return_value={"contracts": 25.0})
+        self.engine.real_positions["FUTRECON3/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long",
+            "opened_at": utcnow() - timedelta(hours=1), "sl_order_id": None, "order_id": None,
+            "market_type": "futures",
+        }
+
+        with self.assertLogs("src.execution.executor", level="WARNING") as cm:
+            balance = await self.engine.reconcile_real_positions()
+
+        self.assertAlmostEqual(balance, 500.0)
+        self.assertIn("FUTRECON3/USDT", self.engine.real_positions)
+        self.assertEqual(self.engine.real_positions["FUTRECON3/USDT"]["amount"], 10.0)
+        self.assertTrue(any("на бирже БОЛЬШЕ" in msg for msg in cm.output))
+
     async def test_caches_leverage_and_margin_from_fetch_position(self):
         """
         ЭТАП 6: leverage/margin_usdt кэшируются на pos из ТОГО ЖЕ ответа
