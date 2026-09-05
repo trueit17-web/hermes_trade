@@ -822,11 +822,39 @@ class ExecutionEngine:
                 open_orders = await exchange.fetch_open_orders(
                     self._ccxt_symbol(exchange, symbol), params={"orderFilter": order_filter}
                 )
-                for o in (open_orders or []):
-                    await self._cancel_order_safe(symbol, o.get("id"), exchange)
+                await self._cancel_orders_batch(
+                    symbol, [o.get("id") for o in (open_orders or []) if o.get("id")], exchange,
+                )
             except Exception as e:
                 logger.debug(f"Не удалось получить список условных ордеров {symbol} перед переустановкой SL: {e}")
             await self.sync_stop_loss_order(symbol, amount, stop_loss)
+
+    async def _cancel_orders_batch(
+        self, symbol: str, order_ids: list[str], exchange: ccxt.Exchange | None,
+    ) -> None:
+        """
+        Отменить несколько условных ордеров ОДНИМ вызовом ccxt unified
+        cancel_orders (Bybit POST /v5/order/cancel-batch) вместо
+        последовательного цикла _cancel_order_safe — единственное реальное
+        место в кодовой базе, где на рестарте может скопиться сразу
+        несколько зависших условных ордеров по одному символу.
+
+        Не все аккаунты/категории поддерживают batch-отмену (см. ccxt/
+        bybit.py cancel_orders — например, UTA-only) — при любой ошибке
+        падаем на проверенный цикл поодиночке через _cancel_order_safe,
+        поведение на сбое не меняется.
+        """
+        if not order_ids:
+            return
+        if len(order_ids) == 1 or exchange is None:
+            await self._cancel_order_safe(symbol, order_ids[0], exchange)
+            return
+        try:
+            await exchange.cancel_orders(order_ids, self._ccxt_symbol(exchange, symbol))
+        except Exception as e:
+            logger.debug(f"Batch-отмена условных ордеров {symbol} не удалась — отменяем по одному: {e}")
+            for order_id in order_ids:
+                await self._cancel_order_safe(symbol, order_id, exchange)
 
     async def reset_paper_account(self) -> dict:
         """

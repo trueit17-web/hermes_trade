@@ -8822,6 +8822,81 @@ class TestRearmStopLossOrdersFilterByMarketType(unittest.IsolatedAsyncioTestCase
         )
 
 
+class TestRearmStopLossOrdersBatchCancel(unittest.IsolatedAsyncioTestCase):
+    """
+    Фаза D (Bybit MCP): при рестарте на символе может скопиться сразу
+    несколько зависших условных ордеров — _rearm_stop_loss_orders_after_restart
+    теперь отменяет их ОДНИМ вызовом ccxt unified cancel_orders вместо
+    последовательного цикла _cancel_order_safe. Не все аккаунты/категории
+    поддерживают batch-отмену — при ошибке падает на проверенный цикл
+    поодиночке, поведение на сбое не меняется.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+        settings.market_type = "futures"
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+
+    async def test_cancels_multiple_stale_orders_in_one_batch_call(self):
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_open_orders.return_value = [
+            {"id": "stale-sl-1"}, {"id": "stale-sl-2"}, {"id": "stale-sl-3"},
+        ]
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "rearm-batch-sl-1"}
+        self.engine.real_positions["REARMBATCH1/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long", "sl_order_id": None,
+            "stop_loss": 1.8, "market_type": "futures",
+        }
+
+        await self.engine._rearm_stop_loss_orders_after_restart()
+
+        self.engine.exchange.cancel_orders.assert_awaited_once_with(
+            ["stale-sl-1", "stale-sl-2", "stale-sl-3"], "REARMBATCH1/USDT",
+        )
+        self.engine.exchange.cancel_order.assert_not_called()
+
+    async def test_single_stale_order_uses_plain_cancel_not_batch(self):
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_open_orders.return_value = [{"id": "stale-sl-solo"}]
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "rearm-solo-sl-1"}
+        self.engine.real_positions["REARMSOLO1/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long", "sl_order_id": None,
+            "stop_loss": 1.8, "market_type": "futures",
+        }
+
+        await self.engine._rearm_stop_loss_orders_after_restart()
+
+        self.engine.exchange.cancel_order.assert_awaited_once_with("stale-sl-solo", "REARMSOLO1/USDT")
+        self.engine.exchange.cancel_orders.assert_not_called()
+
+    async def test_falls_back_to_per_order_cancel_when_batch_call_raises(self):
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_open_orders.return_value = [
+            {"id": "stale-sl-fb1"}, {"id": "stale-sl-fb2"},
+        ]
+        self.engine.exchange.cancel_orders.side_effect = Exception("UTA-only, not supported")
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "rearm-fallback-sl-1"}
+        self.engine.real_positions["REARMFALLBACK1/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long", "sl_order_id": None,
+            "stop_loss": 1.8, "market_type": "futures",
+        }
+
+        await self.engine._rearm_stop_loss_orders_after_restart()
+
+        self.engine.exchange.cancel_orders.assert_awaited_once()
+        self.assertEqual(self.engine.exchange.cancel_order.await_count, 2)
+        self.engine.exchange.cancel_order.assert_any_await("stale-sl-fb1", "REARMFALLBACK1/USDT")
+        self.engine.exchange.cancel_order.assert_any_await("stale-sl-fb2", "REARMFALLBACK1/USDT")
+
+
 class TestOkxTradePermissionCheck(unittest.IsolatedAsyncioTestCase):
     """
     OKX отдаёт реально выданные API-ключу права прямо в GET /account/config
