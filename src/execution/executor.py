@@ -1398,7 +1398,7 @@ class ExecutionEngine:
         """
         market["limits"] для symbol, если оно есть и имеет ожидаемую форму
         словаря — иначе None. Общий защитный доступ для
-        _below_exchange_minimum/reconcile_real_positions: структура
+        _outside_exchange_amount_limits/reconcile_real_positions: структура
         markets[symbol] не гарантирована (разные биржи, тестовые mock-объекты
         без выставленного .markets), а падать из-за необязательной проверки
         не должны ни отправка ордера, ни сверка позиций.
@@ -1486,18 +1486,35 @@ class ExecutionEngine:
         min_amount = amount_limits.get("min") if isinstance(amount_limits, dict) else None
         return min_amount if isinstance(min_amount, (int, float)) else None
 
-    def _below_exchange_minimum(
+    def _market_max_amount(self, symbol: str, exchange: ccxt.Exchange | None = None) -> float | None:
+        """
+        market["limits"]["amount"]["max"] — ccxt/bybit заполняет его из
+        lotSizeFilter.maxOrderQty (спот) / maxTradingQty|maxOrderQty
+        (linear swap). Низкоценовые монеты с большим circulating supply
+        (напр. MOODENG/USDT) на типичный по USDT размер позиции дают
+        объём в единицах монеты, легко превышающий этот лимит — без
+        проверки такой ордер уходит на биржу и падает оттуда retCode
+        10001 "The number of contracts exceeds maximum limit allowed"
+        (реальный инцидент, прод).
+        """
+        limits = self._market_limits(symbol, exchange)
+        if not limits:
+            return None
+        amount_limits = limits.get("amount")
+        max_amount = amount_limits.get("max") if isinstance(amount_limits, dict) else None
+        return max_amount if isinstance(max_amount, (int, float)) else None
+
+    def _outside_exchange_amount_limits(
         self, symbol: str, amount: float, price: float | None, exchange: ccxt.Exchange | None = None,
     ) -> str | None:
         """
         Проверить объём/стоимость ордера ПРОТИВ биржевых лимитов пары ДО
         отправки запроса — иначе биржа отклоняет ордер (напр. Bybit
-        retCode 170140 "Order value exceeded lower limit"), это летит в
-        логи как ERROR, будто сломался код, а на деле объём просто
-        занижен: посчитанного от текущего доступного баланса (size_pct%
-        от него) размера позиции не хватает даже на минимальный
-        допустимый на бирже ордер по этой паре — сигнал безопасно
-        пропускается, ошибка это ожидаемая при малом остатке средств.
+        retCode 170140 "Order value exceeded lower limit" на заниженном
+        объёме, retCode 10001 "exceeds maximum limit allowed" на
+        завышенном), это летит в логи как ERROR, будто сломался код, а на
+        деле объём просто вне допустимого биржей диапазона по этой паре —
+        сигнал безопасно пропускается.
 
         exchange — клиент РЫНКА ЭТОГО ОРДЕРА (может отличаться от текущего
         тумблера — напр. Telegram-канал настроен на другой рынок, см.
@@ -1513,13 +1530,16 @@ class ExecutionEngine:
             min_amount = self._market_min_amount(symbol, exchange)
             if isinstance(min_amount, (int, float)) and amount < min_amount:
                 return f"объём {amount:.8f} {symbol.split('/')[0]} меньше минимального ({min_amount})"
+            max_amount = self._market_max_amount(symbol, exchange)
+            if isinstance(max_amount, (int, float)) and amount > max_amount:
+                return f"объём {amount:.8f} {symbol.split('/')[0]} больше максимального допустимого биржей ({max_amount})"
             limits = self._market_limits(symbol, exchange) or {}
             cost_limits = limits.get("cost")
             min_cost = cost_limits.get("min") if isinstance(cost_limits, dict) else None
             if isinstance(min_cost, (int, float)) and price and amount * price < min_cost:
                 return f"стоимость ордера {amount * price:.4f} USDT меньше минимальной по паре ({min_cost} USDT)"
         except Exception as e:
-            logger.debug(f"Не удалось проверить минимальные лимиты биржи для {symbol}: {e}")
+            logger.debug(f"Не удалось проверить лимиты объёма биржи для {symbol}: {e}")
         return None
 
     async def _fetch_fill_details_via_trades(
@@ -2012,12 +2032,9 @@ class ExecutionEngine:
             except Exception as e:
                 logger.debug(f"Не удалось установить плечо {leverage_to_set}x для {symbol}: {e}")
 
-        below_min = self._below_exchange_minimum(symbol, amount, price, exchange)
-        if below_min:
-            logger.warning(
-                f"⚠️ Реальный ордер {symbol} пропущен: {below_min} — доступного баланса "
-                f"недостаточно для минимального размера ордера по этой паре."
-            )
+        outside_limits = self._outside_exchange_amount_limits(symbol, amount, price, exchange)
+        if outside_limits:
+            logger.warning(f"⚠️ Реальный ордер {symbol} пропущен: {outside_limits}.")
             return None
 
         # Баланс базовой валюты на СПОТОВОМ кошельке (для фолбэк-подтверждения
@@ -3464,9 +3481,9 @@ class ExecutionEngine:
                 errors.append({"currency": currency, "reason": f"не удалось получить цену {symbol}: {e}"})
                 continue
 
-            below_min = self._below_exchange_minimum(symbol, free, price, exchange)
-            if below_min:
-                skipped.append({"currency": currency, "reason": f"пыль — {below_min}"})
+            outside_limits = self._outside_exchange_amount_limits(symbol, free, price, exchange)
+            if outside_limits:
+                skipped.append({"currency": currency, "reason": f"пыль — {outside_limits}"})
                 continue
 
             try:

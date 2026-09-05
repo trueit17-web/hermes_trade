@@ -2163,6 +2163,56 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.engine.exchange.create_market_buy_order.assert_not_called()
         self.assertNotIn("DATA1/USDT", self.engine.real_positions)
 
+    async def test_execute_real_order_skips_above_exchange_maximum_amount(self):
+        """
+        Реальный инцидент (прод, MOODENG/USDT, фьючерсы): retCode 10001
+        "The number of contracts exceeds maximum limit allowed: too large,
+        order_qty:40909500000000 > max_qty:37000000000000" — низкоценовая
+        монета с большим circulating supply на типичный по USDT размер
+        позиции даёт объём в единицах монеты, превышающий maxOrderQty
+        биржи (ccxt/bybit: market["limits"]["amount"]["max"], из
+        lotSizeFilter.maxOrderQty). Раньше проверялся только минимум —
+        такой ордер уходил на биржу и падал оттуда ERROR'ом. Симметрично
+        минимуму, должен отклоняться ДО отправки.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.markets = {
+            "MOODENG1/USDT": {"limits": {"amount": {"min": 1.0, "max": 37000000000000.0}}}
+        }
+
+        order = await self.engine.create_order(
+            symbol="MOODENG1/USDT", side="buy", amount=40909500000000.0, price=0.00045, order_type="market",
+        )
+
+        self.assertIsNone(order)
+        self.engine.exchange.create_market_buy_order.assert_not_called()
+        self.assertNotIn("MOODENG1/USDT", self.engine.real_positions)
+
+    async def test_execute_real_order_allows_amount_within_maximum(self):
+        """Регресс: объём в допустимом диапазоне не должен блокироваться новой
+        проверкой максимума."""
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.markets = {
+            "WITHINMAX1/USDT": {"limits": {"amount": {"min": 1.0, "max": 1000000.0}}}
+        }
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "within-max-1", "filled": 100.0, "average": 1.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="WITHINMAX1/USDT", side="buy", amount=100.0, price=1.0, order_type="market",
+        )
+
+        self.assertIsNotNone(order)
+        self.engine.exchange.create_market_buy_order.assert_awaited_once()
+
     async def test_execute_real_order_ignores_unusable_markets_metadata(self):
         """
         Если exchange.markets отсутствует/не словарь (как в большинстве
