@@ -2843,6 +2843,46 @@ class TestTelegramSignalParser(unittest.TestCase):
         self.assertEqual(result["take_profits"], [72000.0])
         self.assertEqual(result["tp"], 72000.0)
 
+    def test_spaced_numbered_targets_do_not_swallow_the_numbering_digit(self):
+        """
+        Реальный инцидент (прод, новый канал, сигнал DOT/USDT): "Target 1:
+        0.92718" — номер цели ОТДЕЛЁН от ключевого слова пробелом, в
+        отличие от слитного "TP1:" (см. test_numbered_tp_targets_do_not_
+        swallow_the_numbering_digit выше). \\d* в regex не может дотянуться
+        через пробел до цифры номера, а \\s*[:\\-–—]?\\s* перед ценой —
+        целиком необязательный, так что сам номер цели ошибочно захватывался
+        как цена: все 5 целей канала распознавались как [1.0, 2.0, 3.0,
+        4.0, 5.0] вместо реальных [0.92718, 0.93842, 0.96398, 0.99412,
+        1.02251] — позиция в проде открылась бы с TP-уровнями в разы выше
+        реальной цены входа.
+        """
+        result = self.parse(
+            "#DOT/USDT - Long\n"
+            "Entry:0.914\n"
+            "Stop Loss:0.77609\n"
+            "Target 1:0.92718\n"
+            "Target 2:0.93842\n"
+            "Target 3:0.96398\n"
+            "Target 4:0.99412\n"
+            "Target 5:1.02251\n"
+            "Leverage: x21"
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "DOT/USDT")
+        self.assertEqual(result["side"], "long")
+        self.assertEqual(result["entry"], 0.914)
+        self.assertEqual(result["sl"], 0.77609)
+        self.assertEqual(
+            result["take_profits"], [0.92718, 0.93842, 0.96398, 0.99412, 1.02251],
+        )
+        self.assertEqual(result["tp"], 1.02251)
+        self.assertEqual(result["leverage"], 21.0)
+
+    def test_spaced_numbered_sl_does_not_swallow_the_numbering_digit(self):
+        result = self.parse("ETH/USDT SHORT Entry: 3500 SL 1: 3600 TP: 3200")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["sl"], 3600.0)
+
     def test_leverage_absent_when_not_mentioned(self):
         result = self.parse("BTC/USDT Long 69000 SL 68000 TP 72000")
         self.assertIsNotNone(result)
