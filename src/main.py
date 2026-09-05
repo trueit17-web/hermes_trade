@@ -779,6 +779,11 @@ class TradingBot:
                 # использует их напрямую вместо интерполяции между entry и
                 # одним числом tp (см. комментарий в _tp_levels).
                 "take_profits": take_profits,
+                # Объём НА МОМЕНТ ОТКРЫТИЯ — неизменная база для расчёта доли
+                # каждого TP-уровня (1/N от исходного объёма, см.
+                # _check_position_exit); "amount" выше мутирует после каждого
+                # частичного закрытия и для этого не годится.
+                "original_amount": actual_amount,
                 "tp_hit_count": 0,
                 "opened_at": utcnow(),
                 "order_id": order.id, "entry_fee": order.fee,
@@ -1328,57 +1333,63 @@ class TradingBot:
     def _tp_levels(
         entry_price: float, tp: float | None, strategy_id: str | None = None,
         take_profits: list[float] | None = None,
-    ) -> tuple:
+    ) -> list[float]:
         """
-        3 уровня частичной фиксации прибыли (TP1 закрывает 50% остатка,
-        TP2 — ещё 50% (25% от исходного объёма), TP3 — всё, что осталось —
-        см. _check_position_exit).
+        Уровни частичной фиксации прибыли, ближайший к входу — первый (см.
+        _check_position_exit: закрывает по 1/N исходного объёма на каждом
+        уровне, кроме последнего — тот закрывает весь остаток).
 
-        Если канал прислал реальные несколько целей (take_profits — самая
-        близкая к входу первая), используем ИХ напрямую вместо интерполяции:
-        ближайшая цель -> TP1 (сработает первой), самая дальняя -> TP3
-        (финальный выход). Меньше 3 значений — недостающие ближние уровни
-        (TP1 и/или TP2) просто пропускаются (None), а не выдумываются: одна
-        цель канала — TP3=та единственная цена, полное закрытие по ней, как
-        для сделок без Telegram-сигнала ниже. Раньше даже при явных TP1/TP2/
-        TP3 от канала здесь всё равно линейно интерполировались фейковые
-        уровни между entry и ОДНИМ числом (после того как парсер схлопывал
-        несколько целей в одно) — реальные, прямо указанные каналом цены
-        отбрасывались.
+        Если канал прислал реальные цели (take_profits — самая близкая к
+        входу первая), используем ИХ НАПРЯМУЮ, ВСЕ — сколько канал прислал
+        (реальные сигналы нередко дают до 7-8 целей), а не только первые 3.
+        Раньше здесь были захардкожены ровно 3 слота (TP1/TP2/TP3) —
+        `take_profits[:3]` — и всё, что канал указал сверх трёх ближайших
+        целей, молча отбрасывалось: позиция закрывалась целиком уже на 3-й
+        цели, даже если канал явно рассчитывал на 8 уровней фиксации.
+        Ещё раньше (до самого первого фикса) даже при явных целях канала
+        здесь линейно интерполировались фейковые уровни между entry и ОДНИМ
+        числом (после того как парсер схлопывал несколько целей в одно) —
+        реальные, прямо указанные каналом цены отбрасывались целиком.
 
         Без take_profits — прежнее поведение: линейная интерполяция между
-        entry и tp (TP1 = 1/3 пути, TP2 = 2/3 пути), симметричная для long/
-        short (tp > entry для long, tp < entry для short).
+        entry и tp на 3 уровня (1/3 и 2/3 пути), симметричная для long/short
+        (tp > entry для long, tp < entry для short).
 
         Для сделок НЕ от Telegram-канала (strategy_id != "telegram_signal")
-        используется только одинарный TP (TP1=TP2=None, TP3=tp) — позиция
-        закрывается целиком по единственному уровню, без частичных фиксаций.
+        используется только одинарный TP — позиция закрывается целиком по
+        единственному уровню, без частичных фиксаций.
         """
         if strategy_id != "telegram_signal":
-            return None, None, tp if tp else None
+            return [tp] if tp else []
         if take_profits:
             # take_profits приходит уже отсортированным по возрастанию
             # расстояния от входа в прибыльную сторону (ближайшая цель
             # первая) — см. parse_with_regex/parse_with_llm/parse_with_gemini
             # в src/telegram/.
-            values = list(take_profits)[:3]
-            if len(values) == 1:
-                return None, None, values[0]
-            if len(values) == 2:
-                return None, values[0], values[1]
-            return values[0], values[1], values[2]
+            return list(take_profits)
         if not tp:
-            return None, None, None
+            return []
         tp1 = entry_price + (tp - entry_price) / 3
         tp2 = entry_price + (tp - entry_price) * 2 / 3
-        return tp1, tp2, tp
+        return [tp1, tp2, tp]
 
-    REASON_RU: ClassVar[dict[str, str]] = {
-        "stop_loss": "Stop Loss",
-        "take_profit_1": "Take Profit 1 (50%)",
-        "take_profit_2": "Take Profit 2 (25%)",
-        "take_profit_3": "Take Profit 3 (остаток)",
-    }
+    @staticmethod
+    def _reason_ru(reason: str, is_partial: bool, n_levels: int) -> str:
+        """
+        Человекочитаемая причина закрытия для логов/уведомлений. Раньше это
+        был статический словарь ровно на 3 ключа (take_profit_1/2/3) с
+        зашитыми в текст процентами 50%/25% — не масштабировался на
+        произвольное число уровней (см. _tp_levels/_check_position_exit).
+        """
+        if reason == "stop_loss":
+            return "Stop Loss"
+        if reason.startswith("take_profit_"):
+            level = reason.rsplit("_", 1)[-1]
+            if is_partial:
+                pct = 100 / n_levels if n_levels else 100
+                return f"Take Profit {level} ({pct:.3g}%)"
+            return f"Take Profit {level} (остаток)"
+        return reason
 
     def _apply_trailing_stop(self, symbol: str, current_price: float) -> None:
         """
@@ -1511,10 +1522,20 @@ class TradingBot:
 
     async def _check_position_exit(self, symbol: str, current_price: float) -> bool:
         """
-        Проверить открытую позицию на достижение SL или одного из 3 уровней
-        TP. TP1/TP2 закрывают часть позиции (50% текущего остатка каждый —
-        итого 50%/25%/25% от исходного объёма) и двигают SL в безубыток
-        после первого срабатывания; TP3 (или SL) закрывают всё, что осталось.
+        Проверить открытую позицию на достижение SL или одного из уровней
+        TP (их может быть от 1 до сколько угодно — см. _tp_levels). Каждый
+        уровень, кроме последнего, закрывает 1/N ИСХОДНОГО объёма позиции
+        (N — общее число уровней у этой позиции); последний уровень (или
+        SL) закрывает весь остаток. После первого частичного срабатывания
+        SL переносится в безубыток.
+
+        Раньше уровней всегда было ровно 3 (TP1=50% остатка, TP2=ещё 50%
+        остатка = 25% исходного, TP3=остаток) — столько же ставилось
+        всегда, сколько бы целей канал ни прислал: реальный сигнал с 8
+        целями закрывался целиком уже на 3-й, ближайшей (см. _tp_levels).
+        Теперь число уровней = длине списка реальных целей канала, а доля
+        каждого — 1/N от исходного объёма.
+
         Возвращает True, если позиция была закрыта (полностью) в этом вызове.
         """
         position = self.open_positions.get(symbol)
@@ -1533,39 +1554,45 @@ class TradingBot:
         side = position["side"]
         sl = position.get("sl")
         tp_hit_count = position.get("tp_hit_count", 0)
-        tp1, tp2, tp3 = self._tp_levels(
+        tp_levels = self._tp_levels(
             position["entry_price"], position.get("tp"), position.get("strategy_id"),
             position.get("take_profits"),
         )
+        n_levels = len(tp_levels)
 
         reason = None
-        if side == "long":
-            if sl and current_price <= sl:
-                reason = "stop_loss"
-            elif tp_hit_count < 3 and tp3 and current_price >= tp3:
-                reason = "take_profit_3"
-            elif tp_hit_count < 2 and tp2 and current_price >= tp2:
-                reason = "take_profit_2"
-            elif tp_hit_count < 1 and tp1 and current_price >= tp1:
-                reason = "take_profit_1"
-        else:  # short
-            if sl and current_price >= sl:
-                reason = "stop_loss"
-            elif tp_hit_count < 3 and tp3 and current_price <= tp3:
-                reason = "take_profit_3"
-            elif tp_hit_count < 2 and tp2 and current_price <= tp2:
-                reason = "take_profit_2"
-            elif tp_hit_count < 1 and tp1 and current_price <= tp1:
-                reason = "take_profit_1"
+        level_hit = None
+        sl_triggered = bool(sl) and (
+            current_price <= sl if side == "long" else current_price >= sl
+        )
+        if sl_triggered:
+            reason = "stop_loss"
+        else:
+            # Цена могла перепрыгнуть сразу через несколько уровней (гэп) —
+            # ищем САМЫЙ ДАЛЬНИЙ ещё не достигнутый уровень, а не бьём их
+            # по одному на следующих итерациях цикла.
+            for level in range(n_levels - 1, tp_hit_count - 1, -1):
+                target = tp_levels[level]
+                reached = current_price >= target if side == "long" else current_price <= target
+                if reached:
+                    level_hit = level
+                    reason = f"take_profit_{level + 1}"
+                    break
 
         if reason is None:
             return False
 
-        # TP1/TP2 закрывают половину текущего остатка; TP3 и SL — всё, что
-        # осталось. Если после частичного закрытия остаётся управляющая
+        # Все уровни, кроме последнего, закрывают 1/N ИСХОДНОГО объёма
+        # позиции (original_amount — не мутирует при частичных закрытиях,
+        # в отличие от position["amount"]). Последний уровень и SL — весь
+        # остаток. Если после частичного закрытия остаётся управляющая
         # погрешность (пыль), закрываем полностью, а не оставляем висеть.
-        is_partial = reason in ("take_profit_1", "take_profit_2")
-        close_amount = position["amount"] * 0.5 if is_partial else position["amount"]
+        is_partial = reason != "stop_loss" and level_hit is not None and level_hit < n_levels - 1
+        if is_partial:
+            original_amount = position.get("original_amount") or position["amount"]
+            close_amount = min(original_amount / n_levels, position["amount"])
+        else:
+            close_amount = position["amount"]
         if position["amount"] - close_amount <= 1e-9:
             is_partial = False
             close_amount = position["amount"]
@@ -1645,7 +1672,7 @@ class TradingBot:
                 )
 
         emoji = "✅" if result["pnl"] > 0 else "❌"
-        reason_ru = self.REASON_RU.get(reason, reason)
+        reason_ru = self._reason_ru(reason, is_partial, n_levels)
         logger.info(
             f"{emoji} {'Частично закрыта' if is_partial else 'Позиция закрыта'}: {symbol} {side.upper()} | "
             f"{reason_ru} @ {current_price:.4f} | объём {close_amount:.6f} | "

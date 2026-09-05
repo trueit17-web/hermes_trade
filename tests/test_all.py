@@ -5028,32 +5028,30 @@ class TestTpLevels(unittest.TestCase):
         return main_module.TradingBot._tp_levels(entry_price, tp, strategy_id)
 
     def test_telegram_signal_splits_into_three_levels(self):
-        tp1, tp2, tp3 = self._tp_levels(100.0, 130.0, "telegram_signal")
-        self.assertAlmostEqual(tp1, 110.0)
-        self.assertAlmostEqual(tp2, 120.0)
-        self.assertAlmostEqual(tp3, 130.0)
+        levels = self._tp_levels(100.0, 130.0, "telegram_signal")
+        self.assertEqual(len(levels), 3)
+        self.assertAlmostEqual(levels[0], 110.0)
+        self.assertAlmostEqual(levels[1], 120.0)
+        self.assertAlmostEqual(levels[2], 130.0)
 
     def test_strategy_signal_uses_single_tp(self):
-        tp1, tp2, tp3 = self._tp_levels(100.0, 130.0, "ensemble_voter")
-        self.assertIsNone(tp1)
-        self.assertIsNone(tp2)
-        self.assertEqual(tp3, 130.0)
+        levels = self._tp_levels(100.0, 130.0, "ensemble_voter")
+        self.assertEqual(levels, [130.0])
 
     def test_no_strategy_id_defaults_to_single_tp(self):
-        tp1, tp2, tp3 = self._tp_levels(100.0, 130.0, None)
-        self.assertIsNone(tp1)
-        self.assertIsNone(tp2)
-        self.assertEqual(tp3, 130.0)
+        levels = self._tp_levels(100.0, 130.0, None)
+        self.assertEqual(levels, [130.0])
 
-    def test_no_tp_returns_all_none_regardless_of_source(self):
-        self.assertEqual(self._tp_levels(100.0, None, "telegram_signal"), (None, None, None))
-        self.assertEqual(self._tp_levels(100.0, None, "ensemble_voter"), (None, None, None))
+    def test_no_tp_returns_empty_regardless_of_source(self):
+        self.assertEqual(self._tp_levels(100.0, None, "telegram_signal"), [])
+        self.assertEqual(self._tp_levels(100.0, None, "ensemble_voter"), [])
 
     def test_short_side_symmetric_for_telegram_signal(self):
-        tp1, tp2, tp3 = self._tp_levels(100.0, 70.0, "telegram_signal")
-        self.assertAlmostEqual(tp1, 90.0)
-        self.assertAlmostEqual(tp2, 80.0)
-        self.assertAlmostEqual(tp3, 70.0)
+        levels = self._tp_levels(100.0, 70.0, "telegram_signal")
+        self.assertEqual(len(levels), 3)
+        self.assertAlmostEqual(levels[0], 90.0)
+        self.assertAlmostEqual(levels[1], 80.0)
+        self.assertAlmostEqual(levels[2], 70.0)
 
 
 class TestTpLevelsUsesRealChannelTargets(unittest.TestCase):
@@ -5062,7 +5060,8 @@ class TestTpLevelsUsesRealChannelTargets(unittest.TestCase):
     всё равно линейно интерполировал 3 фейковых уровня между entry и ОДНИМ
     числом (после того как парсер уже схлопнул несколько целей в одно) —
     реальные цены, прямо указанные каналом, отбрасывались. Теперь
-    take_profits (ближайшая цель первая) используется напрямую.
+    take_profits (ближайшая цель первая) используется напрямую, ВСЕ —
+    сколько бы их ни было (реальные сигналы дают до 7-8 целей).
     """
 
     def _tp_levels(self, entry_price, tp, strategy_id, take_profits):
@@ -5070,44 +5069,43 @@ class TestTpLevelsUsesRealChannelTargets(unittest.TestCase):
         return main_module.TradingBot._tp_levels(entry_price, tp, strategy_id, take_profits)
 
     def test_three_real_targets_used_directly_not_interpolated(self):
-        tp1, tp2, tp3 = self._tp_levels(100.0, 130.0, "telegram_signal", [111.0, 122.0, 130.0])
-        self.assertEqual(tp1, 111.0)
-        self.assertEqual(tp2, 122.0)
-        self.assertEqual(tp3, 130.0)
+        levels = self._tp_levels(100.0, 130.0, "telegram_signal", [111.0, 122.0, 130.0])
+        self.assertEqual(levels, [111.0, 122.0, 130.0])
 
-    def test_two_real_targets_map_to_tp2_tp3_leaving_tp1_none(self):
-        """Только 2 цели — недостающий ближний уровень (TP1) пропускается,
-        а не выдумывается интерполяцией."""
-        tp1, tp2, tp3 = self._tp_levels(100.0, 130.0, "telegram_signal", [120.0, 130.0])
-        self.assertIsNone(tp1)
-        self.assertEqual(tp2, 120.0)
-        self.assertEqual(tp3, 130.0)
+    def test_two_real_targets_used_directly(self):
+        levels = self._tp_levels(100.0, 130.0, "telegram_signal", [120.0, 130.0])
+        self.assertEqual(levels, [120.0, 130.0])
 
     def test_single_real_target_is_full_close_not_partial_split(self):
-        tp1, tp2, tp3 = self._tp_levels(100.0, 130.0, "telegram_signal", [130.0])
-        self.assertIsNone(tp1)
-        self.assertIsNone(tp2)
-        self.assertEqual(tp3, 130.0)
+        levels = self._tp_levels(100.0, 130.0, "telegram_signal", [130.0])
+        self.assertEqual(levels, [130.0])
 
-    def test_more_than_three_targets_uses_first_three(self):
-        tp1, tp2, tp3 = self._tp_levels(
-            100.0, 140.0, "telegram_signal", [110.0, 120.0, 130.0, 140.0],
+    def test_more_than_three_targets_uses_all_of_them(self):
+        """
+        Регресс на реальный баг: сигналы канала нередко дают до 7-8 целей,
+        а _tp_levels() раньше брал только первые 3 (values[:3]) — всё
+        остальное молча отбрасывалось, и позиция закрывалась целиком уже
+        на 3-й, ближайшей цели. Теперь используются ВСЕ уровни, которые
+        прислал канал.
+        """
+        levels = self._tp_levels(
+            100.0, 180.0, "telegram_signal",
+            [110.0, 120.0, 130.0, 140.0, 150.0, 160.0, 170.0, 180.0],
         )
-        self.assertEqual(tp1, 110.0)
-        self.assertEqual(tp2, 120.0)
-        self.assertEqual(tp3, 130.0)
+        self.assertEqual(
+            levels, [110.0, 120.0, 130.0, 140.0, 150.0, 160.0, 170.0, 180.0],
+        )
 
     def test_empty_take_profits_falls_back_to_interpolation(self):
-        tp1, tp2, tp3 = self._tp_levels(100.0, 130.0, "telegram_signal", [])
-        self.assertAlmostEqual(tp1, 110.0)
-        self.assertAlmostEqual(tp2, 120.0)
-        self.assertAlmostEqual(tp3, 130.0)
+        levels = self._tp_levels(100.0, 130.0, "telegram_signal", [])
+        self.assertEqual(len(levels), 3)
+        self.assertAlmostEqual(levels[0], 110.0)
+        self.assertAlmostEqual(levels[1], 120.0)
+        self.assertAlmostEqual(levels[2], 130.0)
 
     def test_real_targets_ignored_for_non_telegram_source(self):
-        tp1, tp2, tp3 = self._tp_levels(100.0, 130.0, "ensemble_voter", [111.0, 122.0, 130.0])
-        self.assertIsNone(tp1)
-        self.assertIsNone(tp2)
-        self.assertEqual(tp3, 130.0)
+        levels = self._tp_levels(100.0, 130.0, "ensemble_voter", [111.0, 122.0, 130.0])
+        self.assertEqual(levels, [130.0])
 
 
 class TestSymbolBlacklistSkipsProcessing(unittest.IsolatedAsyncioTestCase):
@@ -9687,6 +9685,10 @@ class TestExecuteTelegramSignalStoresRealTakeProfits(unittest.IsolatedAsyncioTes
         self.assertEqual(
             bot.open_positions["BTC/USDT"]["take_profits"], [51000.0, 52000.0, 53000.0],
         )
+        self.assertEqual(
+            bot.open_positions["BTC/USDT"]["original_amount"],
+            bot.open_positions["BTC/USDT"]["amount"],
+        )
 
     async def test_missing_parsed_take_profits_defaults_to_empty_list(self):
         bot = self._make_bot()
@@ -9702,6 +9704,97 @@ class TestExecuteTelegramSignalStoresRealTakeProfits(unittest.IsolatedAsyncioTes
             })
 
         self.assertEqual(bot.open_positions["BTC/USDT"]["take_profits"], [])
+
+
+class TestCheckPositionExitUsesAllTpLevelsEqualSplit(unittest.IsolatedAsyncioTestCase):
+    """
+    Регресс на реальный баг: сигналы канала нередко дают до 7-8 целей, а
+    _check_position_exit (через _tp_levels) раньше всегда работал ровно с
+    3 уровнями (50%/25%/25% от исходного объёма), сколько бы целей канал
+    ни прислал — позиция закрывалась целиком уже на 3-й, ближайшей цели.
+    Теперь используются ВСЕ уровни канала, и каждый (кроме последнего)
+    закрывает 1/N исходного объёма позиции.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot(), main_module.execution_engine
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "paper"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_four_targets_close_equal_quarters_each(self):
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        symbol = "MULTITP1/USDT"
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": 100.0, "amount": 8.0}
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 100.0, "amount": 8.0,
+            "original_amount": 8.0, "strategy_id": "telegram_signal",
+            "sl": 90.0, "tp": 140.0, "take_profits": [110.0, 120.0, 130.0, 140.0],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+        }
+        close_amounts = []
+
+        async def fake_close(**kwargs):
+            close_amounts.append(kwargs["amount"])
+            engine.paper_positions[symbol]["amount"] -= kwargs["amount"]
+            if engine.paper_positions[symbol]["amount"] <= 1e-9:
+                engine.paper_positions.pop(symbol, None)
+            return {"pnl": 1.0, "pnl_pct": 1.0, "outcome": "win", "trade_id": 1}
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close):
+            self.assertFalse(await bot._check_position_exit(symbol, 110.0))
+            self.assertFalse(await bot._check_position_exit(symbol, 120.0))
+            self.assertFalse(await bot._check_position_exit(symbol, 130.0))
+            self.assertTrue(await bot._check_position_exit(symbol, 140.0))
+
+        # 8.0 / 4 уровня = ровно по 2.0 на каждом, включая последний (а не
+        # 50%/25%/25%, и не остановка после 3-го уровня).
+        self.assertEqual(len(close_amounts), 4)
+        for amount in close_amounts:
+            self.assertAlmostEqual(amount, 2.0)
+        self.assertNotIn(symbol, bot.open_positions)
+
+    async def test_price_gap_past_multiple_levels_attributes_farthest_reached(self):
+        """Цена может перепрыгнуть сразу несколько целей одним движением —
+        должен засчитаться самый дальний достигнутый уровень, а не первый
+        по порядку (иначе на следующей итерации уже пройденные уровни
+        засчитались бы повторно)."""
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        symbol = "MULTITP2/USDT"
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": 100.0, "amount": 4.0}
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 100.0, "amount": 4.0,
+            "original_amount": 4.0, "strategy_id": "telegram_signal",
+            "sl": 90.0, "tp": 130.0, "take_profits": [110.0, 120.0, 130.0],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+        }
+        reasons = []
+
+        async def fake_close(**kwargs):
+            reasons.append(kwargs["reason"])
+            engine.paper_positions[symbol]["amount"] -= kwargs["amount"]
+            if engine.paper_positions[symbol]["amount"] <= 1e-9:
+                engine.paper_positions.pop(symbol, None)
+            return {"pnl": 1.0, "pnl_pct": 1.0, "outcome": "win", "trade_id": 1}
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close):
+            # Цена сразу прыгает выше TP2 (пропуская TP1) — должен
+            # засчитаться TP2, а не TP1.
+            await bot._check_position_exit(symbol, 125.0)
+
+        self.assertEqual(reasons, ["take_profit_2"])
 
 
 class TestExecuteTelegramSignalPassesParsedLeverage(unittest.IsolatedAsyncioTestCase):
