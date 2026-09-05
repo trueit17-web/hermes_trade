@@ -3716,6 +3716,119 @@ class TestParseTelegramSignalImageRouting(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
 
 
+class TestClosedTradeReportNotParsedAsSignal(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент (прод, BNB/USDT): канал шлёт отчёт об уже ЗАКРЫТОЙ
+    сделке в том же формате заголовка, что и у нового сигнала ("МОНЕТА:
+    $BNB/USDT (2-5x)\\nНАПРАВЛЕНИЕ: ЛОНГ📈"), различие — только отметки ✅
+    у уже достигнутых целей и итоговая строка прибыли. Кириллическое
+    "ЛОНГ" не матчится ни одним side-паттерном regex (parse_with_regex
+    тихо возвращает None), сообщение уходит в LLM-фолбэк — и LLM (несмотря
+    на явную инструкцию "update об уже открытой сделке -> не сигнал")
+    всё равно классифицировала его как исполнимый сигнал, придумав entry
+    (цены входа в тексте нет вообще): бот открыл реальную позицию по
+    отчёту о прошлой сделке. is_closed_trade_report — детерминированная
+    проверка ДО любого парсера, не полагающаяся на то, что LLM ни разу не
+    нарушит инструкцию.
+    """
+
+    def test_detects_the_real_incident_message(self):
+        from src.telegram.channel_monitor import is_closed_trade_report
+
+        text = (
+            "МОНЕТА: $BNB/USDT (2-5x)\n"
+            "НАПРАВЛЕНИЕ: ЛОНГ📈\n"
+            "➖➖➖➖➖➖➖\n"
+            "Цель 1: 635.00✅\n"
+            "Цель 2: 665.00✅\n"
+            "Цель 3: 700.00✅\n"
+            "Цель 4: 740.00✅\n"
+            "\n"
+            "🔥Прибыль: 109.1% (5x)🔥\n"
+            "➖➖➖➖➖➖➖"
+        )
+        self.assertTrue(is_closed_trade_report(text))
+
+    def test_english_profit_report_variant_also_detected(self):
+        from src.telegram.channel_monitor import is_closed_trade_report
+
+        text = "BTC/USDT LONG\nTarget 1: 51000 ✅\nTarget 2: 52000 ✅\nProfit: 45.2% (10x)"
+        self.assertTrue(is_closed_trade_report(text))
+
+    def test_single_hit_target_with_profit_is_enough(self):
+        from src.telegram.channel_monitor import is_closed_trade_report
+
+        text = "ETH/USDT SHORT\nЦель 1: 3200 ✅\nPnL: 12%"
+        self.assertTrue(is_closed_trade_report(text))
+
+    def test_does_not_flag_ordinary_new_signal_with_dot_format(self):
+        from src.telegram.channel_monitor import is_closed_trade_report
+
+        text = (
+            "#DOT/USDT - Long\n\nEntry:0.914\nStop Loss:0.77609\n\n"
+            "Target 1:0.92718\nTarget 2:0.93842\nLeverage: x21"
+        )
+        self.assertFalse(is_closed_trade_report(text))
+
+    def test_does_not_flag_ordinary_new_signal_plain_format(self):
+        from src.telegram.channel_monitor import is_closed_trade_report
+
+        self.assertFalse(is_closed_trade_report("BTC/USDT LONG 69000 SL 68000 TP 72000"))
+
+    def test_does_not_flag_signal_with_checkmarks_but_no_profit_line(self):
+        """✅ без упоминания прибыли — недостаточно, чтобы посчитать отчётом
+        (например, канал мог просто украсить исходный сигнал галочками)."""
+        from src.telegram.channel_monitor import is_closed_trade_report
+
+        text = "BTC/USDT LONG ✅\nEntry: 69000\nSL: 68000\nTarget 1: 72000 ✅"
+        self.assertFalse(is_closed_trade_report(text))
+
+    def test_does_not_flag_profit_mention_without_hit_target_marker(self):
+        """Прибыль/процент без единой отметки ✅ у цели — тоже недостаточно."""
+        from src.telegram.channel_monitor import is_closed_trade_report
+
+        text = "Ожидаемая прибыль по сделке: около 20% при достижении цели 1"
+        self.assertFalse(is_closed_trade_report(text))
+
+    async def test_parse_telegram_signal_returns_none_for_closed_report(self):
+        from src.telegram.channel_monitor import parse_telegram_signal
+
+        text = (
+            "МОНЕТА: $BNB/USDT (2-5x)\n"
+            "НАПРАВЛЕНИЕ: ЛОНГ📈\n"
+            "Цель 1: 635.00✅\n"
+            "🔥Прибыль: 109.1% (5x)🔥"
+        )
+        result = await parse_telegram_signal(text)
+        self.assertIsNone(result)
+
+    async def test_parse_telegram_signal_skips_llm_entirely_for_closed_report(self):
+        """Гарантия, что проверка идёт ДО LLM-фолбэков, а не просто совпадает
+        с их ответом: LLM здесь намеренно замокан отвечать "это сигнал" — но
+        до него дело не должно дойти вообще."""
+        import src.telegram.llm_parser as llm_parser_module
+        from src.telegram.channel_monitor import parse_telegram_signal
+
+        self._saved_enabled = settings.telegram_llm_fallback_enabled
+        self._saved_key = settings.anthropic_api_key
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = "test-key"
+        mock_client = AsyncMock()
+        llm_parser_module._client = mock_client
+        try:
+            text = (
+                "МОНЕТА: $BNB/USDT (2-5x)\nНАПРАВЛЕНИЕ: ЛОНГ📈\n"
+                "Цель 1: 635.00✅\n🔥Прибыль: 109.1% (5x)🔥"
+            )
+            result = await parse_telegram_signal(text)
+            self.assertIsNone(result)
+            mock_client.messages.create.assert_not_called()
+        finally:
+            settings.telegram_llm_fallback_enabled = self._saved_enabled
+            settings.anthropic_api_key = self._saved_key
+            llm_parser_module._client = None
+
+
 class TestGroqSignalParser(unittest.IsolatedAsyncioTestCase):
     """
     Groq LLM-фолбэк парсинга — второй уровень, между Anthropic и Gemini

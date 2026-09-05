@@ -311,6 +311,45 @@ def normalize_pair(pair: str) -> str:
     return f"{pair}/USDT"
 
 
+_HIT_TARGET_PATTERN = re.compile(
+    r"(?:цель|target|tp)\s*\d*\s*[:\-–—]?\s*[\d.]+\s*✅", re.IGNORECASE,
+)
+_PROFIT_REPORT_PATTERN = re.compile(r"прибыль|profit|pnl", re.IGNORECASE)
+_PERCENT_PATTERN = re.compile(r"\d+(?:[.,]\d+)?\s*%")
+
+
+def is_closed_trade_report(text: str) -> bool:
+    """
+    Отчёт канала о ЗАКРЫТОЙ/уже отработавшей сделке, а не новый сигнал —
+    реальный инцидент (прод, BNB/USDT): канал шлёт итог по уже сработавшей
+    позиции в ТОМ ЖЕ формате заголовка, что и у нового сигнала ("МОНЕТА:
+    $BNB/USDT (2-5x)\\nНАПРАВЛЕНИЕ: ЛОНГ📈"), различие только в отметках
+    ✅ у уже достигнутых целей и итоговой строке прибыли ("Цель 1:
+    635.00✅ ... 🔥Прибыль: 109.1% (5x)🔥") — цены входа в таком сообщении
+    нет вообще.
+
+    Ни regex (кириллическое "ЛОНГ" не матчится ни с одним side_pattern
+    ниже — parse_with_regex тихо возвращает None), ни явная инструкция в
+    промпте LLM-фолбэков ("an update about an already-open trade" ->
+    is_signal: false) не спасли: сообщение дошло до LLM и та всё равно
+    классифицировала его как исполнимый сигнал, придумав entry (в тексте
+    цены входа нет ни одной) — прямое нарушение и этого правила, и
+    "NEVER invent, guess, or extrapolate prices". Полагаться на то, что
+    LLM ни разу не ошибётся с инструкцией, недостаточно — нужна
+    детерминированная проверка ДО любого парсера (regex и ВСЕХ LLM-
+    фолбэков разом), не зависящая от языка/провайдера.
+
+    Срабатывает только на СОЧЕТАНИИ двух маркеров (хотя бы одна цель,
+    отмеченная как достигнутая, И упоминание прибыли с процентом) —
+    поодиночке любой из них теоретически мог бы встретиться в необычном,
+    но настоящем сигнале другого канала; вместе они специфичны именно
+    для отчёта об уже закрытой/частично закрытой сделке.
+    """
+    if not _PROFIT_REPORT_PATTERN.search(text) or not _PERCENT_PATTERN.search(text):
+        return False
+    return bool(_HIT_TARGET_PATTERN.search(text))
+
+
 async def parse_telegram_signal(
     text: str, channel_config: dict | None = None, image_bytes: bytes | None = None,
 ) -> dict | None:
@@ -322,6 +361,13 @@ async def parse_telegram_signal(
     Или None если сигнал не распознан.
     """
     if not text and not image_bytes:
+        return None
+
+    if text and is_closed_trade_report(text):
+        # Проверяем ДО любого парсера (regex и ВСЕХ LLM-фолбэков) — см.
+        # докстринг is_closed_trade_report: полагаться на то, что LLM ни
+        # разу не нарушит собственную инструкцию "update о уже открытой
+        # сделке -> не сигнал", недостаточно (реальный инцидент, прод).
         return None
 
     if image_bytes:
