@@ -7465,6 +7465,61 @@ class TestReconcileFuturesPositions(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("FUTRECON3/USDT", self.engine.real_positions)
 
+    async def test_finalizes_futures_short_closed_externally_via_buy_trade(self):
+        """
+        Регресс на прод-инцидент (WIF/USDT short на фьючерсах): позиция
+        пропала с биржи (fetch_position contracts=0) без известного
+        sl_order_id для точной проверки — сверка падает в
+        _finalize_via_recent_trade_history и должна найти закрывающую
+        сделку в истории. Закрытие SHORT — это BUY (откуп), а не SELL:
+        раньше метод искал только "sell" и для short никогда не находил
+        такую сделку, теряя закрытие без PnL (фолбэк на
+        _reconcile_phantom_position).
+        """
+        from sqlalchemy import select, desc
+        from src.db.session import get_session
+        from src.db.models import Trade, Symbol
+        from src.utils.timeutils import utcnow
+
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0},
+        })
+        self.engine.exchange.fetch_position = AsyncMock(return_value={"contracts": 0.0})
+        opened_at = utcnow() - timedelta(hours=1)
+        self.engine.real_positions["FUTSHORTCLOSE1/USDT"] = {
+            "amount": 100.0, "entry_price": 2.0, "side": "short",
+            "strategy_id": None, "entry_fee": 0.2, "order_id": None,
+            "opened_at": opened_at, "sl_order_id": None,
+            "market_type": "futures",
+        }
+        recent_ts_ms = int((opened_at + timedelta(minutes=30)).timestamp() * 1000)
+        self.engine.exchange.fetch_my_trades = AsyncMock(return_value=[
+            {"id": "short-close-1", "side": "buy", "amount": 100.0, "price": 1.8,
+             "cost": 180.0, "timestamp": recent_ts_ms, "fee": {"cost": 0.18, "currency": "USDT"}},
+        ])
+
+        await self.engine.reconcile_real_positions()
+
+        self.assertNotIn("FUTSHORTCLOSE1/USDT", self.engine.real_positions)
+        async with get_session() as session:
+            symbol_row = (
+                await session.execute(select(Symbol).where(Symbol.symbol == "FUTSHORTCLOSE1/USDT"))
+            ).scalar_one()
+            trade = (
+                await session.execute(
+                    select(Trade).where(Trade.symbol_id == symbol_row.id).order_by(desc(Trade.id))
+                )
+            ).scalars().first()
+        self.assertIsNotNone(trade)
+        # short PnL: (entry - exit) * amount - entry_fee - exit_fee = (2.0-1.8)*100 - 0.2 - 0.18 = 19.62
+        self.assertAlmostEqual(float(trade.pnl), 19.62, places=4)
+        self.assertFalse(trade.is_open)
+
     async def test_mixed_markets_fetches_spot_balance_from_spot_client_not_current_toggle(self):
         """
         Реальный сценарий с прода: тумблер стоит на futures, но

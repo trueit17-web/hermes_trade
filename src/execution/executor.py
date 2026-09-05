@@ -2692,6 +2692,16 @@ class ExecutionEngine:
         историю сделок вообще не удалось получить) не гадаем и оставляем
         обычный фолбэк на _reconcile_phantom_position (без PnL, но без
         риска приписать чужую сделку).
+
+        Реальный инцидент (прод, WIF/USDT short на фьючерсах): closing_side
+        раньше был жёстко захардкожен как "sell" — верно только для LONG
+        (закрытие long = продажа). Закрытие SHORT-позиции на бирже — это
+        BUY (откуп), и такая сделка тут никогда не находилась: фильтр
+        молча возвращал пустой список, метод отдавал False, и любая
+        short-позиция, закрывшаяся вне цикла бота (сработавший SL,
+        ликвидация, ручное закрытие на бирже), проваливалась дальше в
+        _reconcile_phantom_position — терялась без PnL, хотя реальная
+        закрывающая сделка была в истории и её было чем найти.
         """
         tracked_amount = pos.get("amount") or 0
         opened_at = pos.get("opened_at")
@@ -2716,19 +2726,20 @@ class ExecutionEngine:
             # UTC, и даёт неверный epoch вне контейнеров с TZ=UTC — сначала
             # явно проставляем tzinfo=UTC, как и utcnow_timestamp.
             opened_at_ts = opened_at.replace(tzinfo=UTC).timestamp() * 1000
-            sells = [
+            closing_side = "sell" if pos.get("side", "long") == "long" else "buy"
+            closing_trades = [
                 t for t in recent
-                if str(t.get("side", "")).lower() == "sell" and (t.get("timestamp") or 0) >= opened_at_ts
+                if str(t.get("side", "")).lower() == closing_side and (t.get("timestamp") or 0) >= opened_at_ts
             ]
-            if not sells:
+            if not closing_trades:
                 return False
 
-            total_amount = sum(float(t.get("amount") or 0) for t in sells)
+            total_amount = sum(float(t.get("amount") or 0) for t in closing_trades)
             if total_amount <= 0:
                 return False
             if abs(total_amount - tracked_amount) / tracked_amount > 0.15:
                 logger.debug(
-                    f"Сверка {symbol}: недавние продажи ({total_amount:.8f}) слишком расходятся с "
+                    f"Сверка {symbol}: недавние {closing_side} ({total_amount:.8f}) слишком расходятся с "
                     f"отслеживаемым объёмом ({tracked_amount:.8f}) — не гадаем, чей это ордер."
                 )
                 return False
@@ -2738,7 +2749,7 @@ class ExecutionEngine:
 
         total_cost = sum(
             float(t["cost"]) if t.get("cost") is not None else float(t.get("amount") or 0) * float(t.get("price") or 0)
-            for t in sells
+            for t in closing_trades
         )
         exit_price = total_cost / total_amount if total_amount else 0
         if not exit_price:
@@ -2753,7 +2764,7 @@ class ExecutionEngine:
         # известная валюта конкретной сделки).
         base_currency = symbol.split("/")[0]
         exit_fee = 0.0
-        for t in sells:
+        for t in closing_trades:
             fee = t.get("fee") or {}
             cost = fee.get("cost")
             if not cost:
@@ -2763,7 +2774,7 @@ class ExecutionEngine:
                 fill_price = float(t.get("price") or exit_price)
                 cost *= fill_price
             exit_fee += cost
-        trade_ids = [str(t["id"]) for t in sells if t.get("id")]
+        trade_ids = [str(t["id"]) for t in closing_trades if t.get("id")]
 
         await self._record_external_close(
             symbol, pos, exit_price=exit_price, amount=total_amount, exit_fee=exit_fee,
