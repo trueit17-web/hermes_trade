@@ -8009,17 +8009,19 @@ class TestReconcileFuturesPositions(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(balance, 500.0)
         self.assertIn("FUTRECON2/USDT", self.engine.real_positions)
 
-    async def test_warns_when_exchange_shows_more_than_tracked(self):
+    async def test_adopts_excess_when_exchange_shows_more_than_tracked(self):
         """
         Реальный инцидент (прод, SUI/USDT): ордер открытия не подтвердился
         как исполненный в течение окна поллинга (на фьючерсах нет баланс-
         based фолбэка, аналогичного споту) — позиция НЕ регистрируется, но
-        МОГЛА реально исполниться на бирже. Раньше "actual_amount >=
+        РЕАЛЬНО исполнился на бирже (подтверждено: 23660 контрактов на
+        бирже против 11810 отслеживаемых). Раньше "actual_amount >=
         tracked_amount" молча покрывал и случай "больше" — излишек
-        контрактов оставался полностью невидимым (без SL/TP, без учёта в
-        risk/PnL). Теперь этот случай хотя бы флагируется предупреждением;
-        размер отслеживаемой позиции НЕ корректируется автоматически (это
-        решение о риске/sizing, не баг с очевидным фиксом).
+        контрактов оставался полностью невидимым (без SL, без учёта в
+        risk/PnL). Теперь бот подхватывает излишек как источник истины:
+        объём расширяется до фактического, entry_price берётся из
+        exchange["entryPrice"] (биржа уже посчитала средневзвешенную цену
+        всей позиции), SL переставляется на полный объём.
         """
         from src.utils.timeutils import utcnow
 
@@ -8031,9 +8033,12 @@ class TestReconcileFuturesPositions(unittest.IsolatedAsyncioTestCase):
         self.engine.exchange.fetch_balance = AsyncMock(return_value={
             "free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0},
         })
-        self.engine.exchange.fetch_position = AsyncMock(return_value={"contracts": 25.0})
+        self.engine.exchange.fetch_position = AsyncMock(
+            return_value={"contracts": 25.0, "entryPrice": 1.95, "leverage": 10.0, "initialMargin": 4.875},
+        )
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "adopted-sl-1"}
         self.engine.real_positions["FUTRECON3/USDT"] = {
-            "amount": 10.0, "entry_price": 2.0, "side": "long",
+            "amount": 10.0, "entry_price": 2.0, "side": "long", "stop_loss": 1.8,
             "opened_at": utcnow() - timedelta(hours=1), "sl_order_id": None, "order_id": None,
             "market_type": "futures",
         }
@@ -8042,9 +8047,39 @@ class TestReconcileFuturesPositions(unittest.IsolatedAsyncioTestCase):
             balance = await self.engine.reconcile_real_positions()
 
         self.assertAlmostEqual(balance, 500.0)
-        self.assertIn("FUTRECON3/USDT", self.engine.real_positions)
-        self.assertEqual(self.engine.real_positions["FUTRECON3/USDT"]["amount"], 10.0)
-        self.assertTrue(any("на бирже БОЛЬШЕ" in msg for msg in cm.output))
+        pos = self.engine.real_positions["FUTRECON3/USDT"]
+        self.assertEqual(pos["amount"], 25.0)
+        self.assertEqual(pos["entry_price"], 1.95)
+        self.assertEqual(pos["sl_order_id"], "adopted-sl-1")
+        self.engine.exchange.create_market_sell_order.assert_awaited_once_with(
+            "FUTRECON3/USDT", 25.0, params={"stopLossPrice": 1.8, "reduceOnly": True},
+        )
+        self.assertTrue(any("объём скорректирован" in msg for msg in cm.output))
+
+    async def test_keeps_old_entry_price_when_exchange_omits_entry_price(self):
+        from src.utils.timeutils import utcnow
+
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0},
+        })
+        self.engine.exchange.fetch_position = AsyncMock(return_value={"contracts": 25.0})
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "adopted-sl-2"}
+        self.engine.real_positions["FUTRECON4/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long", "stop_loss": 1.8,
+            "opened_at": utcnow() - timedelta(hours=1), "sl_order_id": None, "order_id": None,
+            "market_type": "futures",
+        }
+
+        await self.engine.reconcile_real_positions()
+
+        pos = self.engine.real_positions["FUTRECON4/USDT"]
+        self.assertEqual(pos["amount"], 25.0)
+        self.assertEqual(pos["entry_price"], 2.0)
 
     async def test_caches_leverage_and_margin_from_fetch_position(self):
         """
