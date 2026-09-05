@@ -4,7 +4,14 @@ import logging
 import uuid
 from datetime import UTC
 
-import ccxt.async_support as ccxt
+# ccxt.pro (не отдельный платный пакет, а часть того же ccxt, что уже
+# стоит в requirements.txt) — прямой подкласс ccxt.async_support для
+# каждой биржи (те же create_order/fetch_position/set_leverage/...),
+# плюс watch_orders/watch_positions/watch_ticker для push-уведомлений по
+# WebSocket вместо REST-поллинга (см. _watch_orders_loop ниже) — реальные
+# события об исполнении SL/TP обнаруживаются почти мгновенно, а не ждут
+# следующего 60-секундного прохода reconcile_real_positions().
+import ccxt.pro as ccxt
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import selectinload
 
@@ -55,6 +62,14 @@ class ExecutionEngine:
         # который резолвит клиент по market_type САМОЙ позиции, а не по
         # текущему тумблеру.
         self._exchanges: dict[str, ccxt.Exchange] = {}
+        # Долгоживущие задачи push-прослушивания ордеров по WebSocket
+        # (ccxt.pro watch_orders) — по одной на market_type, см.
+        # _start_watch_task/_watch_orders_loop/_stop_watch_tasks. В
+        # отличие от Telethon (который сам управляет своим сетевым циклом
+        # внутри client.start()), watch_orders() у ccxt.pro блокируется до
+        # следующего события и должен вызываться из СВОЕГО цикла — отсюда
+        # отдельная asyncio-задача на каждый подключённый рынок.
+        self._watch_tasks: dict[str, asyncio.Task] = {}
         self.exchange_id: str | None = None
         self.is_paper: bool = settings.is_paper
         self.paper_balance: float = settings.startup_capital_usdt
@@ -180,6 +195,12 @@ class ExecutionEngine:
         # что и рестарт до фикса #31. Закрываем ВСЕ подключённые клиенты
         # (не только текущего рынка) — после предыдущего initialize() мог
         # остаться и лениво поднятый клиент второго рынка (см. ниже).
+        # Старые WS-задачи слушают ТЕ ЖЕ клиенты, которые сейчас закрываются
+        # ниже — без остановки они продолжили бы жить и на следующей
+        # итерации своего цикла подхватили бы НОВЫЙ клиент того же
+        # market_type (переподставленный в self._exchanges), задваивая
+        # подписку на один и тот же рынок.
+        await self._stop_watch_tasks()
         for market_type, exchange in list(self._exchanges.items()):
             try:
                 await exchange.close()
@@ -217,6 +238,7 @@ class ExecutionEngine:
                 return
 
             self.exchange = await self._connect_exchange(exchange_id, settings.market_type)
+            self._start_watch_task(settings.market_type)
             logger.info(
                 f"🔗 Execution Engine: подключено к {exchange_id}"
                 f"{' (демо-счёт)' if settings.use_exchange_sandbox else ' (LIVE, реальные средства)'}"
@@ -243,6 +265,7 @@ class ExecutionEngine:
                     self._exchanges[other_market_type] = await self._connect_exchange(
                         exchange_id, other_market_type,
                     )
+                    self._start_watch_task(other_market_type)
                     logger.info(
                         f"🔗 Execution Engine: дополнительно подключено к {exchange_id} "
                         f"[{other_market_type}] — есть открытые real-позиции на этом рынке."
@@ -378,11 +401,136 @@ class ExecutionEngine:
             logger.error(f"Не удалось подключиться к {self.exchange_id} [{market_type}] для нового ордера: {e}")
             return None
         self._exchanges[market_type] = exchange
+        self._start_watch_task(market_type)
         logger.info(
             f"🔗 Execution Engine: лениво подключено к {self.exchange_id} [{market_type}] — "
             f"сигнал требует этот рынок."
         )
         return exchange
+
+    def _start_watch_task(self, market_type: str) -> None:
+        """
+        Запустить (если ещё не запущена) долгоживущую задачу push-
+        прослушивания ордеров этого рынка по WebSocket — см.
+        _watch_orders_loop. Вызывается сразу после того, как клиент этого
+        market_type появился в self._exchanges (initialize(), лениво
+        подключаемые "другие рынки" внутри initialize(), и
+        _ensure_exchange_connected()).
+
+        Проверка exchange.has["watchOrders"] — не формальность, а тот же
+        защитный паттерн, что и в _market_limits (isinstance-проверка
+        перед чтением из потенциально не-словаря): у реального ccxt.pro
+        exchange.has — обычный dict с "watchOrders": True, а у голого
+        AsyncMock() без явной настройки (обычный паттерн в сотнях
+        существующих тестов этого файла — они не про WS и не должны о нём
+        знать) exchange.has сам становится AsyncMock, не dict. Без этой
+        проверки долгоживущий retry-цикл _watch_orders_loop запускался бы
+        и для таких моков — а глобальная тестовая фикстура conftest.py
+        (_no_real_polling_delay) патчит asyncio.sleep в этом модуле в
+        no-op для ВСЕХ тестов сразу (чтобы не ждать реальные паузы в уже
+        существующих ограниченных ретраях) — под этим патчем БЕСКОНЕЧНЫЙ
+        цикл (в отличие от всех остальных, ограниченных по числу попыток
+        ретраев в этом файле) крутился бы без единой реальной паузы,
+        насмерть съедая CPU (реальный инцидент при разработке: полный
+        прогон тестов завис на многие минуты).
+        """
+        exchange = self._exchanges.get(market_type)
+        has = getattr(exchange, "has", None) if exchange is not None else None
+        if not isinstance(has, dict) or not has.get("watchOrders"):
+            return
+        existing = self._watch_tasks.get(market_type)
+        if existing is not None and not existing.done():
+            return
+        self._watch_tasks[market_type] = asyncio.create_task(self._watch_orders_loop(market_type))
+
+    async def _stop_watch_tasks(self) -> None:
+        """Остановить и дождаться завершения всех задач-слушателей ордеров
+        (перед закрытием клиентов в close() и перед переподключением в
+        initialize() — см. комментарии на местах вызова)."""
+        tasks = list(self._watch_tasks.values())
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.debug(f"WS-задача слушателя ордеров завершилась с ошибкой при остановке: {e}")
+        self._watch_tasks = {}
+
+    async def _watch_orders_loop(self, market_type: str) -> None:
+        """
+        Push-уведомления об исполнении ордеров конкретного рынка (ccxt.pro
+        watch_orders, WebSocket) — вместо того чтобы ждать следующего
+        60-секундного прохода reconcile_real_positions(), обнаруживаем
+        срабатывание биржевого SL почти мгновенно. Периодический
+        REST-опрос (reconcile_real_positions) НЕ заменяется этим циклом —
+        остаётся страховкой на случай пропущенного события (реконнект,
+        сетевой сбой между итерациями этого цикла).
+
+        watch_orders() у ccxt.pro — не подписка "запустил и забыл": каждый
+        вызов блокируется до следующего обновления и должен вызываться из
+        СОБСТВЕННОГО долгоживущего цикла (в отличие от Telethon, который
+        сам управляет своим сетевым циклом внутри client.start()) —
+        отсюда отдельная asyncio-задача на каждый подключённый рынок, а
+        не колбэк-подписка. Запускается только для клиентов, реально
+        поддерживающих watchOrders (см. _start_watch_task) — этот цикл
+        предполагает настоящий ccxt.pro WebSocket, а не произвольный мок.
+
+        Любая ошибка (реконнект WS, биржа временно недоступна) — не повод
+        ронять задачу насовсем: пауза и повторная попытка, пока задачу
+        явно не отменят (_stop_watch_tasks).
+        """
+        while True:
+            exchange = self._exchanges.get(market_type)
+            if exchange is None:
+                await asyncio.sleep(5)
+                continue
+            try:
+                orders = await exchange.watch_orders()
+                for order in orders:
+                    await self._on_order_fill(order, market_type)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ WS watch_orders [{market_type}] прервался: {e} — повтор через 5с."
+                )
+                await asyncio.sleep(5)
+
+    async def _on_order_fill(self, order: dict, market_type: str) -> None:
+        """
+        Реакция на push-событие об исполнении ордера (см.
+        _watch_orders_loop). Сейчас интересует только срабатывание
+        биржевого SL-ордера (pos["sl_order_id"]) — TP-ордеров на бирже
+        сознательно нет (см. докстринг _place_stop_loss_order), открытие
+        позиции уже обрабатывается синхронно в _execute_real_order, так
+        что любой другой ордер здесь просто игнорируется.
+
+        Переиспользует уже существующий _finalize_externally_closed_
+        position — тот сам заново запрашивает ордер (fetch_order) для
+        авторитетных цены/комиссии/объёма и делает всю запись Order+Trade
+        через _record_external_close, так что PnL-логика не дублируется:
+        роль этого метода — узнать о срабатывании РАНЬШЕ, а не считать
+        закрытие самостоятельно.
+        """
+        order_id = order.get("id")
+        status = str(order.get("status") or "").lower()
+        if not order_id or status not in ("closed", "filled"):
+            return
+        for symbol, pos in list(self.real_positions.items()):
+            if pos.get("market_type", "spot") != market_type:
+                continue
+            if pos.get("sl_order_id") != order_id:
+                continue
+            finalized = await self._finalize_externally_closed_position(symbol, pos)
+            if not finalized:
+                logger.debug(
+                    f"WS сообщил об исполнении SL {order_id} ({symbol}), но подтвердить закрытие "
+                    f"не удалось — подхватит ближайший плановый reconcile_real_positions()."
+                )
+            return
 
     async def _warn_if_okx_trade_permission_missing(self, exchange_id: str):
         """
@@ -751,6 +899,7 @@ class ExecutionEngine:
 
     async def close(self):
         """Закрыть все подключённые соединения с биржей (spot и/или futures)."""
+        await self._stop_watch_tasks()
         if not self._exchanges:
             return
         for market_type, exchange in list(self._exchanges.items()):

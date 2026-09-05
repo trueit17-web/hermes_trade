@@ -8018,6 +8018,186 @@ class TestReconcileFuturesPositions(unittest.IsolatedAsyncioTestCase):
         self.assertIn("MON/USDT", self.engine.real_positions)
 
 
+class TestWatchOrdersTask(unittest.IsolatedAsyncioTestCase):
+    """
+    WebSocket-слушатель исполнений ордеров (ccxt.pro watch_orders) —
+    обнаруживает срабатывание биржевого SL почти мгновенно, вместо того
+    чтобы ждать следующего 60-секундного прохода reconcile_real_positions()
+    (см. _watch_orders_loop/_on_order_fill/_start_watch_task в executor.py).
+
+    _start_watch_task должен запускать задачу ТОЛЬКО когда у клиента реально
+    есть exchange.has["watchOrders"] (настоящий ccxt.pro) — регресс на
+    реальный инцидент при разработке: для голого AsyncMock() (обычный
+    паттерн в сотнях других тестов этого файла, никак не связанных с WS)
+    exchange.has сам становится AsyncMock, а не dict; без этой проверки
+    _watch_orders_loop запускался бы и для них — а глобальная фикстура
+    conftest.py (_no_real_polling_delay) патчит asyncio.sleep в этом модуле
+    в no-op для ВСЕХ тестов сразу, из-за чего бесконечный retry-цикл
+    крутился бы без единой реальной паузы, съедая CPU и подвешивая прогон
+    всего файла тестов на многие минуты.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def _ws_capable_exchange(self) -> AsyncMock:
+        ex = AsyncMock()
+        ex.has = {"watchOrders": True}
+        return ex
+
+    def test_start_watch_task_noop_for_mock_without_watchOrders_capability(self):
+        """Голый AsyncMock() без exchange.has — задача не запускается вообще."""
+        self.engine._exchanges["futures"] = AsyncMock()
+
+        self.engine._start_watch_task("futures")
+
+        self.assertNotIn("futures", self.engine._watch_tasks)
+
+    def test_start_watch_task_noop_when_has_lacks_watchOrders(self):
+        ex = AsyncMock()
+        ex.has = {"watchOrders": False}
+        self.engine._exchanges["futures"] = ex
+
+        self.engine._start_watch_task("futures")
+
+        self.assertNotIn("futures", self.engine._watch_tasks)
+
+    async def test_start_watch_task_starts_for_ws_capable_exchange(self):
+        ex = self._ws_capable_exchange()
+        ex.watch_orders = AsyncMock(side_effect=asyncio.CancelledError())
+        self.engine._exchanges["futures"] = ex
+
+        self.engine._start_watch_task("futures")
+
+        self.assertIn("futures", self.engine._watch_tasks)
+        self.assertFalse(self.engine._watch_tasks["futures"].done())
+
+    async def test_start_watch_task_is_idempotent_while_running(self):
+        ex = self._ws_capable_exchange()
+        ex.watch_orders = AsyncMock(side_effect=asyncio.CancelledError())
+        self.engine._exchanges["futures"] = ex
+
+        self.engine._start_watch_task("futures")
+        first_task = self.engine._watch_tasks["futures"]
+        self.engine._start_watch_task("futures")
+
+        self.assertIs(self.engine._watch_tasks["futures"], first_task)
+
+    async def test_on_order_fill_finalizes_matching_position_by_sl_order_id(self):
+        self.engine.real_positions["INJ/USDT"] = {
+            "amount": 100.0, "entry_price": 4.5, "side": "long",
+            "market_type": "futures", "sl_order_id": "sl-123",
+        }
+        with patch.object(
+            self.engine, "_finalize_externally_closed_position",
+            AsyncMock(return_value=True),
+        ) as mock_finalize:
+            await self.engine._on_order_fill(
+                {"id": "sl-123", "status": "filled"}, "futures",
+            )
+
+        mock_finalize.assert_awaited_once_with("INJ/USDT", self.engine.real_positions["INJ/USDT"])
+
+    async def test_on_order_fill_ignores_unrelated_order_id(self):
+        self.engine.real_positions["INJ/USDT"] = {
+            "amount": 100.0, "entry_price": 4.5, "side": "long",
+            "market_type": "futures", "sl_order_id": "sl-123",
+        }
+        with patch.object(
+            self.engine, "_finalize_externally_closed_position",
+            AsyncMock(return_value=True),
+        ) as mock_finalize:
+            await self.engine._on_order_fill(
+                {"id": "some-other-order", "status": "filled"}, "futures",
+            )
+
+        mock_finalize.assert_not_awaited()
+
+    async def test_on_order_fill_ignores_non_filled_status(self):
+        self.engine.real_positions["INJ/USDT"] = {
+            "amount": 100.0, "entry_price": 4.5, "side": "long",
+            "market_type": "futures", "sl_order_id": "sl-123",
+        }
+        with patch.object(
+            self.engine, "_finalize_externally_closed_position",
+            AsyncMock(return_value=True),
+        ) as mock_finalize:
+            await self.engine._on_order_fill(
+                {"id": "sl-123", "status": "new"}, "futures",
+            )
+
+        mock_finalize.assert_not_awaited()
+
+    async def test_on_order_fill_ignores_position_on_different_market_type(self):
+        """SL-ордер с тем же id, но у позиции другого рынка (spot vs futures
+        клиенты независимы) — не должен приниматься за совпадение."""
+        self.engine.real_positions["INJ/USDT"] = {
+            "amount": 100.0, "entry_price": 4.5, "side": "long",
+            "market_type": "spot", "sl_order_id": "sl-123",
+        }
+        with patch.object(
+            self.engine, "_finalize_externally_closed_position",
+            AsyncMock(return_value=True),
+        ) as mock_finalize:
+            await self.engine._on_order_fill(
+                {"id": "sl-123", "status": "filled"}, "futures",
+            )
+
+        mock_finalize.assert_not_awaited()
+
+    async def test_watch_orders_loop_processes_order_then_stops_on_cancel(self):
+        """Полный цикл через реальный _watch_orders_loop (не напрямую
+        _on_order_fill) — watch_orders() отдаёт один заказ, затем задачу
+        отменяют; проверяем, что находка по sl_order_id всё равно долетела
+        до _finalize_externally_closed_position."""
+        ex = self._ws_capable_exchange()
+        ex.watch_orders = AsyncMock(side_effect=[
+            [{"id": "sl-999", "status": "filled"}],
+            asyncio.CancelledError(),
+        ])
+        self.engine._exchanges["futures"] = ex
+        self.engine.real_positions["INJ/USDT"] = {
+            "amount": 100.0, "entry_price": 4.5, "side": "long",
+            "market_type": "futures", "sl_order_id": "sl-999",
+        }
+
+        with patch.object(
+            self.engine, "_finalize_externally_closed_position",
+            AsyncMock(return_value=True),
+        ) as mock_finalize:
+            self.engine._start_watch_task("futures")
+            task = self.engine._watch_tasks["futures"]
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        mock_finalize.assert_awaited_once_with("INJ/USDT", self.engine.real_positions["INJ/USDT"])
+
+    async def test_stop_watch_tasks_cancels_running_task(self):
+        ex = self._ws_capable_exchange()
+
+        # watch_orders никогда сам не завершается (реалистичная имитация
+        # реального долгого WS-ожидания) — единственный способ остановить
+        # задачу здесь — явная отмена через _stop_watch_tasks. asyncio.sleep
+        # здесь — из ЭТОГО тестового модуля, не из src.execution.executor,
+        # поэтому глобальный патч conftest.py (_no_real_polling_delay) на
+        # него не действует — вызов реально не завершается сам по себе.
+        async def _never_returns():
+            await asyncio.sleep(999999)
+
+        ex.watch_orders = AsyncMock(side_effect=_never_returns)
+        self.engine._exchanges["futures"] = ex
+        self.engine._start_watch_task("futures")
+        task = self.engine._watch_tasks["futures"]
+
+        await self.engine._stop_watch_tasks()
+
+        self.assertTrue(task.cancelled())
+        self.assertEqual(self.engine._watch_tasks, {})
+
+
 class TestCcxtSymbolTranslationForFutures(unittest.IsolatedAsyncioTestCase):
     """
     Реальный инцидент (прод, месяцами): у ccxt спотовый и linear-swap
