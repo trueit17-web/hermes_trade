@@ -147,7 +147,7 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "groq_api_key", "label": "Groq API key", "group": "LLM-фолбэк парсинга", "type": "secret", "depends_on": "telegram_llm_fallback_enabled",
      "description": "Ключ Groq API — второй вариант LLM-фолбэка (пробуется, если Anthropic не настроен или не смог разобрать сообщение). Открытые модели (Llama и т.п.) на бесплатном тарифе, заметно быстрее и щедрее по rate-limit'ам, чем Gemini."},
     {"key": "groq_model", "label": "Groq модель", "group": "LLM-фолбэк парсинга", "type": "str", "depends_on": "telegram_llm_fallback_enabled",
-     "description": "Идентификатор модели на Groq, используемой для разбора сигналов (например llama-3.1-8b-instant)."},
+     "description": "Идентификатор модели на Groq, используемой для разбора сигналов (например openai/gpt-oss-20b)."},
     {"key": "gemini_api_key", "label": "Gemini API key", "group": "LLM-фолбэк парсинга", "type": "secret", "depends_on": "telegram_llm_fallback_enabled",
      "description": "Ключ Google Gemini API — третий вариант LLM-фолбэка (пробуется, если ни Anthropic, ни Groq не настроены или не смогли разобрать сообщение)."},
     {"key": "gemini_model", "label": "Gemini модель", "group": "LLM-фолбэк парсинга", "type": "str", "depends_on": "telegram_llm_fallback_enabled",
@@ -155,7 +155,7 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "cerebras_api_key", "label": "Cerebras API key", "group": "LLM-фолбэк парсинга", "type": "secret", "depends_on": "telegram_llm_fallback_enabled",
      "description": "Ключ Cerebras API — четвёртый, последний резервный вариант LLM-фолбэка (пробуется, если ни один из предыдущих трёх не настроен или не смог разобрать сообщение). Открытые модели на бесплатном тарифе, независимый от Groq/Gemini источник."},
     {"key": "cerebras_model", "label": "Cerebras модель", "group": "LLM-фолбэк парсинга", "type": "str", "depends_on": "telegram_llm_fallback_enabled",
-     "description": "Идентификатор модели на Cerebras, используемой для разбора сигналов (например llama-3.3-70b)."},
+     "description": "Идентификатор модели на Cerebras, используемой для разбора сигналов (например llama-4-scout-17b-16e-instruct)."},
 
     # Учётные данные Telegram-приложения — отдельно от "Telegram сигналы"
     # (это про доступ к API, а не про поведение исполнения сигналов).
