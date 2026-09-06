@@ -13075,6 +13075,275 @@ class TestTelegramChannelEndpointsWireLiveMonitoring(unittest.IsolatedAsyncioTes
         bot.remove_telegram_channel_from_live_monitoring.assert_called_once_with("@to_be_deleted_wiring_test")
 
 
+class TestExtractStopHitPair(unittest.TestCase):
+    """
+    extract_stop_hit_pair (channel_monitor.py) — реальный запрос
+    пользователя: канал шлёт отдельное сообщение "Stop Target Hit" о том,
+    что СРАБОТАЛ ЕГО СОБСТВЕННЫЙ стоп по паре — нужно распознать этот
+    отчёт (а не пытаться его распарсить как новый сигнал) и извлечь пару.
+    """
+
+    def test_detects_pair_with_hashtag_format(self):
+        from src.telegram.channel_monitor import extract_stop_hit_pair
+
+        pair = extract_stop_hit_pair("#APT/USDT\n\nStop Target Hit ❌")
+        self.assertEqual(pair, "APT/USDT")
+
+    def test_case_insensitive_and_hyphenated(self):
+        from src.telegram.channel_monitor import extract_stop_hit_pair
+
+        self.assertEqual(extract_stop_hit_pair("BTC/USDT stop-target hit"), "BTC/USDT")
+        self.assertEqual(extract_stop_hit_pair("ETHUSDT STOP TARGET HIT"), "ETH/USDT")
+
+    def test_returns_none_without_the_phrase(self):
+        from src.telegram.channel_monitor import extract_stop_hit_pair
+
+        self.assertIsNone(extract_stop_hit_pair("#APT/USDT Target 1 hit ✅ Прибыль: 5%"))
+        self.assertIsNone(extract_stop_hit_pair("Просто текст без упоминания стопа"))
+
+    def test_returns_none_when_pair_not_extractable(self):
+        from src.telegram.channel_monitor import extract_stop_hit_pair
+
+        self.assertIsNone(extract_stop_hit_pair("Stop Target Hit ❌ на одной из сделок"))
+
+
+class TestHandlerRoutesStopHitReports(unittest.IsolatedAsyncioTestCase):
+    """_handler() (channel_monitor.py) должен отделять отчёты "Stop Target
+    Hit" от обычных сообщений ДО parse_telegram_signal — та же причина,
+    что и у is_closed_trade_report (см. её докстринг): в отчёте нет ни
+    entry, ни SL/TP, которые LLM-фолбэку иначе пришлось бы придумывать."""
+
+    def setUp(self):
+        import src.telegram.channel_monitor as cm
+        self.cm = cm
+        self._saved_monitored = dict(cm._monitored)
+        self._saved_subscribers = list(cm._subscribers)
+        cm._monitored.clear()
+        cm._subscribers.clear()
+
+    def tearDown(self):
+        self.cm._monitored.clear()
+        self.cm._monitored.update(self._saved_monitored)
+        self.cm._subscribers.clear()
+        self.cm._subscribers.extend(self._saved_subscribers)
+
+    async def test_stop_hit_report_notifies_subscribers_and_skips_parsing(self):
+        self.cm._monitored[-100777] = {
+            "channel_id": "@stopchan", "channel_title": "Stop Chan", "parser_config": {},
+        }
+        event = MagicMock()
+        event.chat_id = -100777
+        event.message.text = "#APT/USDT\n\nStop Target Hit ❌"
+        event.message.photo = None
+
+        received = []
+
+        async def fake_cb(ev):
+            received.append(ev)
+        self.cm._subscribers.append(fake_cb)
+
+        with patch.object(self.cm, "parse_telegram_signal", new=AsyncMock()) as parse_mock:
+            await self.cm._handler(event)
+
+        parse_mock.assert_not_called()
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]["type"], "channel_stop_hit")
+        self.assertEqual(received[0]["pair"], "APT/USDT")
+        self.assertEqual(received[0]["channel_id"], "@stopchan")
+        self.assertEqual(received[0]["raw_message"], event.message.text)
+
+    async def test_normal_signal_still_goes_through_parser(self):
+        self.cm._monitored[-100778] = {
+            "channel_id": "@normalchan", "channel_title": "Normal", "parser_config": {},
+        }
+        event = MagicMock()
+        event.chat_id = -100778
+        event.message.text = "BTC/USDT LONG 50000 SL 49000 TP 52000"
+        event.message.photo = None
+
+        received = []
+
+        async def fake_cb(ev):
+            received.append(ev)
+        self.cm._subscribers.append(fake_cb)
+
+        with patch.object(self.cm, "parse_telegram_signal", new=AsyncMock(return_value=None)) as parse_mock:
+            await self.cm._handler(event)
+
+        parse_mock.assert_awaited_once()
+        self.assertEqual(received, [])  # parsed=None -> подписчики не уведомляются вообще
+
+
+class TestOnChannelStopHitReport(unittest.IsolatedAsyncioTestCase):
+    """
+    TradingBot._on_channel_stop_hit_report — реальный запрос пользователя:
+    если канал прислал "Stop Target Hit" по паре, закрыть СВОЮ открытую
+    позицию по этой паре немедленно, не дожидаясь следующей проверки
+    цены/срабатывания биржевого SL. Закрывает только позицию, открытую
+    ИМЕННО этим каналом (strategy_id="telegram_signal" + совпадающий
+    channel_id) — не любую позицию с тем же символом.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot(), main_module.execution_engine
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "paper"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_closes_matching_telegram_position(self):
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        symbol = "STOPHIT1/USDT"
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": 100.0, "amount": 5.0}
+        engine.last_prices[symbol] = 95.0
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 100.0, "amount": 5.0,
+            "original_amount": 5.0, "strategy_id": "telegram_signal", "channel_id": "@stopchan",
+            "sl": 95.0, "tp": 110.0, "take_profits": [110.0],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+        }
+
+        async def fake_close(**kwargs):
+            engine.paper_positions.pop(symbol, None)
+            return {"pnl": -25.0, "pnl_pct": -5.0, "outcome": "loss", "trade_id": 1}
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close) as mock_close, \
+                patch("src.main.send_notification", new=AsyncMock()) as mock_send:
+            await bot._on_telegram_signal({
+                "type": "channel_stop_hit", "channel_id": "@stopchan", "pair": symbol,
+                "raw_message": "#STOPHIT1/USDT Stop Target Hit ❌",
+            })
+
+        mock_close.assert_awaited_once()
+        self.assertEqual(mock_close.await_args.kwargs["reason"], "channel_stop_report")
+        self.assertEqual(mock_close.await_args.kwargs["exit_price"], 95.0)
+        self.assertNotIn(symbol, bot.open_positions)
+        mock_send.assert_awaited_once()
+
+    async def test_ignores_report_from_different_channel(self):
+        """Пара совпадает, но позиция открыта ДРУГИМ каналом — отчёт не
+        должен закрывать чужую позицию."""
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        symbol = "STOPHIT2/USDT"
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": 100.0, "amount": 5.0}
+        engine.last_prices[symbol] = 95.0
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 100.0, "amount": 5.0,
+            "original_amount": 5.0, "strategy_id": "telegram_signal", "channel_id": "@other_channel",
+            "sl": 95.0, "tp": 110.0, "take_profits": [110.0],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+        }
+
+        with patch.object(engine, "close_paper_position", new=AsyncMock()) as mock_close:
+            await bot._on_telegram_signal({
+                "type": "channel_stop_hit", "channel_id": "@stopchan", "pair": symbol,
+                "raw_message": "x",
+            })
+
+        mock_close.assert_not_awaited()
+        self.assertIn(symbol, bot.open_positions)
+
+    async def test_ignores_report_for_non_telegram_strategy_position(self):
+        """Позиция по этому символу существует, но открыта алго-стратегией
+        (не telegram_signal) — отчёт канала не должен её трогать."""
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        symbol = "STOPHIT3/USDT"
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": 100.0, "amount": 5.0}
+        engine.last_prices[symbol] = 95.0
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 100.0, "amount": 5.0,
+            "original_amount": 5.0, "strategy_id": "ensemble_voter", "channel_id": None,
+            "sl": 95.0, "tp": 110.0, "take_profits": [110.0],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+        }
+
+        with patch.object(engine, "close_paper_position", new=AsyncMock()) as mock_close:
+            await bot._on_telegram_signal({
+                "type": "channel_stop_hit", "channel_id": "@stopchan", "pair": symbol,
+                "raw_message": "x",
+            })
+
+        mock_close.assert_not_awaited()
+        self.assertIn(symbol, bot.open_positions)
+
+    async def test_noop_when_no_open_position_for_pair(self):
+        bot, engine = self._make_bot()
+        with patch.object(engine, "close_paper_position", new=AsyncMock()) as mock_close:
+            await bot._on_telegram_signal({
+                "type": "channel_stop_hit", "channel_id": "@stopchan", "pair": "NOPOSITION/USDT",
+                "raw_message": "x",
+            })
+        mock_close.assert_not_awaited()
+
+    async def test_paper_mode_defers_close_when_current_price_unknown(self):
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        symbol = "STOPHIT4/USDT"
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": 100.0, "amount": 5.0}
+        engine.last_prices.pop(symbol, None)
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 100.0, "amount": 5.0,
+            "original_amount": 5.0, "strategy_id": "telegram_signal", "channel_id": "@stopchan",
+            "sl": 95.0, "tp": 110.0, "take_profits": [110.0],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+        }
+
+        with patch.object(engine, "close_paper_position", new=AsyncMock()) as mock_close:
+            await bot._on_telegram_signal({
+                "type": "channel_stop_hit", "channel_id": "@stopchan", "pair": symbol,
+                "raw_message": "x",
+            })
+
+        mock_close.assert_not_awaited()
+        self.assertIn(symbol, bot.open_positions)  # позиция не тронута, попробуем на следующей итерации
+
+    async def test_real_mode_closes_via_close_real_position(self):
+        from src.utils.timeutils import utcnow
+
+        settings.trading_mode = "real"
+        bot, engine = self._make_bot()
+        symbol = "STOPHIT5/USDT"
+        engine.real_positions[symbol] = {"side": "long", "entry_price": 100.0, "amount": 5.0}
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 100.0, "amount": 5.0,
+            "original_amount": 5.0, "strategy_id": "telegram_signal", "channel_id": "@stopchan",
+            "sl": 95.0, "tp": 110.0, "take_profits": [110.0],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+        }
+
+        async def fake_close(**kwargs):
+            engine.real_positions.pop(symbol, None)
+            return {"pnl": -25.0, "pnl_pct": -5.0, "outcome": "loss", "trade_id": 1}
+
+        with patch.object(engine, "close_real_position", side_effect=fake_close) as mock_close, \
+                patch.object(engine, "close_paper_position", new=AsyncMock()) as mock_close_paper, \
+                patch("src.main.send_notification", new=AsyncMock()):
+            await bot._on_telegram_signal({
+                "type": "channel_stop_hit", "channel_id": "@stopchan", "pair": symbol,
+                "raw_message": "x",
+            })
+
+        mock_close.assert_awaited_once()
+        self.assertEqual(mock_close.await_args.kwargs["reason"], "channel_stop_report")
+        self.assertNotIn("exit_price", mock_close.await_args.kwargs)
+        mock_close_paper.assert_not_awaited()
+        self.assertNotIn(symbol, bot.open_positions)
+
+
 class TestBackfillChannelHistory(unittest.IsolatedAsyncioTestCase):
     """
     backfill_channel_history (src/telegram/history_backfill.py) — накопление

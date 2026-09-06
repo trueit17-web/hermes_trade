@@ -613,6 +613,10 @@ class TradingBot:
 
     async def _on_telegram_signal(self, signal_event: dict):
         """Обработка Telegram сигнала."""
+        if signal_event.get("type") == "channel_stop_hit":
+            await self._on_channel_stop_hit_report(signal_event)
+            return
+
         channel_id = signal_event.get("channel_id", "")
         pair = signal_event.get("parsed_pair", "")
         side = signal_event.get("parsed_side", "")
@@ -737,6 +741,101 @@ class TradingBot:
             logger.info("⏳ Сигнал ожидает подтверждения")
 
         await self._save_telegram_signal(signal_event, quality, decision, order)
+
+    async def _on_channel_stop_hit_report(self, event: dict):
+        """
+        Канал прислал отчёт "Stop Target Hit" (см. extract_stop_hit_pair в
+        channel_monitor.py) — сработал ЕГО СОБСТВЕННЫЙ стоп по паре из
+        сообщения. Закрываем СВОЮ позицию по этой же паре немедленно,
+        не дожидаясь следующей 60-секундной сверки цены/срабатывания
+        биржевого SL-ордера: страховка на случай, если наш собственный SL
+        уже сдвинут (ступенчатый трейлинг после частичного TP) и поэтому
+        НЕ сработал бы там же, где сработал стоп у канала.
+
+        Закрывает ТОЛЬКО если у нас есть открытая позиция по этой паре,
+        источник которой — ИМЕННО этот канал (channel_id совпадает) —
+        совпадение пары с другим источником (алго-стратегия, другой канал)
+        не должно закрываться по чужому отчёту.
+        """
+        pair = event.get("pair")
+        channel_id = event.get("channel_id")
+        if not pair or not channel_id:
+            return
+
+        position = self.open_positions.get(pair)
+        if (
+            not position
+            or position.get("strategy_id") != "telegram_signal"
+            or position.get("channel_id") != channel_id
+        ):
+            return
+
+        tracked = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
+        if pair not in tracked:
+            del self.open_positions[pair]
+            return
+
+        side = position["side"]
+        opened_at = position.get("opened_at")
+        holding_seconds = int((utcnow() - opened_at).total_seconds()) if opened_at else 0
+
+        if settings.is_paper:
+            current_price = execution_engine.last_prices.get(pair)
+            if current_price is None:
+                logger.warning(
+                    f"🚫 Канал сообщил о стопе по {pair}, но текущая цена ещё не известна — "
+                    "закрытие отложено до следующей торговой итерации"
+                )
+                return
+            result = await execution_engine.close_paper_position(
+                symbol=pair, side=side, entry_price=position["entry_price"], amount=position["amount"],
+                exit_price=current_price, reason="channel_stop_report",
+                entry_fee=position.get("entry_fee", 0.0), holding_seconds=holding_seconds,
+                strategy_id=position.get("strategy_id"), order_open_id=position.get("order_id"),
+            )
+        else:
+            result = await execution_engine.close_real_position(
+                symbol=pair, side=side, entry_price=position["entry_price"], amount=position["amount"],
+                reason="channel_stop_report", entry_fee=position.get("entry_fee", 0.0),
+                holding_seconds=holding_seconds, strategy_id=position.get("strategy_id"),
+                order_open_id=position.get("order_id"),
+            )
+
+        if result is None:
+            tracked = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
+            if pair not in tracked:
+                del self.open_positions[pair]
+            return
+
+        risk_manager.on_trade_closed(result["pnl"])
+        self.daily_pnl = getattr(risk_manager.state, "daily_pnl", 0.0)
+        del self.open_positions[pair]
+        risk_manager.on_position_closed(pair)
+        await protection_manager.on_close(
+            channel_key(channel_id), pair, result["pnl"], "channel_stop_report", pnl_pct=result["pnl_pct"],
+        )
+        if result.get("trade_id"):
+            await self._link_telegram_signal_trade(position.get("order_id"), result["trade_id"], result.get("outcome"))
+
+        emoji = "✅" if result["pnl"] > 0 else "❌"
+        logger.info(
+            f"{emoji} Позиция закрыта по отчёту канала о стопе: {pair} {side.upper()} | "
+            f"PnL: {result['pnl']:+.2f} ({result['pnl_pct']:+.2f}%)"
+        )
+        await decision_logger.flush_for_trade(
+            position.get("order_id"), result["trade_id"],
+            close_description=f"Закрыта по отчёту канала о стопе @ рынку | PnL {result['pnl']:+.2f} ({result['pnl_pct']:+.2f}%)",
+            close_details={
+                "reason": "channel_stop_report", "amount": position["amount"],
+                "pnl": result["pnl"], "pnl_pct": result["pnl_pct"], "outcome": result.get("outcome"),
+            },
+        )
+        await send_notification(
+            f"{emoji} Закрыта {side.upper()} {pair}\n"
+            f"Причина: Стоп (подтверждён каналом)\n"
+            f"PnL: {result['pnl']:+.2f} USDT ({result['pnl_pct']:+.2f}%)",
+            reply_to_message_id=position.get("notification_message_id"),
+        )
 
     async def _save_telegram_signal(
         self, signal_event: dict, quality: float | None, decision: str, order,

@@ -124,6 +124,31 @@ async def _handler(event: events.NewMessage.Event):
         + (" [+изображение]" if image_bytes else "")
     )
 
+    # Отчёт канала о срабатывании ЕГО СОБСТВЕННОГО стопа ("Stop Target
+    # Hit ❌") — проверяем РАНЬШЕ любого парсера, той же логикой, что и
+    # is_closed_trade_report внутри parse_telegram_signal: в этом
+    # сообщении нет ни entry, ни SL/TP, которые LLM-фолбэку пришлось бы
+    # придумывать самому, приняв отчёт об уже закрытой в минус сделке за
+    # новый сигнал. При совпадении закрываем СВОЮ позицию по этой паре
+    # немедленно (см. TradingBot._on_telegram_signal / event["type"] ==
+    # "channel_stop_hit" в main.py) вместо того, чтобы пытаться разобрать
+    # это как сигнал.
+    if raw_text:
+        stop_hit_pair = extract_stop_hit_pair(raw_text)
+        if stop_hit_pair:
+            logger.info(f"[TG] Канал {channel['channel_id']} сообщил о стопе по {stop_hit_pair}")
+            for cb in _subscribers:
+                try:
+                    await cb({
+                        "type": "channel_stop_hit",
+                        "channel_id": channel["channel_id"],
+                        "pair": stop_hit_pair,
+                        "raw_message": raw_text,
+                    })
+                except Exception as e:
+                    logger.error(f"Ошибка уведомления подписчика об отчёте канала о стопе: {e}")
+            return
+
     parsed = await parse_telegram_signal(raw_text, channel, image_bytes=image_bytes)
 
     if parsed:
@@ -437,25 +462,13 @@ async def parse_telegram_signal(
     return None
 
 
-def parse_with_regex(text: str) -> dict | None:
+def _extract_pair(text: str) -> str | None:
     """
-    Парсинг сигнала с помощью регулярных выражений.
-    Поддерживает форматы:
-    - "BTC/USDT Long 69000 SL 68000 TP 72000"
-    - "ETH/USDT - Short | Entry: 3500 | Stop: 3600 | Target: 3200"
-    - "XRPUSDT LONG 1.85 SL 1.70 TP 2.10"
-    - "BTCUSDT short 68500 sl 67500 tp 65000"
-    - "#WIF SHORT / Плечо: 25-30х / Диапазон входа: по рынку /
-      Тейки: 0.1962 0.1933 0.1853 / Стоп: 0.2091" — хэштег-тикер без
-      quote-валюты, диапазон плеча, маркет-вход, цели одной строкой,
-      кириллические ключевые слова.
+    Извлечь и нормализовать торговую пару из сырого текста сообщения —
+    общая логика для parse_with_regex (полноценный сигнал) и
+    extract_stop_hit_pair (отчёт канала о срабатывании его собственного
+    стопа, где остальных полей сигнала уже нет).
     """
-    text = text.strip()
-
-    # Нормализуем: убираем лишние символы
-    clean = re.sub(r"[•·•]", "", text)
-    clean = re.sub(r"\s+", " ", clean)
-
     # Ищем пару (BTC/USDT, ETH/USDT и т.д.)
     pair_patterns = [
         # BTC/USDT — quote ОГРАНИЧЕН известными валютами (_KNOWN_QUOTES), а
@@ -501,7 +514,53 @@ def parse_with_regex(text: str) -> dict | None:
     if not pair:
         return None
 
-    pair = normalize_pair(pair)
+    return normalize_pair(pair)
+
+
+_STOP_HIT_PATTERN = re.compile(r"stop[\s-]*target[\s-]*hit", re.IGNORECASE)
+
+
+def extract_stop_hit_pair(text: str) -> str | None:
+    """
+    Отчёт канала о том, что СРАБОТАЛ ЕГО СОБСТВЕННЫЙ стоп ("Stop Target
+    Hit ❌" и т.п.) по уже открытой ранее сделке — не новый сигнал и не
+    is_closed_trade_report (там нужна связка "цель ✅" + "%прибыли", здесь
+    же убыток и такой связки нет). Возвращает нормализованную пару, если
+    сообщение — такой отчёт и пару удалось извлечь, иначе None.
+
+    Проверяется в _handler() РАНЬШЕ любого парсера (regex и LLM-фолбэков),
+    по тем же причинам, что и is_closed_trade_report: не полагаться на то,
+    что LLM не примет отчёт об уже закрытой в минус сделке за новый сигнал
+    (тем более в этом отчёте нет ни entry, ни SL/TP, которые LLM пришлось
+    бы придумать самой).
+    """
+    if not _STOP_HIT_PATTERN.search(text):
+        return None
+    return _extract_pair(text)
+
+
+def parse_with_regex(text: str) -> dict | None:
+    """
+    Парсинг сигнала с помощью регулярных выражений.
+    Поддерживает форматы:
+    - "BTC/USDT Long 69000 SL 68000 TP 72000"
+    - "ETH/USDT - Short | Entry: 3500 | Stop: 3600 | Target: 3200"
+    - "XRPUSDT LONG 1.85 SL 1.70 TP 2.10"
+    - "BTCUSDT short 68500 sl 67500 tp 65000"
+    - "#WIF SHORT / Плечо: 25-30х / Диапазон входа: по рынку /
+      Тейки: 0.1962 0.1933 0.1853 / Стоп: 0.2091" — хэштег-тикер без
+      quote-валюты, диапазон плеча, маркет-вход, цели одной строкой,
+      кириллические ключевые слова.
+    """
+    text = text.strip()
+
+    # Нормализуем: убираем лишние символы
+    clean = re.sub(r"[•·•]", "", text)
+    clean = re.sub(r"\s+", " ", clean)
+
+    pair = _extract_pair(text)
+    if not pair:
+        return None
 
     # Ищем направление
     side = None
