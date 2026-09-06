@@ -83,6 +83,15 @@ class ExecutionEngine:
         self.real_positions: dict[str, dict] = {}
         self.last_prices: dict[str, float] = {}
         self.order_counter = 0
+        # Причина последнего "return None" из create_order/_execute_real_order
+        # — вызывающий код (напр. _execute_telegram_signal в main.py) видел
+        # только сам факт order is None, без причины, и был вынужден писать
+        # в TelegramSignal.reject_reason бесполезный fallback "см. логи"
+        # (реальная жалоба пользователя: в блоке каналов итог сделки не
+        # объяснял отказ). Сбрасывается в None в начале create_order —
+        # значение имеет смысл читать сразу после return None из него, не
+        # позже.
+        self.last_order_rejection_reason: str | None = None
 
     @property
     def exchange(self) -> ccxt.Exchange | None:
@@ -1059,12 +1068,16 @@ class ExecutionEngine:
         на споте (там плеча не существует) и в paper-режиме (там нет
         реального маржинального механизма — см. _execute_paper_order).
         """
+        self.last_order_rejection_reason = None
+
         if risk_manager.state.kill_switch_active:
             logger.warning(f"❌ Попытка создать ордер при активном kill switch: {symbol}")
+            self.last_order_rejection_reason = "аварийный стоп торговли (kill switch) активен"
             return None
 
         if not self.can_execute():
             logger.warning(f"❌ Исполнение отклонено: {symbol} {side}")
+            self.last_order_rejection_reason = "торговля приостановлена (ручная пауза)"
             return None
 
         client_order_id = str(uuid.uuid4())[:12]
@@ -1089,6 +1102,7 @@ class ExecutionEngine:
             except Exception as e:
                 logger.warning(f"Не удалось получить цену для {symbol}: {e}")
                 if execution_price is None:
+                    self.last_order_rejection_reason = f"не удалось получить цену на бирже: {e}"
                     return None
 
         # Расчёт комиссии
@@ -2045,6 +2059,7 @@ class ExecutionEngine:
                 f"❌ Реальный ордер {symbol} отклонён: нет подключения к бирже для рынка "
                 f"'{order_market_type}'."
             )
+            self.last_order_rejection_reason = f"нет подключения к бирже для рынка '{order_market_type}'"
             return None
 
         # На споте нет встроенного шорта — этот метод вызывается ТОЛЬКО для
@@ -2072,6 +2087,7 @@ class ExecutionEngine:
                 f"реально исполнилась бы, распродав реальные средства без возможности закрыть "
                 f"'позицию' обратно."
             )
+            self.last_order_rejection_reason = "шорт не поддерживается на споте"
             return None
 
         leverage_to_set = settings.futures_leverage
@@ -2104,6 +2120,7 @@ class ExecutionEngine:
         outside_limits = self._outside_exchange_amount_limits(symbol, amount, price, exchange)
         if outside_limits:
             logger.warning(f"⚠️ Реальный ордер {symbol} пропущен: {outside_limits}.")
+            self.last_order_rejection_reason = outside_limits
             return None
 
         # Баланс базовой валюты на СПОТОВОМ кошельке (для фолбэк-подтверждения
@@ -2133,6 +2150,7 @@ class ExecutionEngine:
                     order = await exchange.create_limit_sell_order(ccxt_symbol, price, amount)
             else:
                 logger.error(f"Неизвестный тип ордера: {order_data['type']}")
+                self.last_order_rejection_reason = f"неизвестный тип ордера: {order_data['type']}"
                 return None
 
             order = await self._fetch_confirmed_order(order, symbol, exchange)
@@ -2174,6 +2192,9 @@ class ExecutionEngine:
                         f"❌ Ордер {order.get('id')} ({symbol}) не подтверждён как реально "
                         f"исполненный на бирже (filled={order.get('filled')!r}) — позиция НЕ "
                         f"регистрируется, данные должны быть идентичны бирже."
+                    )
+                    self.last_order_rejection_reason = (
+                        "ордер не подтверждён биржей как реально исполненный"
                     )
                     return None
                 logger.warning(
@@ -2295,6 +2316,7 @@ class ExecutionEngine:
 
         except Exception as e:
             logger.error(f"❌ Ошибка исполнения реального ордера {symbol}: {e}")
+            self.last_order_rejection_reason = f"ошибка биржи: {e}"
             return None
 
     async def close_real_position(

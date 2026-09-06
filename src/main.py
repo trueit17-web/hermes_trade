@@ -721,10 +721,18 @@ class TradingBot:
                     # _execute_telegram_signal сам проставляет reject_reason
                     # на своих собственных ранних выходах (шорт на споте,
                     # отрицательное матожидание канала) — этот fallback на
-                    # случай, если ордер не прошёл уже на самой бирже
-                    # (execution_engine.create_order() вернул None по другой
-                    # причине, видной только в логах execution_engine).
-                    signal_event["reject_reason"] = "не удалось исполнить ордер на бирже — см. логи"
+                    # случай, если ордер не прошёл уже на самой бирже.
+                    # execution_engine.last_order_rejection_reason несёт
+                    # РЕАЛЬНУЮ причину последнего return None из create_order/
+                    # _execute_real_order (реальный инцидент: пользователь не
+                    # мог понять причину отказа в блоке каналов дашборда,
+                    # видел только бесполезное "см. логи") — читаем его СРАЗУ
+                    # после create_order, до того как что-то ещё успеет его
+                    # перезаписать.
+                    signal_event["reject_reason"] = (
+                        execution_engine.last_order_rejection_reason
+                        or "не удалось исполнить ордер на бирже (причина не определена)"
+                    )
         else:
             logger.info("⏳ Сигнал ожидает подтверждения")
 

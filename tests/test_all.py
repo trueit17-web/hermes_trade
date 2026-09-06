@@ -2345,6 +2345,75 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(order)
         self.engine.exchange.create_market_buy_order.assert_awaited_once()
 
+    async def test_last_order_rejection_reason_reflects_max_amount_rejection(self):
+        """
+        Реальная жалоба пользователя: в блоке каналов дашборда итог
+        отклонённой сделки показывал только бесполезное "не удалось
+        исполнить ордер на бирже — см. логи" вместо настоящей причины.
+        execution_engine.last_order_rejection_reason должен нести ту же
+        причину, что и WARNING в логе, чтобы main.py мог прокинуть её в
+        TelegramSignal.reject_reason.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.markets = {
+            "ALT2/USDT": {
+                "limits": {"amount": {"min": 1.0, "max": 300000000000000.0}},
+                "info": {"lotSizeFilter": {"maxMktOrderQty": "250000000000000"}},
+            }
+        }
+
+        order = await self.engine.create_order(
+            symbol="ALT2/USDT", side="buy", amount=279846200000000.0, price=0.0000651, order_type="market",
+        )
+
+        self.assertIsNone(order)
+        self.assertIsNotNone(self.engine.last_order_rejection_reason)
+        self.assertIn("больше максимального допустимого биржей", self.engine.last_order_rejection_reason)
+
+    async def test_last_order_rejection_reason_reflects_exchange_exception(self):
+        """Ошибка биржи (retCode и т.п.), поднятая как исключение из
+        create_market_buy_order, — самый частый в проде источник отказа —
+        тоже должна попасть в last_order_rejection_reason, а не оставаться
+        видной только в логе ERROR."""
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order = AsyncMock(
+            side_effect=Exception('bybit {"retCode":10001,"retMsg":"exceeds maximum limit"}')
+        )
+
+        order = await self.engine.create_order(
+            symbol="EXCFAIL1/USDT", side="buy", amount=10.0, price=1.0, order_type="market",
+        )
+
+        self.assertIsNone(order)
+        self.assertIn("retCode", self.engine.last_order_rejection_reason)
+
+    async def test_last_order_rejection_reason_reset_on_successful_order(self):
+        """Регресс: успешный ордер должен очищать причину прошлого отказа,
+        иначе следующий успешный сигнал того же канала унаследовал бы
+        старый reject_reason при повторном отказе без явной новой причины."""
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.last_order_rejection_reason = "старая причина отказа"
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "reset-1", "filled": 10.0, "price": None, "average": 1.0,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="RESETOK1/USDT", side="buy", amount=10.0, price=1.0, order_type="market",
+        )
+
+        self.assertIsNotNone(order)
+        self.assertIsNone(self.engine.last_order_rejection_reason)
+
     async def test_execute_real_order_ignores_missing_market_order_max_qty(self):
         """Регресс: рынки без lotSizeFilter.maxMktOrderQty в info (спот, старые
         тестовые моки) должны вести себя как раньше — блокировка только по
@@ -12062,6 +12131,95 @@ class TestExecuteTelegramSignalStoresRealTakeProfits(unittest.IsolatedAsyncioTes
             })
 
         self.assertEqual(bot.open_positions["BTC/USDT"]["take_profits"], [])
+
+
+class TestTelegramSignalRejectReasonReflectsExchangeFailure(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальная жалоба пользователя: в блоке каналов дашборда "Итог сделки"
+    отклонённого сигнала показывал бесполезное "не удалось исполнить ордер
+    на бирже — см. логи" вместо настоящей причины (лимиты объёма, ошибка
+    API и т.п.) — execution_engine.create_order() возвращал None, а
+    конкретная причина оставалась видна только в его собственных логах.
+    execution_engine.last_order_rejection_reason теперь несёт эту причину
+    наружу в TelegramSignal.reject_reason.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved_mode = settings.active_trading_mode
+        self._saved_trading_mode = settings.trading_mode
+        settings.active_trading_mode = "signals"
+        settings.trading_mode = "real"
+
+    def tearDown(self):
+        settings.active_trading_mode = self._saved_mode
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_reject_reason_uses_execution_engine_specific_reason(self):
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures"))
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            mock_engine.last_order_rejection_reason = (
+                "объём 279846200000000.00000000 ALT больше максимального "
+                "допустимого биржей (250000000000000.0)"
+            )
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "ALT/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 0.065,
+                "parsed_sl": 0.06,
+                "parsed_tp": 0.07,
+                "raw_message": "test",
+            })
+
+        bot._save_telegram_signal.assert_awaited_once()
+        saved_event, quality, decision, order = bot._save_telegram_signal.await_args.args
+        self.assertEqual(decision, "rejected")
+        self.assertIsNone(order)
+        self.assertEqual(saved_event["reject_reason"], mock_engine.last_order_rejection_reason)
+        self.assertNotIn("см. логи", saved_event["reject_reason"])
+
+    async def test_reject_reason_falls_back_when_engine_reason_missing(self):
+        """Регресс: если last_order_rejection_reason почему-то не
+        проставился — не оставляем None, используем нейтральный fallback
+        вместо старого бесполезного текста."""
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures"))
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            mock_engine.last_order_rejection_reason = None
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "ALT/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 0.065,
+                "parsed_sl": 0.06,
+                "parsed_tp": 0.07,
+                "raw_message": "test",
+            })
+
+        saved_event = bot._save_telegram_signal.await_args.args[0]
+        self.assertEqual(
+            saved_event["reject_reason"], "не удалось исполнить ордер на бирже (причина не определена)"
+        )
 
 
 class TestCheckPositionExitUsesAllTpLevelsEqualSplit(unittest.IsolatedAsyncioTestCase):
