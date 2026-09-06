@@ -1163,7 +1163,7 @@ function renderPositions(status) {
       // pnlPctLeveraged — % от МАРЖИ (то, как обычно считает доходность
       // сам канал/трейдер).
       const leveragedSuffix = !status.is_paper && pos.market_type === "futures" && pos.leverage
-        ? ` (${(pnlPct * pos.leverage) >= 0 ? "+" : ""}${fmt(pnlPct * pos.leverage, 2)}% от маржи)`
+        ? ` (${(pnlPct * pos.leverage) >= 0 ? "+" : ""}${fmt(pnlPct * pos.leverage, 2)}%)`
         : "";
       pnlHtml = `<span class="${pnlPct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${pnlPct >= 0 ? "+" : ""}${fmt(pnlPct, 2)}%${leveragedSuffix}</span>`;
     }
@@ -1243,7 +1243,7 @@ function renderManualPositions(status) {
       // pnlPctLeveraged — % от МАРЖИ (то, как обычно считает доходность
       // сам канал/трейдер).
       const leveragedSuffix = !status.is_paper && pos.market_type === "futures" && pos.leverage
-        ? ` (${(pnlPct * pos.leverage) >= 0 ? "+" : ""}${fmt(pnlPct * pos.leverage, 2)}% от маржи)`
+        ? ` (${(pnlPct * pos.leverage) >= 0 ? "+" : ""}${fmt(pnlPct * pos.leverage, 2)}%)`
         : "";
       pnlHtml = `<span class="${pnlPct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${pnlPct >= 0 ? "+" : ""}${fmt(pnlPct, 2)}%${leveragedSuffix}</span>`;
     }
@@ -1517,7 +1517,7 @@ async function renderTrades() {
         ? ` <span class="muted" title="Плечо на бирже на момент закрытия">⚡${t.leverage}x</span>`
         : "";
       const leveragedPnl = t.pnl_pct_leveraged !== null && t.pnl_pct_leveraged !== undefined
-        ? ` (${t.pnl_pct_leveraged >= 0 ? "+" : ""}${fmt(t.pnl_pct_leveraged, 2)}% от маржи)`
+        ? ` (${t.pnl_pct_leveraged >= 0 ? "+" : ""}${fmt(t.pnl_pct_leveraged, 2)}%)`
         : "";
       return `
       <tr class="trade-row" data-trade-id="${t.id}" title="Показать подробности сделки">
@@ -1916,7 +1916,7 @@ async function renderBackfillStats() {
       const winLossBe = `<span class="pnl-pos">${s.simulated_win}</span>/` +
         `<span class="pnl-neg">${s.simulated_loss}</span>/${s.simulated_break_even}`;
       const avgPnlLeveraged = s.avg_pnl_pct_leveraged === null || s.avg_pnl_pct_leveraged === undefined ? "" :
-        ` (${s.avg_pnl_pct_leveraged >= 0 ? "+" : ""}${s.avg_pnl_pct_leveraged}% от маржи)`;
+        ` (${s.avg_pnl_pct_leveraged >= 0 ? "+" : ""}${s.avg_pnl_pct_leveraged}%)`;
       const avgPnl = s.avg_pnl_pct === null || s.avg_pnl_pct === undefined ? "—" :
         `<span class="${s.avg_pnl_pct >= 0 ? "pnl-pos" : "pnl-neg"}">${s.avg_pnl_pct >= 0 ? "+" : ""}${s.avg_pnl_pct}%${avgPnlLeveraged}</span>`;
       return `
