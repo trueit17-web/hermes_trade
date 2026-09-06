@@ -155,7 +155,7 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "cerebras_api_key", "label": "Cerebras API key", "group": "LLM-фолбэк парсинга", "type": "secret", "depends_on": "telegram_llm_fallback_enabled",
      "description": "Ключ Cerebras API — четвёртый, последний резервный вариант LLM-фолбэка (пробуется, если ни один из предыдущих трёх не настроен или не смог разобрать сообщение). Открытые модели на бесплатном тарифе, независимый от Groq/Gemini источник."},
     {"key": "cerebras_model", "label": "Cerebras модель", "group": "LLM-фолбэк парсинга", "type": "str", "depends_on": "telegram_llm_fallback_enabled",
-     "description": "Идентификатор модели на Cerebras, используемой для разбора сигналов (например llama-4-scout-17b-16e-instruct)."},
+     "description": "Идентификатор модели на Cerebras, используемой для разбора сигналов (например gpt-oss-120b)."},
 
     # Учётные данные Telegram-приложения — отдельно от "Telegram сигналы"
     # (это про доступ к API, а не про поведение исполнения сигналов).
