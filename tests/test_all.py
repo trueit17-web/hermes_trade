@@ -2285,6 +2285,89 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(order)
         self.engine.exchange.create_market_buy_order.assert_awaited_once()
 
+    async def test_execute_real_order_skips_above_market_order_max_qty(self):
+        """
+        Реальный инцидент (прод, ALT/USDT, фьючерсы): retCode 10001 "The
+        number of contracts exceeds maximum limit allowed: too large,
+        order_qty:279846200000000 > max_qty:250000000000000" — ПРОИЗОШЛО
+        НЕСМОТРЯ на уже задеплоенную и рабочую проверку по
+        market["limits"]["amount"]["max"] (та же проверка минутами раньше
+        корректно заблокировала YGG/USDT в тех же логах). Причина: Bybit
+        отдельно ограничивает объём MARKET-ордеров через lotSizeFilter.
+        maxMktOrderQty (обычно ниже, чем maxOrderQty/maxTradingQty,
+        применимые к лимитным ордерам) — ccxt не прокладывает это поле в
+        унифицированные limits, только в сырой market["info"]. Объём,
+        прошедший проверку по unified max, должен всё равно блокироваться
+        по этому отдельному лимиту, раз наш execution engine отправляет
+        только market-ордера.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.markets = {
+            "ALT1/USDT": {
+                "limits": {"amount": {"min": 1.0, "max": 300000000000000.0}},
+                "info": {"lotSizeFilter": {"maxMktOrderQty": "250000000000000"}},
+            }
+        }
+
+        order = await self.engine.create_order(
+            symbol="ALT1/USDT", side="buy", amount=279846200000000.0, price=0.0000651, order_type="market",
+        )
+
+        self.assertIsNone(order)
+        self.engine.exchange.create_market_buy_order.assert_not_called()
+        self.assertNotIn("ALT1/USDT", self.engine.real_positions)
+
+    async def test_execute_real_order_allows_amount_within_market_order_max_qty(self):
+        """Регресс: объём в допустимом диапазоне по maxMktOrderQty не должен
+        блокироваться новой проверкой."""
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.markets = {
+            "ALT2/USDT": {
+                "limits": {"amount": {"min": 1.0, "max": 300000000000000.0}},
+                "info": {"lotSizeFilter": {"maxMktOrderQty": "250000000000000"}},
+            }
+        }
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "alt-within-max-1", "filled": 100.0, "average": 1.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="ALT2/USDT", side="buy", amount=100.0, price=1.0, order_type="market",
+        )
+
+        self.assertIsNotNone(order)
+        self.engine.exchange.create_market_buy_order.assert_awaited_once()
+
+    async def test_execute_real_order_ignores_missing_market_order_max_qty(self):
+        """Регресс: рынки без lotSizeFilter.maxMktOrderQty в info (спот, старые
+        тестовые моки) должны вести себя как раньше — блокировка только по
+        unified limits.amount.max."""
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.markets = {
+            "NOINFO1/USDT": {"limits": {"amount": {"min": 1.0, "max": 1000000.0}}}
+        }
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "noinfo-1", "filled": 100.0, "average": 1.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="NOINFO1/USDT", side="buy", amount=100.0, price=1.0, order_type="market",
+        )
+
+        self.assertIsNotNone(order)
+        self.engine.exchange.create_market_buy_order.assert_awaited_once()
+
     async def test_execute_real_order_ignores_unusable_markets_metadata(self):
         """
         Если exchange.markets отсутствует/не словарь (как в большинстве

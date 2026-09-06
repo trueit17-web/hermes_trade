@@ -1423,6 +1423,61 @@ class ExecutionEngine:
         except Exception:
             return None
 
+    def _market_info(self, symbol: str, exchange: ccxt.Exchange | None = None) -> dict | None:
+        """market["info"] — сырой (непреобразованный) ответ биржи для symbol,
+        тем же защитным доступом, что и _market_limits (см. её докстринг:
+        структура markets[symbol] не гарантирована — mock-объекты в тестах,
+        разные биржи)."""
+        try:
+            ex = exchange if exchange is not None else self.exchange
+            markets = ex.markets if ex else None
+            if not isinstance(markets, dict):
+                return None
+            market = markets.get(self._ccxt_symbol(ex, symbol))
+            if not isinstance(market, dict):
+                return None
+            info = market.get("info")
+            return info if isinstance(info, dict) else None
+        except Exception:
+            return None
+
+    def _market_max_market_order_amount(self, symbol: str, exchange: ccxt.Exchange | None = None) -> float | None:
+        """
+        lotSizeFilter.maxMktOrderQty из СЫРОГО ответа биржи (market["info"])
+        — Bybit V5 (/v5/market/instruments-info) отдельно ограничивает
+        объём именно MARKET-ордеров, и этот лимит обычно ЗАМЕТНО НИЖЕ, чем
+        maxOrderQty/maxTradingQty, применимые к лимитным ордерам (защита от
+        проскальзывания на маркет-ордерах). ccxt (используемая версия) НЕ
+        прокладывает maxMktOrderQty в унифицированный market["limits"]
+        ["amount"]["max"] — тот заполняется только из maxOrderQty/
+        maxTradingQty (см. _market_max_amount) — поэтому объём, прошедший
+        унифицированную проверку, всё равно может быть отклонён биржей
+        отдельно как market-ордер.
+
+        Реальный инцидент (прод): ALT/USDT получил retCode 10001 "exceeds
+        maximum limit allowed" НЕСМОТРЯ на уже задеплоенную и рабочую
+        проверку по _market_max_amount (та же проверка минутами раньше
+        корректно заблокировала YGG/USDT) — потому что унифицированный
+        maxOrderQty/maxTradingQty для ALT/USDT был выше фактического
+        биржевого лимита именно для market-ордера. Наш execution engine
+        всегда отправляет MARKET-ордера (create_market_buy_order/
+        create_market_sell_order) — этот лимит применим всегда.
+        """
+        info = self._market_info(symbol, exchange)
+        if not info:
+            return None
+        lot_size_filter = info.get("lotSizeFilter")
+        if not isinstance(lot_size_filter, dict):
+            return None
+        raw = lot_size_filter.get("maxMktOrderQty")
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
     async def _leverage_tiers(self, symbol: str, exchange: ccxt.Exchange | None = None) -> list | None:
         """
         Тиры risk-limit биржи (см. fetch_market_leverage_tiers) для symbol —
@@ -1488,21 +1543,35 @@ class ExecutionEngine:
 
     def _market_max_amount(self, symbol: str, exchange: ccxt.Exchange | None = None) -> float | None:
         """
-        market["limits"]["amount"]["max"] — ccxt/bybit заполняет его из
-        lotSizeFilter.maxOrderQty (спот) / maxTradingQty|maxOrderQty
-        (linear swap). Низкоценовые монеты с большим circulating supply
-        (напр. MOODENG/USDT) на типичный по USDT размер позиции дают
-        объём в единицах монеты, легко превышающий этот лимит — без
-        проверки такой ордер уходит на биржу и падает оттуда retCode
-        10001 "The number of contracts exceeds maximum limit allowed"
-        (реальный инцидент, прод).
+        Наименьший из двух независимых биржевых максимумов объёма ордера:
+
+        1. market["limits"]["amount"]["max"] — ccxt/bybit заполняет его из
+           lotSizeFilter.maxOrderQty (спот) / maxTradingQty|maxOrderQty
+           (linear swap). Низкоценовые монеты с большим circulating supply
+           (напр. MOODENG/USDT) на типичный по USDT размер позиции дают
+           объём в единицах монеты, легко превышающий этот лимит — без
+           проверки такой ордер уходит на биржу и падает оттуда retCode
+           10001 "The number of contracts exceeds maximum limit allowed"
+           (реальный инцидент, прод).
+        2. lotSizeFilter.maxMktOrderQty — отдельный, обычно более низкий
+           лимит именно для MARKET-ордеров, который ccxt не прокладывает в
+           унифицированные limits (см. _market_max_market_order_amount) —
+           без него проверка выше может пропустить объём, который биржа
+           всё равно отклонит как market-ордер (реальный инцидент, прод:
+           ALT/USDT, retCode 10001 несмотря на уже работающую проверку по
+           п.1 — см. докстринг _market_max_market_order_amount).
         """
         limits = self._market_limits(symbol, exchange)
-        if not limits:
-            return None
-        amount_limits = limits.get("amount")
-        max_amount = amount_limits.get("max") if isinstance(amount_limits, dict) else None
-        return max_amount if isinstance(max_amount, (int, float)) else None
+        max_amount = None
+        if limits:
+            amount_limits = limits.get("amount")
+            parsed_max = amount_limits.get("max") if isinstance(amount_limits, dict) else None
+            if isinstance(parsed_max, (int, float)):
+                max_amount = parsed_max
+        market_order_max = self._market_max_market_order_amount(symbol, exchange)
+        if isinstance(market_order_max, (int, float)):
+            max_amount = market_order_max if max_amount is None else min(max_amount, market_order_max)
+        return max_amount
 
     def _outside_exchange_amount_limits(
         self, symbol: str, amount: float, price: float | None, exchange: ccxt.Exchange | None = None,
