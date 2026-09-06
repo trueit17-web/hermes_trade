@@ -3100,21 +3100,37 @@ class ExecutionEngine:
         """
         sl_order_id = pos.get("sl_order_id")
         if not sl_order_id:
+            logger.warning(
+                f"⚠️ Сверка {symbol}: финализация по биржевому SL-ордеру невозможна — "
+                f"sl_order_id не отслеживается для этой позиции, пробуем историю сделок."
+            )
             return False
         exchange = self._exchange_for(pos)
         if exchange is None:
+            logger.warning(
+                f"⚠️ Сверка {symbol}: нет клиента биржи рынка {pos.get('market_type')!r} для "
+                f"проверки биржевого SL-ордера {sl_order_id}."
+            )
             return False
         try:
             order = await exchange.fetch_order(sl_order_id, self._ccxt_symbol(exchange, symbol))
         except Exception as e:
-            logger.debug(f"Не удалось проверить биржевой SL-ордер {sl_order_id} ({symbol}): {e}")
+            logger.warning(f"⚠️ Не удалось проверить биржевой SL-ордер {sl_order_id} ({symbol}): {e}")
             return False
         status = str(order.get("status") or "").lower()
         if status not in ("closed", "filled"):
+            logger.warning(
+                f"⚠️ Сверка {symbol}: биржевой SL-ордер {sl_order_id} имеет статус {status!r} "
+                f"(не closed/filled) — не он закрыл позицию, пробуем историю сделок."
+            )
             return False
 
         amount = float(order.get("filled") or pos.get("amount") or 0)
         if amount <= 0:
+            logger.warning(
+                f"⚠️ Сверка {symbol}: биржевой SL-ордер {sl_order_id} закрыт, но filled-объём "
+                f"равен 0 — пробуем историю сделок."
+            )
             return False
 
         trade_fill = await self._fetch_fill_details_via_trades(str(sl_order_id), symbol, exchange)
@@ -3126,6 +3142,10 @@ class ExecutionEngine:
         else:
             exit_price = order.get("average") or order.get("price")
             if not exit_price:
+                logger.warning(
+                    f"⚠️ Сверка {symbol}: биржевой SL-ордер {sl_order_id} закрыт, но у него нет "
+                    f"ни average, ни price — пробуем историю сделок."
+                )
                 return False
             closing_side = "sell" if pos.get("side", "long") == "long" else "buy"
             exit_fee, exit_fee_currency = self._resolve_fee(order.get("fee"), amount, exit_price, closing_side, symbol)
@@ -3173,9 +3193,17 @@ class ExecutionEngine:
         tracked_amount = pos.get("amount") or 0
         opened_at = pos.get("opened_at")
         if tracked_amount <= 0 or not opened_at:
+            logger.warning(
+                f"⚠️ Сверка {symbol}: финализация по истории сделок невозможна — "
+                f"tracked_amount={tracked_amount!r} opened_at={opened_at!r}."
+            )
             return False
         exchange = self._exchange_for(pos)
         if exchange is None:
+            logger.warning(
+                f"⚠️ Сверка {symbol}: нет клиента биржи рынка {pos.get('market_type')!r} для "
+                f"проверки истории сделок."
+            )
             return False
         # Как и другие необязательные сверки с биржей в этом классе (см.
         # _fetch_fill_details_via_trades) — вся функция под одним широким
@@ -3186,6 +3214,10 @@ class ExecutionEngine:
         try:
             recent = await exchange.fetch_my_trades(self._ccxt_symbol(exchange, symbol), limit=20)
             if not recent:
+                logger.warning(
+                    f"⚠️ Сверка {symbol}: биржа не вернула ни одной недавней сделки — "
+                    f"снимаем позицию с учёта без PnL."
+                )
                 return False
 
             # opened_at — наивный datetime в UTC (см. utcnow); .timestamp()
@@ -3199,19 +3231,24 @@ class ExecutionEngine:
                 if str(t.get("side", "")).lower() == closing_side and (t.get("timestamp") or 0) >= opened_at_ts
             ]
             if not closing_trades:
+                logger.warning(
+                    f"⚠️ Сверка {symbol}: среди последних {len(recent)} сделок биржи нет "
+                    f"{closing_side} после открытия позиции ({opened_at}) — снимаем без PnL."
+                )
                 return False
 
             total_amount = sum(float(t.get("amount") or 0) for t in closing_trades)
             if total_amount <= 0:
+                logger.warning(f"⚠️ Сверка {symbol}: суммарный объём найденных {closing_side}-сделок равен 0.")
                 return False
             if abs(total_amount - tracked_amount) / tracked_amount > 0.15:
-                logger.debug(
-                    f"Сверка {symbol}: недавние {closing_side} ({total_amount:.8f}) слишком расходятся с "
-                    f"отслеживаемым объёмом ({tracked_amount:.8f}) — не гадаем, чей это ордер."
+                logger.warning(
+                    f"⚠️ Сверка {symbol}: недавние {closing_side} ({total_amount:.8f}) слишком расходятся с "
+                    f"отслеживаемым объёмом ({tracked_amount:.8f}) — не гадаем, чей это ордер, снимаем без PnL."
                 )
                 return False
         except Exception as e:
-            logger.debug(f"Не удалось сверить закрытие {symbol} по истории сделок: {e}")
+            logger.warning(f"⚠️ Не удалось сверить закрытие {symbol} по истории сделок: {e}")
             return False
 
         total_cost = sum(
@@ -3220,6 +3257,7 @@ class ExecutionEngine:
         )
         exit_price = total_cost / total_amount if total_amount else 0
         if not exit_price:
+            logger.warning(f"⚠️ Сверка {symbol}: не удалось вычислить exit_price из найденных сделок.")
             return False
         # Несколько сделок закрытия могут быть с РАЗНОЙ валютой комиссии
         # (например, часть — в USDT, часть — в base-валюте, если бирже

@@ -449,6 +449,32 @@ class RiskLock(Base):
     )
 
 
+class LogEntry(Base):
+    """Персистентная копия лог-записей приложения — раньше /logs веб-панели
+    отдавал только in-memory ring-буфер (RingBufferHandler, capacity=2000),
+    который терялся целиком при каждом рестарте процесса и на активном
+    боте перезаписывался за десятки минут, из-за чего диагностика
+    инцидента (напр. почему реконсиляция позиции не смогла найти
+    закрывающую сделку) была невозможна уже через короткое время после
+    события. Пишется фоновым flush-циклом (см. _flush_logs_to_db_loop в
+    main.py) из очереди, которую параллельно с ring-буфером наполняет тот
+    же RingBufferHandler (см. src/utils/logging.py) — без ограничения на
+    возраст записи, история хранится целиком."""
+    __tablename__ = "log_entries"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    level: Mapped[str] = mapped_column(String(10), nullable=False)
+    logger: Mapped[str] = mapped_column(String(200), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+
+    __table_args__ = (
+        Index("ix_log_entries_timestamp", "timestamp"),
+        Index("ix_log_entries_level", "level"),
+        Index("ix_log_entries_logger", "logger"),
+    )
+
+
 class RiskCloseEvent(Base):
     """Факт полного закрытия сделки — общий лёгкий журнал для Protections
     (StoplossGuard/LosingStreak по pnl/reason) и expectancy-based sizing

@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import signal
+from datetime import UTC
 from pathlib import Path
 from typing import Any
 
@@ -11,12 +12,13 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import selectinload
 
 from src.config import settings
 from src.db.models import (
     BotConfig,
+    LogEntry,
     Order,
     PerformanceSnapshot,
     TelegramChannel,
@@ -35,7 +37,7 @@ from src.risk.protections import channel_key, protection_manager
 from src.risk.risk_manager import risk_manager
 from src.strategy import strategy_registry
 from src.telegram.notifier import send_notification
-from src.utils.logging import get_logger_families, get_recent_logs
+from src.utils.logging import LEVEL_ORDER, get_logger_families
 from src.utils.timeutils import utcnow
 from src.web import auth
 from src.web.connections_status import get_connections_status
@@ -1265,24 +1267,74 @@ async def update_settings(request: SettingsUpdateRequest):
     return {"success": not result["errors"], **result}
 
 
+def _logger_family_filter(families: list[str]):
+    """SQL-условие 'logger принадлежит одному из выбранных семейств' — то же
+    свёртывание имени, что и _logger_family в src/utils/logging.py (первые
+    два dot-сегмента для 'src.*', иначе первый сегмент): logger равен
+    семейству целиком (напр. 'uvicorn') ИЛИ начинается с 'семейство.'
+    (напр. 'src.execution.executor' для семейства 'src.execution')."""
+    clauses = []
+    for family in families:
+        clauses.append(LogEntry.logger == family)
+        clauses.append(LogEntry.logger.like(f"{family}.%"))
+    return or_(*clauses)
+
+
 @app.get("/logs")
 async def get_logs(
     level: str | None = None,
     search: str | None = None,
     loggers: str | None = None,
     limit: int = 200,
+    before_id: int | None = None,
 ):
-    """Последние логи процесса (из ring-буфера в памяти) с фильтрами для веб-панели.
+    """Персистентная история логов (таблица LogEntry) с фильтрами для веб-панели —
+    в отличие от прежнего in-memory ring-буфера переживает рестарт процесса и не
+    теряет записи старше последних ~2000 (см. _flush_logs_to_db_loop в main.py).
 
     loggers — список выбранных в чекбокс-фильтре 'семейств' логгеров через
     запятую; параметр отсутствует = без фильтра, пустая строка = ничего
     не выбрано (показать пусто).
+
+    before_id — для кнопки "Загрузить ещё" в дашборде: вернуть limit записей
+    СТАРШЕ (id меньше) этого id, вместо последних limit записей. Ответ несёт
+    next_before_id — id для следующего такого вызова, или null, если более
+    старых записей, подходящих под фильтр, не осталось.
     """
     logger_families = [x for x in loggers.split(",") if x] if loggers is not None else None
+    if logger_families is not None and not logger_families:
+        return {"logs": [], "next_before_id": None}
+    limit = min(limit, 2000)
+
+    query = select(LogEntry)
+    min_level = LEVEL_ORDER.get((level or "").upper())
+    if min_level is not None:
+        allowed_levels = [lvl for lvl, order in LEVEL_ORDER.items() if order >= min_level]
+        query = query.where(LogEntry.level.in_(allowed_levels))
+    if logger_families is not None:
+        query = query.where(_logger_family_filter(logger_families))
+    if search:
+        query = query.where(LogEntry.message.ilike(f"%{search}%"))
+    if before_id is not None:
+        query = query.where(LogEntry.id < before_id)
+    query = query.order_by(LogEntry.id.desc()).limit(limit)
+
+    async with get_session() as session:
+        rows = list((await session.execute(query)).scalars().all())
+    rows.reverse()  # старые -> новые, как и раньше отдавал ring-буфер
+
     return {
-        "logs": get_recent_logs(
-            level=level, search=search, loggers=logger_families, limit=min(limit, 2000)
-        )
+        "logs": [
+            {
+                "id": r.id,
+                "timestamp": r.timestamp.replace(tzinfo=UTC).isoformat(),
+                "level": r.level,
+                "logger": r.logger,
+                "message": r.message,
+            }
+            for r in rows
+        ],
+        "next_before_id": rows[0].id if rows and len(rows) == limit else None,
     }
 
 

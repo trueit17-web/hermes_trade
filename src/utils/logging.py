@@ -1,6 +1,7 @@
 """Настройка логирования с поддержкой цветного вывода и структурированных логов."""
 import json
 import logging
+import queue
 from collections import deque
 from datetime import UTC, datetime
 from typing import Any
@@ -15,10 +16,21 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 _LEVEL_ORDER = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+# Публичный алиас — используется также вне этого модуля (см. GET /logs в
+# src/web/api.py, отдающий персистентную историю из LogEntry, а не только
+# ring-буфер) для фильтрации "уровень и выше" тем же порядком уровней.
+LEVEL_ORDER = _LEVEL_ORDER
 
 
 class RingBufferHandler(logging.Handler):
-    """Хранит последние N лог-записей в памяти для отображения в веб-панели."""
+    """Хранит последние N лог-записей в памяти для отображения в веб-панели.
+
+    Одновременно кладёт ту же запись в _pending_db_records (без ограничения
+    размера) — оттуда её периодически забирает фоновый flush-цикл
+    (_flush_logs_to_db_loop в main.py) и пишет в LogEntry (см. src/db/models.py),
+    чтобы полная история логов переживала рестарт процесса и не терялась при
+    перезаписи ring-буфера (capacity здесь — всего 2000 записей, на активном
+    боте перезаписывается за десятки минут)."""
 
     def __init__(self, capacity: int = 2000):
         super().__init__()
@@ -26,17 +38,41 @@ class RingBufferHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord):
         try:
-            self.records.append({
+            entry = {
                 "timestamp": datetime.now(UTC).isoformat(),
                 "level": record.levelname,
                 "logger": record.name,
                 "message": record.getMessage(),
-            })
+            }
+            self.records.append(entry)
+            _pending_db_records.put_nowait(entry)
         except Exception:
             pass
 
 
 ring_buffer_handler = RingBufferHandler()
+
+# Неограниченная по размеру очередь (в отличие от ring_buffer_handler.records,
+# у которой maxlen=2000) — накапливает записи между проходами фонового
+# flush-цикла (main.py: _flush_logs_to_db_loop), не теряя ни одной, даже если
+# сам цикл временно отстал (например, БД была недоступна). queue.SimpleQueue,
+# а не deque — logging.Handler.emit может вызываться из разных потоков
+# (uvicorn/thread pool), нужна потокобезопасная put/get без явной блокировки.
+_pending_db_records: queue.SimpleQueue = queue.SimpleQueue()
+
+
+def drain_pending_log_records(max_items: int = 10000) -> list[dict]:
+    """Забрать накопленные с прошлого вызова лог-записи (не более max_items за
+    раз — защита от одной гигантской транзакции, если flush-цикл долго не
+    запускался) для записи в БД. Не блокирует — если очередь опустела раньше
+    max_items, просто возвращает то, что успело накопиться."""
+    records = []
+    for _ in range(max_items):
+        try:
+            records.append(_pending_db_records.get_nowait())
+        except queue.Empty:
+            break
+    return records
 
 # Логгеры, которые модульная система логирования настраивает явно (см.
 # setup_logging ниже) плюс сторонние — показываются в чекбокс-фильтре

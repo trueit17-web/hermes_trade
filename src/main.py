@@ -20,6 +20,7 @@ from src.data_ingest.feature_engine import get_feature_engine
 from src.data_ingest.market_data import MarketDataIngest
 from src.db.models import (
     Exchange,
+    LogEntry,
     PerformanceSnapshot,
     Symbol,
     TelegramChannel,
@@ -49,7 +50,7 @@ from src.telegram.channel_monitor import (
     subscribe_telegram_signal,
 )
 from src.telegram.notifier import send_notification
-from src.utils.logging import logger, setup_logging
+from src.utils.logging import drain_pending_log_records, logger, setup_logging
 from src.utils.timeutils import utcnow
 from src.web.api import app as web_app
 from src.web.settings_store import load_settings_overrides
@@ -1886,7 +1887,60 @@ class TradingBot:
         logger.info("✅ Очистка завершена")
 
 
-async def _run_until_shutdown(bot_task: asyncio.Task, server_task: asyncio.Task, web_server) -> None:
+async def _flush_logs_to_db_loop(interval: float = 5.0) -> None:
+    """
+    Периодически переносит записи, накопленные RingBufferHandler в очереди
+    _pending_db_records (см. src/utils/logging.py), в персистентную таблицу
+    LogEntry — без этого фонового цикла ring-буфер (capacity=2000) остаётся
+    ЕДИНСТВЕННЫМ источником для /logs веб-панели и теряется целиком при
+    каждом рестарте процесса, а на активном боте перезаписывается за
+    десятки минут. Реальный инцидент: не удалось разобраться, почему сверка
+    позиции SUI/USDT не смогла восстановить PnL закрытия — WARNING-подробности
+    (см. _finalize_externally_closed_position/_finalize_via_recent_trade_history)
+    к моменту расследования уже вылетели из буфера.
+
+    Отдельная задача (как bot_task/server_task ниже), а не часть основного
+    60-секундного торгового цикла — тот слишком редкий для логов активного
+    бота (очередь успела бы разрастись между проходами) и не должен
+    зависеть от логирования лишней связью; сбой записи в БД (например, она
+    временно недоступна) не должен ронять ни цикл, ни сам этот цикл —
+    записи просто останутся в очереди до следующей попытки.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        await _flush_pending_log_records()
+
+
+async def _flush_pending_log_records() -> int:
+    """Слить всё, что накопилось в очереди _pending_db_records, в LogEntry —
+    вынесено из _flush_logs_to_db_loop отдельной функцией, чтобы тестировать
+    саму запись без обвязки sleep-цикла. Возвращает число записанных строк
+    (0, если очередь была пуста или запись в БД не удалась)."""
+    records = drain_pending_log_records()
+    if not records:
+        return 0
+    try:
+        async with get_session() as session:
+            session.add_all([
+                LogEntry(
+                    timestamp=datetime.fromisoformat(r["timestamp"]),
+                    level=r["level"],
+                    logger=r["logger"],
+                    message=r["message"],
+                )
+                for r in records
+            ])
+            await session.commit()
+        return len(records)
+    except Exception as e:
+        logger.debug(f"Не удалось сохранить {len(records)} лог-записей в БД: {e}")
+        return 0
+
+
+async def _run_until_shutdown(
+    bot_task: asyncio.Task, server_task: asyncio.Task, web_server,
+    extra_tasks: list[asyncio.Task] | None = None,
+) -> None:
     """
     Дождаться завершения основного цикла бота и веб-сервера, что бы ни
     случилось раньше (штатный сигнал остановки отменяет bot_task — см.
@@ -1897,13 +1951,21 @@ async def _run_until_shutdown(bot_task: asyncio.Task, server_task: asyncio.Task,
     оставшейся задаче и гарантированно дожидаемся обеих через gather с
     return_exceptions=True, прежде чем вернуть управление наружу (только
     тогда TradingBot.run() успевает дойти до своего _cleanup()).
+
+    extra_tasks — фоновые задачи вроде _flush_logs_to_db_loop, чьё
+    завершение НЕ должно само по себе запускать остановку (в отличие от
+    bot_task/server_task в asyncio.wait ниже), но которые нужно отменить и
+    дождаться наравне с основными при остановке процесса.
     """
     await asyncio.wait({bot_task, server_task}, return_when=asyncio.FIRST_COMPLETED)
     if not bot_task.done():
         bot_task.cancel()
     if not server_task.done():
         web_server.should_exit = True
-    results = await asyncio.gather(bot_task, server_task, return_exceptions=True)
+    for task in extra_tasks or []:
+        if not task.done():
+            task.cancel()
+    results = await asyncio.gather(bot_task, server_task, *(extra_tasks or []), return_exceptions=True)
     for result in results:
         if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
             logger.error(f"Ошибка при остановке: {result}")
@@ -1937,6 +1999,7 @@ async def main():
 
     bot_task = asyncio.create_task(bot.run())
     server_task = asyncio.create_task(web_server.serve())
+    log_flush_task = asyncio.create_task(_flush_logs_to_db_loop())
 
     # SIGTERM — то, чем docker/docker-compose штатно останавливает контейнер
     # (docker stop, пересоздание образа при "docker compose up -d") — по
@@ -1959,7 +2022,7 @@ async def main():
     loop.add_signal_handler(signal.SIGINT, _request_shutdown, "SIGINT")
 
     try:
-        await _run_until_shutdown(bot_task, server_task, web_server)
+        await _run_until_shutdown(bot_task, server_task, web_server, extra_tasks=[log_flush_task])
     except Exception as e:
         logger.critical(f"Критическая ошибка: {e}")
         import traceback

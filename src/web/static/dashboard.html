@@ -806,6 +806,10 @@
       </div>
     </div>
     <div class="logs-box logs-box-full" id="logsBox"><div class="muted" style="padding:12px 16px">Загрузка…</div></div>
+    <div class="log-history-actions" style="display:flex; gap:8px; padding:8px 0 0;">
+      <button type="button" id="btnLoadOlderLogs" class="btn-ghost" style="display:none">⬆ Загрузить ещё (история)</button>
+      <button type="button" id="btnResumeLogs" class="btn-ghost" style="display:none">▶ Вернуться к live-логам</button>
+    </div>
   </div>
 </div>
 
@@ -2560,7 +2564,7 @@ function renderModuleCheckboxes() {
       if (cb.checked) selectedModules.add(cb.dataset.module);
       else selectedModules.delete(cb.dataset.module);
       updateModuleDropdownLabel();
-      loadLogs();
+      reloadLogsLive();
     });
   });
   updateModuleDropdownLabel();
@@ -2591,26 +2595,56 @@ document.addEventListener("click", (e) => {
 document.getElementById("moduleSelectAll").addEventListener("click", () => {
   allModules.forEach(m => selectedModules.add(m));
   renderModuleCheckboxes();
-  loadLogs();
+  reloadLogsLive();
 });
 document.getElementById("moduleSelectNone").addEventListener("click", () => {
   selectedModules.clear();
   renderModuleCheckboxes();
-  loadLogs();
+  reloadLogsLive();
 });
 
-async function loadLogs() {
+// Логи теперь хранятся целиком в БД (LogEntry), а не только в 2000-записном
+// ring-буфере — вкладка по умолчанию продолжает "жить" (тянет последние N
+// записей раз в REFRESH_MS), но кнопка "Загрузить ещё" может подгрузить
+// историю старше видимого окна. Пока пользователь листает историю,
+// периодическое обновление приостановлено (logsPaused) — иначе следующий
+// же тик перезаписал бы box.innerHTML только последними записями и подгруженная
+// история тут же исчезла бы.
+let logsPaused = false;
+let oldestVisibleLogId = null;
+
+function currentLogParams() {
   const level = document.getElementById("logLevelFilter").value;
   const search = document.getElementById("logSearchFilter").value.trim();
   const params = new URLSearchParams({ limit: "300" });
   if (level) params.set("level", level);
   if (search) params.set("search", search);
   if (modulesInitialized) params.set("loggers", Array.from(selectedModules).join(","));
+  return params;
+}
 
+function renderLogLines(logs) {
+  return logs.length ? logs.map(l => `
+    <div class="log-line log-${l.level}">
+      <span class="log-time">${fmtTimeMsk(l.timestamp)}</span>
+      <span class="log-level">${l.level}</span>
+      <span class="log-logger muted">${escapeHtml(l.logger)}</span>
+      <span class="log-msg">${escapeHtml(l.message)}</span>
+    </div>
+  `).join("") : `<div class="muted" style="padding:12px 16px">Нет записей по текущему фильтру</div>`;
+}
+
+function updateLoadOlderButton(nextBeforeId) {
+  document.getElementById("btnLoadOlderLogs").style.display = nextBeforeId ? "" : "none";
+}
+
+async function loadLogs() {
+  if (logsPaused) return;
   const box = document.getElementById("logsBox");
   try {
-    const data = await api(`/logs?${params.toString()}`);
+    const data = await api(`/logs?${currentLogParams().toString()}`);
     const logs = data.logs || [];
+    oldestVisibleLogId = logs.length ? logs[0].id : null;
     // Раньше позиция скролла восстанавливалась только если пользователь
     // был внизу (автослежение за новыми строками) — если он прокрутил
     // вверх читать историю, каждое обновление (раз в 5с, пока открыта
@@ -2619,25 +2653,50 @@ async function loadLogs() {
     // продолжать следовать за новыми записями.
     const wasAtBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
     const prevScrollTop = box.scrollTop;
-    box.innerHTML = logs.length ? logs.map(l => `
-      <div class="log-line log-${l.level}">
-        <span class="log-time">${fmtTimeMsk(l.timestamp)}</span>
-        <span class="log-level">${l.level}</span>
-        <span class="log-logger muted">${escapeHtml(l.logger)}</span>
-        <span class="log-msg">${escapeHtml(l.message)}</span>
-      </div>
-    `).join("") : `<div class="muted" style="padding:12px 16px">Нет записей по текущему фильтру</div>`;
+    box.innerHTML = renderLogLines(logs);
     box.scrollTop = wasAtBottom ? box.scrollHeight : prevScrollTop;
+    updateLoadOlderButton(data.next_before_id);
   } catch (err) {
     box.innerHTML = `<div class="muted" style="padding:12px 16px">Ошибка загрузки: ${err.message}</div>`;
   }
 }
 
-["logLevelFilter"].forEach(id => document.getElementById(id).addEventListener("change", loadLogs));
+function reloadLogsLive() {
+  logsPaused = false;
+  document.getElementById("btnResumeLogs").style.display = "none";
+  loadLogs();
+}
+
+async function loadOlderLogs() {
+  if (!oldestVisibleLogId) return;
+  logsPaused = true;
+  document.getElementById("btnResumeLogs").style.display = "";
+  const params = currentLogParams();
+  params.set("before_id", String(oldestVisibleLogId));
+  const box = document.getElementById("logsBox");
+  try {
+    const data = await api(`/logs?${params.toString()}`);
+    const older = data.logs || [];
+    if (older.length) {
+      const prevScrollHeight = box.scrollHeight;
+      box.insertAdjacentHTML("afterbegin", renderLogLines(older));
+      box.scrollTop = box.scrollHeight - prevScrollHeight;
+      oldestVisibleLogId = older[0].id;
+    }
+    updateLoadOlderButton(data.next_before_id);
+  } catch (err) {
+    // Ошибка подгрузки истории не должна портить уже отображённые логи.
+  }
+}
+
+document.getElementById("btnLoadOlderLogs").addEventListener("click", loadOlderLogs);
+document.getElementById("btnResumeLogs").addEventListener("click", reloadLogsLive);
+
+["logLevelFilter"].forEach(id => document.getElementById(id).addEventListener("change", reloadLogsLive));
 ["logSearchFilter"].forEach(id => {
   document.getElementById(id).addEventListener("input", () => {
     clearTimeout(logsFilterTimer);
-    logsFilterTimer = setTimeout(loadLogs, 400);
+    logsFilterTimer = setTimeout(reloadLogsLive, 400);
   });
 });
 

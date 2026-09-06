@@ -4560,6 +4560,169 @@ class TestLogging(unittest.TestCase):
         from src.utils.logging import log_trade
         log_trade(1, "BTC/USDT", "long", 100.0, 1.0, "win", "RSI Strategy")
 
+    def test_ring_buffer_handler_also_enqueues_for_db_flush(self):
+        """
+        RingBufferHandler кладёт запись не только в ring-буфер (потерялся бы
+        целиком при рестарте процесса), но и в отдельную неограниченную
+        очередь — оттуда её периодически забирает _flush_logs_to_db_loop
+        (main.py) и пишет в персистентную таблицу LogEntry. Без этого полная
+        история логов не переживала бы рестарт (реальный инцидент: не
+        удалось найти причину, почему SUI/USDT не финализировался с PnL, —
+        нужные записи к моменту расследования уже вылетели из буфера)."""
+        import logging as std_logging
+        from src.utils.logging import drain_pending_log_records, ring_buffer_handler
+
+        drain_pending_log_records()  # очистить то, что могло накопиться от других тестов
+        probe_logger = std_logging.getLogger("test.ring_buffer_db_queue")
+        probe_logger.addHandler(ring_buffer_handler)
+        probe_logger.setLevel(std_logging.INFO)
+        try:
+            probe_logger.info("проверочная запись для очереди БД")
+        finally:
+            probe_logger.removeHandler(ring_buffer_handler)
+
+        records = drain_pending_log_records()
+        self.assertTrue(any(r["message"] == "проверочная запись для очереди БД" for r in records))
+
+    def test_drain_pending_log_records_empties_the_queue(self):
+        from src.utils.logging import drain_pending_log_records
+        drain_pending_log_records()
+        self.assertEqual(drain_pending_log_records(), [])
+
+
+class TestLogsEndpointPersistence(unittest.IsolatedAsyncioTestCase):
+    """
+    GET /logs раньше отдавал только in-memory ring-буфер (RingBufferHandler,
+    capacity=2000) — терялся целиком при каждом рестарте процесса и
+    перезаписывался за десятки минут активной торговли. Теперь читает из
+    персистентной таблицы LogEntry (см. _flush_logs_to_db_loop в main.py) —
+    эти тесты бьют напрямую в src.web.api.get_logs, минуя HTTP-слой (тот же
+    стиль, что и у остальных тестов api.py в этом файле)."""
+
+    async def asyncTearDown(self):
+        from sqlalchemy import delete
+        from src.db.session import get_session
+        from src.db.models import LogEntry
+        async with get_session() as session:
+            await session.execute(delete(LogEntry))
+            await session.commit()
+
+    @staticmethod
+    async def _seed(entries):
+        from src.db.session import get_session
+        from src.db.models import LogEntry
+        async with get_session() as session:
+            for level, logger_name, message in entries:
+                session.add(LogEntry(timestamp=datetime.now(), level=level, logger=logger_name, message=message))
+            await session.commit()
+
+    async def test_filters_by_minimum_level(self):
+        from src.web.api import get_logs
+        await self._seed([
+            ("DEBUG", "src.execution.executor", "debug msg"),
+            ("WARNING", "src.execution.executor", "warning msg"),
+            ("ERROR", "src.execution.executor", "error msg"),
+        ])
+        result = await get_logs(level="WARNING", limit=100)
+        messages = [entry["message"] for entry in result["logs"]]
+        self.assertNotIn("debug msg", messages)
+        self.assertIn("warning msg", messages)
+        self.assertIn("error msg", messages)
+
+    async def test_filters_by_logger_family(self):
+        from src.web.api import get_logs
+        await self._seed([
+            ("INFO", "src.execution.executor", "exec msg"),
+            ("INFO", "src.risk.risk_manager", "risk msg"),
+        ])
+        result = await get_logs(loggers="src.execution", limit=100)
+        messages = [entry["message"] for entry in result["logs"]]
+        self.assertIn("exec msg", messages)
+        self.assertNotIn("risk msg", messages)
+
+    async def test_empty_loggers_selection_returns_nothing(self):
+        from src.web.api import get_logs
+        await self._seed([("INFO", "src.execution.executor", "exec msg")])
+        result = await get_logs(loggers="", limit=100)
+        self.assertEqual(result["logs"], [])
+
+    async def test_search_filters_by_substring(self):
+        from src.web.api import get_logs
+        await self._seed([
+            ("INFO", "src.execution.executor", "ALT/USDT ошибка"),
+            ("INFO", "src.execution.executor", "не относится"),
+        ])
+        result = await get_logs(search="ALT/USDT", limit=100)
+        messages = [entry["message"] for entry in result["logs"]]
+        self.assertEqual(messages, ["ALT/USDT ошибка"])
+
+    async def test_pagination_via_before_id_walks_backwards_in_time(self):
+        from src.web.api import get_logs
+        await self._seed([("INFO", "src.execution.executor", f"msg{i}") for i in range(5)])
+
+        first_page = await get_logs(limit=2)
+        self.assertEqual([e["message"] for e in first_page["logs"]], ["msg3", "msg4"])
+        self.assertIsNotNone(first_page["next_before_id"])
+
+        second_page = await get_logs(limit=2, before_id=first_page["next_before_id"])
+        self.assertEqual([e["message"] for e in second_page["logs"]], ["msg1", "msg2"])
+        self.assertIsNotNone(second_page["next_before_id"])
+
+        third_page = await get_logs(limit=2, before_id=second_page["next_before_id"])
+        self.assertEqual([e["message"] for e in third_page["logs"]], ["msg0"])
+        self.assertIsNone(third_page["next_before_id"])
+
+    async def test_next_before_id_is_none_when_history_exhausted(self):
+        from src.web.api import get_logs
+        await self._seed([("INFO", "src.execution.executor", "only one")])
+        result = await get_logs(limit=50)
+        self.assertIsNone(result["next_before_id"])
+
+
+class TestFlushLogsToDb(unittest.IsolatedAsyncioTestCase):
+    """_flush_pending_log_records — записывающая половина фонового
+    _flush_logs_to_db_loop (main.py), вынесенная отдельно, чтобы тестировать
+    саму запись без обвязки sleep-цикла."""
+
+    async def asyncTearDown(self):
+        from sqlalchemy import delete
+        from src.db.session import get_session
+        from src.db.models import LogEntry
+        async with get_session() as session:
+            await session.execute(delete(LogEntry))
+            await session.commit()
+
+    async def test_flushes_queued_records_into_log_entry_table(self):
+        from datetime import UTC
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import LogEntry
+        from src.main import _flush_pending_log_records
+        from src.utils.logging import drain_pending_log_records, _pending_db_records
+
+        drain_pending_log_records()  # очистить накопленное от других тестов
+        _pending_db_records.put_nowait({
+            "timestamp": datetime.now(UTC).isoformat(), "level": "WARNING",
+            "logger": "src.execution.executor", "message": "проверка flush в БД",
+        })
+
+        written = await _flush_pending_log_records()
+
+        self.assertEqual(written, 1)
+        async with get_session() as session:
+            rows = (
+                await session.execute(select(LogEntry).where(LogEntry.message == "проверка flush в БД"))
+            ).scalars().all()
+        self.assertEqual(len(rows), 1)
+
+    async def test_returns_zero_when_queue_empty(self):
+        from src.main import _flush_pending_log_records
+        from src.utils.logging import drain_pending_log_records
+
+        drain_pending_log_records()
+        written = await _flush_pending_log_records()
+        self.assertEqual(written, 0)
+
 
 class TestBacktestPosition(unittest.TestCase):
     """Тесты для BacktestPosition."""
@@ -8646,6 +8809,116 @@ class TestReconcileFuturesPositions(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(balance, 500.0)
         spot_mock.fetch_balance.assert_awaited_once()
         self.assertIn("MON/USDT", self.engine.real_positions)
+
+
+class TestFinalizeDiagnosticLogging(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент (прод, SUI/USDT): позиция реально закрылась на бирже,
+    но ни _finalize_externally_closed_position, ни _finalize_via_recent_
+    trade_history не смогли её финализировать с PnL — реконсиляция снесла
+    её в _reconcile_phantom_position без единой записи PnL. Разобраться,
+    ПОЧЕМУ обе finalize-попытки провалились, оказалось невозможно: часть их
+    return False была вообще без лога, часть — на DEBUG (перезаписан в
+    ring-буфере/не включён в прод-уровень логирования уже к моменту
+    расследования). Эти тесты проверяют, что теперь КАЖДАЯ точка выхода
+    отдаёт WARNING с конкретной причиной.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+
+    async def test_finalize_by_sl_order_logs_when_no_sl_order_id_tracked(self):
+        pos = {"amount": 100.0, "entry_price": 4.5, "side": "long", "market_type": "futures"}
+        with self.assertLogs("src.execution.executor", level="WARNING") as cm:
+            result = await self.engine._finalize_externally_closed_position("SUI/USDT", pos)
+        self.assertFalse(result)
+        self.assertTrue(any("sl_order_id не отслеживается" in m for m in cm.output))
+
+    async def test_finalize_by_sl_order_logs_when_order_status_not_closed(self):
+        settings.market_type = "futures"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_order = AsyncMock(
+            return_value={"id": "sl-sui-1", "status": "canceled"}
+        )
+        pos = {
+            "amount": 100.0, "entry_price": 4.5, "side": "long",
+            "market_type": "futures", "sl_order_id": "sl-sui-1",
+        }
+        with self.assertLogs("src.execution.executor", level="WARNING") as cm:
+            result = await self.engine._finalize_externally_closed_position("SUI/USDT", pos)
+        self.assertFalse(result)
+        self.assertTrue(any("canceled" in m for m in cm.output))
+
+    async def test_finalize_by_sl_order_logs_when_fetch_order_raises(self):
+        settings.market_type = "futures"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_order = AsyncMock(side_effect=Exception("order vanished"))
+        pos = {
+            "amount": 100.0, "entry_price": 4.5, "side": "long",
+            "market_type": "futures", "sl_order_id": "sl-sui-2",
+        }
+        with self.assertLogs("src.execution.executor", level="WARNING") as cm:
+            result = await self.engine._finalize_externally_closed_position("SUI/USDT", pos)
+        self.assertFalse(result)
+        self.assertTrue(any("order vanished" in m for m in cm.output))
+
+    async def test_finalize_by_trade_history_logs_when_no_trades_returned(self):
+        settings.market_type = "futures"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_my_trades = AsyncMock(return_value=[])
+        pos = {
+            "amount": 100.0, "entry_price": 4.5, "side": "long",
+            "market_type": "futures", "opened_at": datetime.now() - timedelta(minutes=30),
+        }
+        with self.assertLogs("src.execution.executor", level="WARNING") as cm:
+            result = await self.engine._finalize_via_recent_trade_history("SUI/USDT", pos)
+        self.assertFalse(result)
+        self.assertTrue(any("не вернула ни одной" in m for m in cm.output))
+
+    async def test_finalize_by_trade_history_logs_when_no_matching_closing_side(self):
+        """pos side="long" -> ищем sell; среди сделок только buy — не должны
+        молча решить, что закрытия не было, без объяснения в логе."""
+        settings.market_type = "futures"
+        self.engine.exchange = AsyncMock()
+        opened_at = datetime.now() - timedelta(minutes=30)
+        self.engine.exchange.fetch_my_trades = AsyncMock(return_value=[
+            {"side": "buy", "amount": 100.0, "price": 1.0,
+             "timestamp": int((opened_at + timedelta(minutes=5)).timestamp() * 1000)},
+        ])
+        pos = {
+            "amount": 100.0, "entry_price": 4.5, "side": "long",
+            "market_type": "futures", "opened_at": opened_at,
+        }
+        with self.assertLogs("src.execution.executor", level="WARNING") as cm:
+            result = await self.engine._finalize_via_recent_trade_history("SUI/USDT", pos)
+        self.assertFalse(result)
+        self.assertTrue(any("нет sell после открытия" in m for m in cm.output))
+
+    async def test_finalize_by_trade_history_logs_when_volume_mismatch(self):
+        settings.market_type = "futures"
+        self.engine.exchange = AsyncMock()
+        opened_at = datetime.now() - timedelta(minutes=30)
+        self.engine.exchange.fetch_my_trades = AsyncMock(return_value=[
+            {"side": "sell", "amount": 10.0, "price": 1.0, "cost": 10.0,
+             "timestamp": int((opened_at + timedelta(minutes=5)).timestamp() * 1000)},
+        ])
+        pos = {
+            "amount": 100.0, "entry_price": 4.5, "side": "long",
+            "market_type": "futures", "opened_at": opened_at,
+        }
+        with self.assertLogs("src.execution.executor", level="WARNING") as cm:
+            result = await self.engine._finalize_via_recent_trade_history("SUI/USDT", pos)
+        self.assertFalse(result)
+        self.assertTrue(any("слишком расходятся" in m for m in cm.output))
 
 
 class TestWatchOrdersTask(unittest.IsolatedAsyncioTestCase):
