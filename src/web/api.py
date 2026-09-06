@@ -18,6 +18,7 @@ from sqlalchemy.orm import selectinload
 from src.config import settings
 from src.db.models import (
     BotConfig,
+    HistoricalSignal,
     LogEntry,
     Order,
     PerformanceSnapshot,
@@ -36,6 +37,7 @@ from src.risk import expectancy_sizing
 from src.risk.protections import channel_key, protection_manager
 from src.risk.risk_manager import risk_manager
 from src.strategy import strategy_registry
+from src.telegram.history_backfill import backfill_channel_history
 from src.telegram.notifier import send_notification
 from src.utils.logging import LEVEL_ORDER, get_logger_families
 from src.utils.timeutils import utcnow
@@ -1572,6 +1574,67 @@ async def delete_telegram_channel(channel_id: int):
             main_module.current_bot.remove_telegram_channel_from_live_monitoring(channel_string_id)
 
         return {"success": True}
+
+
+@app.post("/telegram/channels/{channel_id}/backfill")
+async def backfill_telegram_channel(channel_id: int, limit: int = 200):
+    """
+    Подгрузить до `limit` СТАРЫХ сообщений канала (из истории Telegram, не
+    live-поток) и разобрать их тем же парсером, что и live-сигналы — в
+    отдельную таблицу HistoricalSignal (см. её докстринг в src/db/models.py):
+    накопление данных под будущую ML-модель качества сигнала, не влияет на
+    live-статистику канала.
+
+    Идемпотентно и инкрементально: повторные вызовы сами продолжают вглубь
+    истории канала (см. backfill_channel_history) — можно нажимать кнопку
+    в дашборде многократно, пока reached_channel_start не станет true.
+    """
+    async with get_session() as session:
+        channel = await session.get(TelegramChannel, channel_id)
+        if channel is None:
+            raise HTTPException(status_code=404, detail="Канал не найден")
+        channel_config = {
+            "channel_id": channel.channel_id,
+            "channel_title": channel.channel_title,
+            "parser_config": channel.parser_config or {},
+        }
+
+    result = await backfill_channel_history(
+        db_channel_id=channel_id,
+        channel_id=channel_config["channel_id"],
+        channel_config=channel_config,
+        limit=min(limit, 1000),
+    )
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+    return result
+
+
+@app.get("/telegram/channels/{channel_id}/backfill-summary")
+async def telegram_channel_backfill_summary(channel_id: int):
+    """Сводка по уже загруженной бэкафиллом истории канала — для отображения
+    во вкладке "Обучение" дашборда без повторного запуска самого бэкафилла."""
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                select(HistoricalSignal.parse_status, HistoricalSignal.message_date)
+                .where(HistoricalSignal.channel_id == channel_id)
+            )
+        ).all()
+
+    counts = {"parsed": 0, "closed_report": 0, "unparsed": 0}
+    for status, _ in rows:
+        if status in counts:
+            counts[status] += 1
+    oldest_date = min((d for _, d in rows), default=None)
+
+    return {
+        "total": len(rows),
+        "parsed": counts["parsed"],
+        "closed_reports": counts["closed_report"],
+        "unparsed": counts["unparsed"],
+        "oldest_message_date": oldest_date.isoformat() + "Z" if oldest_date else None,
+    }
 
 
 @app.get("/telegram/channels/stats")

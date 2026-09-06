@@ -622,6 +622,7 @@
     <button class="tab-btn active" data-tab="dashboard">Дашборд</button>
     <button class="tab-btn" data-tab="manual">Ручная торговля</button>
     <button class="tab-btn" data-tab="settings">Настройки</button>
+    <button class="tab-btn" data-tab="training">Обучение</button>
     <button class="tab-btn" data-tab="logs">Логи</button>
   </nav>
   <div class="header-actions">
@@ -703,37 +704,15 @@
     <div class="pagination" id="tradesPagination"></div>
   </section>
 
-  <div class="settings-layout">
-    <section>
-      <h2>ML модели</h2>
-      <div id="mlReadiness" class="muted" style="margin-bottom:10px;">Загрузка…</div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Тип</th><th>Активная версия</th><th>Метрики</th></tr></thead>
-          <tbody id="mlActiveBody"><tr class="empty-row"><td colspan="3">Загрузка…</td></tr></tbody>
-        </table>
-      </div>
-      <button type="button" id="btnToggleMlModels" class="btn-ghost" style="margin-top:10px;">Выбрать модель</button>
-      <div id="mlAllModelsWrap" style="display:none; margin-top:10px;">
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Тип</th><th>Версия</th><th>Активна</th><th>Метрики</th><th></th></tr></thead>
-            <tbody id="mlBody"><tr class="empty-row"><td colspan="5">Загрузка…</td></tr></tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-
-    <section>
-      <h2>Стратегии</h2>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Название</th><th>ID</th><th>Вес</th><th>Активна</th></tr></thead>
-          <tbody id="strategiesBody"><tr class="empty-row"><td colspan="4">Загрузка…</td></tr></tbody>
-        </table>
-      </div>
-    </section>
-  </div>
+  <section>
+    <h2>Стратегии</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Название</th><th>ID</th><th>Вес</th><th>Активна</th></tr></thead>
+        <tbody id="strategiesBody"><tr class="empty-row"><td colspan="4">Загрузка…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
 
   <section>
     <h2>Telegram-каналы (источники сигналов)</h2>
@@ -764,6 +743,51 @@
     </div>
   </section>
 
+</div>
+
+<div id="tabTraining" class="tab-panel" style="display:none">
+  <section>
+    <h2>ML модели</h2>
+    <div id="mlReadiness" class="muted" style="margin-bottom:10px;">Загрузка…</div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Тип</th><th>Активная версия</th><th>Метрики</th></tr></thead>
+        <tbody id="mlActiveBody"><tr class="empty-row"><td colspan="3">Загрузка…</td></tr></tbody>
+      </table>
+    </div>
+    <button type="button" id="btnToggleMlModels" class="btn-ghost" style="margin-top:10px;">Выбрать модель</button>
+    <div id="mlAllModelsWrap" style="display:none; margin-top:10px;">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Тип</th><th>Версия</th><th>Активна</th><th>Метрики</th><th></th></tr></thead>
+          <tbody id="mlBody"><tr class="empty-row"><td colspan="5">Загрузка…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Историческая загрузка сигналов канала</h2>
+    <div class="muted" style="margin-bottom:10px;">
+      Подгружает прошлые сообщения Telegram-канала (не живой поток) и разбирает
+      их тем же парсером, что и живые сигналы — в отдельную таблицу, не влияющую
+      на статистику канала. Цель — накопить достаточно примеров для будущей
+      ML-модели качества сигнала (на живых сделках их пока слишком мало).
+      Кнопку можно нажимать многократно — каждый раз подгружаются более старые
+      сообщения, пока не будет достигнуто начало канала.
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Канал</th><th>Загружено</th><th>Распознано</th>
+            <th>Отчёты о закрытии</th><th>Не распознано</th><th>Самое старое</th><th></th>
+          </tr>
+        </thead>
+        <tbody id="backfillBody"><tr class="empty-row"><td colspan="7">Загрузка…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
 </div>
 
 <div id="tabSettings" class="tab-panel" style="display:none">
@@ -1849,6 +1873,67 @@ document.getElementById("btnToggleMlModels").addEventListener("click", () => {
   btn.textContent = isHidden ? "Скрыть список моделей" : "Выбрать модель";
 });
 
+async function renderBackfillStats() {
+  const body = document.getElementById("backfillBody");
+  try {
+    const data = await api("/telegram/channels");
+    const channels = data.channels || [];
+    if (!channels.length) {
+      body.innerHTML = `<tr class="empty-row"><td colspan="7">Каналы не настроены</td></tr>`;
+      return;
+    }
+    const summaries = await Promise.all(
+      channels.map(c => api(`/telegram/channels/${c.id}/backfill-summary`).catch(() => null))
+    );
+    body.innerHTML = channels.map((c, i) => {
+      const s = summaries[i];
+      if (!s) {
+        return `
+          <tr>
+            <td>${escapeHtml(c.channel_title || c.channel_id)}</td>
+            <td colspan="4" class="muted">Ошибка загрузки сводки</td>
+            <td class="muted">—</td>
+            <td><button class="btn-ghost" data-backfill-channel="${c.id}">⬇ Загрузить историю</button></td>
+          </tr>
+        `;
+      }
+      return `
+        <tr>
+          <td>${escapeHtml(c.channel_title || c.channel_id)}</td>
+          <td>${s.total}</td>
+          <td>${s.parsed}</td>
+          <td>${s.closed_reports}</td>
+          <td>${s.unparsed}</td>
+          <td class="muted">${s.oldest_message_date ? fmtTimeMsk(s.oldest_message_date) : "—"}</td>
+          <td><button class="btn-ghost" data-backfill-channel="${c.id}">⬇ Загрузить историю</button></td>
+        </tr>
+      `;
+    }).join("");
+
+    body.querySelectorAll("[data-backfill-channel]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const id = btn.dataset.backfillChannel;
+        const originalText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = "Загрузка…";
+        try {
+          const result = await api(`/telegram/channels/${id}/backfill?limit=200`, { method: "POST" });
+          const note = result.reached_channel_start ? " (достигнуто начало канала)" : "";
+          showToast(`Загружено ${result.stored} новых сообщений, распознано: ${result.parsed_ok}${note}`);
+          await renderBackfillStats();
+        } catch (err) {
+          showToast(`Ошибка загрузки истории: ${err.message}`, true);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = originalText;
+        }
+      });
+    });
+  } catch (err) {
+    body.innerHTML = `<tr class="empty-row"><td colspan="7">Ошибка: ${err.message}</td></tr>`;
+  }
+}
+
 // Аналогично expandedTrades выше — renderTelegram() перестраивает всю
 // таблицу каналов на каждый REFRESH_MS, без этой карты развёрнутая
 // история сигналов сворачивалась бы сама по себе при любом плановом
@@ -2231,9 +2316,14 @@ function switchTab(tab) {
   document.getElementById("tabDashboard").style.display = tab === "dashboard" ? "" : "none";
   document.getElementById("tabManual").style.display = tab === "manual" ? "" : "none";
   document.getElementById("tabSettings").style.display = tab === "settings" ? "" : "none";
+  document.getElementById("tabTraining").style.display = tab === "training" ? "" : "none";
   document.getElementById("tabLogs").style.display = tab === "logs" ? "" : "none";
   if (tab === "settings") {
     loadSettings();
+  }
+  if (tab === "training") {
+    renderMlModels();
+    renderBackfillStats();
   }
   if (tab === "logs") {
     loadConnections();
@@ -2833,11 +2923,14 @@ async function refreshAll() {
     const trades = await renderTrades();
     renderStats(status, trades || []);
     await renderStrategies();
-    await renderMlModels();
     await renderTelegram();
     await renderProtections();
     await renderBalances();
     if (currentTab === "manual") await renderManualTrades();
+    if (currentTab === "training") {
+      await renderMlModels();
+      await renderBackfillStats();
+    }
     document.getElementById("lastUpdated").textContent =
       "Обновлено: " + new Date().toLocaleTimeString("ru-RU");
   } catch (err) {

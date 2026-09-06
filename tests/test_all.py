@@ -13075,5 +13075,331 @@ class TestTelegramChannelEndpointsWireLiveMonitoring(unittest.IsolatedAsyncioTes
         bot.remove_telegram_channel_from_live_monitoring.assert_called_once_with("@to_be_deleted_wiring_test")
 
 
+class TestBackfillChannelHistory(unittest.IsolatedAsyncioTestCase):
+    """
+    backfill_channel_history (src/telegram/history_backfill.py) — накопление
+    исторических сообщений канала в HistoricalSignal для будущей ML-модели
+    качества сигнала (обсуждение с пользователем: 20 живых закрытых сделок
+    недостаточно для обучения). НЕ должно затрагивать live-статистику канала
+    (TelegramSignal) — отдельная таблица.
+    """
+
+    async def asyncTearDown(self):
+        from sqlalchemy import delete
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal
+        async with get_session() as session:
+            await session.execute(delete(HistoricalSignal))
+            await session.commit()
+
+    @staticmethod
+    def _make_message(msg_id, text, date=None):
+        from datetime import UTC, datetime
+        from types import SimpleNamespace
+        return SimpleNamespace(id=msg_id, text=text, date=date or datetime.now(UTC))
+
+    async def test_returns_error_when_no_telegram_client(self):
+        from src.telegram.history_backfill import backfill_channel_history
+
+        with patch("src.telegram.history_backfill.get_telegram_client", return_value=None):
+            result = await backfill_channel_history(1, "@nope", {"channel_id": "@nope"})
+
+        self.assertIn("error", result)
+
+    async def test_returns_error_when_entity_resolution_fails(self):
+        from src.telegram.history_backfill import backfill_channel_history
+
+        client = MagicMock()
+        client.get_entity = AsyncMock(side_effect=Exception("канал не найден"))
+        with patch("src.telegram.history_backfill.get_telegram_client", return_value=client):
+            result = await backfill_channel_history(1, "@missing", {"channel_id": "@missing"})
+
+        self.assertIn("error", result)
+
+    async def test_stores_parsed_closed_report_and_unparsed_with_correct_counts(self):
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal, TelegramChannel
+        from src.telegram.history_backfill import backfill_channel_history
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@backfill_test_1")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+
+        messages = [
+            self._make_message(501, "LONG BTC/USDT signal text"),
+            self._make_message(500, "Цель 1: 635.00✅ Прибыль: 109% (5x)"),
+            self._make_message(499, "какой-то нераспознаваемый текст"),
+            self._make_message(498, ""),  # медиа без подписи — пропускается целиком
+        ]
+        client = MagicMock()
+        client.get_entity = AsyncMock(return_value=object())
+        client.get_messages = AsyncMock(return_value=messages)
+
+        async def fake_parse(text, channel_config, image_bytes=None):
+            if text == "LONG BTC/USDT signal text":
+                return {"pair": "BTC/USDT", "side": "long", "entry": 50000.0, "sl": 49000.0, "tp": 53000.0}
+            return None
+
+        with patch("src.telegram.history_backfill.get_telegram_client", return_value=client), \
+                patch("src.telegram.history_backfill.is_closed_trade_report",
+                      side_effect=lambda t: "Прибыль" in t), \
+                patch("src.telegram.history_backfill.parse_telegram_signal", side_effect=fake_parse):
+            result = await backfill_channel_history(
+                db_channel_id, "@backfill_test_1", {"channel_id": "@backfill_test_1"}, limit=200,
+            )
+
+        self.assertEqual(result["scanned"], 4)
+        self.assertEqual(result["stored"], 3)  # без учёта пустого медиа-сообщения
+        self.assertEqual(result["already_had"], 0)
+        self.assertEqual(result["closed_reports"], 1)
+        self.assertEqual(result["parsed_ok"], 1)
+        self.assertEqual(result["unparsed"], 1)
+        self.assertTrue(result["reached_channel_start"])  # 4 < limit=200
+
+        async with get_session() as session:
+            rows = (
+                await session.execute(
+                    select(HistoricalSignal).where(HistoricalSignal.channel_id == db_channel_id)
+                )
+            ).scalars().all()
+        by_id = {r.telegram_message_id: r for r in rows}
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(by_id[501].parse_status, "parsed")
+        self.assertEqual(by_id[501].parsed_pair, "BTC/USDT")
+        self.assertEqual(by_id[500].parse_status, "closed_report")
+        self.assertIsNone(by_id[500].parsed_pair)
+        self.assertEqual(by_id[499].parse_status, "unparsed")
+
+    async def test_idempotent_skips_already_stored_messages(self):
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal, TelegramChannel
+        from src.telegram.history_backfill import backfill_channel_history
+        from src.utils.timeutils import utcnow
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@backfill_test_2")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+            session.add(HistoricalSignal(
+                channel_id=db_channel_id, telegram_message_id=700,
+                raw_message="уже загружено раньше", message_date=utcnow(),
+                parse_status="unparsed",
+            ))
+            await session.commit()
+
+        messages = [self._make_message(700, "уже загружено раньше")]
+        client = MagicMock()
+        client.get_entity = AsyncMock(return_value=object())
+        client.get_messages = AsyncMock(return_value=messages)
+
+        parse_mock = AsyncMock(return_value=None)
+        with patch("src.telegram.history_backfill.get_telegram_client", return_value=client), \
+                patch("src.telegram.history_backfill.is_closed_trade_report", return_value=False), \
+                patch("src.telegram.history_backfill.parse_telegram_signal", parse_mock):
+            result = await backfill_channel_history(
+                db_channel_id, "@backfill_test_2", {"channel_id": "@backfill_test_2"}, limit=200,
+            )
+
+        self.assertEqual(result["already_had"], 1)
+        self.assertEqual(result["stored"], 0)
+        parse_mock.assert_not_awaited()
+
+        async with get_session() as session:
+            rows = (
+                await session.execute(
+                    select(HistoricalSignal).where(HistoricalSignal.channel_id == db_channel_id)
+                )
+            ).scalars().all()
+        self.assertEqual(len(rows), 1)  # не задублировалось
+
+    async def test_offset_id_uses_min_already_stored_message_id(self):
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal, TelegramChannel
+        from src.telegram.history_backfill import backfill_channel_history
+        from src.utils.timeutils import utcnow
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@backfill_test_3")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+            for msg_id in (105, 100, 110):
+                session.add(HistoricalSignal(
+                    channel_id=db_channel_id, telegram_message_id=msg_id,
+                    raw_message="x", message_date=utcnow(), parse_status="unparsed",
+                ))
+            await session.commit()
+
+        client = MagicMock()
+        client.get_entity = AsyncMock(return_value=object())
+        client.get_messages = AsyncMock(return_value=[])
+        with patch("src.telegram.history_backfill.get_telegram_client", return_value=client), \
+                patch("src.telegram.history_backfill.is_closed_trade_report", return_value=False), \
+                patch("src.telegram.history_backfill.parse_telegram_signal", AsyncMock(return_value=None)):
+            await backfill_channel_history(
+                db_channel_id, "@backfill_test_3", {"channel_id": "@backfill_test_3"}, limit=50,
+            )
+
+        call_kwargs = client.get_messages.await_args.kwargs
+        self.assertEqual(call_kwargs["offset_id"], 100)  # MIN(105, 100, 110)
+        self.assertEqual(call_kwargs["limit"], 50)
+
+    async def test_reached_channel_start_false_when_full_batch_returned(self):
+        from src.db.session import get_session
+        from src.db.models import TelegramChannel
+        from src.telegram.history_backfill import backfill_channel_history
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@backfill_test_4")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+
+        messages = [self._make_message(i, "нераспознаваемое") for i in range(5)]
+        client = MagicMock()
+        client.get_entity = AsyncMock(return_value=object())
+        client.get_messages = AsyncMock(return_value=messages)
+        with patch("src.telegram.history_backfill.get_telegram_client", return_value=client), \
+                patch("src.telegram.history_backfill.is_closed_trade_report", return_value=False), \
+                patch("src.telegram.history_backfill.parse_telegram_signal", AsyncMock(return_value=None)):
+            result = await backfill_channel_history(
+                db_channel_id, "@backfill_test_4", {"channel_id": "@backfill_test_4"}, limit=5,
+            )
+
+        self.assertFalse(result["reached_channel_start"])  # 5 == limit=5 — может быть ещё история
+
+
+class TestBackfillApiEndpoints(unittest.IsolatedAsyncioTestCase):
+    """POST/GET /telegram/channels/{id}/backfill(-summary) — API-обвязка
+    над backfill_channel_history для вкладки "Обучение" дашборда."""
+
+    async def asyncTearDown(self):
+        from sqlalchemy import delete
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal
+        async with get_session() as session:
+            await session.execute(delete(HistoricalSignal))
+            await session.commit()
+
+    async def test_backfill_endpoint_404_for_missing_channel(self):
+        from fastapi import HTTPException
+        from src.web.api import backfill_telegram_channel
+
+        with self.assertRaises(HTTPException) as cm:
+            await backfill_telegram_channel(channel_id=999999)
+        self.assertEqual(cm.exception.status_code, 404)
+
+    async def test_backfill_endpoint_returns_summary_on_success(self):
+        from src.db.session import get_session
+        from src.db.models import TelegramChannel
+        from src.web.api import backfill_telegram_channel
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@api_backfill_1")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+
+        fake_result = {"scanned": 10, "stored": 8, "already_had": 2, "closed_reports": 1,
+                        "parsed_ok": 5, "unparsed": 2, "reached_channel_start": False}
+        with patch("src.web.api.backfill_channel_history", AsyncMock(return_value=fake_result)) as mock_backfill:
+            result = await backfill_telegram_channel(channel_id=db_channel_id, limit=200)
+
+        self.assertEqual(result, fake_result)
+        mock_backfill.assert_awaited_once()
+        call_kwargs = mock_backfill.await_args.kwargs
+        self.assertEqual(call_kwargs["db_channel_id"], db_channel_id)
+        self.assertEqual(call_kwargs["channel_id"], "@api_backfill_1")
+
+    async def test_backfill_endpoint_502_on_backend_error(self):
+        from fastapi import HTTPException
+        from src.db.session import get_session
+        from src.db.models import TelegramChannel
+        from src.web.api import backfill_telegram_channel
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@api_backfill_2")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+
+        with patch("src.web.api.backfill_channel_history",
+                    AsyncMock(return_value={"error": "Telegram клиент не инициализирован"})):
+            with self.assertRaises(HTTPException) as cm:
+                await backfill_telegram_channel(channel_id=db_channel_id)
+        self.assertEqual(cm.exception.status_code, 502)
+
+    async def test_backfill_endpoint_caps_limit_at_1000(self):
+        from src.db.session import get_session
+        from src.db.models import TelegramChannel
+        from src.web.api import backfill_telegram_channel
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@api_backfill_3")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+
+        with patch("src.web.api.backfill_channel_history",
+                    AsyncMock(return_value={"scanned": 0, "stored": 0, "already_had": 0,
+                                             "closed_reports": 0, "parsed_ok": 0, "unparsed": 0,
+                                             "reached_channel_start": True})) as mock_backfill:
+            await backfill_telegram_channel(channel_id=db_channel_id, limit=999999)
+
+        self.assertEqual(mock_backfill.await_args.kwargs["limit"], 1000)
+
+    async def test_backfill_summary_counts_by_status(self):
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal, TelegramChannel
+        from src.utils.timeutils import utcnow
+        from src.web.api import telegram_channel_backfill_summary
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@api_backfill_summary_1")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+            older = utcnow() - timedelta(days=5)
+            newer = utcnow()
+            session.add_all([
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=1,
+                                  raw_message="a", message_date=older, parse_status="parsed"),
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=2,
+                                  raw_message="b", message_date=newer, parse_status="closed_report"),
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=3,
+                                  raw_message="c", message_date=newer, parse_status="unparsed"),
+            ])
+            await session.commit()
+
+        result = await telegram_channel_backfill_summary(db_channel_id)
+
+        self.assertEqual(result["total"], 3)
+        self.assertEqual(result["parsed"], 1)
+        self.assertEqual(result["closed_reports"], 1)
+        self.assertEqual(result["unparsed"], 1)
+        self.assertIn(older.isoformat()[:19], result["oldest_message_date"])
+
+    async def test_backfill_summary_empty_channel(self):
+        from src.db.session import get_session
+        from src.db.models import TelegramChannel
+        from src.web.api import telegram_channel_backfill_summary
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@api_backfill_summary_empty")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+
+        result = await telegram_channel_backfill_summary(db_channel_id)
+
+        self.assertEqual(result["total"], 0)
+        self.assertIsNone(result["oldest_message_date"])
+
+
 if __name__ == "__main__":
     unittest.main()

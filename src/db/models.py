@@ -272,6 +272,9 @@ class TelegramChannel(Base):
     signals: Mapped[list["TelegramSignal"]] = relationship(
         back_populates="channel", cascade="all, delete-orphan",
     )
+    historical_signals: Mapped[list["HistoricalSignal"]] = relationship(
+        back_populates="channel", cascade="all, delete-orphan",
+    )
 
 
 class TelegramSignal(Base):
@@ -319,6 +322,58 @@ class TelegramSignal(Base):
     channel: Mapped["TelegramChannel"] = relationship(back_populates="signals")
     executed_order: Mapped[Optional["Order"]] = relationship()
     executed_trade: Mapped[Optional["Trade"]] = relationship()
+
+
+class HistoricalSignal(Base):
+    """
+    Исторический сигнал канала, полученный БЭКАФИЛЛОМ прошлых сообщений
+    (см. src/telegram/history_backfill.py) — не через live-мониторинг.
+    Отдельная таблица от TelegramSignal, а не переиспользование её же:
+    live-таблица участвует в статистике канала (win rate, expectancy
+    sizing) и в decision-флоу ("pending"/"rejected"/"executed") — смешивать
+    туда исторические строки, по которым НИКОГДА не было реального
+    исполнения, исказило бы обе эти вещи.
+
+    Единственная цель этой таблицы — накопить достаточно размеченных
+    примеров ДЛЯ БУДУЩЕЙ ML-модели качества сигнала (обсуждение с
+    пользователем: 20 реальных закрытых Telegram-сделок недостаточно для
+    обучения — история канала в Telegram может дать на порядки больше).
+    Сам исход (выиграл/проиграл сигнал) здесь ещё не считается — это
+    следующий этап (симуляция по историческим свечам биржи).
+
+    telegram_message_id — ID сообщения В Telegram (не путать с id этой
+    строки) — обеспечивает идемпотентность бэкафилла: уникальный индекс по
+    (channel_id, telegram_message_id) не даёт повторному запуску на том же
+    диапазоне создать дубли, а MIN(telegram_message_id) по каналу служит
+    курсором для докачки более старой истории на следующий запуск.
+    """
+    __tablename__ = "historical_signals"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    channel_id: Mapped[int] = mapped_column(ForeignKey("telegram_channels.id"))
+    telegram_message_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw_message: Mapped[str] = mapped_column(Text, nullable=False)
+    message_date: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # parsed — распознан как торговый сигнал; closed_report — отчёт о уже
+    # закрытой сделке (см. is_closed_trade_report), не сигнал вообще;
+    # unparsed — не удалось разобрать ни одним парсером (не обязательно
+    # ошибка: могло быть обычное сообщение канала не о сделке).
+    parse_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    parsed_pair: Mapped[str | None] = mapped_column(String(50))
+    parsed_side: Mapped[str | None] = mapped_column(String(10))
+    parsed_entry: Mapped[float | None] = mapped_column(DECIMAL)
+    parsed_sl: Mapped[float | None] = mapped_column(DECIMAL)
+    parsed_tp: Mapped[float | None] = mapped_column(DECIMAL)
+    parsed_take_profits: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    parsed_leverage: Mapped[float | None] = mapped_column(DECIMAL)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    channel: Mapped["TelegramChannel"] = relationship(back_populates="historical_signals")
+
+    __table_args__ = (
+        UniqueConstraint("channel_id", "telegram_message_id", name="uq_historical_signal_message"),
+        Index("ix_historical_signals_channel_date", "channel_id", "message_date"),
+    )
 
 
 class MLModel(Base):
