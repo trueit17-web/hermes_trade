@@ -1988,6 +1988,40 @@ async def decide_telegram_signal(signal_id: int, decision: TelegramSignalDecisio
     return {"success": True, "decision": "executed", "order_id": order.id}
 
 
+@app.post("/telegram/signals/{signal_id}/adopt-untracked-position")
+async def adopt_untracked_position(signal_id: int):
+    """
+    Реальный инцидент (прод, HYPE/USDT): ордер реально исполнился на
+    бирже (фьючерсы), но подтверждение (fetch_order/история сделок) не
+    успело прийти за окно поллинга (см. "не подтверждён как реально
+    исполненный" — execution_engine._execute_real_order) — позиция
+    осталась ПОЛНОСТЬЮ незарегистрированной, и периодическая сверка
+    (reconcile_real_positions) не может её поймать сама — та сверяет
+    только уже отслеживаемые символы (_warn_about_untracked_futures_
+    positions лишь повторяет предупреждение в /logs без авто-подхвата).
+
+    signal_id — id ОТКЛОНЁННОГО TelegramSignal с этим сигналом (несёт
+    intended SL/TP/take_profits/leverage — то, что канал прислал и что
+    бот пытался исполнить). Фактические amount/entry_price подтверждаются
+    ЖИВЫМИ с биржи, сразу выставляется реальный SL-ордер.
+
+    Только для real-режима.
+    """
+    if settings.is_paper:
+        raise HTTPException(status_code=400, detail="Доступно только в real-режиме")
+
+    import src.main as main_module
+    bot = main_module.current_bot
+    if bot is None:
+        raise HTTPException(status_code=503, detail="Бот ещё не готов (current_bot=None)")
+
+    result = await bot.adopt_unconfirmed_telegram_position(signal_id)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    logger.warning(f"♻️ Позиция {result['symbol']} подхвачена вручную через дашборд (сигнал #{signal_id})")
+    return result
+
+
 @app.get("/performance")
 async def get_performance():
     """Производительность бота (последние снимки)."""

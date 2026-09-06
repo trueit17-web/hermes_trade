@@ -1078,6 +1078,85 @@ class TradingBot:
             self.active_symbols.append(symbol)
             await self._refresh_symbol_candles(symbol)
 
+    async def adopt_unconfirmed_telegram_position(self, signal_id: int) -> dict:
+        """
+        Реальный инцидент (прод, HYPE/USDT): ордер реально исполнился на
+        бирже, но подтверждение не успело прийти за окно поллинга (см.
+        execution_engine._execute_real_order — "не подтверждён как
+        реально исполненный") — позиция осталась полностью
+        незарегистрированной, и reconcile_real_positions не может её
+        поймать сама (сверяет только УЖЕ отслеживаемые символы).
+
+        signal_id — id ОТКЛОНЁННОГО TelegramSignal с этим сигналом: несёт
+        intended SL/TP/take_profits/leverage — именно то, что канал
+        прислал и что бот пытался исполнить, единственный надёжный
+        источник этих данных, раз сам ордер так и не подтвердился.
+        Фактические amount/entry_price подтверждаются ЖИВЫМИ с биржи (см.
+        execution_engine.adopt_unconfirmed_futures_position).
+        """
+        async with get_session() as session:
+            signal = (
+                await session.execute(
+                    select(TelegramSignal)
+                    .options(selectinload(TelegramSignal.channel))
+                    .where(TelegramSignal.id == signal_id)
+                )
+            ).scalar_one_or_none()
+            if signal is None:
+                return {"error": "Сигнал не найден"}
+            if not signal.parsed_pair or not signal.parsed_side:
+                return {"error": "У сигнала нет распознанной пары/стороны"}
+            symbol = signal.parsed_pair
+            side = signal.parsed_side
+            sl = float(signal.parsed_sl) if signal.parsed_sl else None
+            tp = float(signal.parsed_tp) if signal.parsed_tp else None
+            take_profits = (
+                [float(x) for x in signal.parsed_take_profits] if signal.parsed_take_profits else []
+            )
+            leverage = float(signal.parsed_leverage) if signal.parsed_leverage else None
+            channel_string_id = signal.channel.channel_id if signal.channel else None
+
+        if symbol in self.open_positions:
+            return {"error": f"{symbol} уже отслеживается ботом"}
+
+        order = await execution_engine.adopt_unconfirmed_futures_position(
+            symbol=symbol, side=side, stop_loss=sl, take_profit=tp, leverage=leverage,
+        )
+        if order is None:
+            return {"error": f"На бирже нет открытой фьючерсной позиции {symbol}, либо она уже отслеживается"}
+
+        amount = float(order.filled_amount or order.amount)
+        entry_price = float(order.filled_price or order.price)
+        self.open_positions[symbol] = {
+            "side": side, "entry_price": entry_price,
+            "amount": amount, "strategy_id": "telegram_signal",
+            "rationale": "Telegram сигнал (подхвачен вручную)", "sl": sl, "tp": tp,
+            "take_profits": take_profits,
+            "original_amount": amount,
+            "tp_hit_count": 0,
+            "opened_at": utcnow(),
+            "order_id": order.id, "entry_fee": 0.0,
+            "channel_id": channel_string_id,
+        }
+        risk_manager.on_position_added(symbol, 0.0)
+        self.daily_pnl = getattr(risk_manager.state, "daily_pnl", 0.0)
+
+        if symbol not in self.active_symbols:
+            self.active_symbols.append(symbol)
+            await self._refresh_symbol_candles(symbol)
+
+        async with get_session() as session:
+            db_signal = await session.get(TelegramSignal, signal_id)
+            db_signal.decision = "executed"
+            db_signal.reject_reason = None
+            db_signal.executed_order_id = order.id
+            await session.commit()
+
+        return {
+            "success": True, "symbol": symbol, "amount": amount, "entry_price": entry_price,
+            "sl_order_id": execution_engine.real_positions.get(symbol, {}).get("sl_order_id"),
+        }
+
     async def run(self):
         """Основной цикл торговли."""
         if not self.running:

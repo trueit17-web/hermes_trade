@@ -14829,5 +14829,352 @@ class TestReopenMistakenlyClosedTrade(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(logs, [])
 
 
+class TestAdoptUnconfirmedFuturesPosition(unittest.IsolatedAsyncioTestCase):
+    """
+    ExecutionEngine.adopt_unconfirmed_futures_position — реальный
+    инцидент (прод, HYPE/USDT): ордер реально исполнился на бирже, но
+    подтверждение (fetch_order/история сделок) не успело прийти за окно
+    поллинга — позиция осталась полностью незарегистрированной, а
+    reconcile_real_positions не может её поймать (сверяет только уже
+    отслеживаемые символы). Amount/entry_price подтверждаются ЖИВЫМИ с
+    биржи (fetch_position), а не берутся из локальных расчётов.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    async def test_adopts_position_and_places_sl(self):
+        self.engine.exchange_id = "bybit"
+        exchange = AsyncMock()
+        exchange.fetch_position = AsyncMock(
+            return_value={"contracts": 206.39, "entryPrice": 88.259, "leverage": 32.0}
+        )
+        exchange.create_market_buy_order.return_value = {"id": "adopt-sl-1"}
+        self.engine._exchanges["futures"] = exchange
+
+        order = await self.engine.adopt_unconfirmed_futures_position(
+            symbol="HYPEADOPT1/USDT", side="short", stop_loss=89.74926, take_profit=84.82448,
+            leverage=32.0,
+        )
+
+        self.assertIsNotNone(order)
+        self.assertEqual(order.status, "filled")
+        self.assertAlmostEqual(float(order.filled_amount), 206.39)
+        self.assertAlmostEqual(float(order.filled_price), 88.259)
+        self.assertIn("HYPEADOPT1/USDT", self.engine.real_positions)
+        pos = self.engine.real_positions["HYPEADOPT1/USDT"]
+        self.assertEqual(pos["side"], "short")
+        self.assertAlmostEqual(pos["amount"], 206.39)
+        self.assertAlmostEqual(pos["entry_price"], 88.259)
+        self.assertEqual(pos["leverage"], 32.0)
+        self.assertEqual(pos["sl_order_id"], "adopt-sl-1")
+        exchange.create_market_buy_order.assert_awaited_once()  # закрывающая сторона шорта — buy (SL)
+
+    async def test_returns_none_when_already_tracked(self):
+        self.engine.exchange_id = "bybit"
+        self.engine.real_positions["HYPEADOPT2/USDT"] = {"amount": 1.0, "entry_price": 1.0, "side": "long"}
+        exchange = AsyncMock()
+        self.engine._exchanges["futures"] = exchange
+
+        order = await self.engine.adopt_unconfirmed_futures_position(
+            symbol="HYPEADOPT2/USDT", side="long", stop_loss=0.9, take_profit=1.1,
+        )
+
+        self.assertIsNone(order)
+        exchange.fetch_position.assert_not_called()
+
+    async def test_returns_none_when_no_futures_client(self):
+        order = await self.engine.adopt_unconfirmed_futures_position(
+            symbol="HYPEADOPT3/USDT", side="long", stop_loss=0.9, take_profit=1.1,
+        )
+        self.assertIsNone(order)
+
+    async def test_returns_none_when_contracts_zero(self):
+        self.engine.exchange_id = "bybit"
+        exchange = AsyncMock()
+        exchange.fetch_position = AsyncMock(return_value={"contracts": 0.0})
+        self.engine._exchanges["futures"] = exchange
+
+        order = await self.engine.adopt_unconfirmed_futures_position(
+            symbol="HYPEADOPT4/USDT", side="long", stop_loss=0.9, take_profit=1.1,
+        )
+        self.assertIsNone(order)
+        self.assertNotIn("HYPEADOPT4/USDT", self.engine.real_positions)
+
+    async def test_returns_none_when_fetch_position_raises(self):
+        self.engine.exchange_id = "bybit"
+        exchange = AsyncMock()
+        exchange.fetch_position = AsyncMock(side_effect=Exception("category error"))
+        self.engine._exchanges["futures"] = exchange
+
+        order = await self.engine.adopt_unconfirmed_futures_position(
+            symbol="HYPEADOPT5/USDT", side="long", stop_loss=0.9, take_profit=1.1,
+        )
+        self.assertIsNone(order)
+
+    async def test_returns_none_when_entry_price_missing(self):
+        self.engine.exchange_id = "bybit"
+        exchange = AsyncMock()
+        exchange.fetch_position = AsyncMock(return_value={"contracts": 5.0, "entryPrice": None})
+        self.engine._exchanges["futures"] = exchange
+
+        order = await self.engine.adopt_unconfirmed_futures_position(
+            symbol="HYPEADOPT6/USDT", side="long", stop_loss=0.9, take_profit=1.1,
+        )
+        self.assertIsNone(order)
+        self.assertNotIn("HYPEADOPT6/USDT", self.engine.real_positions)
+
+    async def test_does_not_place_sl_when_stop_loss_none(self):
+        self.engine.exchange_id = "bybit"
+        exchange = AsyncMock()
+        exchange.fetch_position = AsyncMock(return_value={"contracts": 5.0, "entryPrice": 100.0})
+        self.engine._exchanges["futures"] = exchange
+
+        order = await self.engine.adopt_unconfirmed_futures_position(
+            symbol="HYPEADOPT7/USDT", side="long", stop_loss=None, take_profit=None,
+        )
+        self.assertIsNotNone(order)
+        exchange.create_market_sell_order.assert_not_called()
+        exchange.create_market_buy_order.assert_not_called()
+        self.assertIsNone(self.engine.real_positions["HYPEADOPT7/USDT"]["sl_order_id"])
+
+
+class TestAdoptUnconfirmedTelegramPosition(unittest.IsolatedAsyncioTestCase):
+    """TradingBot.adopt_unconfirmed_telegram_position — оркестрирует
+    восстановление: берёт intended SL/TP/leverage из отклонённого
+    TelegramSignal, регистрирует позицию в open_positions/risk_manager,
+    помечает сигнал исполненным."""
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot(), main_module.execution_engine
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "real"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_returns_error_for_missing_signal(self):
+        bot, engine = self._make_bot()
+        result = await bot.adopt_unconfirmed_telegram_position(999999)
+        self.assertIn("error", result)
+
+    async def test_returns_error_when_signal_missing_pair_or_side(self):
+        from src.db.session import get_session
+        from src.db.models import TelegramSignal, TelegramChannel
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@adopt_test_missing", market="futures")
+            session.add(channel)
+            await session.commit()
+            signal = TelegramSignal(
+                channel_id=channel.id, raw_message="x", message_date=utcnow(),
+                parsed_pair=None, parsed_side=None, decision="rejected",
+            )
+            session.add(signal)
+            await session.commit()
+            signal_id = signal.id
+
+        result = await bot.adopt_unconfirmed_telegram_position(signal_id)
+        self.assertIn("error", result)
+
+    async def test_returns_error_when_already_tracked(self):
+        from src.db.session import get_session
+        from src.db.models import TelegramSignal, TelegramChannel
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@adopt_test_1", market="futures")
+            session.add(channel)
+            await session.commit()
+            signal = TelegramSignal(
+                channel_id=channel.id, raw_message="x", message_date=utcnow(),
+                parsed_pair="ADOPTTRACKED1/USDT", parsed_side="short",
+                parsed_sl=10.0, decision="rejected",
+            )
+            session.add(signal)
+            await session.commit()
+            signal_id = signal.id
+
+        bot.open_positions["ADOPTTRACKED1/USDT"] = {"side": "short", "amount": 1.0, "entry_price": 1.0}
+
+        result = await bot.adopt_unconfirmed_telegram_position(signal_id)
+        self.assertIn("error", result)
+
+    async def test_returns_error_when_no_live_exchange_position(self):
+        from src.db.session import get_session
+        from src.db.models import TelegramSignal, TelegramChannel
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@adopt_test_2", market="futures")
+            session.add(channel)
+            await session.commit()
+            signal = TelegramSignal(
+                channel_id=channel.id, raw_message="x", message_date=utcnow(),
+                parsed_pair="ADOPTNOLIVE1/USDT", parsed_side="short",
+                parsed_sl=10.0, decision="rejected",
+            )
+            session.add(signal)
+            await session.commit()
+            signal_id = signal.id
+
+        with patch.object(engine, "adopt_unconfirmed_futures_position", AsyncMock(return_value=None)):
+            result = await bot.adopt_unconfirmed_telegram_position(signal_id)
+        self.assertIn("error", result)
+
+    async def test_successfully_adopts_and_marks_signal_executed(self):
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import TelegramSignal, TelegramChannel, Order
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        bot._refresh_symbol_candles = AsyncMock()
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@adopt_test_3", market="futures")
+            session.add(channel)
+            await session.commit()
+            exchange_id, symbol_id = await engine._resolve_symbol_id(session, "ADOPTOK1/USDT")
+            fake_order = Order(
+                exchange_id=exchange_id, symbol_id=symbol_id,
+                side="sell", order_type="market", amount=206.39, price=88.259,
+                status="filled", filled_amount=206.39, filled_price=88.259,
+                fee=0.0, client_order_id="adopt-ok-1",
+            )
+            session.add(fake_order)
+            await session.commit()
+            fake_order_id = fake_order.id
+
+            signal = TelegramSignal(
+                channel_id=channel.id, raw_message="x", message_date=utcnow(),
+                parsed_pair="ADOPTOK1/USDT", parsed_side="short",
+                parsed_sl=89.74926, parsed_tp=84.82448,
+                parsed_take_profits=[87.54246, 86.87661, 84.82448],
+                parsed_leverage=32.0, decision="rejected",
+                reject_reason="ордер не подтверждён биржей как реально исполненный",
+            )
+            session.add(signal)
+            await session.commit()
+            signal_id = signal.id
+
+        async with get_session() as session:
+            fake_order_obj = await session.get(Order, fake_order_id)
+
+        async def fake_adopt(**kwargs):
+            # Реальная реализация всегда регистрирует позицию в
+            # real_positions ДО возврата ордера — мок должен воспроизвести
+            # этот побочный эффект, иначе тест не поймал бы код, неявно
+            # полагающийся на него (см. sl_order_id в результате ниже).
+            engine.real_positions["ADOPTOK1/USDT"] = {"sl_order_id": "adopt-ok-sl-1"}
+            return fake_order_obj
+
+        with patch.object(
+            engine, "adopt_unconfirmed_futures_position", AsyncMock(side_effect=fake_adopt),
+        ) as mock_adopt:
+            result = await bot.adopt_unconfirmed_telegram_position(signal_id)
+
+        mock_adopt.assert_awaited_once_with(
+            symbol="ADOPTOK1/USDT", side="short", stop_loss=89.74926, take_profit=84.82448,
+            leverage=32.0,
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(result["symbol"], "ADOPTOK1/USDT")
+        self.assertAlmostEqual(result["amount"], 206.39)
+        self.assertAlmostEqual(result["entry_price"], 88.259)
+
+        pos = bot.open_positions["ADOPTOK1/USDT"]
+        self.assertEqual(pos["strategy_id"], "telegram_signal")
+        self.assertEqual(pos["channel_id"], "@adopt_test_3")
+        self.assertEqual(pos["take_profits"], [87.54246, 86.87661, 84.82448])
+        self.assertEqual(pos["tp_hit_count"], 0)
+        self.assertIn("ADOPTOK1/USDT", bot.active_symbols)
+
+        async with get_session() as session:
+            refreshed_signal = await session.get(TelegramSignal, signal_id)
+            self.assertEqual(refreshed_signal.decision, "executed")
+            self.assertIsNone(refreshed_signal.reject_reason)
+            self.assertEqual(refreshed_signal.executed_order_id, fake_order_id)
+
+
+class TestAdoptUntrackedPositionApiEndpoint(unittest.IsolatedAsyncioTestCase):
+    """POST /telegram/signals/{signal_id}/adopt-untracked-position."""
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_returns_400_in_paper_mode(self):
+        from fastapi import HTTPException
+        from src.web.api import adopt_untracked_position
+
+        settings.trading_mode = "paper"
+        with self.assertRaises(HTTPException) as cm:
+            await adopt_untracked_position(999999)
+        self.assertEqual(cm.exception.status_code, 400)
+
+    async def test_returns_503_when_bot_not_ready(self):
+        import src.main as main_module
+        from fastapi import HTTPException
+        from src.web.api import adopt_untracked_position
+
+        settings.trading_mode = "real"
+        saved_bot = main_module.current_bot
+        main_module.current_bot = None
+        try:
+            with self.assertRaises(HTTPException) as cm:
+                await adopt_untracked_position(999999)
+            self.assertEqual(cm.exception.status_code, 503)
+        finally:
+            main_module.current_bot = saved_bot
+
+    async def test_returns_404_when_bot_reports_error(self):
+        import src.main as main_module
+        from fastapi import HTTPException
+        from src.web.api import adopt_untracked_position
+
+        settings.trading_mode = "real"
+        fake_bot = MagicMock()
+        fake_bot.adopt_unconfirmed_telegram_position = AsyncMock(return_value={"error": "не найден"})
+        saved_bot = main_module.current_bot
+        main_module.current_bot = fake_bot
+        try:
+            with self.assertRaises(HTTPException) as cm:
+                await adopt_untracked_position(1)
+            self.assertEqual(cm.exception.status_code, 404)
+        finally:
+            main_module.current_bot = saved_bot
+
+    async def test_returns_success_result_from_bot(self):
+        import src.main as main_module
+        from src.web.api import adopt_untracked_position
+
+        settings.trading_mode = "real"
+        fake_result = {"success": True, "symbol": "HYPE/USDT", "amount": 206.39, "entry_price": 88.259}
+        fake_bot = MagicMock()
+        fake_bot.adopt_unconfirmed_telegram_position = AsyncMock(return_value=fake_result)
+        saved_bot = main_module.current_bot
+        main_module.current_bot = fake_bot
+        try:
+            result = await adopt_untracked_position(1)
+            self.assertEqual(result, fake_result)
+        finally:
+            main_module.current_bot = saved_bot
+
+
 if __name__ == "__main__":
     unittest.main()

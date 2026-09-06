@@ -2938,6 +2938,82 @@ class ExecutionEngine:
         await self._warn_about_untracked_futures_positions()
         return self._extract_usdt_balance(balance)
 
+    async def adopt_unconfirmed_futures_position(
+        self, symbol: str, side: str, stop_loss: float | None, take_profit: float | None,
+        leverage: float | None = None, strategy_id: str | None = "telegram_signal",
+    ) -> Order | None:
+        """
+        Реальный инцидент (прод, HYPE/USDT): ордер реально исполнился на
+        бирже, но подтверждение (fetch_order/история сделок) не успело
+        прийти за окно поллинга (см. "не подтверждён как реально
+        исполненный" в _execute_real_order) — позиция осталась ПОЛНОСТЬЮ
+        незарегистрированной (self.real_positions её не видит вообще), и
+        reconcile_real_positions не может её поймать сама — сверяет только
+        УЖЕ отслеживаемые символы (см. _warn_about_untracked_futures_
+        positions, которая лишь повторяет предупреждение без авто-подхвата
+        — раньше не было надёжного источника intended SL/TP/leverage).
+
+        stop_loss/take_profit/leverage здесь передаются вызывающим кодом
+        (TradingBot.adopt_unconfirmed_telegram_position — берёт их из
+        исходного TelegramSignal, который канал прислал и который бот
+        пытался исполнить), а amount/entry_price подтверждаются ЖИВЫМИ с
+        биржи (fetch_position — тот же источник истины, что и "adopt
+        excess" в _reconcile_futures_position) — не берутся из локальных
+        расчётов ДО отправки ордера.
+
+        Возвращает None, если на бирже нет позиции с ненулевым объёмом,
+        символ уже отслеживается, или entryPrice не удалось получить —
+        подхватывать в таком случае нечего/небезопасно.
+        """
+        if symbol in self.real_positions:
+            return None
+        exchange = self._exchanges.get("futures")
+        if exchange is None:
+            return None
+        try:
+            position = await exchange.fetch_position(self._ccxt_symbol(exchange, symbol))
+            contracts = float(position.get("contracts") or 0)
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось подтвердить позицию {symbol} у биржи для подхвата: {e}")
+            return None
+        if contracts == 0:
+            return None
+        entry_price = position.get("entryPrice")
+        if not isinstance(entry_price, (int, float)) or entry_price <= 0:
+            logger.warning(f"⚠️ Биржа не вернула entryPrice для {symbol} — подхват невозможен.")
+            return None
+        resolved_leverage = position.get("leverage") or leverage
+
+        async with get_session() as session:
+            exchange_id, symbol_id = await self._resolve_symbol_id(session, symbol)
+            strategy_db_id = await self._resolve_strategy_id(session, strategy_id)
+            order = Order(
+                exchange_id=exchange_id, symbol_id=symbol_id, strategy_id=strategy_db_id,
+                side="buy" if side == "long" else "sell", order_type="market",
+                amount=contracts, price=entry_price, status="filled",
+                filled_amount=contracts, filled_price=entry_price, fee=0.0,
+                stop_loss=stop_loss, take_profit=take_profit, market_type="futures",
+                client_order_id=str(uuid.uuid4())[:12],
+                notes="Восстановлен: ордер исполнился на бирже, но не был подтверждён вовремя",
+            )
+            session.add(order)
+            await session.commit()
+
+        self.real_positions[symbol] = {
+            "amount": contracts, "entry_price": entry_price, "side": side,
+            "strategy_id": strategy_id, "stop_loss": stop_loss, "take_profit": take_profit,
+            "order_id": order.id, "entry_fee": 0.0, "opened_at": utcnow(),
+            "sl_order_id": None, "market_type": "futures", "leverage": resolved_leverage,
+        }
+        if stop_loss:
+            await self.sync_stop_loss_order(symbol, contracts, stop_loss)
+
+        logger.warning(
+            f"♻️ Позиция {symbol} подхвачена вручную через дашборд: {contracts} контрактов @ "
+            f"{entry_price} (была не зарегистрирована из-за неподтверждённого ордера открытия)."
+        )
+        return order
+
     async def _warn_about_untracked_futures_positions(self) -> None:
         """
         Всё, что выше в reconcile_real_positions — сверка УЖЕ отслеживаемых
