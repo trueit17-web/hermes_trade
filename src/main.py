@@ -14,6 +14,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
+import src.bot_registry as bot_registry
 from src.config import settings
 from src.data_ingest.coinglass_client import get_coinglass_client
 from src.data_ingest.feature_engine import get_feature_engine
@@ -55,15 +56,6 @@ from src.utils.timeutils import utcnow
 from src.web.api import app as web_app
 from src.web.settings_store import load_settings_overrides
 from src.web.websocket import setup_websocket_broadcast
-
-# Ссылка на единственный работающий экземпляр бота — нужна веб-панели
-# (src/web/api.py), чтобы вручную открытая через дашборд позиция сразу же
-# попадала в основной торговый цикл (open_positions/active_symbols), а не
-# ждала следующего перезапуска. main.py импортирует src.web.api (для
-# web_app), поэтому обратный импорт (from src.main import current_bot) в
-# api.py должен быть ленивым — внутри функции, а не на уровне модуля,
-# иначе получится циклический импорт при старте процесса.
-current_bot: "TradingBot | None" = None
 
 
 class TradingBot:
@@ -1061,8 +1053,9 @@ class TradingBot:
         её не увидел (open_positions пуст для неё), SL/TP не проверялись бы,
         а её символ не попал бы в active_symbols, и цена не обновлялась бы.
         Та же регистрация, что и в _on_telegram_signal выше, но вызывается
-        снаружи основного цикла — из src/web/api.py через src.main.current_bot,
-        сразу после исполнения ордера на бирже/в paper-режиме.
+        снаружи основного цикла — из src/web/api.py через
+        src.bot_registry.current_bot, сразу после исполнения ордера на
+        бирже/в paper-режиме.
         """
         self.open_positions[symbol] = {
             "side": side, "entry_price": entry_price,
@@ -2181,9 +2174,8 @@ async def _run_until_shutdown(
 
 async def main():
     """Точка входа."""
-    global current_bot
     bot = TradingBot()
-    current_bot = bot
+    bot_registry.current_bot = bot
 
     # setup_websocket_broadcast() существовал, но нигде не вызывался —
     # /ws-эндпоинт принимал подключения, но event_bus ни разу не был

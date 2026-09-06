@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 from sqlalchemy.orm import selectinload
 
+import src.bot_registry as bot_registry
 from src.config import settings
 from src.db.models import (
     BotConfig,
@@ -616,9 +617,8 @@ async def create_manual_order(request: ManualOrderCreate):
     # /status), а основной торговый цикл узнал бы о ней только на
     # следующем плановом обновлении торговой вселенной — SL/TP не
     # проверялись бы и цена не обновлялась бы до тех пор.
-    import src.main as main_module
-    if main_module.current_bot is not None:
-        await main_module.current_bot.register_manual_position(
+    if bot_registry.current_bot is not None:
+        await bot_registry.current_bot.register_manual_position(
             symbol=symbol, side="long" if side == "buy" else "short",
             entry_price=float(order.filled_price), amount=float(order.filled_amount),
             order_id=order.id, entry_fee=float(order.fee),
@@ -677,10 +677,9 @@ async def edit_position(request: PositionEditRequest):
         # по старой, уже неактуальной цене.
         await execution_engine.sync_stop_loss_order(symbol, position.get("amount") or 0, new_sl)
 
-    import src.main as main_module
     bot_position = (
-        main_module.current_bot.open_positions.get(symbol)
-        if main_module.current_bot is not None else None
+        bot_registry.current_bot.open_positions.get(symbol)
+        if bot_registry.current_bot is not None else None
     )
     if bot_position is not None:
         bot_position["sl"] = new_sl
@@ -1607,10 +1606,9 @@ async def create_telegram_channel(channel: TelegramChannelCreate):
 
         logger.info(f"Telegram канал добавлен: {channel.channel_id}")
 
-        import src.main as main_module
         live_monitoring = False
-        if main_module.current_bot is not None:
-            live_monitoring = await main_module.current_bot.add_telegram_channel_to_live_monitoring(
+        if bot_registry.current_bot is not None:
+            live_monitoring = await bot_registry.current_bot.add_telegram_channel_to_live_monitoring(
                 channel_id=new_channel.channel_id,
                 channel_title=new_channel.channel_title or "",
                 parser_config=new_channel.parser_config or {},
@@ -1674,9 +1672,8 @@ async def delete_telegram_channel(channel_id: int):
         await session.commit()
         logger.info(f"Telegram канал удалён: {channel_string_id}")
 
-        import src.main as main_module
-        if main_module.current_bot is not None:
-            main_module.current_bot.remove_telegram_channel_from_live_monitoring(channel_string_id)
+        if bot_registry.current_bot is not None:
+            bot_registry.current_bot.remove_telegram_channel_from_live_monitoring(channel_string_id)
 
         return {"success": True}
 
@@ -1961,8 +1958,7 @@ async def decide_telegram_signal(signal_id: int, decision: TelegramSignalDecisio
         }
         pair = signal.parsed_pair
 
-    import src.main as main_module
-    bot = main_module.current_bot
+    bot = bot_registry.current_bot
     if bot is None:
         raise HTTPException(status_code=503, detail="Бот ещё не готов (current_bot=None)")
     if pair in bot.open_positions:
@@ -2010,8 +2006,7 @@ async def adopt_untracked_position(signal_id: int):
     if settings.is_paper:
         raise HTTPException(status_code=400, detail="Доступно только в real-режиме")
 
-    import src.main as main_module
-    bot = main_module.current_bot
+    bot = bot_registry.current_bot
     if bot is None:
         raise HTTPException(status_code=503, detail="Бот ещё не готов (current_bot=None)")
 

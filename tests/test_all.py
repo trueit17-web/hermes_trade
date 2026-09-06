@@ -10157,20 +10157,22 @@ class TestManualTrading(unittest.IsolatedAsyncioTestCase):
     """
 
     def setUp(self):
+        import src.bot_registry as bot_registry
         import src.main as main_module
         import src.web.api as api_module
         from fastapi import HTTPException
 
         self.main_module = main_module
+        self.bot_registry = bot_registry
         self.api_module = api_module
         self.HTTPException = HTTPException
         self._saved_trading_mode = settings.trading_mode
-        self._saved_current_bot = main_module.current_bot
+        self._saved_current_bot = bot_registry.current_bot
         self._saved_engine = api_module.execution_engine
 
     def tearDown(self):
         settings.trading_mode = self._saved_trading_mode
-        self.main_module.current_bot = self._saved_current_bot
+        self.bot_registry.current_bot = self._saved_current_bot
         self.api_module.execution_engine = self._saved_engine
 
     async def _install_engine_and_bot(self, exchange_id="binance", is_paper=True):
@@ -10185,7 +10187,7 @@ class TestManualTrading(unittest.IsolatedAsyncioTestCase):
         bot = self.main_module.TradingBot()
         bot.ingest = AsyncMock()
         bot.ingest.fetch_ohlcv = AsyncMock(return_value=None)
-        self.main_module.current_bot = bot
+        self.bot_registry.current_bot = bot
         return engine, bot
 
     async def test_create_manual_order_paper_registers_in_bot_and_engine(self):
@@ -12741,18 +12743,20 @@ class TestDecideTelegramSignal(unittest.IsolatedAsyncioTestCase):
     """
 
     def setUp(self):
+        import src.bot_registry as bot_registry
         import src.main as main_module
         import src.web.api as api_module
         self.main_module = main_module
+        self.bot_registry = bot_registry
         self.api_module = api_module
         self._saved_trading_mode = settings.trading_mode
-        self._saved_current_bot = main_module.current_bot
+        self._saved_current_bot = bot_registry.current_bot
         self._saved_engine = api_module.execution_engine
         self._saved_main_engine = main_module.execution_engine
 
     def tearDown(self):
         settings.trading_mode = self._saved_trading_mode
-        self.main_module.current_bot = self._saved_current_bot
+        self.bot_registry.current_bot = self._saved_current_bot
         self.api_module.execution_engine = self._saved_engine
         self.main_module.execution_engine = self._saved_main_engine
 
@@ -12772,7 +12776,7 @@ class TestDecideTelegramSignal(unittest.IsolatedAsyncioTestCase):
         bot = self.main_module.TradingBot()
         bot.ingest = AsyncMock()
         bot.ingest.fetch_ohlcv = AsyncMock(return_value=None)
-        self.main_module.current_bot = bot
+        self.bot_registry.current_bot = bot
         return engine, bot
 
     async def _make_pending_signal(self, **overrides) -> int:
@@ -12820,7 +12824,7 @@ class TestDecideTelegramSignal(unittest.IsolatedAsyncioTestCase):
             signal = await session.get(TelegramSignal, signal_id)
             self.assertEqual(signal.decision, "rejected")
             self.assertEqual(signal.reject_reason, "отклонён вручную")
-        self.assertNotIn("BTC/USDT", self.main_module.current_bot.open_positions)
+        self.assertNotIn("BTC/USDT", self.bot_registry.current_bot.open_positions)
 
     async def test_execute_failure_persists_reject_reason(self):
         """
@@ -12894,7 +12898,7 @@ class TestDecideTelegramSignal(unittest.IsolatedAsyncioTestCase):
         from src.web.api import TelegramSignalDecision, decide_telegram_signal
 
         await self._install_engine_and_bot()
-        self.main_module.current_bot = None
+        self.bot_registry.current_bot = None
         signal_id = await self._make_pending_signal()
 
         with self.assertRaises(HTTPException) as ctx:
@@ -13109,19 +13113,19 @@ class TestTelegramChannelEndpointsWireLiveMonitoring(unittest.IsolatedAsyncioTes
     никакого эффекта до рестарта бота."""
 
     def setUp(self):
-        import src.main as main_module
-        self.main_module = main_module
-        self._saved_current_bot = main_module.current_bot
+        import src.bot_registry as bot_registry
+        self.bot_registry = bot_registry
+        self._saved_current_bot = bot_registry.current_bot
 
     def tearDown(self):
-        self.main_module.current_bot = self._saved_current_bot
+        self.bot_registry.current_bot = self._saved_current_bot
 
     async def test_create_channel_calls_live_wiring_and_reports_result(self):
         from src.web.api import TelegramChannelCreate, create_telegram_channel
 
         bot = MagicMock()
         bot.add_telegram_channel_to_live_monitoring = AsyncMock(return_value=True)
-        self.main_module.current_bot = bot
+        self.bot_registry.current_bot = bot
 
         result = await create_telegram_channel(TelegramChannelCreate(
             channel_id="@wiring_test_channel",
@@ -13139,7 +13143,7 @@ class TestTelegramChannelEndpointsWireLiveMonitoring(unittest.IsolatedAsyncioTes
 
         bot = MagicMock()
         bot.add_telegram_channel_to_live_monitoring = AsyncMock(return_value=False)
-        self.main_module.current_bot = bot
+        self.bot_registry.current_bot = bot
 
         result = await create_telegram_channel(TelegramChannelCreate(
             channel_id="@wiring_test_channel_2",
@@ -13150,7 +13154,7 @@ class TestTelegramChannelEndpointsWireLiveMonitoring(unittest.IsolatedAsyncioTes
     async def test_create_channel_without_ready_bot_reports_not_live(self):
         from src.web.api import TelegramChannelCreate, create_telegram_channel
 
-        self.main_module.current_bot = None
+        self.bot_registry.current_bot = None
         result = await create_telegram_channel(TelegramChannelCreate(
             channel_id="@wiring_test_channel_3",
         ))
@@ -13169,7 +13173,7 @@ class TestTelegramChannelEndpointsWireLiveMonitoring(unittest.IsolatedAsyncioTes
 
         bot = MagicMock()
         bot.remove_telegram_channel_from_live_monitoring = MagicMock()
-        self.main_module.current_bot = bot
+        self.bot_registry.current_bot = bot
 
         result = await delete_telegram_channel(channel_db_id)
 
@@ -15128,52 +15132,90 @@ class TestAdoptUntrackedPositionApiEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cm.exception.status_code, 400)
 
     async def test_returns_503_when_bot_not_ready(self):
-        import src.main as main_module
+        import src.bot_registry as bot_registry
         from fastapi import HTTPException
         from src.web.api import adopt_untracked_position
 
         settings.trading_mode = "real"
-        saved_bot = main_module.current_bot
-        main_module.current_bot = None
+        saved_bot = bot_registry.current_bot
+        bot_registry.current_bot = None
         try:
             with self.assertRaises(HTTPException) as cm:
                 await adopt_untracked_position(999999)
             self.assertEqual(cm.exception.status_code, 503)
         finally:
-            main_module.current_bot = saved_bot
+            bot_registry.current_bot = saved_bot
 
     async def test_returns_404_when_bot_reports_error(self):
-        import src.main as main_module
+        import src.bot_registry as bot_registry
         from fastapi import HTTPException
         from src.web.api import adopt_untracked_position
 
         settings.trading_mode = "real"
         fake_bot = MagicMock()
         fake_bot.adopt_unconfirmed_telegram_position = AsyncMock(return_value={"error": "не найден"})
-        saved_bot = main_module.current_bot
-        main_module.current_bot = fake_bot
+        saved_bot = bot_registry.current_bot
+        bot_registry.current_bot = fake_bot
         try:
             with self.assertRaises(HTTPException) as cm:
                 await adopt_untracked_position(1)
             self.assertEqual(cm.exception.status_code, 404)
         finally:
-            main_module.current_bot = saved_bot
+            bot_registry.current_bot = saved_bot
 
     async def test_returns_success_result_from_bot(self):
-        import src.main as main_module
+        import src.bot_registry as bot_registry
         from src.web.api import adopt_untracked_position
 
         settings.trading_mode = "real"
         fake_result = {"success": True, "symbol": "HYPE/USDT", "amount": 206.39, "entry_price": 88.259}
         fake_bot = MagicMock()
         fake_bot.adopt_unconfirmed_telegram_position = AsyncMock(return_value=fake_result)
-        saved_bot = main_module.current_bot
-        main_module.current_bot = fake_bot
+        saved_bot = bot_registry.current_bot
+        bot_registry.current_bot = fake_bot
         try:
             result = await adopt_untracked_position(1)
             self.assertEqual(result, fake_result)
         finally:
-            main_module.current_bot = saved_bot
+            bot_registry.current_bot = saved_bot
+
+
+class TestBotRegistrySharedAcrossModules(unittest.TestCase):
+    """
+    Регрессия на реальный прод-баг: процесс запускается как
+    `python -m src.main`, из-за чего интерпретатор регистрирует этот файл
+    в sys.modules ТОЛЬКО под именем "__main__". Раньше current_bot жил
+    прямо в src/main.py, и любой последующий `import src.main` (например,
+    внутри обработчика в api.py, при первом же обращении к нему) не
+    находил "src.main" в sys.modules и выполнял файл ВТОРОЙ раз как
+    независимый модуль со своими глобальными переменными — current_bot,
+    установленный внутри main() в исходном "__main__"-экземпляре, там
+    навсегда оставался None. В самих тестах это не ловилось, потому что
+    здесь src.main всегда импортируется обычным способом (никогда через
+    -m), поэтому дублирования не возникает — сама эта разница и была
+    причиной, по которой баг был невидим в тестах. current_bot вынесен в
+    отдельный src/bot_registry.py, который не является точкой входа
+    процесса и поэтому не может задваиваться — этот тест фиксирует, что
+    src.main и src.web.api действительно смотрят на один и тот же объект
+    модуля, а не просто передают друг другу значение по счастливой
+    случайности.
+    """
+
+    def test_main_and_api_share_the_same_bot_registry_module(self):
+        import src.bot_registry as bot_registry
+        import src.main as main_module
+        import src.web.api as api_module
+
+        self.assertIs(main_module.bot_registry, bot_registry)
+        self.assertIs(api_module.bot_registry, bot_registry)
+
+        sentinel = object()
+        saved = bot_registry.current_bot
+        try:
+            main_module.bot_registry.current_bot = sentinel
+            self.assertIs(api_module.bot_registry.current_bot, sentinel)
+        finally:
+            bot_registry.current_bot = saved
 
 
 if __name__ == "__main__":
