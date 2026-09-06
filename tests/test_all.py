@@ -13776,5 +13776,305 @@ class TestSimulateOutcomesApiEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(result["avg_pnl_pct"], 2.5, places=4)
 
 
+class TestExtractSignalFeatures(unittest.TestCase):
+    """
+    extract_signal_features (src/telegram/signal_quality_training.py) —
+    чистая функция, признаки под будущий классификатор качества сигнала
+    считаются ТОЛЬКО из того, что известно в момент публикации сигнала
+    (геометрия SL/TP, плечо, время), без цены исполнения/результата.
+    """
+
+    def test_computes_expected_geometry_for_long(self):
+        from datetime import datetime
+        from src.telegram.signal_quality_training import extract_signal_features
+
+        features = extract_signal_features(
+            side="long", entry=100.0, sl=90.0, tp=None,
+            take_profits=[110.0, 120.0, 130.0], leverage=5.0,
+            message_date=datetime(2024, 1, 15, 14, 30),  # понедельник
+        )
+
+        self.assertAlmostEqual(features["sl_distance_pct"], 10.0)
+        self.assertAlmostEqual(features["first_tp_distance_pct"], 10.0)
+        self.assertAlmostEqual(features["final_tp_distance_pct"], 30.0)
+        self.assertAlmostEqual(features["risk_reward_ratio"], 3.0)
+        self.assertEqual(features["num_tp_levels"], 3.0)
+        self.assertEqual(features["leverage"], 5.0)
+        self.assertEqual(features["is_long"], 1.0)
+        self.assertEqual(features["hour"], 14.0)
+        self.assertEqual(features["day_of_week"], 0.0)
+
+    def test_short_side_and_missing_leverage(self):
+        from datetime import datetime
+        from src.telegram.signal_quality_training import extract_signal_features
+
+        features = extract_signal_features(
+            side="short", entry=100.0, sl=110.0, tp=80.0,
+            take_profits=None, leverage=None,
+            message_date=datetime(2024, 1, 15, 8, 0),
+        )
+
+        self.assertEqual(features["is_long"], 0.0)
+        self.assertEqual(features["leverage"], 0.0)
+        self.assertAlmostEqual(features["sl_distance_pct"], 10.0)
+        # tp=80 без явных take_profits интерполируется на 3 уровня между entry и tp
+        self.assertEqual(features["num_tp_levels"], 3.0)
+
+    def test_returns_none_when_sl_missing(self):
+        from datetime import datetime
+        from src.telegram.signal_quality_training import extract_signal_features
+
+        features = extract_signal_features(
+            side="long", entry=100.0, sl=None, tp=110.0,
+            take_profits=None, leverage=None, message_date=datetime(2024, 1, 15),
+        )
+        self.assertIsNone(features)
+
+    def test_returns_none_when_no_tp_levels(self):
+        from datetime import datetime
+        from src.telegram.signal_quality_training import extract_signal_features
+
+        features = extract_signal_features(
+            side="long", entry=100.0, sl=90.0, tp=None,
+            take_profits=None, leverage=None, message_date=datetime(2024, 1, 15),
+        )
+        self.assertIsNone(features)
+
+
+class TestBuildSignalQualityTrainingData(unittest.IsolatedAsyncioTestCase):
+    """
+    build_signal_quality_training_data — тянет ВСЕ уже просимулированные
+    (win/loss/break-even) исторические сигналы любого канала и строит из
+    них датафрейм признаков + бинарную метку target (1.0 — loss).
+    """
+
+    async def asyncTearDown(self):
+        from sqlalchemy import delete
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal
+        async with get_session() as session:
+            await session.execute(delete(HistoricalSignal))
+            await session.commit()
+
+    async def test_includes_only_resolved_outcomes_with_correct_target(self):
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal, TelegramChannel
+        from src.telegram.signal_quality_training import build_signal_quality_training_data
+        from src.utils.timeutils import utcnow
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@sq_train_1")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+            session.add_all([
+                HistoricalSignal(
+                    channel_id=db_channel_id, telegram_message_id=1, raw_message="a",
+                    message_date=utcnow(), parse_status="parsed",
+                    parsed_pair="BTC/USDT", parsed_side="long",
+                    parsed_entry=100.0, parsed_sl=90.0, parsed_take_profits=[110.0, 120.0, 130.0],
+                    simulated_outcome="win",
+                ),
+                HistoricalSignal(
+                    channel_id=db_channel_id, telegram_message_id=2, raw_message="b",
+                    message_date=utcnow(), parse_status="parsed",
+                    parsed_pair="ETH/USDT", parsed_side="short",
+                    parsed_entry=100.0, parsed_sl=110.0, parsed_take_profits=[90.0, 80.0, 70.0],
+                    simulated_outcome="loss",
+                ),
+                HistoricalSignal(
+                    channel_id=db_channel_id, telegram_message_id=3, raw_message="c",
+                    message_date=utcnow(), parse_status="parsed",
+                    parsed_pair="SOL/USDT", parsed_side="long",
+                    parsed_entry=100.0, parsed_sl=95.0, parsed_take_profits=[105.0],
+                    simulated_outcome="unresolved",  # не должен попасть в датасет
+                ),
+                HistoricalSignal(
+                    channel_id=db_channel_id, telegram_message_id=4, raw_message="d",
+                    message_date=utcnow(), parse_status="parsed",
+                    parsed_pair="XRP/USDT", parsed_side="long",
+                    parsed_entry=100.0, parsed_sl=95.0, parsed_take_profits=[105.0],
+                    simulated_outcome=None,  # ещё не симулирован — тоже не должен попасть
+                ),
+            ])
+            await session.commit()
+
+        df = await build_signal_quality_training_data()
+
+        self.assertIsNotNone(df)
+        self.assertEqual(len(df), 2)
+        targets = sorted(df["target"].tolist())
+        self.assertEqual(targets, [0.0, 1.0])
+
+    async def test_returns_none_when_no_resolved_signals(self):
+        from src.telegram.signal_quality_training import build_signal_quality_training_data
+
+        df = await build_signal_quality_training_data()
+        self.assertIsNone(df)
+
+
+class TestSignalQualityDatasetSummary(unittest.IsolatedAsyncioTestCase):
+    """get_signal_quality_dataset_summary — статистика для вкладки
+    "Обучение" (сколько сигналов уже размечено под обучение модели
+    качества сигнала, готовность относительно MIN_TRAINING_SAMPLES)."""
+
+    async def asyncTearDown(self):
+        from sqlalchemy import delete
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal
+        async with get_session() as session:
+            await session.execute(delete(HistoricalSignal))
+            await session.commit()
+
+    async def test_counts_by_outcome_and_readiness(self):
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal, TelegramChannel
+        from src.ml import MIN_TRAINING_SAMPLES
+        from src.telegram.signal_quality_training import get_signal_quality_dataset_summary
+        from src.utils.timeutils import utcnow
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@sq_summary_1")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+            session.add_all([
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=1, raw_message="a",
+                                  message_date=utcnow(), parse_status="parsed", simulated_outcome="win"),
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=2, raw_message="b",
+                                  message_date=utcnow(), parse_status="parsed", simulated_outcome="loss"),
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=3, raw_message="c",
+                                  message_date=utcnow(), parse_status="parsed", simulated_outcome="break-even"),
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=4, raw_message="d",
+                                  message_date=utcnow(), parse_status="parsed", simulated_outcome="unresolved"),
+            ])
+            await session.commit()
+
+        result = await get_signal_quality_dataset_summary()
+
+        self.assertEqual(result["total_resolved"], 3)
+        self.assertEqual(result["win"], 1)
+        self.assertEqual(result["loss"], 1)
+        self.assertEqual(result["break_even"], 1)
+        self.assertEqual(result["min_training_samples"], MIN_TRAINING_SAMPLES)
+        self.assertFalse(result["ready"])
+
+
+class TestTrainSignalQualityClassifier(unittest.IsolatedAsyncioTestCase):
+    """
+    ModelTrainer.train_signal_quality_classifier — тот же обучающий
+    пайплайн (train/val split, Optuna при достаточном объёме иначе
+    дефолтные параметры, LightGBM, пиклинг, регистрация MLModel), что и
+    train_direction_classifier/train_volatility_predictor, но на
+    признаках HistoricalSignal вместо MLFeature.
+    """
+
+    async def test_registers_active_model_row(self):
+        from sqlalchemy import select
+        from src.db.models import MLModel
+        from src.db.session import get_session
+        from src.ml import ModelTrainer
+
+        rng = np.random.default_rng(11)
+        n = 150
+        df = pd.DataFrame({
+            "sl_distance_pct": rng.uniform(1, 10, n),
+            "first_tp_distance_pct": rng.uniform(1, 10, n),
+            "final_tp_distance_pct": rng.uniform(5, 30, n),
+            "risk_reward_ratio": rng.uniform(0.5, 5.0, n),
+            "num_tp_levels": rng.choice([1.0, 3.0], n),
+            "leverage": rng.uniform(1, 20, n),
+            "is_long": rng.choice([0.0, 1.0], n),
+            "hour": rng.integers(0, 24, n).astype(float),
+            "day_of_week": rng.integers(0, 7, n).astype(float),
+            "target": rng.choice([0.0, 1.0], n),
+        })
+
+        trainer = ModelTrainer()
+        result = await trainer.train_signal_quality_classifier(training_data=df)
+        self.assertIsNotNone(result)
+        self.assertIn("accuracy", result["metrics"])
+
+        async with get_session() as session:
+            row = (
+                await session.execute(
+                    select(MLModel).where(
+                        MLModel.model_type == "signal_quality_classifier",
+                        MLModel.version == result["version"],
+                    )
+                )
+            ).scalar_one_or_none()
+        self.assertIsNotNone(row)
+        self.assertTrue(row.is_active)
+
+    async def test_returns_none_below_min_training_samples(self):
+        from src.ml import ModelTrainer
+
+        df = pd.DataFrame({
+            "sl_distance_pct": [5.0, 6.0],
+            "first_tp_distance_pct": [5.0, 6.0],
+            "final_tp_distance_pct": [15.0, 18.0],
+            "risk_reward_ratio": [3.0, 3.0],
+            "num_tp_levels": [3.0, 3.0],
+            "leverage": [5.0, 5.0],
+            "is_long": [1.0, 0.0],
+            "hour": [10.0, 11.0],
+            "day_of_week": [1.0, 2.0],
+            "target": [0.0, 1.0],
+        })
+
+        result = await ModelTrainer().train_signal_quality_classifier(training_data=df)
+        self.assertIsNone(result)
+
+    async def test_returns_none_when_no_data(self):
+        from src.ml import ModelTrainer
+
+        with patch(
+            "src.telegram.signal_quality_training.build_signal_quality_training_data",
+            AsyncMock(return_value=None),
+        ):
+            result = await ModelTrainer().train_signal_quality_classifier()
+        self.assertIsNone(result)
+
+
+class TestSignalQualityApiEndpoints(unittest.IsolatedAsyncioTestCase):
+    """GET /ml/signal-quality/dataset-summary и POST /ml/signal-quality/train."""
+
+    async def test_dataset_summary_endpoint_delegates_to_helper(self):
+        from src.web.api import get_signal_quality_dataset_summary
+
+        fake_summary = {"total_resolved": 5, "win": 2, "loss": 2, "break_even": 1,
+                         "min_training_samples": 100, "ready": False}
+        with patch("src.web.api._get_signal_quality_dataset_summary",
+                    AsyncMock(return_value=fake_summary)):
+            result = await get_signal_quality_dataset_summary()
+        self.assertEqual(result, fake_summary)
+
+    async def test_train_endpoint_activates_model_on_success(self):
+        from src.web.api import train_signal_quality_model
+
+        fake_result = {"version": 2, "metrics": {"accuracy": 0.7}}
+        with patch("src.web.api.model_trainer.train_signal_quality_classifier",
+                    AsyncMock(return_value=fake_result)), \
+             patch("src.web.api.model_registry.activate_model", AsyncMock(return_value=True)) as mock_activate:
+            result = await train_signal_quality_model()
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["result"], fake_result)
+        mock_activate.assert_awaited_once_with("signal_quality_classifier", 2)
+
+    async def test_train_endpoint_reports_failure_without_error_when_no_data(self):
+        from src.web.api import train_signal_quality_model
+
+        with patch("src.web.api.model_trainer.train_signal_quality_classifier",
+                    AsyncMock(return_value=None)), \
+             patch("src.web.api.model_registry.activate_model", AsyncMock()) as mock_activate:
+            result = await train_signal_quality_model()
+
+        self.assertFalse(result["success"])
+        self.assertIsNone(result["result"])
+        mock_activate.assert_not_awaited()
+
+
 if __name__ == "__main__":
     unittest.main()

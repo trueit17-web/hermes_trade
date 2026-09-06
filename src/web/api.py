@@ -40,6 +40,9 @@ from src.strategy import strategy_registry
 from src.telegram.history_backfill import backfill_channel_history
 from src.telegram.notifier import send_notification
 from src.telegram.signal_outcome_simulation import simulate_channel_signal_outcomes
+from src.telegram.signal_quality_training import (
+    get_signal_quality_dataset_summary as _get_signal_quality_dataset_summary,
+)
 from src.utils.logging import LEVEL_ORDER, get_logger_families
 from src.utils.timeutils import utcnow
 from src.web import auth
@@ -1166,6 +1169,33 @@ async def trigger_retrain():
         "result": result,
         "volatility_result": vol_result,
     }
+
+
+@app.get("/ml/signal-quality/dataset-summary")
+async def get_signal_quality_dataset_summary():
+    """
+    Сколько исторических сигналов (любого канала) уже размечены исходом
+    (win/loss/break-even) и готовы под обучение классификатора качества
+    сигнала — третий этап плана после бэкафилла и симуляции исходов.
+    """
+    return await _get_signal_quality_dataset_summary()
+
+
+@app.post("/ml/signal-quality/train")
+async def train_signal_quality_model():
+    """
+    Обучить классификатор качества сигнала (train_signal_quality_
+    classifier) на всех уже размеченных HistoricalSignal — тот же паттерн,
+    что и /ml/retrain: при успехе новая версия сразу активируется через
+    model_registry (деактивируя предыдущие), при недостатке данных
+    (< MIN_TRAINING_SAMPLES) вернёт success=false без ошибки.
+    """
+    logger.info("Запуск обучения signal quality classifier...")
+    result = await model_trainer.train_signal_quality_classifier()
+    if result:
+        logger.info(f"Signal quality classifier обучен: v{result['version']}")
+        await model_registry.activate_model("signal_quality_classifier", result["version"])
+    return {"success": result is not None, "result": result}
 
 
 @app.get("/config")

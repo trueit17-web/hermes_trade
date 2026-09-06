@@ -790,6 +790,19 @@
       </table>
     </div>
   </section>
+
+  <section>
+    <h2>Модель качества сигнала</h2>
+    <div class="muted" style="margin-bottom:10px;">
+      Классификатор "убыточный ли сигнал", обученный на признаках, известных ещё
+      ДО исполнения (геометрия SL/TP канала, плечо, время публикации) и метке
+      win/loss/break-even из симуляции выше. Обучается сразу на всех каналах.
+      Появляется в общем списке моделей вверху вкладки под типом
+      signal_quality_classifier.
+    </div>
+    <div id="sqReadiness" class="muted" style="margin-bottom:10px;">Загрузка…</div>
+    <button type="button" id="btnTrainSignalQuality" class="btn-primary">Обучить модель</button>
+  </section>
 </div>
 
 <div id="tabSettings" class="tab-panel" style="display:none">
@@ -1966,6 +1979,42 @@ async function renderBackfillStats() {
   }
 }
 
+async function renderSignalQualityReadiness() {
+  const el = document.getElementById("sqReadiness");
+  try {
+    const s = await api("/ml/signal-quality/dataset-summary");
+    const mark = s.ready ? "✅" : "⏳";
+    el.innerHTML =
+      `Размечено сигналов: <b>${s.total_resolved}</b> ` +
+      `(win: <span class="pnl-pos">${s.win}</span>, loss: <span class="pnl-neg">${s.loss}</span>, ` +
+      `break-even: ${s.break_even}; нужно ≥${s.min_training_samples}) ${mark}`;
+  } catch (err) {
+    el.textContent = `Ошибка загрузки статистики: ${err.message}`;
+  }
+}
+
+document.getElementById("btnTrainSignalQuality").addEventListener("click", async () => {
+  const btn = document.getElementById("btnTrainSignalQuality");
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = "Обучение…";
+  try {
+    const result = await api("/ml/signal-quality/train", { method: "POST" });
+    if (result.success) {
+      showToast(`Модель обучена: v${result.result.version}, accuracy=${result.result.metrics.accuracy}`);
+    } else {
+      showToast("Недостаточно данных для обучения — см. статистику выше", true);
+    }
+    await renderMlModels();
+    await renderSignalQualityReadiness();
+  } catch (err) {
+    showToast(`Ошибка обучения: ${err.message}`, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalText;
+  }
+});
+
 // Аналогично expandedTrades выше — renderTelegram() перестраивает всю
 // таблицу каналов на каждый REFRESH_MS, без этой карты развёрнутая
 // история сигналов сворачивалась бы сама по себе при любом плановом
@@ -2356,6 +2405,7 @@ function switchTab(tab) {
   if (tab === "training") {
     renderMlModels();
     renderBackfillStats();
+    renderSignalQualityReadiness();
   }
   if (tab === "logs") {
     loadConnections();
@@ -2962,6 +3012,7 @@ async function refreshAll() {
     if (currentTab === "training") {
       await renderMlModels();
       await renderBackfillStats();
+      await renderSignalQualityReadiness();
     }
     document.getElementById("lastUpdated").textContent =
       "Обновлено: " + new Date().toLocaleTimeString("ru-RU");

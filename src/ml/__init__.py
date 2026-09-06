@@ -450,6 +450,134 @@ class ModelTrainer:
             "trained_at": utcnow().isoformat(),
         }
 
+    async def train_signal_quality_classifier(
+        self,
+        training_data: pd.DataFrame | None = None,
+    ) -> dict | None:
+        """
+        Обучить классификатор "убыточный ли сигнал канала" на признаках,
+        известных ДО исполнения (геометрия SL/TP, плечо, время) — метка
+        берётся из HistoricalSignal.simulated_outcome, посчитанного
+        symbol_outcome_simulation.py прогоном по историческим свечам
+        биржи (см. src/telegram/signal_quality_training.py).
+
+        В отличие от train_direction_classifier/train_volatility_predictor
+        источник данных не FeatureStore (там candle-фичи для алго-
+        стратегии), а отдельная таблица HistoricalSignal — поэтому своя
+        загрузка датасета, но тот же остальной пайплайн обучения
+        (train/val split, Optuna при достаточном объёме, LightGBM,
+        пиклинг, регистрация в MLModel) — переиспользуется 1-в-1 из
+        train_direction_classifier ради единообразия и совместимости с
+        уже существующими generic ModelRegistry/GET /ml/models.
+        """
+        logger.info("Начато обучение signal quality classifier")
+
+        if training_data is None:
+            from src.telegram.signal_quality_training import build_signal_quality_training_data
+            training_data = await build_signal_quality_training_data()
+
+        if training_data is None or training_data.empty:
+            logger.warning("Нет данных для обучения signal quality classifier")
+            return None
+
+        from src.telegram.signal_quality_training import SIGNAL_QUALITY_FEATURE_COLS
+        available_cols = [c for c in SIGNAL_QUALITY_FEATURE_COLS if c in training_data.columns]
+        if not available_cols:
+            logger.warning("Нет доступных признаков для обучения signal quality classifier")
+            return None
+
+        X = training_data[available_cols].dropna()
+        y = training_data.loc[X.index, "target"]
+
+        if len(X) < MIN_TRAINING_SAMPLES:
+            logger.warning(
+                f"Слишком мало данных для обучения signal quality classifier: "
+                f"{len(X)} (нужно ≥{MIN_TRAINING_SAMPLES})"
+            )
+            return None
+
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y if len(y.unique()) > 1 else None
+        )
+
+        if len(X_train) >= settings.ml_optuna_min_samples:
+            best_params = self._tune_classifier_params(
+                X_train, y_train, X_val, y_val, settings.ml_optuna_trials
+            )
+            logger.info(f"Optuna: лучшие параметры signal quality classifier: {best_params}")
+        else:
+            best_params = dict(DEFAULT_CLASSIFIER_PARAMS)
+
+        model = lgb.LGBMClassifier(**best_params, random_state=42, verbose=-1)
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=50),
+                lgb.log_evaluation(period=50),
+            ],
+        )
+
+        y_pred = model.predict(X_val)
+        accuracy = accuracy_score(y_val, y_pred)
+        precision = precision_score(y_val, y_pred, average="weighted", zero_division=0)
+        recall = recall_score(y_val, y_pred, average="weighted", zero_division=0)
+        f1 = f1_score(y_val, y_pred, average="weighted", zero_division=0)
+
+        version = await self._get_next_version("signal_quality_classifier")
+        model_path = MODELS_DIR / f"signal_quality_classifier_v{version}.pkl"
+        with open(model_path, "wb") as f:
+            pickle.dump({
+                "model": model,
+                "feature_cols": available_cols,
+                "version": version,
+                "trained_at": utcnow().isoformat(),
+            }, f)
+
+        logger.info(
+            f"✅ Signal quality classifier обучен: v{version} | "
+            f"accuracy={accuracy:.3f} precision={precision:.3f} recall={recall:.3f} f1={f1:.3f}"
+        )
+
+        try:
+            async with get_session() as session:
+                model_record = MLModel(
+                    model_type="signal_quality_classifier",
+                    version=version,
+                    model_path=str(model_path),
+                    params={
+                        **best_params,
+                        "feature_cols": available_cols,
+                    },
+                    metrics={
+                        "accuracy": round(accuracy, 4),
+                        "precision": round(precision, 4),
+                        "recall": round(recall, 4),
+                        "f1": round(f1, 4),
+                        "train_samples": len(X_train),
+                        "val_samples": len(X_val),
+                    },
+                    is_active=True,
+                    released_at=utcnow(),
+                )
+                session.add(model_record)
+                await session.commit()
+        except Exception as e:
+            logger.warning(f"Не удалось зарегистрировать модель в БД: {e}")
+
+        return {
+            "version": version,
+            "model_path": str(model_path),
+            "metrics": {
+                "accuracy": round(accuracy, 4),
+                "precision": round(precision, 4),
+                "recall": round(recall, 4),
+                "f1": round(f1, 4),
+            },
+            "feature_cols": available_cols,
+            "trained_at": utcnow().isoformat(),
+        }
+
     def _tune_classifier_params(self, X_train, y_train, X_val, y_val, n_trials: int) -> dict:
         """Подобрать гиперпараметры LightGBM-классификатора через Optuna."""
 
