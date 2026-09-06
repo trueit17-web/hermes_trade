@@ -13273,6 +13273,98 @@ class TestBackfillChannelHistory(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["reached_channel_start"])  # 5 == limit=5 — может быть ещё история
 
+    async def test_duplicate_message_id_within_same_batch_does_not_abort_run(self):
+        """
+        Реальный инцидент, прод: "duplicate key value violates unique
+        constraint uq_historical_signal_message" несколько раз подряд на
+        одном канале — вставка одного и того же telegram_message_id (не
+        попавшего в снимок existing_ids, снятый ДО цикла) должна ловиться
+        и засчитываться как already_had, а не обрывать обработку
+        оставшихся сообщений в батче необработанным исключением.
+        """
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal, TelegramChannel
+        from src.telegram.history_backfill import backfill_channel_history
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@backfill_dup_1")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+
+        messages = [
+            self._make_message(900, "первое сообщение с id=900"),
+            self._make_message(900, "повторное сообщение с ТЕМ ЖЕ id=900"),
+            self._make_message(901, "следующее сообщение после дубля"),
+        ]
+        client = MagicMock()
+        client.get_entity = AsyncMock(return_value=object())
+        client.get_messages = AsyncMock(return_value=messages)
+        with patch("src.telegram.history_backfill.get_telegram_client", return_value=client), \
+                patch("src.telegram.history_backfill.is_closed_trade_report", return_value=False), \
+                patch("src.telegram.history_backfill.parse_telegram_signal", AsyncMock(return_value=None)):
+            result = await backfill_channel_history(
+                db_channel_id, "@backfill_dup_1", {"channel_id": "@backfill_dup_1"}, limit=200,
+            )
+
+        self.assertEqual(result["scanned"], 3)
+        self.assertEqual(result["stored"], 2)  # id=900 первый раз + id=901
+        self.assertEqual(result["already_had"], 1)  # id=900 второй раз — пойман как гонка на INSERT
+
+        async with get_session() as session:
+            rows = (
+                await session.execute(
+                    select(HistoricalSignal).where(HistoricalSignal.channel_id == db_channel_id)
+                )
+            ).scalars().all()
+        self.assertEqual(len(rows), 2)  # без дубля в БД
+
+    async def test_concurrent_calls_for_same_channel_are_serialized(self):
+        """
+        Повторное нажатие кнопки "⬇ История" в дашборде до завершения
+        предыдущего прогона для ТОГО ЖЕ канала раньше запускало два
+        параллельных прогона, гонявшихся за одним и тем же снимком
+        existing_ids — лок на канал (_channel_locks) должен не давать
+        второму прогону начать get_messages, пока первый не закончит.
+        """
+        import asyncio
+        from src.db.session import get_session
+        from src.db.models import TelegramChannel
+        from src.telegram.history_backfill import backfill_channel_history
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@backfill_lock_1")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+
+        call_log = []
+
+        async def fake_get_messages(entity, limit, offset_id):
+            call_log.append("start")
+            await asyncio.sleep(0.05)
+            call_log.append("end")
+            return []
+
+        client = MagicMock()
+        client.get_entity = AsyncMock(return_value=object())
+        client.get_messages = AsyncMock(side_effect=fake_get_messages)
+
+        with patch("src.telegram.history_backfill.get_telegram_client", return_value=client):
+            await asyncio.gather(
+                backfill_channel_history(
+                    db_channel_id, "@backfill_lock_1", {"channel_id": "@backfill_lock_1"}, limit=10,
+                ),
+                backfill_channel_history(
+                    db_channel_id, "@backfill_lock_1", {"channel_id": "@backfill_lock_1"}, limit=10,
+                ),
+            )
+
+        # Без сериализации оба "start" оказались бы рядом (второй прогон
+        # начал бы get_messages до "end" первого).
+        self.assertEqual(call_log, ["start", "end", "start", "end"])
+
 
 class TestBackfillApiEndpoints(unittest.IsolatedAsyncioTestCase):
     """POST/GET /telegram/channels/{id}/backfill(-summary) — API-обвязка
