@@ -14135,6 +14135,64 @@ class TestSimulateOutcomesApiEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["simulated_loss"], 1)
         self.assertEqual(result["not_yet_simulated"], 1)
         self.assertAlmostEqual(result["avg_pnl_pct"], 2.5, places=4)
+        # Без указанного плеча канала (parsed_leverage не задан ни на одной
+        # из строк) — leveraged-версия совпадает с обычной (множитель 1.0).
+        self.assertAlmostEqual(result["avg_pnl_pct_leveraged"], 2.5, places=4)
+
+    async def test_backfill_summary_scales_leveraged_pnl_by_signal_leverage(self):
+        """
+        Реальный запрос пользователя: в истории загрузки канала рядом со
+        средним PnL% нужен и PnL% с учётом реального плеча канала (та же
+        идея, что и pnl_pct_leveraged у уже закрытых сделок — см.
+        Trade.leverage) — каждая строка масштабируется СВОИМ parsed_
+        leverage, а не общим одним множителем на все строки сразу.
+        """
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal, TelegramChannel
+        from src.utils.timeutils import utcnow
+        from src.web.api import telegram_channel_backfill_summary
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@sim_api_4", market="futures")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+            session.add_all([
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=1, raw_message="a",
+                                  message_date=utcnow(), parse_status="parsed",
+                                  simulated_outcome="win", simulated_pnl_pct=2.0, parsed_leverage=10.0),
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=2, raw_message="b",
+                                  message_date=utcnow(), parse_status="parsed",
+                                  simulated_outcome="loss", simulated_pnl_pct=-4.0, parsed_leverage=5.0),
+                # Без указанного плеча — множитель 1.0 (как в споте).
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=3, raw_message="c",
+                                  message_date=utcnow(), parse_status="parsed",
+                                  simulated_outcome="win", simulated_pnl_pct=1.0, parsed_leverage=None),
+            ])
+            await session.commit()
+
+        result = await telegram_channel_backfill_summary(db_channel_id)
+
+        # Обычный (без плеча): (2.0 + -4.0 + 1.0) / 3 = -0.33 (round до 2 знаков)
+        self.assertAlmostEqual(result["avg_pnl_pct"], round(-1 / 3, 2), places=4)
+        # С плечом: (2.0*10 + -4.0*5 + 1.0*1) / 3 = (20 - 20 + 1) / 3 = 0.33
+        self.assertAlmostEqual(result["avg_pnl_pct_leveraged"], round(1 / 3, 2), places=4)
+
+    async def test_backfill_summary_leveraged_pnl_none_when_no_resolved_rows(self):
+        from src.db.session import get_session
+        from src.db.models import TelegramChannel
+        from src.web.api import telegram_channel_backfill_summary
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@sim_api_5")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+
+        result = await telegram_channel_backfill_summary(db_channel_id)
+
+        self.assertIsNone(result["avg_pnl_pct"])
+        self.assertIsNone(result["avg_pnl_pct_leveraged"])
 
 
 class TestExtractSignalFeatures(unittest.TestCase):

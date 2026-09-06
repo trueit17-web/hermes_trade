@@ -1915,8 +1915,10 @@ async function renderBackfillStats() {
       }
       const winLossBe = `<span class="pnl-pos">${s.simulated_win}</span>/` +
         `<span class="pnl-neg">${s.simulated_loss}</span>/${s.simulated_break_even}`;
+      const avgPnlLeveraged = s.avg_pnl_pct_leveraged === null || s.avg_pnl_pct_leveraged === undefined ? "" :
+        ` (${s.avg_pnl_pct_leveraged >= 0 ? "+" : ""}${s.avg_pnl_pct_leveraged}% от маржи)`;
       const avgPnl = s.avg_pnl_pct === null || s.avg_pnl_pct === undefined ? "—" :
-        `<span class="${s.avg_pnl_pct >= 0 ? "pnl-pos" : "pnl-neg"}">${s.avg_pnl_pct >= 0 ? "+" : ""}${s.avg_pnl_pct}%</span>`;
+        `<span class="${s.avg_pnl_pct >= 0 ? "pnl-pos" : "pnl-neg"}">${s.avg_pnl_pct >= 0 ? "+" : ""}${s.avg_pnl_pct}%${avgPnlLeveraged}</span>`;
       return `
         <tr>
           <td>${escapeHtml(c.channel_title || c.channel_id)}</td>

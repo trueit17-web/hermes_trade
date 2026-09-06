@@ -1679,6 +1679,7 @@ async def telegram_channel_backfill_summary(channel_id: int):
                 select(
                     HistoricalSignal.parse_status, HistoricalSignal.message_date,
                     HistoricalSignal.simulated_outcome, HistoricalSignal.simulated_pnl_pct,
+                    HistoricalSignal.parsed_leverage,
                 )
                 .where(HistoricalSignal.channel_id == channel_id)
             )
@@ -1687,14 +1688,20 @@ async def telegram_channel_backfill_summary(channel_id: int):
     counts = {"parsed": 0, "closed_report": 0, "unparsed": 0}
     outcome_counts = {"win": 0, "loss": 0, "break-even": 0, "unresolved": 0}
     pnl_values = []
-    for status, _, outcome, pnl_pct in rows:
+    # Плечо канала (если указано) применяется к цене-based доходности так
+    # же, как pnl_pct_leveraged у реальных сделок (см. Trade.pnl_pct_
+    # leveraged) — leverage лишь масштабирует % от маржи, поэтому просто
+    # умножение, без пересчёта позиции/маржи заново.
+    pnl_leveraged_values = []
+    for status, _, outcome, pnl_pct, leverage in rows:
         if status in counts:
             counts[status] += 1
         if outcome in outcome_counts:
             outcome_counts[outcome] += 1
         if pnl_pct is not None:
             pnl_values.append(pnl_pct)
-    oldest_date = min((d for _, d, _, _ in rows), default=None)
+            pnl_leveraged_values.append(pnl_pct * float(leverage or 1.0))
+    oldest_date = min((d for _, d, _, _, _ in rows), default=None)
 
     return {
         "total": len(rows),
@@ -1708,6 +1715,9 @@ async def telegram_channel_backfill_summary(channel_id: int):
         "simulated_unresolved": outcome_counts["unresolved"],
         "not_yet_simulated": counts["parsed"] - sum(outcome_counts.values()),
         "avg_pnl_pct": round(sum(pnl_values) / len(pnl_values), 2) if pnl_values else None,
+        "avg_pnl_pct_leveraged": (
+            round(sum(pnl_leveraged_values) / len(pnl_leveraged_values), 2) if pnl_leveraged_values else None
+        ),
     }
 
 
