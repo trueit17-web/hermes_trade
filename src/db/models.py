@@ -338,14 +338,18 @@ class HistoricalSignal(Base):
     примеров ДЛЯ БУДУЩЕЙ ML-модели качества сигнала (обсуждение с
     пользователем: 20 реальных закрытых Telegram-сделок недостаточно для
     обучения — история канала в Telegram может дать на порядки больше).
-    Сам исход (выиграл/проиграл сигнал) здесь ещё не считается — это
-    следующий этап (симуляция по историческим свечам биржи).
 
     telegram_message_id — ID сообщения В Telegram (не путать с id этой
     строки) — обеспечивает идемпотентность бэкафилла: уникальный индекс по
     (channel_id, telegram_message_id) не даёт повторному запуску на том же
     диапазоне создать дубли, а MIN(telegram_message_id) по каналу служит
     курсором для докачки более старой истории на следующий запуск.
+
+    simulated_* — реальная метка исхода (win/loss/break-even/unresolved),
+    посчитанная СЛЕДУЮЩИМ этапом (src/telegram/signal_outcome_simulation.py)
+    прогоном по историческим свечам биржи той же логики частичных TP и
+    ступенчатого SL, что и у живого _check_position_exit — до этого этапа
+    (и для сигналов, для которых он ещё не запускался) все поля NULL.
     """
     __tablename__ = "historical_signals"
 
@@ -367,6 +371,16 @@ class HistoricalSignal(Base):
     parsed_take_profits: Mapped[list | None] = mapped_column(JSON, nullable=True)
     parsed_leverage: Mapped[float | None] = mapped_column(DECIMAL)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # win, loss, break-even — сигнал полностью отыгран (по SL или по
+    # последнему уровню TP); "unresolved" — исторических свечей после
+    # сигнала ещё недостаточно, чтобы определить исход НИ по одному
+    # уровню (см. simulate_signal_against_candles). NULL — симуляция ещё
+    # не запускалась для этой строки.
+    simulated_outcome: Mapped[str | None] = mapped_column(String(20))
+    simulated_pnl_pct: Mapped[float | None] = mapped_column(Float)
+    simulated_exit_reason: Mapped[str | None] = mapped_column(String(30))
+    simulated_tp_hit_count: Mapped[int | None] = mapped_column(Integer)
+    simulated_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     channel: Mapped["TelegramChannel"] = relationship(back_populates="historical_signals")
 

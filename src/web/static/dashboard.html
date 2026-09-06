@@ -771,20 +771,22 @@
     <div class="muted" style="margin-bottom:10px;">
       Подгружает прошлые сообщения Telegram-канала (не живой поток) и разбирает
       их тем же парсером, что и живые сигналы — в отдельную таблицу, не влияющую
-      на статистику канала. Цель — накопить достаточно примеров для будущей
-      ML-модели качества сигнала (на живых сделках их пока слишком мало).
-      Кнопку можно нажимать многократно — каждый раз подгружаются более старые
-      сообщения, пока не будет достигнуто начало канала.
+      на статистику канала. Затем симуляция прогоняет распознанные сигналы по
+      историческим свечам биржи той же логикой частичных TP и ступенчатого SL,
+      что и у живого бота, и даёт реальную метку win/loss/break-even. Цель —
+      накопить примеры для будущей ML-модели качества сигнала (на живых сделках
+      их пока слишком мало). Кнопки можно нажимать многократно.
     </div>
     <div class="table-wrap">
       <table>
         <thead>
           <tr>
             <th>Канал</th><th>Загружено</th><th>Распознано</th>
-            <th>Отчёты о закрытии</th><th>Не распознано</th><th>Самое старое</th><th></th>
+            <th>Отчёты о закрытии</th><th>Не распознано</th><th>Самое старое</th>
+            <th>Win/Loss/BE</th><th>Не симулировано</th><th>Ср. PnL%</th><th></th>
           </tr>
         </thead>
-        <tbody id="backfillBody"><tr class="empty-row"><td colspan="7">Загрузка…</td></tr></tbody>
+        <tbody id="backfillBody"><tr class="empty-row"><td colspan="10">Загрузка…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -1879,7 +1881,7 @@ async function renderBackfillStats() {
     const data = await api("/telegram/channels");
     const channels = data.channels || [];
     if (!channels.length) {
-      body.innerHTML = `<tr class="empty-row"><td colspan="7">Каналы не настроены</td></tr>`;
+      body.innerHTML = `<tr class="empty-row"><td colspan="10">Каналы не настроены</td></tr>`;
       return;
     }
     const summaries = await Promise.all(
@@ -1891,12 +1893,17 @@ async function renderBackfillStats() {
         return `
           <tr>
             <td>${escapeHtml(c.channel_title || c.channel_id)}</td>
-            <td colspan="4" class="muted">Ошибка загрузки сводки</td>
-            <td class="muted">—</td>
-            <td><button class="btn-ghost" data-backfill-channel="${c.id}">⬇ Загрузить историю</button></td>
+            <td colspan="7" class="muted">Ошибка загрузки сводки</td>
+            <td>
+              <button class="btn-ghost" data-backfill-channel="${c.id}">⬇ Загрузить историю</button>
+            </td>
           </tr>
         `;
       }
+      const winLossBe = `<span class="pnl-pos">${s.simulated_win}</span>/` +
+        `<span class="pnl-neg">${s.simulated_loss}</span>/${s.simulated_break_even}`;
+      const avgPnl = s.avg_pnl_pct === null || s.avg_pnl_pct === undefined ? "—" :
+        `<span class="${s.avg_pnl_pct >= 0 ? "pnl-pos" : "pnl-neg"}">${s.avg_pnl_pct >= 0 ? "+" : ""}${s.avg_pnl_pct}%</span>`;
       return `
         <tr>
           <td>${escapeHtml(c.channel_title || c.channel_id)}</td>
@@ -1905,7 +1912,13 @@ async function renderBackfillStats() {
           <td>${s.closed_reports}</td>
           <td>${s.unparsed}</td>
           <td class="muted">${s.oldest_message_date ? fmtTimeMsk(s.oldest_message_date) : "—"}</td>
-          <td><button class="btn-ghost" data-backfill-channel="${c.id}">⬇ Загрузить историю</button></td>
+          <td>${winLossBe}</td>
+          <td class="muted">${s.not_yet_simulated}</td>
+          <td>${avgPnl}</td>
+          <td>
+            <button class="btn-ghost" data-backfill-channel="${c.id}">⬇ История</button>
+            <button class="btn-ghost" data-simulate-channel="${c.id}">📊 Симулировать</button>
+          </td>
         </tr>
       `;
     }).join("");
@@ -1929,8 +1942,27 @@ async function renderBackfillStats() {
         }
       });
     });
+
+    body.querySelectorAll("[data-simulate-channel]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const id = btn.dataset.simulateChannel;
+        const originalText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = "Симуляция…";
+        try {
+          const result = await api(`/telegram/channels/${id}/simulate-outcomes?limit=50`, { method: "POST" });
+          showToast(`Просимулировано: ${result.simulated}, нет данных: ${result.skipped_no_data}, не определилось: ${result.unresolved}`);
+          await renderBackfillStats();
+        } catch (err) {
+          showToast(`Ошибка симуляции: ${err.message}`, true);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = originalText;
+        }
+      });
+    });
   } catch (err) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="7">Ошибка: ${err.message}</td></tr>`;
+    body.innerHTML = `<tr class="empty-row"><td colspan="10">Ошибка: ${err.message}</td></tr>`;
   }
 }
 

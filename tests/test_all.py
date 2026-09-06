@@ -13401,5 +13401,380 @@ class TestBackfillApiEndpoints(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result["oldest_message_date"])
 
 
+class TestSimulateSignalAgainstCandles(unittest.TestCase):
+    """
+    simulate_signal_against_candles (src/telegram/signal_outcome_simulation.py)
+    — второй этап плана: реальная метка win/loss/break-even для исторических
+    сигналов по свечам биржи, прогоняя ТУ ЖЕ логику частичных TP (1/N
+    исходного объёма на уровень) и ступенчатого SL (TP1 -> безубыток, TPn
+    (n>=2) -> уровень TP(n-1)), что и живой _check_position_exit (main.py).
+    Сравнивает только close свечи — как и сам живой бот.
+    """
+
+    def _sim(self, side, entry, sl, tp, take_profits, closes):
+        from src.telegram.signal_outcome_simulation import simulate_signal_against_candles
+        return simulate_signal_against_candles(side, entry, sl, tp, take_profits, closes)
+
+    def test_no_sl_is_unresolved_regardless_of_candles(self):
+        result = self._sim("long", 100.0, None, 130.0, None, [110.0, 120.0, 130.0])
+        self.assertEqual(result["outcome"], "unresolved")
+        self.assertIsNone(result["pnl_pct"])
+
+    def test_no_candles_is_unresolved(self):
+        result = self._sim("long", 100.0, 90.0, 130.0, None, [])
+        self.assertEqual(result["outcome"], "unresolved")
+
+    def test_never_touches_sl_or_tp_is_unresolved(self):
+        result = self._sim("long", 100.0, 90.0, 130.0, [110.0, 120.0, 130.0], [105.0, 103.0, 104.0])
+        self.assertEqual(result["outcome"], "unresolved")
+        self.assertEqual(result["tp_hit_count"], 0)
+
+    def test_immediate_stop_loss_is_a_loss(self):
+        result = self._sim("long", 100.0, 90.0, 130.0, [110.0, 120.0, 130.0], [95.0, 89.0])
+        self.assertEqual(result["outcome"], "loss")
+        self.assertEqual(result["exit_reason"], "stop_loss")
+        self.assertEqual(result["tp_hit_count"], 0)
+        self.assertAlmostEqual(result["pnl_pct"], -11.0, places=4)
+
+    def test_full_run_through_all_tp_levels_is_a_win(self):
+        result = self._sim("long", 100.0, 90.0, None, [110.0, 120.0, 130.0], [110.0, 120.0, 130.0])
+        self.assertEqual(result["outcome"], "win")
+        self.assertEqual(result["exit_reason"], "take_profit_3")
+        self.assertEqual(result["tp_hit_count"], 3)
+        # (10/3 + 20/3 + 30/3) = 20.0
+        self.assertAlmostEqual(result["pnl_pct"], 20.0, places=4)
+
+    def test_ratchets_sl_to_prior_tp_level_after_each_partial_hit(self):
+        """TP1 -> безубыток, TP2 -> уровень TP1 — после третьей свечи цена
+        откатывается ровно на TP1 (100->110->120->110) и должна закрыться
+        стопом на уровне TP1, а не в убыток, как раньше (до ступенчатого
+        SL — только безубыток после TP1, TP2 бы его никак не подвинул)."""
+        result = self._sim(
+            "long", 100.0, 90.0, None, [110.0, 120.0, 130.0], [110.0, 120.0, 110.0],
+        )
+        self.assertEqual(result["outcome"], "win")
+        self.assertEqual(result["exit_reason"], "stop_loss")
+        self.assertEqual(result["tp_hit_count"], 2)
+        # (10/3) + (20/3) + (10/3 из оставшихся 1/3 объёма) = 13.333...
+        self.assertAlmostEqual(result["pnl_pct"], 13.333333, places=4)
+
+    def test_break_even_when_stop_loss_hit_exactly_at_entry(self):
+        result = self._sim("long", 100.0, 100.0, None, [110.0, 120.0, 130.0], [100.0])
+        self.assertEqual(result["outcome"], "break-even")
+        self.assertEqual(result["exit_reason"], "stop_loss")
+        self.assertEqual(result["tp_hit_count"], 0)
+        self.assertAlmostEqual(result["pnl_pct"], 0.0, places=6)
+
+    def test_short_side_mirrors_long_logic(self):
+        result = self._sim("short", 100.0, 110.0, None, [90.0, 80.0, 70.0], [90.0, 100.0])
+        self.assertEqual(result["outcome"], "win")
+        self.assertEqual(result["exit_reason"], "stop_loss")
+        self.assertEqual(result["tp_hit_count"], 1)
+        self.assertAlmostEqual(result["pnl_pct"], 3.333333, places=4)
+
+    def test_gap_past_all_levels_in_one_candle_hits_farthest_level(self):
+        """Цена может перепрыгнуть сразу все уровни одной свечой — должен
+        засчитаться самый дальний (последний), закрывая всю позицию сразу,
+        а не растягиваться по уже пройденным промежуточным уровням."""
+        result = self._sim("long", 100.0, 90.0, None, [110.0, 120.0, 130.0], [135.0])
+        self.assertEqual(result["outcome"], "win")
+        self.assertEqual(result["exit_reason"], "take_profit_3")
+        self.assertEqual(result["tp_hit_count"], 1)
+        self.assertAlmostEqual(result["pnl_pct"], 35.0, places=4)
+
+    def test_unresolved_after_partial_tp_still_counts_as_win(self):
+        """Свечи закончились после одного частичного TP, финальная цель не
+        достигнута — ступенчатый SL держит остаток минимум в безубытке,
+        поэтому итог уже не может быть отрицательным."""
+        result = self._sim("long", 100.0, 90.0, None, [110.0, 120.0, 130.0], [110.0])
+        self.assertEqual(result["outcome"], "win")
+        self.assertEqual(result["exit_reason"], "unresolved_after_partial_tp")
+        self.assertEqual(result["tp_hit_count"], 1)
+        self.assertAlmostEqual(result["pnl_pct"], 3.333333, places=4)
+
+    def test_interpolates_three_levels_when_take_profits_not_given(self):
+        """Без реальных целей канала (take_profits) — та же линейная
+        интерполяция на 3 уровня между entry и tp, что и в
+        TradingBot._tp_levels (main.py)."""
+        result = self._sim("long", 100.0, 90.0, 130.0, None, [110.0])
+        self.assertEqual(result["tp_hit_count"], 1)
+        self.assertEqual(result["exit_reason"], "unresolved_after_partial_tp")
+
+
+class TestSimulateChannelSignalOutcomes(unittest.IsolatedAsyncioTestCase):
+    """
+    simulate_channel_signal_outcomes — асинхронная обвязка над
+    simulate_signal_against_candles: тянет свечи биржи (ccxt, публичные
+    market-data) и пишет результат обратно в HistoricalSignal.
+    """
+
+    async def asyncTearDown(self):
+        from sqlalchemy import delete
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal
+        async with get_session() as session:
+            await session.execute(delete(HistoricalSignal))
+            await session.commit()
+
+    @staticmethod
+    def _make_exchange_mock(ohlcv_by_symbol=None, ohlcv=None):
+        exchange = MagicMock()
+        exchange.load_markets = AsyncMock()
+        exchange.close = AsyncMock()
+        if ohlcv_by_symbol is not None:
+            async def fetch_ohlcv(symbol, timeframe="1h", since=None, limit=1000):
+                return ohlcv_by_symbol.get(symbol, [])
+            exchange.fetch_ohlcv = AsyncMock(side_effect=fetch_ohlcv)
+        else:
+            exchange.fetch_ohlcv = AsyncMock(return_value=ohlcv or [])
+        return exchange
+
+    async def test_simulates_parsed_signal_and_persists_outcome(self):
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal, TelegramChannel
+        from src.telegram.signal_outcome_simulation import simulate_channel_signal_outcomes
+        from src.utils.timeutils import utcnow
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@sim_test_1", market="futures")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+            session.add(HistoricalSignal(
+                channel_id=db_channel_id, telegram_message_id=1, raw_message="x",
+                message_date=utcnow(), parse_status="parsed",
+                parsed_pair="BTC/USDT", parsed_side="long",
+                parsed_entry=100.0, parsed_sl=90.0,
+                parsed_take_profits=[110.0, 120.0, 130.0],
+            ))
+            await session.commit()
+
+        # ohlcv: [timestamp, open, high, low, close, volume] — используется
+        # только close (индекс 4), см. докстринг simulate_signal_against_candles.
+        ohlcv = [[0, 0, 0, 0, c, 0] for c in (110.0, 120.0, 130.0)]
+        exchange = self._make_exchange_mock(ohlcv=ohlcv)
+        with patch("src.telegram.signal_outcome_simulation.ccxt.bybit", return_value=exchange):
+            result = await simulate_channel_signal_outcomes(
+                db_channel_id, "futures", limit=50, exchange_id="bybit",
+            )
+
+        self.assertEqual(result["simulated"], 1)
+        self.assertEqual(result["skipped_no_data"], 0)
+        exchange.fetch_ohlcv.assert_awaited_once()
+        self.assertEqual(exchange.fetch_ohlcv.await_args.args[0], "BTC/USDT:USDT")  # futures-суффикс
+        exchange.close.assert_awaited_once()
+
+        async with get_session() as session:
+            row = (
+                await session.execute(
+                    select(HistoricalSignal).where(HistoricalSignal.channel_id == db_channel_id)
+                )
+            ).scalar_one()
+        self.assertEqual(row.simulated_outcome, "win")
+        self.assertEqual(row.simulated_exit_reason, "take_profit_3")
+        self.assertIsNotNone(row.simulated_at)
+
+    async def test_uses_spot_symbol_without_suffix(self):
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal, TelegramChannel
+        from src.telegram.signal_outcome_simulation import simulate_channel_signal_outcomes
+        from src.utils.timeutils import utcnow
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@sim_test_2", market="spot")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+            session.add(HistoricalSignal(
+                channel_id=db_channel_id, telegram_message_id=1, raw_message="x",
+                message_date=utcnow(), parse_status="parsed",
+                parsed_pair="ETH/USDT", parsed_side="long",
+                parsed_entry=100.0, parsed_sl=90.0, parsed_tp=110.0,
+            ))
+            await session.commit()
+
+        exchange = self._make_exchange_mock(ohlcv=[[0, 0, 0, 0, 89.0, 0]])
+        with patch("src.telegram.signal_outcome_simulation.ccxt.bybit", return_value=exchange):
+            await simulate_channel_signal_outcomes(db_channel_id, "spot", limit=50, exchange_id="bybit")
+
+        self.assertEqual(exchange.fetch_ohlcv.await_args.args[0], "ETH/USDT")  # без суффикса
+
+    async def test_skips_when_no_candle_data_available(self):
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal, TelegramChannel
+        from src.telegram.signal_outcome_simulation import simulate_channel_signal_outcomes
+        from src.utils.timeutils import utcnow
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@sim_test_3", market="spot")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+            session.add(HistoricalSignal(
+                channel_id=db_channel_id, telegram_message_id=1, raw_message="x",
+                message_date=utcnow(), parse_status="parsed",
+                parsed_pair="NOSUCHCOIN/USDT", parsed_side="long",
+                parsed_entry=100.0, parsed_sl=90.0, parsed_tp=110.0,
+            ))
+            await session.commit()
+
+        exchange = self._make_exchange_mock(ohlcv=[])
+        with patch("src.telegram.signal_outcome_simulation.ccxt.bybit", return_value=exchange):
+            result = await simulate_channel_signal_outcomes(db_channel_id, "spot", exchange_id="bybit")
+
+        self.assertEqual(result["skipped_no_data"], 1)
+        self.assertEqual(result["simulated"], 0)
+
+    async def test_ignores_rows_missing_required_fields(self):
+        """unparsed/closed_report строки и строки без entry/sl не должны
+        попадать в выборку для симуляции вообще."""
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal, TelegramChannel
+        from src.telegram.signal_outcome_simulation import simulate_channel_signal_outcomes
+        from src.utils.timeutils import utcnow
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@sim_test_4", market="spot")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+            session.add_all([
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=1, raw_message="x",
+                                  message_date=utcnow(), parse_status="unparsed"),
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=2, raw_message="x",
+                                  message_date=utcnow(), parse_status="closed_report"),
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=3, raw_message="x",
+                                  message_date=utcnow(), parse_status="parsed",
+                                  parsed_pair="BTC/USDT", parsed_side="long", parsed_entry=100.0),
+                # parsed, но нет sl — тоже не должен попасть.
+            ])
+            await session.commit()
+
+        exchange = self._make_exchange_mock(ohlcv=[])
+        with patch("src.telegram.signal_outcome_simulation.ccxt.bybit", return_value=exchange):
+            result = await simulate_channel_signal_outcomes(db_channel_id, "spot", exchange_id="bybit")
+
+        self.assertEqual(result, {"simulated": 0, "skipped_no_data": 0, "unresolved": 0})
+        exchange.fetch_ohlcv.assert_not_awaited()
+
+    async def test_does_not_resimulate_already_simulated_rows(self):
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal, TelegramChannel
+        from src.telegram.signal_outcome_simulation import simulate_channel_signal_outcomes
+        from src.utils.timeutils import utcnow
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@sim_test_5", market="spot")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+            session.add(HistoricalSignal(
+                channel_id=db_channel_id, telegram_message_id=1, raw_message="x",
+                message_date=utcnow(), parse_status="parsed",
+                parsed_pair="BTC/USDT", parsed_side="long",
+                parsed_entry=100.0, parsed_sl=90.0, parsed_tp=110.0,
+                simulated_outcome="win", simulated_pnl_pct=5.0,
+            ))
+            await session.commit()
+
+        exchange = self._make_exchange_mock(ohlcv=[[0, 0, 0, 0, 200.0, 0]])
+        with patch("src.telegram.signal_outcome_simulation.ccxt.bybit", return_value=exchange):
+            result = await simulate_channel_signal_outcomes(db_channel_id, "spot", exchange_id="bybit")
+
+        self.assertEqual(result, {"simulated": 0, "skipped_no_data": 0, "unresolved": 0})
+        exchange.fetch_ohlcv.assert_not_awaited()
+
+
+class TestSimulateOutcomesApiEndpoint(unittest.IsolatedAsyncioTestCase):
+    """POST /telegram/channels/{id}/simulate-outcomes и расширенная сводка
+    GET .../backfill-summary с полями simulated_*."""
+
+    async def asyncTearDown(self):
+        from sqlalchemy import delete
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal
+        async with get_session() as session:
+            await session.execute(delete(HistoricalSignal))
+            await session.commit()
+
+    async def test_simulate_endpoint_404_for_missing_channel(self):
+        from fastapi import HTTPException
+        from src.web.api import simulate_telegram_channel_outcomes
+
+        with self.assertRaises(HTTPException) as cm:
+            await simulate_telegram_channel_outcomes(channel_id=999999)
+        self.assertEqual(cm.exception.status_code, 404)
+
+    async def test_simulate_endpoint_uses_channel_market_and_returns_result(self):
+        from src.db.session import get_session
+        from src.db.models import TelegramChannel
+        from src.web.api import simulate_telegram_channel_outcomes
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@sim_api_1", market="futures")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+
+        fake_result = {"simulated": 3, "skipped_no_data": 1, "unresolved": 0}
+        with patch("src.web.api.simulate_channel_signal_outcomes",
+                    AsyncMock(return_value=fake_result)) as mock_sim:
+            result = await simulate_telegram_channel_outcomes(channel_id=db_channel_id, limit=50)
+
+        self.assertEqual(result, fake_result)
+        call_kwargs = mock_sim.await_args.kwargs
+        self.assertEqual(call_kwargs["db_channel_id"], db_channel_id)
+        self.assertEqual(call_kwargs["market_type"], "futures")
+
+    async def test_simulate_endpoint_502_on_backend_error(self):
+        from fastapi import HTTPException
+        from src.db.session import get_session
+        from src.db.models import TelegramChannel
+        from src.web.api import simulate_telegram_channel_outcomes
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@sim_api_2", market="spot")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+
+        with patch("src.web.api.simulate_channel_signal_outcomes",
+                    AsyncMock(return_value={"error": "биржа недоступна"})):
+            with self.assertRaises(HTTPException) as cm:
+                await simulate_telegram_channel_outcomes(channel_id=db_channel_id)
+        self.assertEqual(cm.exception.status_code, 502)
+
+    async def test_backfill_summary_includes_outcome_counts(self):
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal, TelegramChannel
+        from src.utils.timeutils import utcnow
+        from src.web.api import telegram_channel_backfill_summary
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@sim_api_3", market="spot")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+            session.add_all([
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=1, raw_message="a",
+                                  message_date=utcnow(), parse_status="parsed",
+                                  simulated_outcome="win", simulated_pnl_pct=10.0),
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=2, raw_message="b",
+                                  message_date=utcnow(), parse_status="parsed",
+                                  simulated_outcome="loss", simulated_pnl_pct=-5.0),
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=3, raw_message="c",
+                                  message_date=utcnow(), parse_status="parsed"),  # ещё не симулирован
+            ])
+            await session.commit()
+
+        result = await telegram_channel_backfill_summary(db_channel_id)
+
+        self.assertEqual(result["simulated_win"], 1)
+        self.assertEqual(result["simulated_loss"], 1)
+        self.assertEqual(result["not_yet_simulated"], 1)
+        self.assertAlmostEqual(result["avg_pnl_pct"], 2.5, places=4)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -39,6 +39,7 @@ from src.risk.risk_manager import risk_manager
 from src.strategy import strategy_registry
 from src.telegram.history_backfill import backfill_channel_history
 from src.telegram.notifier import send_notification
+from src.telegram.signal_outcome_simulation import simulate_channel_signal_outcomes
 from src.utils.logging import LEVEL_ORDER, get_logger_families
 from src.utils.timeutils import utcnow
 from src.web import auth
@@ -1610,23 +1611,60 @@ async def backfill_telegram_channel(channel_id: int, limit: int = 200):
     return result
 
 
+@app.post("/telegram/channels/{channel_id}/simulate-outcomes")
+async def simulate_telegram_channel_outcomes(channel_id: int, limit: int = 50):
+    """
+    Симулировать исход (win/loss/break-even) до `limit` ещё не
+    симулированных распознанных исторических сигналов канала по
+    свечам биржи (см. simulate_channel_signal_outcomes) — второй этап
+    после бэкафилла: даёт РЕАЛЬНУЮ метку для будущей ML-модели, а не
+    только сырой текст сигнала.
+
+    market_type берётся из настройки канала (тот же рынок, на котором
+    канал реально исполняется/исполнялся бы) — не из текущего глобального
+    тумблера.
+    """
+    async with get_session() as session:
+        channel = await session.get(TelegramChannel, channel_id)
+        if channel is None:
+            raise HTTPException(status_code=404, detail="Канал не найден")
+        market_type = channel.market
+
+    result = await simulate_channel_signal_outcomes(
+        db_channel_id=channel_id, market_type=market_type, limit=min(limit, 500),
+    )
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+    return result
+
+
 @app.get("/telegram/channels/{channel_id}/backfill-summary")
 async def telegram_channel_backfill_summary(channel_id: int):
-    """Сводка по уже загруженной бэкафиллом истории канала — для отображения
-    во вкладке "Обучение" дашборда без повторного запуска самого бэкафилла."""
+    """Сводка по уже загруженной бэкафиллом истории канала и уже
+    просимулированным исходам — для отображения во вкладке "Обучение"
+    дашборда без повторного запуска самого бэкафилла/симуляции."""
     async with get_session() as session:
         rows = (
             await session.execute(
-                select(HistoricalSignal.parse_status, HistoricalSignal.message_date)
+                select(
+                    HistoricalSignal.parse_status, HistoricalSignal.message_date,
+                    HistoricalSignal.simulated_outcome, HistoricalSignal.simulated_pnl_pct,
+                )
                 .where(HistoricalSignal.channel_id == channel_id)
             )
         ).all()
 
     counts = {"parsed": 0, "closed_report": 0, "unparsed": 0}
-    for status, _ in rows:
+    outcome_counts = {"win": 0, "loss": 0, "break-even": 0, "unresolved": 0}
+    pnl_values = []
+    for status, _, outcome, pnl_pct in rows:
         if status in counts:
             counts[status] += 1
-    oldest_date = min((d for _, d in rows), default=None)
+        if outcome in outcome_counts:
+            outcome_counts[outcome] += 1
+        if pnl_pct is not None:
+            pnl_values.append(pnl_pct)
+    oldest_date = min((d for _, d, _, _ in rows), default=None)
 
     return {
         "total": len(rows),
@@ -1634,6 +1672,12 @@ async def telegram_channel_backfill_summary(channel_id: int):
         "closed_reports": counts["closed_report"],
         "unparsed": counts["unparsed"],
         "oldest_message_date": oldest_date.isoformat() + "Z" if oldest_date else None,
+        "simulated_win": outcome_counts["win"],
+        "simulated_loss": outcome_counts["loss"],
+        "simulated_break_even": outcome_counts["break-even"],
+        "simulated_unresolved": outcome_counts["unresolved"],
+        "not_yet_simulated": counts["parsed"] - sum(outcome_counts.values()),
+        "avg_pnl_pct": round(sum(pnl_values) / len(pnl_values), 2) if pnl_values else None,
     }
 
 
