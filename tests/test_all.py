@@ -10622,6 +10622,135 @@ class TestMarketDataMergeCandles(unittest.TestCase):
             settings.candlesticks_cache_size = saved
 
 
+class TestMarketDataIngestFuturesOhlcv(unittest.IsolatedAsyncioTestCase):
+    """
+    Регресс на прод-инцидент: TAO/USDT — реально открытая фьючерсная
+    позиция — не имеет спотового листинга на Bybit вообще. MarketDataIngest
+    держал единственный, всегда-спотовый ccxt-клиент (self.exchange),
+    поэтому fetch_ohlcv("TAO/USDT") валился с "does not have market
+    symbol TAO/USDT" на каждой попытке обновить свечи — цена/TP/трейлинг
+    для этой позиции зависали. fetch_ohlcv(market_type="futures") должен
+    использовать ОТДЕЛЬНЫЙ linear-swap клиент (self.futures_exchange,
+    лениво подключаемый) и unified-символ "BASE/QUOTE:QUOTE" — тот же
+    перевод, что и в ExecutionEngine._ccxt_symbol (вынесен в
+    src/utils/ccxt_helpers.ccxt_symbol, чтобы не дублировать).
+    """
+
+    @staticmethod
+    def _make_ingest():
+        from src.data_ingest.market_data import MarketDataIngest
+        return MarketDataIngest("bybit")
+
+    async def test_spot_request_uses_spot_client_unchanged_symbol(self):
+        ingest = self._make_ingest()
+        fake_spot = MagicMock()
+        fake_spot.options = {"defaultType": "spot"}
+        fake_spot.fetch_ohlcv = AsyncMock(return_value=[[0, 1, 1, 1, 1, 1]])
+        ingest.exchange = fake_spot
+
+        df = await ingest.fetch_ohlcv("BTC/USDT", "1h", limit=200)
+
+        self.assertIsNotNone(df)
+        fake_spot.fetch_ohlcv.assert_awaited_once_with("BTC/USDT", timeframe="1h", limit=200, since=None)
+
+    async def test_futures_request_uses_futures_client_and_suffixes_symbol(self):
+        ingest = self._make_ingest()
+        fake_futures = MagicMock()
+        fake_futures.options = {"defaultType": "swap", "defaultSubType": "linear"}
+        fake_futures.load_markets = AsyncMock()
+        fake_futures.fetch_ohlcv = AsyncMock(return_value=[[0, 1, 1, 1, 1, 1]])
+        ingest._build_exchange = MagicMock(return_value=fake_futures)
+        # Спотовый клиент НЕ должен вызываться для futures-запроса —
+        # AsyncMock без return_value упал бы, если бы код по ошибке
+        # обратился к нему вместо self.futures_exchange.
+        ingest.exchange = None
+
+        df = await ingest.fetch_ohlcv("TAO/USDT", "1h", limit=200, market_type="futures")
+
+        self.assertIsNotNone(df)
+        fake_futures.fetch_ohlcv.assert_awaited_once_with(
+            "TAO/USDT:USDT", timeframe="1h", limit=200, since=None,
+        )
+        self.assertIs(ingest.futures_exchange, fake_futures)
+
+    async def test_futures_client_connected_lazily_only_once(self):
+        ingest = self._make_ingest()
+        fake_futures = MagicMock()
+        fake_futures.options = {"defaultType": "swap", "defaultSubType": "linear"}
+        fake_futures.load_markets = AsyncMock()
+        fake_futures.fetch_ohlcv = AsyncMock(return_value=[[0, 1, 1, 1, 1, 1]])
+        ingest._build_exchange = MagicMock(return_value=fake_futures)
+
+        await ingest.fetch_ohlcv("TAO/USDT", "1h", limit=200, market_type="futures")
+        await ingest.fetch_ohlcv("TAO/USDT", "1h", limit=3, market_type="futures")
+
+        ingest._build_exchange.assert_called_once_with(futures=True)
+
+    async def test_futures_connect_failure_returns_none_without_touching_spot_client(self):
+        ingest = self._make_ingest()
+        fake_spot = MagicMock()
+        fake_spot.fetch_ohlcv = AsyncMock()
+        ingest.exchange = fake_spot
+        ingest._build_exchange = MagicMock(side_effect=Exception("network down"))
+
+        df = await ingest.fetch_ohlcv("TAO/USDT", "1h", market_type="futures")
+
+        self.assertIsNone(df)
+        fake_spot.fetch_ohlcv.assert_not_awaited()
+
+
+class TestRefreshSymbolCandlesRoutesMarketType(unittest.IsolatedAsyncioTestCase):
+    """
+    _refresh_symbol_candles должен запрашивать свечи на ТОМ рынке, на
+    котором реально открыта позиция (execution_engine.get_open_positions()
+    — единственное место, где market_type хранится по символу), а не
+    всегда на споте — иначе фьючерсные позиции без спотового листинга
+    (TAO/USDT) не могут обновить цену вообще (см.
+    TestMarketDataIngestFuturesOhlcv выше).
+    """
+
+    def _make_bot(self):
+        import src.main as main_module
+        return main_module.TradingBot()
+
+    async def test_futures_position_requests_futures_market_type(self):
+        from src.execution.executor import execution_engine
+
+        from src.data_ingest.market_data import MarketDataIngest
+
+        bot = self._make_bot()
+        bot.ingest = MarketDataIngest("bybit")
+        bot.ingest.fetch_ohlcv = AsyncMock(return_value=None)
+        saved_positions = dict(execution_engine.paper_positions)
+        execution_engine.is_paper = True
+        execution_engine.paper_positions["TAO/USDT"] = {"market_type": "futures"}
+        try:
+            await bot._refresh_symbol_candles("TAO/USDT")
+        finally:
+            execution_engine.paper_positions.clear()
+            execution_engine.paper_positions.update(saved_positions)
+
+        bot.ingest.fetch_ohlcv.assert_awaited_once_with("TAO/USDT", "1h", limit=200, market_type="futures")
+
+    async def test_untracked_symbol_defaults_to_spot(self):
+        from src.data_ingest.market_data import MarketDataIngest
+        from src.execution.executor import execution_engine
+
+        bot = self._make_bot()
+        bot.ingest = MarketDataIngest("bybit")
+        bot.ingest.fetch_ohlcv = AsyncMock(return_value=None)
+        saved_positions = dict(execution_engine.paper_positions)
+        execution_engine.is_paper = True
+        execution_engine.paper_positions.pop("SOME/USDT", None)
+        try:
+            await bot._refresh_symbol_candles("SOME/USDT")
+        finally:
+            execution_engine.paper_positions.clear()
+            execution_engine.paper_positions.update(saved_positions)
+
+        bot.ingest.fetch_ohlcv.assert_awaited_once_with("SOME/USDT", "1h", limit=200, market_type="spot")
+
+
 class TestRefreshSymbolCandlesUsesOwnBuffer(unittest.IsolatedAsyncioTestCase):
     """
     Регресс на прод-инцидент: TIA/USDT (открыт через авто-исполнение

@@ -1317,15 +1317,27 @@ class TradingBot:
         incremental-запроса точно так же терялись — возвращался старый
         снимок, то есть "цена не обновляется" воспроизводилось и после
         предыдущего исправления этого бага.
+
+        market_type — рынок берётся из execution_engine.get_open_positions()
+        (единственное место, где он реально отслеживается по символу — см.
+        комментарий у ExecutionEngine._exchange_for), а не из
+        self.open_positions (там market_type не хранится) и не из
+        settings.market_type (глобальный тумблер, а не рынок конкретной
+        позиции — Telegram-каналы могут торговать на разных рынках, см.
+        per-channel market_type). Реальный инцидент: TAO/USDT (фьючерсная
+        позиция) не имеет спотового листинга на Bybit — единственный,
+        всегда-спотовый ingest-клиент валился с "does not have market
+        symbol" на каждой попытке обновить свечи.
         """
+        market_type = execution_engine.get_open_positions().get(symbol, {}).get("market_type", "spot")
         df = self.candles_buffer.get(symbol)
         if df is None or df.empty or len(df) < 50:
-            fetched = await self.ingest.fetch_ohlcv(symbol, "1h", limit=200)
+            fetched = await self.ingest.fetch_ohlcv(symbol, "1h", limit=200, market_type=market_type)
             if fetched is not None:
                 df = self.ingest.merge_candles(df, fetched)
                 self.candles_buffer[symbol] = df
         else:
-            fresh = await self.ingest.fetch_ohlcv(symbol, "1h", limit=3)
+            fresh = await self.ingest.fetch_ohlcv(symbol, "1h", limit=3, market_type=market_type)
             if fresh is not None:
                 df = self.ingest.merge_candles(df, fresh)
                 self.candles_buffer[symbol] = df

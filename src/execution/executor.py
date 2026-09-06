@@ -31,6 +31,7 @@ from src.event_bus import (
     event_bus,
 )
 from src.risk.risk_manager import risk_manager
+from src.utils.ccxt_helpers import ccxt_symbol as _shared_ccxt_symbol
 from src.utils.timeutils import utcnow, utcnow_timestamp
 
 logger = logging.getLogger(__name__)
@@ -162,20 +163,14 @@ class ExecutionEngine:
         spot) — читаем его отсюда же, а не заводим отдельный market_type
         параметр в каждой сигнатуре: то же самое отличие клиента, просто
         доступное напрямую через сам ccxt-объект.
+
+        Логика вынесена в src/utils/ccxt_helpers.py — тот же перевод нужен
+        и MarketDataIngest (src/data_ingest/market_data.py) для фьючерсных
+        символов при загрузке свечей (реальный инцидент: TAO/USDT вообще не
+        имеет спотового листинга на Bybit, поэтому голый "TAO/USDT" не
+        резолвился ни во что и на market-data клиенте).
         """
-        if exchange is None or ":" in symbol or "/" not in symbol:
-            return symbol
-        options = exchange.options
-        # exchange.options — обычный dict у реального ccxt.Exchange; защитная
-        # проверка типа — не только на случай неожиданной биржи без options,
-        # но и на тестовые AsyncMock()-заглушки без спека, у которых
-        # exchange.options САМ становится AsyncMock (см. unittest.mock:
-        # атрибуты AsyncMock по умолчанию рекурсивно тоже AsyncMock) — без
-        # неё .get(...) вернул бы корутину вместо значения.
-        if not isinstance(options, dict) or options.get("defaultType") != "swap":
-            return symbol
-        quote = symbol.split("/")[-1]
-        return f"{symbol}:{quote}"
+        return _shared_ccxt_symbol(exchange, symbol)
 
     def get_open_positions(self) -> dict:
         """Открытые позиции для текущего режима (paper или real)."""

@@ -6,6 +6,7 @@ import ccxt.async_support as ccxt
 import pandas as pd
 
 from src.config import settings
+from src.utils.ccxt_helpers import ccxt_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -16,44 +17,69 @@ class MarketDataIngest:
     - Загрузка исторических OHLCV (для инициализации)
     - Периодическое обновление свечей
     - Буферизация последних N свечей для стратегий
+
+    self.exchange — СПОТОВЫЙ клиент, используется для динамической торговой
+    вселенной (get_tradable_symbols — явно "активные SPOT-пары") и для
+    свечей большинства символов (у которых спотовый и фьючерсный рынок на
+    Bybit делят один и тот же тикер, так что разница на практике не видна).
+    self.futures_exchange — ОТДЕЛЬНЫЙ, лениво подключаемый linear-swap
+    клиент — заводится только при первом запросе свечей для символа с
+    market_type="futures" (см. fetch_ohlcv). Разделены по тому же принципу,
+    что и ExecutionEngine._exchanges в executor.py: реальный инцидент —
+    TAO/USDT на Bybit вообще не имеет спотового листинга, и раньше
+    единственный (всегда спотовый) клиент валился с "does not have market
+    symbol TAO/USDT" на каждой попытке обновить свечи для реально открытой
+    фьючерсной позиции; менять self.exchange целиком на swap сломало бы
+    get_tradable_symbols, который именно спотовый листинг и ожидает.
     """
 
     def __init__(self, exchange_id: str = "binance"):
         self.exchange_id = exchange_id.lower()
         self.exchange: ccxt.Exchange | None = None
+        self.futures_exchange: ccxt.Exchange | None = None
         self.candles_buffer: dict[str, pd.DataFrame] = {}
         self._running = False
 
-    async def initialize(self):
-        """Инициализация подключения к бирже."""
-        try:
-            if self.exchange_id == "binance":
-                self.exchange = ccxt.binance({
-                    "enableRateLimit": True,
-                    "options": {"defaultType": "spot"},
-                })
-            elif self.exchange_id == "bybit":
-                self.exchange = ccxt.bybit({
-                    "enableRateLimit": True,
-                    "options": {"defaultType": "spot"},
-                })
-            else:
-                self.exchange = getattr(ccxt, self.exchange_id)({
-                    "enableRateLimit": True,
-                })
+    def _build_exchange(self, futures: bool) -> ccxt.Exchange:
+        options = {"defaultType": "swap", "defaultSubType": "linear"} if futures else {"defaultType": "spot"}
+        if self.exchange_id in ("binance", "bybit"):
+            return getattr(ccxt, self.exchange_id)({"enableRateLimit": True, "options": options})
+        return getattr(ccxt, self.exchange_id)({"enableRateLimit": True})
 
-            # Загрузить рынки
+    async def initialize(self):
+        """Инициализация подключения к бирже (спотовый клиент)."""
+        try:
+            self.exchange = self._build_exchange(futures=False)
             await self.exchange.load_markets()
             logger.info(f"[{self.exchange_id}] Подключено, рынки загружены")
         except Exception as e:
             logger.error(f"Ошибка инициализации {self.exchange_id}: {e}")
             self.exchange = None
 
+    async def _ensure_futures_exchange(self) -> ccxt.Exchange | None:
+        """Лениво подключить отдельный linear-swap клиент — только для
+        символов, у которых реально открыта фьючерсная позиция (см.
+        комментарий класса)."""
+        if self.futures_exchange is not None:
+            return self.futures_exchange
+        try:
+            exchange = self._build_exchange(futures=True)
+            await exchange.load_markets()
+            self.futures_exchange = exchange
+            logger.info(f"[{self.exchange_id}] Фьючерсный market-data клиент подключён")
+        except Exception as e:
+            logger.error(f"Ошибка инициализации фьючерсного market-data клиента {self.exchange_id}: {e}")
+            self.futures_exchange = None
+        return self.futures_exchange
+
     async def close(self):
-        """Закрыть соединение."""
+        """Закрыть соединение(я)."""
         if self.exchange:
             await self.exchange.close()
             logger.info(f"[{self.exchange_id}] Соединение закрыто")
+        if self.futures_exchange:
+            await self.futures_exchange.close()
+            logger.info(f"[{self.exchange_id}] Фьючерсное соединение закрыто")
 
     async def fetch_ohlcv(
         self,
@@ -61,18 +87,33 @@ class MarketDataIngest:
         timeframe: str = "1h",
         limit: int = 500,
         since: int | None = None,
+        market_type: str = "spot",
     ) -> pd.DataFrame | None:
         """
         Загрузить OHLCV свечи из биржи.
         Возвращает DataFrame с индексом timestamp и колонками: open, high, low, close, volume
+
+        market_type="futures" — использовать отдельный linear-swap клиент
+        (см. _ensure_futures_exchange) и перевести символ в unified-формат
+        "BASE/QUOTE:QUOTE", который ccxt ожидает для этого рынка (см.
+        ccxt_symbol) — без этого символы без спотового листинга (TAO/USDT)
+        не резолвятся вообще, а символы с совпадающим спотовым тикером
+        молча резолвились бы в спотовый рынок.
         """
-        if not self.exchange:
+        if market_type == "futures":
+            exchange = await self._ensure_futures_exchange()
+        else:
+            exchange = self.exchange
+
+        if not exchange:
             logger.warning(f"[{self.exchange_id}] Соединение не инициализировано")
             return None
 
+        request_symbol = ccxt_symbol(exchange, symbol) if market_type == "futures" else symbol
+
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(
-                symbol,
+            ohlcv = await exchange.fetch_ohlcv(
+                request_symbol,
                 timeframe=timeframe,
                 limit=limit,
                 since=since,
