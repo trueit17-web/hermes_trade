@@ -41,6 +41,25 @@ logger = logging.getLogger(__name__)
 # биржа не успела отразить только что купленный актив в fetch_balance()).
 RECONCILE_MIN_AGE_SECONDS = 180
 
+# Русские подписи причины закрытия для Order.notes (см. _reason_notes_ru) —
+# reason приходит как машинный идентификатор (main.py._check_position_exit,
+# api.py close_position_manually, ...), а "Заметка" в карточке ордера на
+# дашборде — предназначенный для человека текст.
+_REASON_NOTES_RU = {
+    "stop_loss": "стоп-лосс",
+    "manual": "вручную",
+    "channel_stop_report": "по отчёту канала о стопе",
+}
+
+
+def _reason_notes_ru(reason: str) -> str:
+    """Человекочитаемая причина закрытия для Order.notes — см. _REASON_NOTES_RU."""
+    if reason in _REASON_NOTES_RU:
+        return _REASON_NOTES_RU[reason]
+    if reason.startswith("take_profit_"):
+        return f"тейк-профит {reason.rsplit('_', 1)[-1]}"
+    return reason
+
 
 class ExecutionEngine:
     """Движок исполнения ордеров."""
@@ -1239,7 +1258,7 @@ class ExecutionEngine:
                 stop_loss=order_data["stop_loss"],
                 take_profit=order_data["take_profit"],
                 client_order_id=order_data["client_order_id"],
-                notes="Paper trading",
+                notes="Открыт (paper)",
             )
             session.add(order)
             await session.flush()
@@ -1334,7 +1353,7 @@ class ExecutionEngine:
                 filled_price=exit_price,
                 fee=exit_fee,
                 client_order_id=str(uuid.uuid4())[:12],
-                notes=f"Paper close ({reason})",
+                notes=f"Закрыт (paper): {_reason_notes_ru(reason)}",
             )
             session.add(close_order)
             await session.flush()
@@ -2613,7 +2632,7 @@ class ExecutionEngine:
                 market_type=market_type,
                 order_id_exchange=",".join(trade_ids) if trade_ids else order["id"],
                 client_order_id=str(uuid.uuid4())[:12],
-                notes=f"Real close ({reason})",
+                notes=f"Закрыт (real): {_reason_notes_ru(reason)}",
             )
             session.add(close_order)
             await session.flush()
@@ -2983,10 +3002,18 @@ class ExecutionEngine:
         base_currency = symbol.split("/")[0]
         available = self._extract_currency_balance(balance, base_currency)
         if available >= tracked_amount:
+            pos.pop("_pending_external_close_check", None)
             return
         min_amount = self._market_min_amount(symbol, self._exchanges.get("spot"))
         unsellable = available == 0 or (min_amount is not None and available < min_amount)
         if not unsellable:
+            pos.pop("_pending_external_close_check", None)
+            return
+        if not self._confirmed_externally_gone(pos):
+            logger.warning(
+                f"⚠️ Сверка {symbol}: похоже, позиция закрылась на бирже (available={available:.8f}) — "
+                f"жду подтверждения на следующей сверке, прежде чем финализировать закрытие."
+            )
             return
         # Прежде чем списывать позицию как фантомную (без PnL), проверяем
         # ДВА способа объяснить исчезновение реальным закрытием на бирже
@@ -3002,8 +3029,10 @@ class ExecutionEngine:
         # ручное на бирже) молча терялось бы из истории сделок навсегда,
         # а не появлялось бы даже после рестарта. Проверяем их ДО
         # grace-периода ниже — SL/TP вполне может сработать по-настоящему
-        # уже через несколько секунд после открытия, и такое реальное
-        # закрытие нужно распознать сразу, а не откладывать.
+        # уже через несколько секунд после открытия (см. _confirmed_
+        # externally_gone выше — требует подтверждения "позиции нет" на
+        # ВТОРОЙ подряд сверке, а не откладывает распознавание самого
+        # закрытия на неопределённый срок).
         if await self._finalize_externally_closed_position(symbol, pos):
             return
         if await self._finalize_via_recent_trade_history(symbol, pos):
@@ -3134,10 +3163,18 @@ class ExecutionEngine:
             await self.sync_stop_loss_order(symbol, actual_amount, pos.get("stop_loss"))
             return
         if actual_amount == tracked_amount:
+            pos.pop("_pending_external_close_check", None)
             return
         min_amount = self._market_min_amount(symbol, exchange)
         unsellable = actual_amount == 0 or (min_amount is not None and actual_amount < min_amount)
         if not unsellable:
+            pos.pop("_pending_external_close_check", None)
+            return
+        if not self._confirmed_externally_gone(pos):
+            logger.warning(
+                f"⚠️ Сверка {symbol}: похоже, позиция закрылась на бирже (контрактов={actual_amount:.8f}) — "
+                f"жду подтверждения на следующей сверке, прежде чем финализировать закрытие."
+            )
             return
         # Та же цепочка объяснений исчезновения, что и на споте (см.
         # _reconcile_spot_position) — оба _finalize_* уже рынко-осознанны
@@ -3156,6 +3193,33 @@ class ExecutionEngine:
             f"закрытия, чтобы не портить equity/просадку."
         )
         await self._reconcile_phantom_position(symbol, pos.get("order_id"))
+
+    @staticmethod
+    def _confirmed_externally_gone(pos: dict) -> bool:
+        """
+        Требует, чтобы "позиции нет на бирже" (contracts==0 на фьючерсах,
+        available==0 на споте) подтвердилось на ВТОРОЙ ПОДРЯД сверке,
+        прежде чем _finalize_externally_closed_position/_finalize_via_
+        recent_trade_history попробуют финализировать закрытие.
+
+        Реальный инцидент: LDO/USDT, APT/USDT записаны закрытыми на
+        основании ОДНОГО ответа биржи (fetch_position()==0), хотя
+        позиция оставалась открытой — единичный некорректный/устаревший
+        ответ биржи был принят как окончательный без подтверждения.
+        Финализация необратима (отменяет наш условный SL-ордер как часть
+        закрытия — см. _record_external_close), поэтому единственный
+        снимок недостаточен: настоящий быстрый SL/TP всё равно будет
+        подтверждён на следующей сверке (~60с), а транзитный сбойный
+        ответ биржи сам исчезнет, когда позиция снова окажется на месте
+        (см. вызывающий код — сбрасывает счётчик, если available/
+        contracts вернулись к норме).
+
+        Возвращает True только на подтверждающем (втором) вызове подряд.
+        """
+        if pos.pop("_pending_external_close_check", False):
+            return True
+        pos["_pending_external_close_check"] = True
+        return False
 
     async def _finalize_externally_closed_position(self, symbol: str, pos: dict) -> bool:
         """
@@ -3446,7 +3510,7 @@ class ExecutionEngine:
                 fee_currency=exit_fee_currency,
                 order_id_exchange=order_id_exchange,
                 client_order_id=str(uuid.uuid4())[:12],
-                notes="Real close (exchange-triggered, outside bot cycle)",
+                notes="Закрыт (real): обнаружено на бирже вне цикла бота",
             )
             session.add(close_order)
             await session.flush()

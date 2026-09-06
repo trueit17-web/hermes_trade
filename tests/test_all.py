@@ -1244,6 +1244,28 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.engine.exchange.create_market_sell_order.assert_not_called()
         self.assertIn("SLCANCELFAIL1/USDT", self.engine.real_positions)
 
+    async def test_spot_single_zero_balance_reading_does_not_finalize_yet(self):
+        """Та же гарантия (см. TestReconcileFuturesPositions.
+        test_single_zero_contracts_reading_does_not_finalize_yet), но для
+        спотовой сверки (available==0 на кошельке вместо contracts==0)."""
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.real_positions["SLSPOTPEND1/USDT"] = {
+            "amount": 100.0, "entry_price": 2.0, "side": "long",
+            "strategy_id": None, "entry_fee": 0.02, "order_id": None,
+            "opened_at": datetime.now(), "sl_order_id": "sl-order-pending-1",
+        }
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"SLSPOTPEND1": 0.0}, "SLSPOTPEND1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+
+        await self.engine.reconcile_real_positions()
+
+        self.assertIn("SLSPOTPEND1/USDT", self.engine.real_positions)
+        self.engine.exchange.fetch_order.assert_not_called()
+
     async def test_reconcile_real_positions_finalizes_externally_triggered_stop_loss(self):
         """
         Если позиция пропала с баланса биржи (available ~0) и на неё был
@@ -1273,6 +1295,11 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
              "fee": {"cost": 0.18, "currency": "USDT"}},
         ])
 
+        # "Позиции нет на бирже" должно подтвердиться на ВТОРОЙ подряд
+        # сверке, прежде чем закрытие финализируется (см. _confirmed_
+        # externally_gone) — единичный ответ биржи не должен сразу
+        # приниматься как окончательный.
+        await self.engine.reconcile_real_positions()
         await self.engine.reconcile_real_positions()
 
         self.assertNotIn("SLFIRED1/USDT", self.engine.real_positions)
@@ -1344,6 +1371,7 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         ])
 
         await self.engine.reconcile_real_positions()
+        await self.engine.reconcile_real_positions()
 
         self.assertNotIn(symbol, self.engine.real_positions)
         async with get_session() as session:
@@ -1384,6 +1412,7 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
              "timestamp": recent_ts_ms, "fee": {"cost": 1.0, "currency": "MIXEDFEE1"}},
         ])
 
+        await self.engine.reconcile_real_positions()
         await self.engine.reconcile_real_positions()
 
         self.assertNotIn("MIXEDFEE1/USDT", self.engine.real_positions)
@@ -1467,6 +1496,7 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         ])
 
         await self.engine.reconcile_real_positions()
+        await self.engine.reconcile_real_positions()
 
         self.assertNotIn("TRHIST1/USDT", self.engine.real_positions)
         async with get_session() as session:
@@ -1526,6 +1556,7 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         ])
 
         await self.engine.reconcile_real_positions()
+        await self.engine.reconcile_real_positions()
 
         self.assertNotIn("TRSLLEAK1/USDT", self.engine.real_positions)
         self.engine.exchange.cancel_order.assert_called_once_with("sl-leftover-1", "TRSLLEAK1/USDT")
@@ -1570,6 +1601,7 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
              "cost": 10.5, "timestamp": recent_ts_ms, "fee": {"cost": 0.01, "currency": "USDT"}},
         ])
 
+        await self.engine.reconcile_real_positions()
         await self.engine.reconcile_real_positions()
 
         self.assertNotIn("TRMISMATCH1/USDT", self.engine.real_positions)
@@ -2509,6 +2541,7 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
             "RECONOK1": {"free": 10.0, "used": 0, "total": 10.0},
         })
 
+        await self.engine.reconcile_real_positions()
         balance = await self.engine.reconcile_real_positions()
 
         self.assertAlmostEqual(balance, 123.45)
@@ -8643,10 +8676,78 @@ class TestReconcileFuturesPositions(unittest.IsolatedAsyncioTestCase):
             "market_type": "futures",
         }
 
+        await self.engine.reconcile_real_positions()
         balance = await self.engine.reconcile_real_positions()
 
         self.assertAlmostEqual(balance, 500.0)
         self.assertNotIn("FUTRECON1/USDT", self.engine.real_positions)
+
+    async def test_single_zero_contracts_reading_does_not_finalize_yet(self):
+        """
+        Реальный инцидент: LDO/USDT, APT/USDT — единичный ответ биржи
+        fetch_position()==0 был принят как окончательный без подтверждения,
+        хотя позиция оставалась открытой на бирже (сработавший SL-ордер
+        бота при этом отменяется как часть финализации — см.
+        _record_external_close). Первая "позиции нет" сверка не должна
+        закрывать позицию сразу — только пометить её как ожидающую
+        подтверждения на следующей сверке.
+        """
+        from src.utils.timeutils import utcnow
+
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0},
+        })
+        self.engine.exchange.fetch_position = AsyncMock(return_value={"contracts": 0.0})
+        self.engine.real_positions["FUTRECON1B/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long",
+            "opened_at": utcnow() - timedelta(hours=1), "sl_order_id": None, "order_id": None,
+            "market_type": "futures",
+        }
+
+        with self.assertLogs("src.execution.executor", level="WARNING") as cm:
+            await self.engine.reconcile_real_positions()
+
+        self.assertIn("FUTRECON1B/USDT", self.engine.real_positions)
+        self.assertTrue(any("жду подтверждения" in msg for msg in cm.output))
+
+    async def test_pending_close_flag_resets_when_position_reappears(self):
+        """Если между сверками позиция снова видна на бирже (транзитный
+        сбойный ответ), счётчик подтверждения должен сброситься — третья
+        сверка "позиции нет" должна снова начинать с первого наблюдения,
+        а не мгновенно финализировать по старому флагу."""
+        from src.utils.timeutils import utcnow
+
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0},
+        })
+        self.engine.real_positions["FUTRECON1C/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long",
+            "opened_at": utcnow() - timedelta(hours=1), "sl_order_id": None, "order_id": None,
+            "market_type": "futures",
+        }
+
+        self.engine.exchange.fetch_position = AsyncMock(return_value={"contracts": 0.0})
+        await self.engine.reconcile_real_positions()  # первое наблюдение "нет" — помечено
+        self.assertIn("FUTRECON1C/USDT", self.engine.real_positions)
+
+        self.engine.exchange.fetch_position = AsyncMock(return_value={"contracts": 10.0})
+        await self.engine.reconcile_real_positions()  # позиция снова на месте — сброс
+        self.assertIn("FUTRECON1C/USDT", self.engine.real_positions)
+        self.assertNotIn("_pending_external_close_check", self.engine.real_positions["FUTRECON1C/USDT"])
+
+        self.engine.exchange.fetch_position = AsyncMock(return_value={"contracts": 0.0})
+        await self.engine.reconcile_real_positions()  # снова первое наблюдение — ещё не финализирует
+        self.assertIn("FUTRECON1C/USDT", self.engine.real_positions)
 
     async def test_keeps_futures_position_when_contracts_match(self):
         from src.utils.timeutils import utcnow
@@ -8835,6 +8936,7 @@ class TestReconcileFuturesPositions(unittest.IsolatedAsyncioTestCase):
              "cost": 180.0, "timestamp": recent_ts_ms, "fee": {"cost": 0.18, "currency": "USDT"}},
         ])
 
+        await self.engine.reconcile_real_positions()
         await self.engine.reconcile_real_positions()
 
         self.assertNotIn("FUTSHORTCLOSE1/USDT", self.engine.real_positions)
@@ -14493,6 +14595,238 @@ class TestSignalQualityApiEndpoints(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["success"])
         self.assertIsNone(result["result"])
         mock_activate.assert_not_awaited()
+
+
+class TestOrderNotesTranslatedToRussian(unittest.IsolatedAsyncioTestCase):
+    """
+    По запросу пользователя: "Заметка" (Order.notes) в карточке ордера на
+    дашборде должна быть на русском — раньше была смесью "Paper trading"/
+    "Paper close (...)"/"Real close (...)"/"Real close (exchange-triggered,
+    outside bot cycle)" с сырыми машинными reason-кодами внутри скобок.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    def test_reason_notes_ru_translates_known_reasons(self):
+        from src.execution.executor import _reason_notes_ru
+
+        self.assertEqual(_reason_notes_ru("stop_loss"), "стоп-лосс")
+        self.assertEqual(_reason_notes_ru("manual"), "вручную")
+        self.assertEqual(_reason_notes_ru("channel_stop_report"), "по отчёту канала о стопе")
+        self.assertEqual(_reason_notes_ru("take_profit_1"), "тейк-профит 1")
+        self.assertEqual(_reason_notes_ru("take_profit_12"), "тейк-профит 12")
+
+    def test_reason_notes_ru_passes_through_unknown_reason(self):
+        from src.execution.executor import _reason_notes_ru
+
+        self.assertEqual(_reason_notes_ru("something_new"), "something_new")
+
+    async def test_paper_open_order_notes_in_russian(self):
+        from src.db.session import get_session
+        from src.db.models import Order
+
+        settings.trading_mode = "paper"
+        self.engine.is_paper = True
+        order = await self.engine.create_order(
+            symbol="NOTESRU1/USDT", side="buy", amount=10.0, price=1.0, order_type="market",
+        )
+        self.assertIsNotNone(order)
+        async with get_session() as session:
+            refreshed = await session.get(Order, order.id)
+        self.assertEqual(refreshed.notes, "Открыт (paper)")
+
+    async def test_paper_close_order_notes_in_russian(self):
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Order, Trade
+
+        settings.trading_mode = "paper"
+        self.engine.is_paper = True
+        result = await self.engine.close_paper_position(
+            symbol="NOTESRU2/USDT", side="long", entry_price=1.0, amount=10.0,
+            exit_price=1.1, reason="take_profit_1", entry_fee=0.0, holding_seconds=60,
+        )
+        self.assertIsNotNone(result)
+        async with get_session() as session:
+            trade = (
+                await session.execute(select(Trade).where(Trade.id == result["trade_id"]))
+            ).scalar_one()
+            close_order = await session.get(Order, trade.order_close_id)
+        self.assertEqual(close_order.notes, "Закрыт (paper): тейк-профит 1")
+
+    async def test_real_close_order_notes_in_russian(self):
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Order, Trade
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_sell_order.return_value = {
+            "id": "notesru-close-1", "filled": 10.0, "price": None, "average": 1.1,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+        self.engine.real_positions["NOTESRU3/USDT"] = {
+            "amount": 10.0, "entry_price": 1.0, "side": "long", "sl_order_id": None,
+        }
+
+        result = await self.engine.close_real_position(
+            symbol="NOTESRU3/USDT", side="long", entry_price=1.0, amount=10.0,
+            reason="stop_loss", entry_fee=0.0, holding_seconds=60,
+        )
+        self.assertIsNotNone(result)
+        async with get_session() as session:
+            trade = (
+                await session.execute(select(Trade).where(Trade.id == result["trade_id"]))
+            ).scalar_one()
+            close_order = await session.get(Order, trade.order_close_id)
+        self.assertEqual(close_order.notes, "Закрыт (real): стоп-лосс")
+
+    async def test_external_close_order_notes_in_russian(self):
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Order, Trade
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        pos = {"amount": 10.0, "entry_price": 1.0, "side": "long", "sl_order_id": None}
+
+        await self.engine._record_external_close(
+            "NOTESRU4/USDT", pos, exit_price=1.2, amount=10.0, exit_fee=0.0,
+            order_id_exchange="ext-notesru-1", log_note="test",
+        )
+
+        async with get_session() as session:
+            trade = (
+                await session.execute(
+                    select(Trade).join(Order, Trade.order_close_id == Order.id)
+                    .where(Order.order_id_exchange == "ext-notesru-1")
+                )
+            ).scalar_one()
+            close_order = await session.get(Order, trade.order_close_id)
+        self.assertEqual(close_order.notes, "Закрыт (real): обнаружено на бирже вне цикла бота")
+
+
+class TestReopenMistakenlyClosedTrade(unittest.IsolatedAsyncioTestCase):
+    """
+    POST /trades/{trade_id}/reopen — по запросу пользователя (реальный
+    инцидент: LDO/USDT записан закрытым сверкой на основании единичного
+    fetch_position()==0, хотя оставался открытым на бирже). Удаляет
+    закрывающие Order+Trade, оставляя открывающий ордер как есть — на
+    следующем рестарте _restore_real_positions_from_db снова учтёт
+    позицию как открытую.
+    """
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_returns_400_in_paper_mode(self):
+        from fastapi import HTTPException
+        from src.web.api import reopen_mistakenly_closed_trade
+
+        settings.trading_mode = "paper"
+        with self.assertRaises(HTTPException) as cm:
+            await reopen_mistakenly_closed_trade(999999)
+        self.assertEqual(cm.exception.status_code, 400)
+
+    async def test_returns_404_for_missing_trade(self):
+        from fastapi import HTTPException
+        from src.web.api import reopen_mistakenly_closed_trade
+
+        settings.trading_mode = "real"
+        with self.assertRaises(HTTPException) as cm:
+            await reopen_mistakenly_closed_trade(999999)
+        self.assertEqual(cm.exception.status_code, 404)
+
+    async def test_deletes_closing_order_and_trade_leaving_opening_order_intact(self):
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Order, Trade, TelegramSignal, TelegramChannel, TradeDecisionLog
+        from src.execution.executor import execution_engine
+        from src.web.api import reopen_mistakenly_closed_trade
+
+        settings.trading_mode = "real"
+
+        async with get_session() as session:
+            exchange_id, symbol_id = await execution_engine._resolve_symbol_id(session, "REOPEN1/USDT")
+            opening_order = Order(
+                exchange_id=exchange_id, symbol_id=symbol_id,
+                side="sell", order_type="market", amount=100.0, price=0.5,
+                status="filled", filled_amount=100.0, filled_price=0.5,
+                fee=0.1, client_order_id="reopen1-open",
+            )
+            session.add(opening_order)
+            await session.flush()
+            closing_order = Order(
+                exchange_id=exchange_id, symbol_id=symbol_id,
+                side="buy", order_type="market", amount=100.0, price=0.6,
+                status="filled", filled_amount=100.0, filled_price=0.6,
+                fee=0.1, client_order_id="reopen1-close",
+                notes="Закрыт (real): обнаружено на бирже вне цикла бота",
+            )
+            session.add(closing_order)
+            await session.flush()
+            trade = Trade(
+                symbol_id=symbol_id, order_open_id=opening_order.id, order_close_id=closing_order.id,
+                direction="short", entry_price=0.5, exit_price=0.6, amount=100.0,
+                pnl=-10.0, pnl_pct=-2.0, outcome="loss", is_open=False,
+            )
+            session.add(trade)
+            await session.flush()
+            trade_id, opening_order_id, closing_order_id = trade.id, opening_order.id, closing_order.id
+
+            # Побочные ссылки, которые должны быть корректно освобождены —
+            # иначе FK на trades.id не даст удалить строку.
+            session.add(TradeDecisionLog(
+                trade_id=trade_id, step_order=1, step_type="position_update",
+                description="test",
+            ))
+            channel = TelegramChannel(channel_id="@reopen_test_1")
+            session.add(channel)
+            await session.flush()
+            signal = TelegramSignal(
+                channel_id=channel.id, raw_message="x", message_date=datetime.now(),
+                parsed_pair="REOPEN1/USDT", decision="executed",
+                executed_order_id=opening_order_id, executed_trade_id=trade_id,
+            )
+            session.add(signal)
+            await session.commit()
+            signal_id = signal.id
+
+        result = await reopen_mistakenly_closed_trade(trade_id)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["symbol"], "REOPEN1/USDT")
+
+        async with get_session() as session:
+            self.assertIsNone(await session.get(Trade, trade_id))
+            self.assertIsNone(await session.get(Order, closing_order_id))
+            self.assertIsNotNone(await session.get(Order, opening_order_id))
+            refreshed_signal = await session.get(TelegramSignal, signal_id)
+            self.assertIsNone(refreshed_signal.executed_trade_id)
+            self.assertEqual(refreshed_signal.executed_order_id, opening_order_id)
+            logs = (
+                await session.execute(
+                    select(TradeDecisionLog).where(TradeDecisionLog.trade_id == trade_id)
+                )
+            ).scalars().all()
+            self.assertEqual(logs, [])
 
 
 if __name__ == "__main__":

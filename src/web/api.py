@@ -1050,6 +1050,80 @@ async def recalculate_trade(trade_id: int):
     return result
 
 
+@app.post("/trades/{trade_id}/reopen")
+async def reopen_mistakenly_closed_trade(trade_id: int):
+    """
+    Отменить ошибочное закрытие сделки, обнаруженное сверкой real-позиций
+    (reconcile_real_positions -> _finalize_externally_closed_position /
+    _finalize_via_recent_trade_history), когда позиция на САМОЙ БИРЖЕ
+    оставалась открытой — реальный инцидент: LDO/USDT, APT/USDT записаны
+    закрытыми (order_close.notes = "Закрыт (real): обнаружено на бирже
+    вне цикла бота") на основании fetch_position()==0 от биржи, хотя
+    пользователь подтвердил, что позиция всё ещё открыта там же (тот же
+    объём/цена входа) — единичный некорректный ответ биржи был принят как
+    окончательный без подтверждения на следующей сверке.
+
+    Удаляет закрывающие Order+Trade (и всё, что на них ссылается —
+    TradeDecisionLog, TelegramSignal.executed_trade_id), оставляя
+    ОТКРЫВАЮЩИЙ ордер как есть. На следующем восстановлении позиций из БД
+    (сейчас — только при рестарте процесса, см. _restore_real_positions_
+    from_db) позиция снова будет учтена как открытая и получит новый
+    биржевой SL-ордер (_rearm_stop_loss_orders_after_restart) — поэтому
+    после вызова этого эндпоинта бот нужно перезапустить, иначе позиция
+    останется без SL-защиты в его собственном учёте.
+
+    Только для real-режима — в paper такого класса рассинхрона с реальной
+    биржей не бывает.
+    """
+    if settings.is_paper:
+        raise HTTPException(status_code=400, detail="Доступно только в real-режиме")
+
+    from sqlalchemy import delete as sa_delete
+    from sqlalchemy import update as sa_update
+
+    from src.db.models import TradeDecisionLog
+
+    async with get_session() as session:
+        trade = (
+            await session.execute(
+                select(Trade).options(selectinload(Trade.symbol)).where(Trade.id == trade_id)
+            )
+        ).scalar_one_or_none()
+        if trade is None:
+            raise HTTPException(status_code=404, detail="Сделка не найдена")
+
+        symbol = trade.symbol.symbol if trade.symbol else None
+        close_order_id = trade.order_close_id
+
+        # Освобождаем FK на удаляемую сделку — TradeDecisionLog.trade_id не
+        # допускает NULL, поэтому сами записи журнала (а не только ссылка)
+        # удаляются вместе со сделкой.
+        await session.execute(sa_delete(TradeDecisionLog).where(TradeDecisionLog.trade_id == trade_id))
+        await session.execute(
+            sa_update(TelegramSignal)
+            .where(TelegramSignal.executed_trade_id == trade_id)
+            .values(executed_trade_id=None)
+        )
+        await session.delete(trade)
+        if close_order_id is not None:
+            close_order = await session.get(Order, close_order_id)
+            if close_order is not None:
+                await session.delete(close_order)
+        await session.commit()
+
+    logger.warning(
+        f"♻️ Сделка #{trade_id} ({symbol}) переоткрыта вручную через дашборд — закрывающие "
+        f"Order/Trade удалены. Требуется рестарт бота, чтобы позиция снова стала "
+        f"отслеживаемой и получила биржевой SL-ордер."
+    )
+    return {
+        "success": True,
+        "symbol": symbol,
+        "note": "Требуется рестарт бота (кнопка «Перезапустить»), чтобы позиция снова "
+                "появилась в открытых и получила SL-ордер на бирже.",
+    }
+
+
 @app.get("/trades/{trade_id}/decision-log")
 async def get_trade_decision_log(trade_id: int):
     """Получить decision log для сделки (почему сделка была открыта/закрыта)."""
