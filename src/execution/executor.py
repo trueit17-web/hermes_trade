@@ -2894,7 +2894,60 @@ class ExecutionEngine:
                     continue
             await self._reconcile_spot_position(symbol, pos, spot_balance)
 
+        await self._warn_about_untracked_futures_positions()
         return self._extract_usdt_balance(balance)
+
+    async def _warn_about_untracked_futures_positions(self) -> None:
+        """
+        Всё, что выше в reconcile_real_positions — сверка УЖЕ отслеживаемых
+        символов (self.real_positions) с биржей. Если позиция открылась на
+        бирже, а ключ символа так и не появился в self.real_positions
+        (например, ордер реально исполнился, но обновление Order.status до
+        "filled" не успело записаться в БД до рестарта — см.
+        _load_open_positions_from_db, которая реконструирует позиции ТОЛЬКО
+        из filled-ордеров), такая позиция остаётся НЕВИДИМОЙ боту навсегда:
+        без SL/TP, без учёта в risk_manager, и её не поймает сверка выше —
+        та в принципе не смотрит на символы вне self.real_positions.
+
+        Реальный инцидент (прод): на бирже оказалось 8 открытых позиций и 7
+        ордеров, когда бот отслеживал только 5. Здесь нет ни исправления
+        причины (не видна без доступа к самой бирже), ни авто-подхвата
+        (у бота нет надёжных данных о реальной цене входа этой позиции,
+        чтобы безопасно взять её под управление и выставить SL) — только
+        явное предупреждение с именами символов, чтобы расхождение было
+        видно в /logs, а не оставалось незамеченным до следующего ручного
+        сравнения с биржей.
+        """
+        exchange = self._exchanges.get("futures")
+        if exchange is None:
+            return
+        try:
+            positions = await exchange.fetch_positions()
+        except Exception as e:
+            logger.debug(f"Не удалось получить полный список позиций биржи для сверки: {e}")
+            return
+        if not isinstance(positions, list):
+            return
+        tracked = {
+            symbol for symbol, pos in self.real_positions.items()
+            if pos.get("market_type", "spot") == "futures"
+        }
+        for raw in positions:
+            if not isinstance(raw, dict):
+                continue
+            contracts = raw.get("contracts")
+            if not isinstance(contracts, (int, float)) or contracts == 0:
+                continue
+            exchange_symbol = raw.get("symbol")
+            if not exchange_symbol:
+                continue
+            canonical = exchange_symbol.split(":")[0]
+            if canonical in tracked:
+                continue
+            logger.warning(
+                f"⚠️ На бирже открыта позиция {canonical} ({contracts} контрактов), которую "
+                f"бот НЕ отслеживает — она не защищена SL/TP ботом. Проверьте вручную на бирже."
+            )
 
     async def _reconcile_spot_position(self, symbol: str, pos: dict, balance: dict) -> None:
         """

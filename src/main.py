@@ -4,7 +4,7 @@ import math
 import signal
 import statistics
 import sys
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
 
 import pandas as pd
@@ -1923,7 +1923,16 @@ async def _flush_pending_log_records() -> int:
         async with get_session() as session:
             session.add_all([
                 LogEntry(
-                    timestamp=datetime.fromisoformat(r["timestamp"]),
+                    # r["timestamp"] — datetime.now(UTC).isoformat() из
+                    # RingBufferHandler.emit, TIMEZONE-AWARE ("+00:00").
+                    # Все DateTime-колонки в этой кодовой базе (см. docstring
+                    # utcnow() в src/utils/timeutils.py) ожидают НАИВНЫЙ UTC
+                    # datetime — драйверы строгих БД (напр. asyncpg/Postgres,
+                    # "timestamp without time zone") отклоняют aware datetime
+                    # исключением на каждой записи. Раньше эта ошибка
+                    # молчала на debug — /logs (теперь читает только из
+                    # LogEntry) оставался пустым без единой подсказки почему.
+                    timestamp=datetime.fromisoformat(r["timestamp"]).astimezone(UTC).replace(tzinfo=None),
                     level=r["level"],
                     logger=r["logger"],
                     message=r["message"],
@@ -1933,7 +1942,13 @@ async def _flush_pending_log_records() -> int:
             await session.commit()
         return len(records)
     except Exception as e:
-        logger.debug(f"Не удалось сохранить {len(records)} лог-записей в БД: {e}")
+        # WARNING, а не debug — сбой здесь означает, что ВСЯ персистентная
+        # история логов молчаливо не пишется (например, таблица log_entries
+        # не создана — миграция 014 не применена), а сам /logs при этом
+        # читает ТОЛЬКО из БД (см. get_logs в api.py) и покажет пустоту без
+        # единой подсказки почему. На debug это было бы видно только в
+        # консоли/файле процесса, а не там, где эту причину реально ищут.
+        logger.warning(f"⚠️ Не удалось сохранить {len(records)} лог-записей в БД: {e}")
         return 0
 
 

@@ -4714,6 +4714,15 @@ class TestFlushLogsToDb(unittest.IsolatedAsyncioTestCase):
                 await session.execute(select(LogEntry).where(LogEntry.message == "проверка flush в БД"))
             ).scalars().all()
         self.assertEqual(len(rows), 1)
+        # Регресс: r["timestamp"] из ring-буфера — TIMEZONE-AWARE ISO-строка
+        # (datetime.now(UTC).isoformat()), а колонка LogEntry.timestamp — как
+        # и все DateTime-колонки в этой кодовой базе (см. docstring utcnow()
+        # в src/utils/timeutils.py) — ожидает НАИВНЫЙ datetime. Реальный
+        # прод-баг: aware datetime попадал в session.add_all() как есть,
+        # строгий драйвер БД отклонял КАЖДУЮ запись исключением, а сама
+        # ошибка молчала на debug — /logs (читает только из LogEntry)
+        # оставался пустым без единой подсказки почему.
+        self.assertIsNone(rows[0].timestamp.tzinfo)
 
     async def test_returns_zero_when_queue_empty(self):
         from src.main import _flush_pending_log_records
@@ -8809,6 +8818,119 @@ class TestReconcileFuturesPositions(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(balance, 500.0)
         spot_mock.fetch_balance.assert_awaited_once()
         self.assertIn("MON/USDT", self.engine.real_positions)
+
+
+class TestWarnUntrackedFuturesPositions(unittest.IsolatedAsyncioTestCase):
+    """
+    reconcile_real_positions сверяет только символы, УЖЕ присутствующие в
+    self.real_positions — позиция, которая реально открылась на бирже, но
+    так и не попала в этот словарь (например, ордер исполнился, но
+    обновление Order.status="filled" не успело записаться до рестарта —
+    _load_open_positions_from_db реконструирует только filled-ордера),
+    оставалась НЕВИДИМОЙ боту навсегда: без SL/TP, без учёта в risk_manager,
+    и её не находила существующая сверка (та в принципе не смотрит на
+    символы вне self.real_positions). Реальный инцидент (прод): на бирже
+    оказалось 8 открытых позиций и 7 ордеров при 5 отслеживаемых ботом.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+        self._saved_trading_mode = settings.trading_mode
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_warns_about_exchange_position_absent_from_tracking(self):
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0},
+        })
+        self.engine.exchange.fetch_positions = AsyncMock(return_value=[
+            {"symbol": "UNTRACKED1/USDT:USDT", "contracts": 123.0},
+        ])
+
+        with self.assertLogs("src.execution.executor", level="WARNING") as cm:
+            await self.engine.reconcile_real_positions()
+
+        self.assertTrue(any("UNTRACKED1/USDT" in m and "НЕ отслеживает" in m for m in cm.output))
+
+    async def test_no_warning_when_all_exchange_positions_are_tracked(self):
+        from src.utils.timeutils import utcnow
+
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0},
+        })
+        self.engine.exchange.fetch_position = AsyncMock(return_value={"contracts": 10.0})
+        self.engine.exchange.fetch_positions = AsyncMock(return_value=[
+            {"symbol": "TRACKED1/USDT:USDT", "contracts": 10.0},
+        ])
+        self.engine.real_positions["TRACKED1/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long",
+            "opened_at": utcnow() - timedelta(hours=1), "sl_order_id": None, "order_id": None,
+            "market_type": "futures",
+        }
+
+        import logging as std_logging
+        logger_obj = std_logging.getLogger("src.execution.executor")
+        with patch.object(logger_obj, "warning") as mock_warning:
+            await self.engine.reconcile_real_positions()
+
+        self.assertTrue(
+            all("НЕ отслеживает" not in str(call.args) for call in mock_warning.call_args_list)
+        )
+
+    async def test_ignores_zero_contract_positions(self):
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0},
+        })
+        self.engine.exchange.fetch_positions = AsyncMock(return_value=[
+            {"symbol": "FLATZERO1/USDT:USDT", "contracts": 0.0},
+        ])
+
+        import logging as std_logging
+        logger_obj = std_logging.getLogger("src.execution.executor")
+        with patch.object(logger_obj, "warning") as mock_warning:
+            await self.engine.reconcile_real_positions()
+
+        self.assertTrue(
+            all("НЕ отслеживает" not in str(call.args) for call in mock_warning.call_args_list)
+        )
+
+    async def test_gracefully_ignores_fetch_positions_failure(self):
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0},
+        })
+        self.engine.exchange.fetch_positions = AsyncMock(side_effect=Exception("not supported"))
+
+        balance = await self.engine.reconcile_real_positions()
+
+        self.assertAlmostEqual(balance, 500.0)
 
 
 class TestFinalizeDiagnosticLogging(unittest.IsolatedAsyncioTestCase):
