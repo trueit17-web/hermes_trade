@@ -12313,6 +12313,145 @@ class TestCheckPositionExitUsesAllTpLevelsEqualSplit(unittest.IsolatedAsyncioTes
         self.assertEqual(reasons, ["take_profit_2"])
 
 
+class TestCheckPositionExitRatchetsStopLossToPriorTpLevel(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный запрос пользователя: раньше SL переставлялся в безубыток
+    ТОЛЬКО после первого частичного TP и дальше замирал там навсегда — TP2,
+    TP3 и т.д. никак его не двигали. Откат до входа после серии успешных
+    целей отдавал бы рынку уже подтверждённую движением прибыль. Теперь
+    каждый следующий частичный TP подтягивает SL к цене ПРЕДЫДУЩЕГО уровня
+    (TP1 -> безубыток, TP2 -> уровень TP1, TP3 -> уровень TP2, и т.д.).
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot(), main_module.execution_engine
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "paper"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_sl_steps_up_to_previous_tp_level_on_each_hit(self):
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        symbol = "RATCHET1/USDT"
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": 100.0, "amount": 8.0}
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 100.0, "amount": 8.0,
+            "original_amount": 8.0, "strategy_id": "telegram_signal",
+            "sl": 90.0, "tp": 140.0, "take_profits": [110.0, 120.0, 130.0, 140.0],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+        }
+
+        async def fake_close(**kwargs):
+            engine.paper_positions[symbol]["amount"] -= kwargs["amount"]
+            if engine.paper_positions[symbol]["amount"] <= 1e-9:
+                engine.paper_positions.pop(symbol, None)
+            return {"pnl": 1.0, "pnl_pct": 1.0, "outcome": "win", "trade_id": 1}
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close):
+            await bot._check_position_exit(symbol, 110.0)  # TP1
+            self.assertAlmostEqual(bot.open_positions[symbol]["sl"], 100.0)  # безубыток
+
+            await bot._check_position_exit(symbol, 120.0)  # TP2
+            self.assertAlmostEqual(bot.open_positions[symbol]["sl"], 110.0)  # уровень TP1
+
+            await bot._check_position_exit(symbol, 130.0)  # TP3
+            self.assertAlmostEqual(bot.open_positions[symbol]["sl"], 120.0)  # уровень TP2
+
+    async def test_short_side_ratchets_correctly(self):
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        symbol = "RATCHET2/USDT"
+        engine.paper_positions[symbol] = {"side": "short", "entry_price": 100.0, "amount": 6.0}
+        bot.open_positions[symbol] = {
+            "side": "short", "entry_price": 100.0, "amount": 6.0,
+            "original_amount": 6.0, "strategy_id": "telegram_signal",
+            "sl": 110.0, "tp": 70.0, "take_profits": [90.0, 80.0, 70.0],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+        }
+
+        async def fake_close(**kwargs):
+            engine.paper_positions[symbol]["amount"] -= kwargs["amount"]
+            if engine.paper_positions[symbol]["amount"] <= 1e-9:
+                engine.paper_positions.pop(symbol, None)
+            return {"pnl": 1.0, "pnl_pct": 1.0, "outcome": "win", "trade_id": 1}
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close):
+            await bot._check_position_exit(symbol, 90.0)  # TP1
+            self.assertAlmostEqual(bot.open_positions[symbol]["sl"], 100.0)
+
+            await bot._check_position_exit(symbol, 80.0)  # TP2
+            self.assertAlmostEqual(bot.open_positions[symbol]["sl"], 90.0)
+
+    async def test_gap_past_multiple_levels_ratchets_to_level_before_farthest_hit(self):
+        """Регресс на цену-гэп: если цена перепрыгивает сразу к TP3, минуя
+        TP1/TP2, SL должен встать на уровень TP2 (level_hit-1), а не в
+        безубыток — засчитывается именно самый дальний реально достигнутый
+        уровень (см. TestCheckPositionExitUsesAllTpLevelsEqualSplit)."""
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        symbol = "RATCHETGAP1/USDT"
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": 100.0, "amount": 4.0}
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 100.0, "amount": 4.0,
+            "original_amount": 4.0, "strategy_id": "telegram_signal",
+            "sl": 90.0, "tp": 140.0, "take_profits": [110.0, 120.0, 130.0, 140.0],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+        }
+
+        async def fake_close(**kwargs):
+            engine.paper_positions[symbol]["amount"] -= kwargs["amount"]
+            if engine.paper_positions[symbol]["amount"] <= 1e-9:
+                engine.paper_positions.pop(symbol, None)
+            return {"pnl": 1.0, "pnl_pct": 1.0, "outcome": "win", "trade_id": 1}
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close):
+            await bot._check_position_exit(symbol, 130.0)  # прыжок сразу к TP3
+
+        self.assertAlmostEqual(bot.open_positions[symbol]["sl"], 120.0)  # уровень TP2
+
+    async def test_real_mode_resyncs_exchange_stop_loss_order(self):
+        """На реальном рынке новый SL должен переставляться на бирже, а не
+        только в памяти — иначе биржевой условный ордер продолжит защищать
+        по устаревшей (более слабой) цене."""
+        from src.utils.timeutils import utcnow
+
+        settings.trading_mode = "real"
+        bot, engine = self._make_bot()
+        symbol = "RATCHETREAL1/USDT"
+        engine.real_positions[symbol] = {"side": "long", "entry_price": 100.0, "amount": 8.0}
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 100.0, "amount": 8.0,
+            "original_amount": 8.0, "strategy_id": "telegram_signal",
+            "sl": 90.0, "tp": 140.0, "take_profits": [110.0, 120.0, 130.0, 140.0],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+        }
+
+        async def fake_close(**kwargs):
+            engine.real_positions[symbol]["amount"] -= kwargs["amount"]
+            if engine.real_positions[symbol]["amount"] <= 1e-9:
+                engine.real_positions.pop(symbol, None)
+            return {"pnl": 1.0, "pnl_pct": 1.0, "outcome": "win", "trade_id": 1}
+
+        with patch.object(engine, "close_real_position", side_effect=fake_close), \
+                patch.object(engine, "sync_stop_loss_order", new=AsyncMock()) as mock_sync:
+            await bot._check_position_exit(symbol, 110.0)  # TP1
+            await bot._check_position_exit(symbol, 120.0)  # TP2
+
+        self.assertEqual(mock_sync.await_args_list[0].args, (symbol, 6.0, 100.0))
+        self.assertEqual(mock_sync.await_args_list[1].args, (symbol, 4.0, 110.0))
+
+
 class TestExecuteTelegramSignalPassesParsedLeverage(unittest.IsolatedAsyncioTestCase):
     """Плечо, указанное каналом в тексте сигнала (parsed_leverage — см.
     extract_leverage в channel_monitor.py), должно доходить до
