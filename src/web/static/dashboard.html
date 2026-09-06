@@ -953,6 +953,25 @@ function fmtDuration(seconds) {
   return `${s}с`;
 }
 
+const OUTCOME_LABELS_RU = {
+  "win": "прибыль", "loss": "убыток", "break-even": "безубыток", "unresolved": "не определён",
+};
+
+function fmtOutcome(outcome, isOpen) {
+  if (outcome) return OUTCOME_LABELS_RU[outcome] || outcome;
+  return isOpen ? "открыта" : "—";
+}
+
+const STEP_TYPE_LABELS_RU = {
+  "market_data": "Рыночные данные", "strategy_signal": "Сигнал стратегии",
+  "ml_score": "ML-оценка", "risk_check": "Риск-проверка",
+  "execution": "Исполнение", "position_update": "Закрытие позиции",
+};
+
+function fmtStepType(stepType) {
+  return STEP_TYPE_LABELS_RU[stepType] || stepType;
+}
+
 function showToast(msg, isError = false) {
   const t = document.getElementById("toast");
   t.textContent = msg;
@@ -1359,7 +1378,7 @@ async function renderManualTrades() {
         <td>${fmtPrice(t.entry_price)}</td>
         <td>${t.exit_price !== null ? fmtPrice(t.exit_price) : "—"}</td>
         <td class="${t.pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${t.pnl >= 0 ? "+" : ""}${fmt(t.pnl)} (${fmt(t.pnl_pct, 2)}%)</td>
-        <td>${t.outcome || (t.is_open ? "открыта" : "—")}</td>
+        <td>${fmtOutcome(t.outcome, t.is_open)}</td>
         <td class="muted">${fmtDuration(t.holding_seconds)}</td>
         <td class="muted">${t.created_at ? new Date(t.created_at).toLocaleString("ru-RU") : "—"}</td>
         <td class="muted">${t.closed_at ? new Date(t.closed_at).toLocaleString("ru-RU") : "—"}</td>
@@ -1527,7 +1546,7 @@ async function renderTrades() {
         <td>${t.exit_price !== null ? fmtPrice(t.exit_price) : "—"}</td>
         <td>${tradeValue !== null ? "$" + fmt(tradeValue) : "—"}</td>
         <td class="${t.pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${t.pnl >= 0 ? "+" : ""}${fmt(t.pnl)} (${fmt(t.pnl_pct, 2)}%)${leveragedPnl}</td>
-        <td>${t.outcome || (t.is_open ? "открыта" : "—")}</td>
+        <td>${fmtOutcome(t.outcome, t.is_open)}</td>
         <td class="muted">${t.source || "—"}</td>
         <td class="muted">${fmtDuration(t.holding_seconds)}</td>
         <td class="muted">${t.closed_at ? new Date(t.closed_at).toLocaleString("ru-RU") : "—"}</td>
@@ -1742,7 +1761,7 @@ function renderTradeDetail(d) {
                 <td>${leg.exit_price !== null ? fmtPrice(leg.exit_price) : "—"}</td>
                 <td>${fmt(leg.amount, 6)}</td>
                 <td class="${leg.pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${leg.pnl >= 0 ? "+" : ""}${fmt(leg.pnl)} (${fmt(leg.pnl_pct, 2)}%)</td>
-                <td>${leg.outcome || "—"}</td>
+                <td>${fmtOutcome(leg.outcome, false)}</td>
                 <td class="muted">${fmtDuration(leg.holding_seconds)}</td>
                 <td class="muted">${leg.closed_at ? new Date(leg.closed_at).toLocaleString("ru-RU") : "—"}</td>
                 <td class="muted">${leg.order_id_exchange_close ? escapeHtml(fmtOrderId(leg.order_id_exchange_close)) : "—"}</td>
@@ -1761,7 +1780,7 @@ function renderTradeDetail(d) {
         ${d.decision_log.map(l => `
           <div class="decision-log-step">
             <span class="log-time">${fmtTimeMsk(l.created_at)}</span>
-            <span class="decision-log-type">${escapeHtml(l.step_type)}</span>
+            <span class="decision-log-type">${escapeHtml(fmtStepType(l.step_type))}</span>
             <span>${escapeHtml(l.description)}</span>
           </div>
         `).join("")}
@@ -1793,7 +1812,7 @@ function renderTradeDetail(d) {
           <div><span class="muted">Объём</span><br>${fmt(d.amount, 6)}</div>
           <div><span class="muted">Сумма сделки</span><br>${tradeValue !== null ? "$" + fmt(tradeValue) : "—"}</div>
           <div><span class="muted">PnL</span><br><span class="${d.pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${d.pnl >= 0 ? "+" : ""}${fmt(d.pnl)} (${fmt(d.pnl_pct, 2)}%)</span></div>
-          <div><span class="muted">Итог</span><br>${d.outcome || (d.is_open ? "открыта" : "—")}</div>
+          <div><span class="muted">Итог</span><br>${fmtOutcome(d.outcome, d.is_open)}</div>
           <div><span class="muted">Открыта</span><br>${d.created_at ? new Date(d.created_at).toLocaleString("ru-RU") : "—"}</div>
           <div><span class="muted">Закрыта</span><br>${d.closed_at ? new Date(d.closed_at).toLocaleString("ru-RU") : "—"}</div>
           <div><span class="muted">ID открывающего ордера</span><br>${d.order_id_exchange_open ? escapeHtml(fmtOrderId(d.order_id_exchange_open)) : "—"}</div>
