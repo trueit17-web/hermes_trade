@@ -2116,6 +2116,53 @@ class ExecutionEngine:
             return diff
         return None
 
+    async def _fetch_futures_position_contracts(self, symbol: str, exchange: ccxt.Exchange | None = None) -> float:
+        """Текущий объём (contracts) открытой фьючерсной позиции по symbol,
+        0.0 если позиции нет или её не удалось получить (best-effort)."""
+        ex = exchange if exchange is not None else self.exchange
+        try:
+            ccxt_symbol = self._ccxt_symbol(ex, symbol)
+            positions = await ex.fetch_positions([ccxt_symbol])
+        except Exception as e:
+            logger.debug(f"Не удалось получить позицию {symbol} на фьючерсах: {e}")
+            return 0.0
+        for pos in positions or []:
+            if not isinstance(pos, dict):
+                continue
+            contracts = pos.get("contracts")
+            if isinstance(contracts, (int, float)):
+                return contracts
+        return 0.0
+
+    async def _confirm_fill_via_futures_position(
+        self, symbol: str, contracts_before: float, expected_amount: float,
+        exchange: ccxt.Exchange | None = None,
+    ) -> float | None:
+        """
+        Фьючерсный аналог _confirm_fill_via_balance — на фьючерсах баланс
+        базовой валюты не меняется при открытии позиции (см. комментарий в
+        _execute_real_order про то, почему балансовый фолбэк там не
+        пробуется на фьючерсах вообще), поэтому вместо баланса сверяем
+        объём (contracts) самой позиции по symbol через fetch_positions()
+        до и после попытки.
+
+        Реальные инциденты (прод, фьючерсы): TRUMP/USDT, APE/USDT и следом
+        сразу STG/USDT + ROSE/USDT + DRIFT/USDT — ордер реально исполнялся
+        на бирже (видно в fetch_positions()), но ни fetch_order-поллинг,
+        ни история сделок не успевали подтвердить его за отведённое окно.
+        Без этого фолбэка позиция считалась НЕ открытой и заканчивалась
+        строкой "ордер не подтверждён биржей как реально исполненный" —
+        бот не регистрировал её (не выставлял SL, не отслеживал), а на
+        бирже она реально висела, попадая только в отдельный аудит
+        "открыта позиция, которую бот не отслеживает" (без авто-подхвата)
+        на каждом цикле сверки, пока кто-то не разберётся вручную.
+        """
+        contracts_after = await self._fetch_futures_position_contracts(symbol, exchange)
+        diff = contracts_after - contracts_before
+        if diff >= expected_amount * 0.5:
+            return diff
+        return None
+
     async def _execute_real_order(self, order_data: dict) -> Order | None:
         """Реальный ордер через биржу."""
         symbol = order_data["symbol"]
@@ -2221,9 +2268,13 @@ class ExecutionEngine:
         # исполнения по изменению баланса ниже) не имеет смысла на фьючерсах —
         # там позиция это отдельная сущность (fetch_positions), а не остаток
         # монеты на кошельке; открытие/закрытие меняет маржу в USDT, а не
-        # баланс базовой валюты. На фьючерсах фолбэк просто не пробуем.
+        # баланс базовой валюты. На фьючерсах вместо баланса снимаем снимок
+        # самой позиции (contracts) — см. _confirm_fill_via_futures_position.
         balance_before = None
-        if not is_futures:
+        futures_contracts_before = 0.0
+        if is_futures:
+            futures_contracts_before = await self._fetch_futures_position_contracts(symbol, exchange)
+        else:
             try:
                 snapshot = await exchange.fetch_balance()
                 balance_before = self._extract_currency_balance(snapshot, symbol.split("/")[0])
@@ -2275,12 +2326,20 @@ class ExecutionEngine:
             elif not (order.get("filled") or 0) > 0:
                 # История сделок недоступна, и fetch_order так и не показал
                 # filled — откатываемся к грубому подтверждению по изменению
-                # баланса (объём есть, а цена/комиссия — оценка по
-                # запрошенной цене/стандартной ставке ниже).
-                confirmed_amount = (
-                    await self._confirm_fill_via_balance(symbol, side, balance_before, amount, exchange)
-                    if balance_before is not None else None
-                )
+                # баланса (спот) или объёма позиции (фьючерсы) — объём есть,
+                # а цена/комиссия оцениваются по запрошенной цене/стандартной
+                # ставке ниже.
+                if is_futures:
+                    confirmed_amount = await self._confirm_fill_via_futures_position(
+                        symbol, futures_contracts_before, amount, exchange,
+                    )
+                    confirm_method = "изменению объёма позиции"
+                else:
+                    confirmed_amount = (
+                        await self._confirm_fill_via_balance(symbol, side, balance_before, amount, exchange)
+                        if balance_before is not None else None
+                    )
+                    confirm_method = "изменению баланса"
                 if confirmed_amount is None:
                     logger.error(
                         f"❌ Ордер {order.get('id')} ({symbol}) не подтверждён как реально "
@@ -2292,7 +2351,7 @@ class ExecutionEngine:
                     )
                     return None
                 logger.warning(
-                    f"⚠️ Ордер {order.get('id')} ({symbol}) подтверждён по изменению баланса на "
+                    f"⚠️ Ордер {order.get('id')} ({symbol}) подтверждён по {confirm_method} на "
                     f"бирже ({confirmed_amount:.8f} {symbol.split('/')[0]}), хотя fetch_order так и "
                     f"не показал filled — цена исполнения оценивается по запрошенной, не биржевой."
                 )

@@ -554,6 +554,53 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         # объём позиции не уменьшается.
         self.assertAlmostEqual(self.engine.real_positions["BALDIFF1/USDT"]["amount"], 2011.85)
 
+    async def test_execute_real_futures_order_confirms_via_position_diff_when_status_never_confirms(self):
+        """
+        Фьючерсный аналог теста выше — на фьючерсах баланс базовой валюты
+        не меняется при открытии позиции (маржа резервируется в USDT), а
+        фолбэк-подтверждение по балансу там вообще не пробуется (см.
+        комментарий в _execute_real_order). Реальные инциденты (прод):
+        TRUMP/USDT, APE/USDT и следом сразу STG/USDT + ROSE/USDT +
+        DRIFT/USDT — ордер реально исполнялся на бирже (виден в
+        fetch_positions()), но не подтверждался ни через fetch_order, ни
+        через историю сделок за отведённое окно — без фолбэка по объёму
+        позиции такой ордер считался проваленным, позиция не
+        регистрировалась (SL не выставлялся) и оставалась незащищённой на
+        бирже, попадая только в отдельный аудит "которую бот не
+        отслеживает" без авто-подхвата.
+        """
+        saved_market_type = settings.market_type
+        settings.trading_mode = "real"
+        settings.market_type = "futures"
+        try:
+            self.engine.is_paper = False
+            self.engine.exchange_id = "bybit"
+            self.engine.exchange = AsyncMock()
+            futures_exchange = self.engine.exchange
+            futures_exchange.fetch_positions = AsyncMock(side_effect=[
+                [],
+                [{"symbol": "POSDIFF1/USDT:USDT", "contracts": 500.0}],
+            ])
+            futures_exchange.create_market_sell_order.return_value = {
+                "id": "never-confirms-fut-1", "filled": None, "average": None, "price": None,
+            }
+            futures_exchange.fetch_order = AsyncMock(return_value={
+                "id": "never-confirms-fut-1", "filled": None, "average": None, "price": None, "status": "open",
+            })
+
+            with patch("src.execution.executor.asyncio.sleep", new=AsyncMock()):
+                order = await self.engine.create_order(
+                    symbol="POSDIFF1/USDT", side="sell", amount=500.0, price=2.0, order_type="market",
+                    market_type="futures",
+                )
+        finally:
+            settings.market_type = saved_market_type
+
+        self.assertIsNotNone(order)
+        self.assertIn("POSDIFF1/USDT", self.engine.real_positions)
+        self.assertAlmostEqual(self.engine.real_positions["POSDIFF1/USDT"]["amount"], 500.0)
+        futures_exchange.fetch_balance.assert_not_called()
+
     async def test_close_real_position_confirms_via_balance_diff_when_status_never_confirms(self):
         """Симметричный случай на закрытии — см. тест выше на открытии."""
         settings.trading_mode = "real"
