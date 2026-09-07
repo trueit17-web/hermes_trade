@@ -11205,6 +11205,57 @@ class TestRefreshSymbolCandlesRoutesMarketType(unittest.IsolatedAsyncioTestCase)
         bot.ingest.fetch_ohlcv.assert_awaited_once_with("SOME/USDT", "1h", limit=200, market_type="spot")
 
 
+class TestResolveMarketTypeForSymbolCachesAfterPositionCloses(unittest.IsolatedAsyncioTestCase):
+    """
+    Регресс на прод-инцидент: TAO/USDT (фьючерсная позиция без спотового
+    листинга на Bybit) после закрытия позиции ПРОДОЛЖАЛА значиться в
+    self.active_symbols (ничего не убирает символ из этого списка сразу
+    при закрытии — только следующий плановый _refresh_symbol_universe), а
+    execution_engine.get_open_positions() для неё уже пуст — market_type
+    резолвился обратно в "spot" по умолчанию, и КАЖДАЯ следующая попытка
+    обновить свечи валилась с "does not have market symbol TAO/USDT"
+    вплоть до следующего пересчёта вселенной. _resolve_market_type_for_
+    symbol должен запоминать последний известный market_type по символу и
+    использовать его как фоллбэк, когда открытой позиции больше нет.
+    """
+
+    def _make_bot(self):
+        import src.main as main_module
+        return main_module.TradingBot()
+
+    async def test_futures_market_type_survives_position_close(self):
+        from src.execution.executor import execution_engine
+
+        bot = self._make_bot()
+        saved_positions = dict(execution_engine.paper_positions)
+        execution_engine.is_paper = True
+        execution_engine.paper_positions["TAO/USDT"] = {"market_type": "futures"}
+        try:
+            # Пока позиция открыта — резолвится напрямую, как и раньше.
+            self.assertEqual(bot._resolve_market_type_for_symbol("TAO/USDT"), "futures")
+
+            # Позиция закрылась — execution_engine больше не знает о символе,
+            # но кэш, заполненный строкой выше, должен пережить это.
+            del execution_engine.paper_positions["TAO/USDT"]
+            self.assertEqual(bot._resolve_market_type_for_symbol("TAO/USDT"), "futures")
+        finally:
+            execution_engine.paper_positions.clear()
+            execution_engine.paper_positions.update(saved_positions)
+
+    async def test_symbol_never_seen_open_defaults_to_spot(self):
+        from src.execution.executor import execution_engine
+
+        bot = self._make_bot()
+        saved_positions = dict(execution_engine.paper_positions)
+        execution_engine.is_paper = True
+        execution_engine.paper_positions.pop("NEVEROPEN1/USDT", None)
+        try:
+            self.assertEqual(bot._resolve_market_type_for_symbol("NEVEROPEN1/USDT"), "spot")
+        finally:
+            execution_engine.paper_positions.clear()
+            execution_engine.paper_positions.update(saved_positions)
+
+
 class TestRefreshSymbolUniverseRoutesMarketType(unittest.IsolatedAsyncioTestCase):
     """
     Регресс на прод-инцидент: _refresh_symbol_universe (первичная загрузка

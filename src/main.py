@@ -80,6 +80,16 @@ class TradingBot:
         self._last_ml_feature_ts: dict[str, Any] = {}
         self.active_symbols: list[str] = []
         self._telegram_channel_db_ids: dict[str, int] = {}
+        # Кэш "последний известный market_type" по символу — см.
+        # _resolve_market_type_for_symbol: без него символ, попавший в
+        # active_symbols ТОЛЬКО из-за открытой фьючерсной позиции без
+        # спотового листинга (напр. TAO/USDT), после закрытия этой позиции
+        # начинал резолвиться в "spot" по умолчанию (позиции для него в
+        # execution_engine больше нет) и валился с "does not have market
+        # symbol" на каждой попытке обновить свечи — вплоть до следующего
+        # полного пересчёта торговой вселенной (_refresh_symbol_universe),
+        # который только тогда убрал бы символ из active_symbols.
+        self._symbol_market_type: dict[str, str] = {}
 
     async def initialize(self):
         """Инициализация всех компонентов."""
@@ -226,18 +236,10 @@ class TradingBot:
         removed = [s for s in self.active_symbols if s not in combined]
 
         for symbol in added:
-            # market_type — из открытой позиции по этому символу (если она
-            # есть), а не всегда "spot" по умолчанию: символы, "оставленные"
-            # выше в kept_for_open_positions, могут быть фьючерсными
-            # позициями без спотового листинга на бирже (см. тот же разбор
-            # в _refresh_symbol_candles). Раньше этот путь (первичная
-            # загрузка истории при старте процесса/появлении новой пары)
-            # не учитывал market_type вообще — реальный инцидент: TAO/USDT
-            # (фьючерсная позиция, нет спотовой пары) на каждом рестарте
-            # процесса валился с "does not have market symbol TAO/USDT" при
-            # первой же попытке подгрузить для неё 200 свечей здесь, хотя
-            # тот же баг в _refresh_symbol_candles уже был исправлен раньше.
-            market_type = execution_engine.get_open_positions().get(symbol, {}).get("market_type", "spot")
+            # market_type — см. _resolve_market_type_for_symbol: символы,
+            # "оставленные" выше в kept_for_open_positions, могут быть
+            # фьючерсными позициями без спотового листинга на бирже.
+            market_type = self._resolve_market_type_for_symbol(symbol)
             df = await self.ingest.fetch_ohlcv(symbol, "1h", limit=200, market_type=market_type)
             if df is not None:
                 self.ingest.update_buffer(symbol, df)
@@ -1381,6 +1383,29 @@ class TradingBot:
             except Exception as e:
                 logger.error(f"Ошибка обработки {symbol}: {e}")
 
+    def _resolve_market_type_for_symbol(self, symbol: str) -> str:
+        """
+        market_type символа для запроса свечей — из execution_engine.
+        get_open_positions() (единственное место, где он реально
+        отслеживается по символу, см. комментарий у ExecutionEngine.
+        _exchange_for), с фоллбэком на self._symbol_market_type — кэш
+        последнего известного значения для этого символа. Без фоллбэка
+        после закрытия позиции (или сразу после её обнаружения как
+        "потерянной" — сверка нашла расхождение, снятие с учёта) символ,
+        оставшийся в self.active_symbols, резолвился бы обратно в "spot"
+        по умолчанию: реальный инцидент — TAO/USDT (фьючерсная позиция без
+        спотового листинга на Bybit) после закрытия позиции продолжала
+        значиться в active_symbols (ничего не чистит список немедленно
+        при закрытии — это делает только следующий плановый пересчёт
+        вселенной) и валилась с "does not have market symbol" на каждой
+        попытке обновить свечи, пока вселенная не пересчитывалась заново.
+        """
+        tracked_market_type = execution_engine.get_open_positions().get(symbol, {}).get("market_type")
+        if tracked_market_type:
+            self._symbol_market_type[symbol] = tracked_market_type
+            return tracked_market_type
+        return self._symbol_market_type.get(symbol, "spot")
+
     async def _refresh_symbol_candles(self, symbol: str) -> pd.DataFrame | None:
         """
         Обновить буфер свечей для пары и вернуть его.
@@ -1423,7 +1448,7 @@ class TradingBot:
         всегда-спотовый ingest-клиент валился с "does not have market
         symbol" на каждой попытке обновить свечи.
         """
-        market_type = execution_engine.get_open_positions().get(symbol, {}).get("market_type", "spot")
+        market_type = self._resolve_market_type_for_symbol(symbol)
         df = self.candles_buffer.get(symbol)
         if df is None or df.empty or len(df) < 50:
             fetched = await self.ingest.fetch_ohlcv(symbol, "1h", limit=200, market_type=market_type)
