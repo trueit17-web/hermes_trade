@@ -6833,6 +6833,7 @@ class TestTelegramAutoExecuteIgnoresProtections(unittest.IsolatedAsyncioTestCase
                 "parsed_pair": "BTC/USDT",
                 "parsed_side": "long",
                 "parsed_entry": 50000.0,
+                "parsed_sl": 48000.0,
                 "raw_message": "test",
             })
 
@@ -11837,6 +11838,7 @@ class TestTradingSourceModeGatesTelegramSignals(unittest.IsolatedAsyncioTestCase
                 "parsed_pair": "BTC/USDT",
                 "parsed_side": "long",
                 "parsed_entry": 50000.0,
+                "parsed_sl": 48000.0,
                 "raw_message": "test",
             })
 
@@ -11860,6 +11862,7 @@ class TestTradingSourceModeGatesTelegramSignals(unittest.IsolatedAsyncioTestCase
                 "parsed_pair": "BTC/USDT",
                 "parsed_side": "long",
                 "parsed_entry": 50000.0,
+                "parsed_sl": 48000.0,
                 "raw_message": "test",
             })
 
@@ -11968,12 +11971,120 @@ class TestTelegramSignalMarketEntryResolution(unittest.IsolatedAsyncioTestCase):
                 "parsed_pair": "BTC/USDT",
                 "parsed_side": "long",
                 "parsed_entry": 50000.0,
+                "parsed_sl": 48000.0,
                 "raw_message": "test",
             })
 
         mock_engine.get_reference_price.assert_not_awaited()
         exec_mock.assert_awaited_once()
         self.assertEqual(exec_mock.await_args.args[0]["parsed_entry"], 50000.0)
+
+
+class TestTelegramSignalRejectsMessagesWithNoPriceData(unittest.IsolatedAsyncioTestCase):
+    """
+    Регресс на прод-инцидент: канал прислал "Заполняю BOME Short" (без
+    единой цифры) — простой парсер всё равно распознал пару и сторону
+    (short/long — обычные ключевые слова), сигнал прошёл на автоисполнение
+    с рыночным входом и дефолтным SL, хотя канал не дал никакого ценового
+    ориентира — по содержанию это был не структурированный сигнал, а
+    комментарий/статус. Настоящий сигнал по тому же символу с реальными
+    тейками/стопом канала пришёл через 2 минуты и был отклонён как "уже
+    есть открытая позиция", т.е. мусорный вход заблокировал исполнение
+    действительно содержательного сигнала. Сообщение без SL И без TP (и
+    без списка take_profits) теперь отклоняется до оценки качества и до
+    исполнения — вне зависимости от порога качества канала.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved_mode = settings.active_trading_mode
+        settings.active_trading_mode = "signals"
+
+    def tearDown(self):
+        settings.active_trading_mode = self._saved_mode
+
+    async def test_no_sl_and_no_tp_rejected_before_execution(self):
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        # Порог качества 0.0 — канал принимает любой скор (как @signalyp в
+        # реальном инциденте), проверяем, что новый гейт срабатывает даже
+        # тогда, когда качество само по себе сигнал бы не остановило.
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures"))
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        with patch("src.main.execution_engine") as mock_engine, \
+                patch.object(bot, "_execute_telegram_signal", new=AsyncMock()) as exec_mock:
+            mock_engine.get_reference_price = AsyncMock(return_value=0.0009206)
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "BOME/USDT",
+                "parsed_side": "short",
+                "parsed_entry": None,
+                "parsed_sl": None,
+                "parsed_tp": None,
+                "raw_message": "Заполняю BOME Short",
+            })
+
+        exec_mock.assert_not_awaited()
+        bot._save_telegram_signal.assert_awaited_once()
+        saved_event, quality, decision, order = bot._save_telegram_signal.await_args.args
+        self.assertEqual(decision, "rejected")
+        self.assertIsNone(order)
+        self.assertIn("SL", saved_event["reject_reason"])
+
+    async def test_sl_present_without_tp_still_executes(self):
+        """Регресс: гейт не должен ловить обычные сигналы, где канал дал
+        хотя бы один из двух уровней (здесь — только SL, без TP)."""
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures"))
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        fake_order = MagicMock(id=1)
+        with patch.object(bot, "_execute_telegram_signal", new=AsyncMock(return_value=fake_order)) as exec_mock:
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "ETH/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 2500.0,
+                "parsed_sl": 2400.0,
+                "parsed_tp": None,
+                "raw_message": "test",
+            })
+
+        exec_mock.assert_awaited_once()
+
+    async def test_take_profits_list_without_single_tp_still_executes(self):
+        """Регресс: список реальных уровней (take_profits) сам по себе
+        достаточен, даже если однозначного parsed_tp почему-то нет."""
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures"))
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        fake_order = MagicMock(id=1)
+        with patch.object(bot, "_execute_telegram_signal", new=AsyncMock(return_value=fake_order)) as exec_mock:
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "ETH/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 2500.0,
+                "parsed_sl": None,
+                "parsed_tp": None,
+                "parsed_take_profits": [2600.0, 2700.0],
+                "raw_message": "test",
+            })
+
+        exec_mock.assert_awaited_once()
 
 
 class TestTelegramSignalQualityScoringUsesCorrectShape(unittest.IsolatedAsyncioTestCase):
@@ -12030,7 +12141,14 @@ class TestTelegramSignalQualityScoringUsesCorrectShape(unittest.IsolatedAsyncioT
     async def test_signal_with_sl_tp_scores_meaningfully_higher_than_without(self):
         """Интеграционная проверка через реальный (не замоканный) score_signal:
         наличие SL/TP и хороший RR должны реально поднимать quality, а не
-        давать одинаковый результат независимо от содержания сигнала."""
+        давать одинаковый результат независимо от содержания сигнала.
+
+        "Без SL/TP" здесь — сигнал с SL, но без TP (а не полностью без
+        обоих сразу) — сигнал без единого ценового ориентира (ни SL, ни
+        TP) теперь отклоняется ДО оценки качества (см.
+        TestTelegramSignalRejectsMessagesWithNoPriceData) и никогда не
+        доходит до score_signal, так что сравнивать здесь больше нечего.
+        """
         from src.telegram.quality_scorer import signal_quality_scorer
 
         bot = self._make_bot()
@@ -12057,12 +12175,13 @@ class TestTelegramSignalQualityScoringUsesCorrectShape(unittest.IsolatedAsyncioT
             "parsed_pair": "BTC/USDT",
             "parsed_side": "long",
             "parsed_entry": 50000.0,
+            "parsed_sl": 49000.0,
             "parsed_confidence": 1.0,
             "raw_message": "test",
         })
-        without_sl_tp = bot._save_telegram_signal.await_args.args[1]
+        without_tp = bot._save_telegram_signal.await_args.args[1]
 
-        self.assertGreater(with_sl_tp, without_sl_tp)
+        self.assertGreater(with_sl_tp, without_tp)
 
 
 class TestTelegramSignalDefaultStopLoss(unittest.IsolatedAsyncioTestCase):
@@ -12235,6 +12354,7 @@ class TestTelegramChannelPositionSizePct(unittest.IsolatedAsyncioTestCase):
                 "parsed_pair": "BTC/USDT",
                 "parsed_side": "long",
                 "parsed_entry": 50000.0,
+                "parsed_sl": 48000.0,
                 "raw_message": "test",
             })
 
