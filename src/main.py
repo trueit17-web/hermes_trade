@@ -22,6 +22,7 @@ from src.data_ingest.market_data import MarketDataIngest
 from src.db.models import (
     Exchange,
     LogEntry,
+    Order,
     PerformanceSnapshot,
     Symbol,
     TelegramChannel,
@@ -129,7 +130,7 @@ class TradingBot:
             f"✅ Execution Engine: {'paper' if settings.is_paper else 'real'} режим"
             f"{f' ({settings.active_exchange})' if not settings.is_paper else ''}"
         )
-        self._sync_open_positions_from_execution_engine()
+        await self._sync_open_positions_from_execution_engine()
         await risk_manager.restore_daily_pnl_from_db()
 
         # Торговая вселенная: все активные spot-пары к symbol_quote_currency
@@ -315,7 +316,7 @@ class TradingBot:
         except Exception as e:
             logger.warning(f"Не удалось сохранить снимок производительности: {e}")
 
-    def _sync_open_positions_from_execution_engine(self):
+    async def _sync_open_positions_from_execution_engine(self):
         """
         Пересобрать self.open_positions и счётчик открытых позиций в
         risk_manager из execution_engine.paper_positions (который на этот
@@ -326,6 +327,30 @@ class TradingBot:
         бы их SL/TP, потому что self.open_positions пуст после рестарта;
         (2) risk_manager занижал бы open_positions_count и разрешил бы
         открывать больше позиций, чем реально разрешено max_open_positions.
+
+        Реальный инцидент (прод): execution_engine.real_positions/
+        paper_positions хранит только ОДИН финальный take_profit — список
+        реальных уровней канала (take_profits) и объём НА МОМЕНТ ОТКРЫТИЯ
+        (original_amount) живут только в self.open_positions и нигде не
+        персистятся. После КАЖДОГО рестарта процесса частично закрытая по
+        нескольким TP-уровням Telegram-позиция теряла список настоящих
+        целей канала — _tp_levels() (без take_profits) откатывался на
+        фейковую линейную интерполяцию между entry и единственным tp: на
+        дашборде и при реальном закрытии TP1/TP2/TP3 переставали
+        соответствовать тому, что канал прислал изначально, и выглядели
+        как "перепутанный порядок". Восстанавливаем take_profits из
+        TelegramSignal.parsed_take_profits (та же связь по
+        executed_order_id, что и в GET /positions/detail) — это
+        единственное персистентное место, где исходный список целей канала
+        вообще сохраняется. original_amount — из Order.filled_amount (не
+        мутирует при частичных закрытиях, в отличие от pos["amount"]) —
+        без него доля каждого следующего уровня считалась бы от уже
+        уменьшенного остатка, а не от исходного объёма. channel_id
+        восстанавливается СТРОКОВЫМ идентификатором канала (не числовым
+        id из БД), чтобы совпадать с тем, что использовалось ДО рестарта
+        (channel_key/expectancy_sizing/protection_manager ключуются по
+        этой строке) — иначе после рестарта позиция начинала бы
+        считаться сигналом от "другого" канала для этих подсистем.
         """
         self.open_positions = {}
         # Раньше здесь безусловно читался execution_engine.paper_positions —
@@ -334,7 +359,33 @@ class TradingBot:
         # рестарта вообще.
         source = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
         balance = execution_engine.paper_balance if settings.is_paper else None
+
+        order_ids = [
+            pos["order_id"] for pos in source.values()
+            if pos.get("strategy_id") == "telegram_signal" and pos.get("order_id")
+        ]
+        signal_by_order_id: dict[int, TelegramSignal] = {}
+        filled_amount_by_order_id: dict[int, float] = {}
+        if order_ids:
+            async with get_session() as session:
+                signals = (
+                    await session.execute(
+                        select(TelegramSignal)
+                        .options(selectinload(TelegramSignal.channel))
+                        .where(TelegramSignal.executed_order_id.in_(order_ids))
+                    )
+                ).scalars().all()
+                signal_by_order_id = {s.executed_order_id: s for s in signals}
+                orders = (
+                    await session.execute(select(Order).where(Order.id.in_(order_ids)))
+                ).scalars().all()
+                filled_amount_by_order_id = {
+                    o.id: float(o.filled_amount) for o in orders if o.filled_amount
+                }
+
         for symbol, pos in source.items():
+            order_id = pos.get("order_id")
+            signal = signal_by_order_id.get(order_id) if order_id else None
             self.open_positions[symbol] = {
                 "side": pos.get("side", "long"),
                 "entry_price": pos.get("entry_price"),
@@ -343,9 +394,12 @@ class TradingBot:
                 "rationale": "Восстановлено при старте бота",
                 "sl": pos.get("stop_loss"),
                 "tp": pos.get("take_profit"),
+                "take_profits": signal.parsed_take_profits if signal else None,
+                "original_amount": filled_amount_by_order_id.get(order_id, pos.get("amount")),
+                "channel_id": signal.channel.channel_id if signal and signal.channel else None,
                 "tp_hit_count": pos.get("tp_hit_count", 0),
                 "opened_at": pos.get("opened_at") or utcnow(),
-                "order_id": pos.get("order_id"),
+                "order_id": order_id,
                 "entry_fee": pos.get("entry_fee", 0.0),
                 "notification_message_id": pos.get("notification_message_id"),
             }

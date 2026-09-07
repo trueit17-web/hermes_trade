@@ -360,6 +360,15 @@
     text-transform: uppercase;
     font-size: 11px;
   }
+  .tp-levels-columns {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0 24px;
+  }
+  .tp-levels-col-title {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--text-dim); margin-bottom: 6px;
+  }
   .tp-levels-list { display: flex; flex-direction: column; gap: 4px; }
   .tp-level {
     display: flex; align-items: baseline; gap: 10px;
@@ -372,6 +381,9 @@
   .tp-level.hit .tp-level-mark { color: #4caf50; }
   .tp-level.pending { color: var(--text-dim); }
   .tp-level.pending .tp-level-mark { color: var(--text-dim); }
+  @media (max-width: 640px) {
+    .tp-levels-columns { grid-template-columns: 1fr; gap: 14px 0; }
+  }
   #lastUpdated { color: var(--text-dim); font-size: 12px; }
   .ws-indicator { display: flex; align-items: center; gap: 6px; font-size: 12px; }
   .toast {
@@ -1322,10 +1334,7 @@ function restoreExpandedPosition(row) {
   }
 }
 
-function tpLevelsHtml(levels) {
-  if (!levels || !levels.length) {
-    return `<div class="muted" style="padding:4px 0">Уровни Take Profit не заданы</div>`;
-  }
+function tpLevelGroupHtml(levels) {
   return `
     <div class="tp-levels-list">
       ${levels.map(lvl => `
@@ -1333,9 +1342,31 @@ function tpLevelsHtml(levels) {
           <span class="tp-level-mark">${lvl.hit ? "✅" : "⏳"}</span>
           <span>TP${lvl.level}</span>
           <span>${fmtPrice(lvl.price)}</span>
-          <span class="muted">${lvl.hit ? "достигнут" : "предстоит"}</span>
         </div>
       `).join("")}
+    </div>
+  `;
+}
+
+// Два явных подраздела (а не один общий список вперемешку) — чтобы сразу,
+// без разбора значков по каждой строке, было видно, сколько уровней уже
+// сработало и сколько ещё впереди.
+function tpLevelsHtml(levels) {
+  if (!levels || !levels.length) {
+    return `<div class="muted" style="padding:4px 0">Уровни Take Profit не заданы</div>`;
+  }
+  const hit = levels.filter(lvl => lvl.hit);
+  const pending = levels.filter(lvl => !lvl.hit);
+  return `
+    <div class="tp-levels-columns">
+      <div class="tp-levels-col">
+        <div class="tp-levels-col-title">✅ Достигнуто (${hit.length})</div>
+        ${hit.length ? tpLevelGroupHtml(hit) : `<div class="muted" style="padding:4px 0">Пока ничего</div>`}
+      </div>
+      <div class="tp-levels-col">
+        <div class="tp-levels-col-title">⏳ Предстоят (${pending.length})</div>
+        ${pending.length ? tpLevelGroupHtml(pending) : `<div class="muted" style="padding:4px 0">Все уровни достигнуты</div>`}
+      </div>
     </div>
   `;
 }

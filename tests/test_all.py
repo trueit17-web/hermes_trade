@@ -10441,6 +10441,142 @@ class TestManualTrading(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail["decision_log"][0]["step_type"], "risk_check")
 
 
+class TestSyncOpenPositionsRestoresTakeProfitsAfterRestart(unittest.IsolatedAsyncioTestCase):
+    """
+    Регресс на прод-инцидент: execution_engine.real_positions/paper_positions
+    хранит только ОДИН финальный take_profit — список реальных уровней
+    канала (take_profits) и объём на момент открытия (original_amount)
+    живут только в TradingBot.open_positions и нигде не персистятся.
+    _sync_open_positions_from_execution_engine() (вызывается из initialize()
+    при каждом рестарте процесса) раньше восстанавливала только "tp"
+    (одно число) — частично закрытая по нескольким TP-уровням Telegram-
+    позиция после рестарта теряла список настоящих целей канала, и
+    _tp_levels() откатывался на фейковую линейную интерполяцию между entry
+    и единственным tp: TP1/TP2/TP3 на дашборде и при реальном закрытии
+    переставали соответствовать тому, что канал прислал изначально.
+    """
+
+    def _make_bot(self):
+        import src.main as main_module
+        return main_module.TradingBot()
+
+    async def test_restores_take_profits_original_amount_and_channel_for_telegram_position(self):
+        from datetime import datetime
+
+        from src.db.models import Order, TelegramChannel, TelegramSignal
+        from src.db.session import get_session
+        from src.execution.executor import execution_engine
+        from src.risk.risk_manager import risk_manager
+
+        async with get_session() as session:
+            exchange_id, symbol_id = await execution_engine._resolve_symbol_id(session, "SYNCTP1/USDT")
+            order = Order(
+                exchange_id=exchange_id, symbol_id=symbol_id,
+                side="buy", order_type="market", amount=100.0, price=1.0,
+                status="filled", filled_amount=100.0, filled_price=1.0, fee=0.1,
+                client_order_id="synctp1-open",
+            )
+            session.add(order)
+            await session.flush()
+            channel = TelegramChannel(channel_id="@synctp_test_channel", channel_title="SyncTP Test")
+            session.add(channel)
+            await session.flush()
+            signal = TelegramSignal(
+                channel_id=channel.id, raw_message="x", message_date=datetime.now(),
+                parsed_pair="SYNCTP1/USDT", parsed_side="long", parsed_entry=1.0,
+                parsed_sl=0.9, parsed_tp=1.5, parsed_take_profits=[1.1, 1.3, 1.5],
+                decision="executed", executed_order_id=order.id,
+            )
+            session.add(signal)
+            await session.commit()
+            order_id = order.id
+
+        saved_positions = dict(execution_engine.paper_positions)
+        saved_is_paper = execution_engine.is_paper
+        saved_balance = execution_engine.paper_balance
+        execution_engine.is_paper = True
+        execution_engine.paper_balance = 10000.0
+        # amount=40 — как будто TP1 (из трёх уровней 100 -> по 33.3 каждый)
+        # уже сработал ДО рестарта: без original_amount из Order.filled_amount
+        # оставшиеся доли считались бы от уже уменьшенного остатка.
+        execution_engine.paper_positions["SYNCTP1/USDT"] = {
+            "amount": 40.0, "entry_price": 1.0, "side": "long",
+            "stop_loss": 1.0, "take_profit": 1.5, "strategy_id": "telegram_signal",
+            "order_id": order_id, "tp_hit_count": 1,
+        }
+        bot = self._make_bot()
+        try:
+            await bot._sync_open_positions_from_execution_engine()
+        finally:
+            execution_engine.paper_positions.clear()
+            execution_engine.paper_positions.update(saved_positions)
+            execution_engine.is_paper = saved_is_paper
+            execution_engine.paper_balance = saved_balance
+            risk_manager.on_position_closed("SYNCTP1/USDT")
+
+        pos = bot.open_positions["SYNCTP1/USDT"]
+        self.assertEqual(pos["take_profits"], [1.1, 1.3, 1.5])
+        self.assertEqual(pos["original_amount"], 100.0)
+        self.assertEqual(pos["channel_id"], "@synctp_test_channel")
+        self.assertEqual(pos["tp_hit_count"], 1)
+
+    async def test_non_telegram_position_gets_no_take_profits_list(self):
+        from src.execution.executor import execution_engine
+        from src.risk.risk_manager import risk_manager
+
+        saved_positions = dict(execution_engine.paper_positions)
+        saved_is_paper = execution_engine.is_paper
+        saved_balance = execution_engine.paper_balance
+        execution_engine.is_paper = True
+        execution_engine.paper_balance = 10000.0
+        execution_engine.paper_positions["SYNCTP2/USDT"] = {
+            "amount": 5.0, "entry_price": 100.0, "side": "long",
+            "stop_loss": 90.0, "take_profit": 120.0, "strategy_id": "manual",
+        }
+        bot = self._make_bot()
+        try:
+            await bot._sync_open_positions_from_execution_engine()
+        finally:
+            execution_engine.paper_positions.clear()
+            execution_engine.paper_positions.update(saved_positions)
+            execution_engine.is_paper = saved_is_paper
+            execution_engine.paper_balance = saved_balance
+            risk_manager.on_position_closed("SYNCTP2/USDT")
+
+        pos = bot.open_positions["SYNCTP2/USDT"]
+        self.assertIsNone(pos["take_profits"])
+        self.assertIsNone(pos["channel_id"])
+        self.assertEqual(pos["original_amount"], 5.0, "без Order — падаем на текущий amount")
+
+    async def test_telegram_position_without_matching_signal_does_not_crash(self):
+        from src.execution.executor import execution_engine
+        from src.risk.risk_manager import risk_manager
+
+        saved_positions = dict(execution_engine.paper_positions)
+        saved_is_paper = execution_engine.is_paper
+        saved_balance = execution_engine.paper_balance
+        execution_engine.is_paper = True
+        execution_engine.paper_balance = 10000.0
+        execution_engine.paper_positions["SYNCTP3/USDT"] = {
+            "amount": 5.0, "entry_price": 100.0, "side": "long",
+            "stop_loss": 90.0, "take_profit": 120.0, "strategy_id": "telegram_signal",
+            "order_id": 999999999,
+        }
+        bot = self._make_bot()
+        try:
+            await bot._sync_open_positions_from_execution_engine()
+        finally:
+            execution_engine.paper_positions.clear()
+            execution_engine.paper_positions.update(saved_positions)
+            execution_engine.is_paper = saved_is_paper
+            execution_engine.paper_balance = saved_balance
+            risk_manager.on_position_closed("SYNCTP3/USDT")
+
+        pos = bot.open_positions["SYNCTP3/USDT"]
+        self.assertIsNone(pos["take_profits"])
+        self.assertIsNone(pos["channel_id"])
+
+
 class TestManualCloseNotificationReplyThreading(unittest.IsolatedAsyncioTestCase):
     """Ручное закрытие через дашборд (POST /positions/close) должно отвечать
     на исходное сообщение об открытии позиции (reply_to_message_id), как и
