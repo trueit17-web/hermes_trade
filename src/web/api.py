@@ -689,6 +689,116 @@ async def edit_position(request: PositionEditRequest):
     return {"success": True, "symbol": symbol, "stop_loss": new_sl, "take_profit": new_tp}
 
 
+@app.get("/positions/detail")
+async def get_position_detail(symbol: str):
+    """
+    Подробности по ОТКРЫТОЙ позиции для разворачиваемой строки на
+    дашборде: уровни TP (достигнутые/предстоящие), канал-источник сигнала
+    и его качество/решение (для Telegram-сигналов) — аналог "Подробностей
+    сделки" (GET /trades/{id}/detail), но для позиции, у которой ещё нет
+    Trade (TradeDecisionLog.trade_id — FK на Trade, а Trade появляется
+    только при ЗАКРЫТИИ — см. decision_logger.py), поэтому и данные
+    берутся из других источников: TelegramSignal напрямую и
+    decision_logger.get_pending_steps (то, что накопилось в памяти с
+    момента открытия, если процесс не перезапускался).
+
+    symbol передаётся query-параметром (не частью пути) — символ вида
+    "BTC/USDT" содержит "/", который сломал бы path-параметр.
+    """
+    tracked = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
+    pos = tracked.get(symbol)
+    if pos is None:
+        raise HTTPException(status_code=404, detail=f"Открытая позиция {symbol} не найдена")
+
+    bot_pos = (
+        bot_registry.current_bot.open_positions.get(symbol)
+        if bot_registry.current_bot is not None else None
+    )
+
+    # Список уровней TP хранится только в TradingBot.open_positions
+    # (main.py) — execution_engine знает лишь финальный take_profit и
+    # счётчик tp_hit_count (см. _check_position_exit/_tp_levels в main.py).
+    # Без bot_pos (например, если бот только что перезапустился и ещё не
+    # успел восстановить его) показываем единственный известный уровень.
+    take_profits = (bot_pos or {}).get("take_profits") or (
+        [float(pos["take_profit"])] if pos.get("take_profit") is not None else []
+    )
+    tp_hit_count = (bot_pos or {}).get("tp_hit_count", pos.get("tp_hit_count", 0))
+    tp_levels = [
+        {"level": i + 1, "price": float(price), "hit": i < tp_hit_count}
+        for i, price in enumerate(take_profits)
+    ]
+
+    order_id = pos.get("order_id")
+    channel = None
+    signal = None
+    if order_id is not None:
+        async with get_session() as session:
+            ts = (
+                await session.execute(
+                    select(TelegramSignal)
+                    .options(selectinload(TelegramSignal.channel))
+                    .where(TelegramSignal.executed_order_id == order_id)
+                )
+            ).scalar_one_or_none()
+            if ts is not None:
+                if ts.channel:
+                    channel = {
+                        "id": ts.channel.id,
+                        "channel_id": ts.channel.channel_id,
+                        "channel_title": ts.channel.channel_title,
+                    }
+                signal = {
+                    "quality_score": ts.quality_score,
+                    "decision": ts.decision,
+                    "reject_reason": ts.reject_reason,
+                    "parsed_pair": ts.parsed_pair,
+                    "parsed_side": ts.parsed_side,
+                    "parsed_entry": float(ts.parsed_entry) if ts.parsed_entry is not None else None,
+                    "parsed_sl": float(ts.parsed_sl) if ts.parsed_sl is not None else None,
+                    "parsed_tp": float(ts.parsed_tp) if ts.parsed_tp is not None else None,
+                    "parsed_take_profits": ts.parsed_take_profits,
+                    "parsed_leverage": float(ts.parsed_leverage) if ts.parsed_leverage is not None else None,
+                    "raw_message": ts.raw_message,
+                    "message_date": ts.message_date.isoformat() + "Z" if ts.message_date else None,
+                }
+
+    # Decision log для НЕ-Telegram позиций (алго-стратегии/ручные) — то,
+    # что уже накоплено в памяти decision_logger с момента открытия и ещё
+    # ждёт закрытия позиции, чтобы попасть в БД (см. docstring выше).
+    decision_log = None
+    if signal is None:
+        from src.execution.decision_logger import decision_logger
+
+        pending = decision_logger.get_pending_steps(order_id)
+        if pending:
+            decision_log = [
+                {
+                    "step_order": s["step_order"],
+                    "step_type": s["step_type"],
+                    "description": s["description"],
+                    "details": s["details"],
+                    "created_at": s["timestamp"].isoformat() + "Z" if s.get("timestamp") else None,
+                }
+                for s in pending
+            ]
+
+    return {
+        "symbol": symbol,
+        "side": pos.get("side"),
+        "entry_price": float(pos["entry_price"]) if pos.get("entry_price") is not None else None,
+        "current_price": pos.get("current_price"),
+        "amount": pos.get("amount"),
+        "stop_loss": float(pos["stop_loss"]) if pos.get("stop_loss") is not None else None,
+        "take_profits": tp_levels,
+        "tp_hit_count": tp_hit_count,
+        "source": _position_source_label(pos.get("strategy_id")),
+        "channel": channel,
+        "signal": signal,
+        "decision_log": decision_log,
+    }
+
+
 @app.get("/risk/state")
 async def get_risk_state():
     """Текущее состояние риска."""

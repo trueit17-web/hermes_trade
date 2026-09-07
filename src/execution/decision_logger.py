@@ -170,6 +170,18 @@ class DecisionLogger:
             self._pending_by_order[order_id] = self._active_steps
         self._active_steps = []
 
+    def get_pending_steps(self, order_id: int | None) -> list[dict]:
+        """
+        Шаги, накопленные для order_id, но ещё НЕ сброшенные в БД (позиция
+        по этому ордеру ещё не закрыта — см. класс-докстринг). Только для
+        чтения — используется, чтобы показать "ход решения" по ещё
+        ОТКРЫТОЙ позиции на дашборде (GET /positions/detail); после
+        рестарта процесса пуст, т.к. накопление только в памяти.
+        """
+        if order_id is None:
+            return []
+        return list(self._pending_by_order.get(order_id, []))
+
     async def flush_for_trade(
         self,
         order_id: int | None,

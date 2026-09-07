@@ -10335,6 +10335,111 @@ class TestManualTrading(unittest.IsolatedAsyncioTestCase):
         symbols_other = {t["symbol"] for t in result_other["trades"]}
         self.assertNotIn("MANUALLIST1/USDT", symbols_other)
 
+    async def test_position_detail_returns_404_for_untracked_symbol(self):
+        await self._install_engine_and_bot(is_paper=True)
+        with self.assertRaises(self.HTTPException) as ctx:
+            await self.api_module.get_position_detail("NOPOSITION2/USDT")
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    async def test_position_detail_marks_reached_and_upcoming_tp_levels(self):
+        engine, bot = await self._install_engine_and_bot(is_paper=True)
+        await self.api_module.create_manual_order(self.api_module.ManualOrderCreate(
+            symbol="DETAILTP1/USDT", side="buy", amount=1.0, price=100.0,
+        ))
+        bot.open_positions["DETAILTP1/USDT"]["take_profits"] = [105.0, 110.0, 115.0]
+        bot.open_positions["DETAILTP1/USDT"]["tp_hit_count"] = 1
+
+        detail = await self.api_module.get_position_detail("DETAILTP1/USDT")
+
+        self.assertEqual(detail["tp_hit_count"], 1)
+        self.assertEqual(
+            [(lvl["level"], lvl["price"], lvl["hit"]) for lvl in detail["take_profits"]],
+            [(1, 105.0, True), (2, 110.0, False), (3, 115.0, False)],
+        )
+
+    async def test_position_detail_falls_back_to_single_tp_without_bot_position(self):
+        engine, bot = await self._install_engine_and_bot(is_paper=True)
+        engine.paper_positions["DETAILTP2/USDT"] = {
+            "amount": 1.0, "entry_price": 100.0, "side": "long",
+            "take_profit": 120.0, "strategy_id": "manual", "tp_hit_count": 0,
+        }
+        # Позиции нет в bot.open_positions (например, бот только что
+        # перезапустился) — take_profits (список) взять неоткуда, должны
+        # упасть на единственный известный уровень из execution_engine.
+        self.assertNotIn("DETAILTP2/USDT", bot.open_positions)
+
+        detail = await self.api_module.get_position_detail("DETAILTP2/USDT")
+
+        self.assertEqual(detail["take_profits"], [{"level": 1, "price": 120.0, "hit": False}])
+        self.assertIsNone(detail["channel"])
+        self.assertIsNone(detail["signal"])
+
+    async def test_position_detail_includes_telegram_channel_and_signal(self):
+        from datetime import datetime
+
+        from src.db.models import Order, TelegramChannel, TelegramSignal
+        from src.db.session import get_session
+
+        engine, bot = await self._install_engine_and_bot(is_paper=True)
+
+        async with get_session() as session:
+            exchange_id, symbol_id = await engine._resolve_symbol_id(session, "DETAILCHAN1/USDT")
+            order = Order(
+                exchange_id=exchange_id, symbol_id=symbol_id,
+                side="buy", order_type="market", amount=10.0, price=1.0,
+                status="filled", filled_amount=10.0, filled_price=1.0, fee=0.01,
+                client_order_id="detailchan1-open",
+            )
+            session.add(order)
+            await session.flush()
+            channel = TelegramChannel(channel_id="@detail_test_channel", channel_title="Detail Test Channel")
+            session.add(channel)
+            await session.flush()
+            signal = TelegramSignal(
+                channel_id=channel.id, raw_message="DETAILCHAN1/USDT Long", message_date=datetime.now(),
+                parsed_pair="DETAILCHAN1/USDT", parsed_side="long", parsed_entry=1.0,
+                parsed_sl=0.9, parsed_tp=1.5, parsed_take_profits=[1.2, 1.35, 1.5],
+                quality_score=0.87, decision="executed", executed_order_id=order.id,
+            )
+            session.add(signal)
+            await session.commit()
+            order_id = order.id
+
+        engine.paper_positions["DETAILCHAN1/USDT"] = {
+            "amount": 10.0, "entry_price": 1.0, "side": "long", "take_profit": 1.5,
+            "strategy_id": "telegram_signal", "order_id": order_id, "tp_hit_count": 0,
+        }
+
+        detail = await self.api_module.get_position_detail("DETAILCHAN1/USDT")
+
+        self.assertEqual(detail["channel"]["channel_title"], "Detail Test Channel")
+        self.assertEqual(detail["channel"]["channel_id"], "@detail_test_channel")
+        self.assertEqual(detail["signal"]["quality_score"], 0.87)
+        self.assertEqual(detail["signal"]["decision"], "executed")
+        self.assertEqual(detail["signal"]["parsed_take_profits"], [1.2, 1.35, 1.5])
+        self.assertIsNone(detail["decision_log"])
+
+    async def test_position_detail_includes_in_memory_decision_log_for_non_telegram_position(self):
+        from src.execution.decision_logger import decision_logger
+
+        engine, bot = await self._install_engine_and_bot(is_paper=True)
+        order = await self.api_module.create_manual_order(self.api_module.ManualOrderCreate(
+            symbol="DETAILLOG1/USDT", side="buy", amount=1.0, price=100.0,
+        ))
+        order_id = order["order_id"]
+        decision_logger._pending_by_order[order_id] = [{
+            "step_order": 1, "step_type": "risk_check",
+            "description": "test step", "details": {}, "timestamp": None,
+        }]
+        try:
+            detail = await self.api_module.get_position_detail("DETAILLOG1/USDT")
+        finally:
+            decision_logger._pending_by_order.pop(order_id, None)
+
+        self.assertIsNone(detail["channel"])
+        self.assertIsNotNone(detail["decision_log"])
+        self.assertEqual(detail["decision_log"][0]["step_type"], "risk_check")
+
 
 class TestManualCloseNotificationReplyThreading(unittest.IsolatedAsyncioTestCase):
     """Ручное закрытие через дашборд (POST /positions/close) должно отвечать
