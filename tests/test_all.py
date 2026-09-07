@@ -1835,6 +1835,109 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         # После TP1 остаток должен восстановиться с SL в безубытке
         self.assertAlmostEqual(restored["stop_loss"], restored["entry_price"])
 
+    async def test_restore_steps_trailing_sl_to_previous_tp_level_after_multiple_hits(self):
+        """
+        Регресс на прод-инцидент (INJ/USDT: tp_hit_count=3, SL после
+        рестарта показывал entry_price вместо цены TP2): _load_open_
+        positions_from_db раньше безусловно писал stop_loss=entry_price
+        для ЛЮБОГО tp_hit_count >= 1 — верно только для tp_hit_count == 1.
+        Начиная с tp_hit_count == 2 ступенчатый трейлинг (см.
+        _check_position_exit в main.py) должен был подтянуть SL к цене
+        ПРЕДЫДУЩЕГО сработавшего уровня, а не оставлять его замёрзшим в
+        безубытке.
+        """
+        from datetime import datetime
+
+        from src.db.models import TelegramChannel, TelegramSignal
+        from src.db.session import get_session
+
+        settings.trading_mode = "paper"
+        await self.engine.initialize("binance")
+
+        order = await self.engine.create_order(
+            symbol="TPSTEPSL1/USDT", side="buy", amount=9.0, price=100.0,
+            order_type="market", stop_loss=90.0, take_profit=130.0,
+            strategy_id="telegram_signal",
+        )
+        self.assertIsNotNone(order)
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@tpstepsl_test_channel", channel_title="TPStepSL Test")
+            session.add(channel)
+            await session.flush()
+            signal = TelegramSignal(
+                channel_id=channel.id, raw_message="x", message_date=datetime.now(),
+                parsed_pair="TPSTEPSL1/USDT", parsed_side="long", parsed_entry=100.0,
+                parsed_sl=90.0, parsed_tp=130.0, parsed_take_profits=[110.0, 120.0, 130.0],
+                decision="executed", executed_order_id=order.id,
+            )
+            session.add(signal)
+            await session.commit()
+
+        # TP1 сработал -> остаток должен встать в безубыток
+        result1 = await self.engine.close_paper_position(
+            symbol="TPSTEPSL1/USDT", side="long", entry_price=100.0, amount=3.0,
+            exit_price=110.0, reason="take_profit_1", entry_fee=order.fee / 3,
+            holding_seconds=60, order_open_id=order.id,
+        )
+        self.assertIsNotNone(result1)
+
+        # TP2 сработал -> остаток должен подтянуться к цене TP1 (110.0), а
+        # не остаться в безубытке (100.0) — это и есть проверяемый баг.
+        result2 = await self.engine.close_paper_position(
+            symbol="TPSTEPSL1/USDT", side="long", entry_price=100.0, amount=3.0,
+            exit_price=120.0, reason="take_profit_2", entry_fee=order.fee / 3,
+            holding_seconds=90, order_open_id=order.id,
+        )
+        self.assertIsNotNone(result2)
+
+        positions, _, _ = await self.engine._load_open_positions_from_db(is_paper=True)
+        self.assertIsNotNone(positions)
+        restored = positions["TPSTEPSL1/USDT"]
+        self.assertEqual(restored["tp_hit_count"], 2)
+        self.assertAlmostEqual(restored["stop_loss"], 110.0)
+
+    async def test_restore_falls_back_to_synthetic_tp_levels_without_channel_take_profits_data(self):
+        """
+        Если исходные уровни канала не удалось найти в БД (например,
+        Telegram-сигнал не сохранился) — восстановление не должно падать:
+        best-effort откат на ту же синтетическую линейную интерполяцию
+        уровней, что и в _tp_levels (main.py) при отсутствии take_profits.
+        """
+        settings.trading_mode = "paper"
+        await self.engine.initialize("binance")
+
+        order = await self.engine.create_order(
+            symbol="TPSTEPSL2/USDT", side="buy", amount=9.0, price=100.0,
+            order_type="market", stop_loss=90.0, take_profit=130.0,
+            strategy_id="telegram_signal",
+        )
+        self.assertIsNotNone(order)
+
+        result1 = await self.engine.close_paper_position(
+            symbol="TPSTEPSL2/USDT", side="long", entry_price=100.0, amount=3.0,
+            exit_price=110.0, reason="take_profit_1", entry_fee=order.fee / 3,
+            holding_seconds=60, order_open_id=order.id,
+        )
+        self.assertIsNotNone(result1)
+        result2 = await self.engine.close_paper_position(
+            symbol="TPSTEPSL2/USDT", side="long", entry_price=100.0, amount=3.0,
+            exit_price=120.0, reason="take_profit_2", entry_fee=order.fee / 3,
+            holding_seconds=90, order_open_id=order.id,
+        )
+        self.assertIsNotNone(result2)
+
+        positions, _, _ = await self.engine._load_open_positions_from_db(is_paper=True)
+        self.assertIsNotNone(positions)
+        restored = positions["TPSTEPSL2/USDT"]
+        self.assertEqual(restored["tp_hit_count"], 2)
+        # Без списка реальных целей канала откатываемся на ту же синтетику
+        # линейной интерполяции, что и _tp_levels в main.py (см.
+        # _restored_tp_levels в executor.py) — не на голый безубыток.
+        entry = restored["entry_price"]
+        expected_tp1 = entry + (restored["take_profit"] - entry) / 3
+        self.assertAlmostEqual(restored["stop_loss"], expected_tp1)
+
     async def test_restore_carries_notification_message_id(self):
         """
         Order.notification_message_id (id уведомления об открытии в

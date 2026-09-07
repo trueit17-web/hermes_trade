@@ -62,6 +62,27 @@ def _reason_notes_ru(reason: str) -> str:
     return reason
 
 
+def _restored_tp_levels(
+    entry_price: float, tp: float | None, strategy_id: str | None, take_profits: list[float] | None,
+) -> list[float]:
+    """
+    Копия TradingBot._tp_levels (main.py) — нужна здесь для восстановления
+    ступенчатого трейлинг-SL при рестарте (см. _load_open_positions_from_db),
+    но main.py не импортируется, чтобы не тянуть в execution engine весь
+    TradingBot и его зависимости (тот же приём, что и в
+    src/telegram/signal_outcome_simulation._tp_levels).
+    """
+    if strategy_id != "telegram_signal":
+        return [tp] if tp else []
+    if take_profits:
+        return list(take_profits)
+    if not tp:
+        return []
+    tp1 = entry_price + (tp - entry_price) / 3
+    tp2 = entry_price + (tp - entry_price) * 2 / 3
+    return [tp1, tp2, tp]
+
+
 class ExecutionEngine:
     """Движок исполнения ордеров."""
 
@@ -765,12 +786,54 @@ class ExecutionEngine:
                 pos["opened_at"] = o.created_at
 
         # Если хотя бы один уровень TP уже сработал, SL остатка позиции был
-        # передвинут в безубыток (см. _check_position_exit в main.py) — это
+        # передвинут ступенчатым трейлингом (см. _check_position_exit в
+        # main.py: TP1 -> безубыток, TPn (n>=2) -> уровень TP(n-1)) — это
         # решение никогда не пишется в Order.stop_loss в БД, поэтому
-        # применяем то же правило здесь, а не восстанавливаем исходный SL.
+        # пересчитываем его здесь по тому же правилу, а не восстанавливаем
+        # исходный SL. Раньше здесь безусловно писалось entry_price для
+        # ЛЮБОГО tp_hit_count >= 1 — верно только для tp_hit_count == 1
+        # (TP1 -> безубыток), но для tp_hit_count >= 2 откатывало уже
+        # подтверждённый рынком трейлинг обратно к безубытку вместо
+        # уровня TP(tp_hit_count-1) (реальный инцидент: прод-позиция
+        # INJ/USDT с tp_hit_count=3 после рестарта показывала SL=entry
+        # вместо цены TP2). Нужны реальные уровни канала (take_profits) —
+        # тот же запрос к TelegramSignal.parsed_take_profits по
+        # executed_order_id, что и в TradingBot._sync_open_positions_from_
+        # execution_engine (main.py) и GET /positions/detail (api.py).
+        multi_tp_order_ids = [
+            pos["order_id"] for pos in positions.values()
+            if pos["tp_hit_count"] >= 1
+            and pos.get("strategy_id") == "telegram_signal"
+            and pos.get("order_id")
+        ]
+        take_profits_by_order_id: dict[int, list[float]] = {}
+        if multi_tp_order_ids:
+            try:
+                async with get_session() as session:
+                    signals = (
+                        await session.execute(
+                            select(TelegramSignal.executed_order_id, TelegramSignal.parsed_take_profits)
+                            .where(TelegramSignal.executed_order_id.in_(multi_tp_order_ids))
+                        )
+                    ).all()
+                take_profits_by_order_id = {
+                    order_id: parsed for order_id, parsed in signals if parsed
+                }
+            except Exception as e:
+                logger.warning(f"Не удалось загрузить исходные уровни TP для восстановления трейлинг-SL: {e}")
+
         for pos in positions.values():
-            if pos["tp_hit_count"] >= 1:
-                pos["stop_loss"] = pos["entry_price"]
+            if pos["tp_hit_count"] < 1:
+                continue
+            tp_levels = _restored_tp_levels(
+                pos["entry_price"], pos.get("take_profit"), pos.get("strategy_id"),
+                take_profits_by_order_id.get(pos.get("order_id")),
+            )
+            level_hit = pos["tp_hit_count"] - 1
+            pos["stop_loss"] = (
+                pos["entry_price"] if level_hit == 0 or level_hit - 1 >= len(tp_levels)
+                else tp_levels[level_hit - 1]
+            )
 
         return positions, float(realized_pnl), cost_basis
 
