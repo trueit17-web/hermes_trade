@@ -226,7 +226,19 @@ class TradingBot:
         removed = [s for s in self.active_symbols if s not in combined]
 
         for symbol in added:
-            df = await self.ingest.fetch_ohlcv(symbol, "1h", limit=200)
+            # market_type — из открытой позиции по этому символу (если она
+            # есть), а не всегда "spot" по умолчанию: символы, "оставленные"
+            # выше в kept_for_open_positions, могут быть фьючерсными
+            # позициями без спотового листинга на бирже (см. тот же разбор
+            # в _refresh_symbol_candles). Раньше этот путь (первичная
+            # загрузка истории при старте процесса/появлении новой пары)
+            # не учитывал market_type вообще — реальный инцидент: TAO/USDT
+            # (фьючерсная позиция, нет спотовой пары) на каждом рестарте
+            # процесса валился с "does not have market symbol TAO/USDT" при
+            # первой же попытке подгрузить для неё 200 свечей здесь, хотя
+            # тот же баг в _refresh_symbol_candles уже был исправлен раньше.
+            market_type = execution_engine.get_open_positions().get(symbol, {}).get("market_type", "spot")
+            df = await self.ingest.fetch_ohlcv(symbol, "1h", limit=200, market_type=market_type)
             if df is not None:
                 self.ingest.update_buffer(symbol, df)
                 self.candles_buffer[symbol] = df

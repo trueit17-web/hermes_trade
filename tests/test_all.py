@@ -11095,6 +11095,49 @@ class TestRefreshSymbolCandlesRoutesMarketType(unittest.IsolatedAsyncioTestCase)
         bot.ingest.fetch_ohlcv.assert_awaited_once_with("SOME/USDT", "1h", limit=200, market_type="spot")
 
 
+class TestRefreshSymbolUniverseRoutesMarketType(unittest.IsolatedAsyncioTestCase):
+    """
+    Регресс на прод-инцидент: _refresh_symbol_universe (первичная загрузка
+    200 свечей для новых/"оставленных ради открытой позиции" пар — при
+    каждом рестарте процесса candles_buffer пуст, поэтому ВСЕ такие пары
+    проходят через ветку "added") запрашивала свечи всегда на споте, не
+    зная о market_type открытой позиции — тот же баг, что уже был исправлен
+    в _refresh_symbol_candles (см. TestRefreshSymbolCandlesRoutesMarketType
+    выше), но пропущенный в этом отдельном вызове. TAO/USDT (фьючерсная
+    позиция без спотового листинга на Bybit) на каждом рестарте валилась с
+    "does not have market symbol TAO/USDT" уже на самом первом обновлении
+    торговой вселенной, до того как _refresh_symbol_candles вообще
+    вызывался.
+    """
+
+    def _make_bot(self):
+        import src.main as main_module
+        return main_module.TradingBot()
+
+    async def test_kept_open_futures_position_requests_futures_market_type(self):
+        from src.execution.executor import execution_engine
+
+        bot = self._make_bot()
+        bot.ingest = AsyncMock()
+        bot.ingest.get_tradable_symbols = AsyncMock(return_value=["BTC/USDT"])
+        bot.ingest.fetch_ohlcv = AsyncMock(return_value=None)
+        bot.open_positions["TAO/USDT"] = {"side": "long"}
+
+        saved_positions = dict(execution_engine.paper_positions)
+        execution_engine.is_paper = True
+        execution_engine.paper_positions["TAO/USDT"] = {"market_type": "futures"}
+        try:
+            await bot._refresh_symbol_universe(initial=True)
+        finally:
+            execution_engine.paper_positions.clear()
+            execution_engine.paper_positions.update(saved_positions)
+            bot.open_positions.clear()
+
+        calls = {c.args[0]: c.kwargs.get("market_type") for c in bot.ingest.fetch_ohlcv.await_args_list}
+        self.assertEqual(calls.get("BTC/USDT"), "spot")
+        self.assertEqual(calls.get("TAO/USDT"), "futures")
+
+
 class TestRefreshSymbolCandlesUsesOwnBuffer(unittest.IsolatedAsyncioTestCase):
     """
     Регресс на прод-инцидент: TIA/USDT (открыт через авто-исполнение
