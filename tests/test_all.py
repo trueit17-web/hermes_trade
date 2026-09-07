@@ -2370,17 +2370,19 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.engine.exchange.create_market_buy_order.assert_not_called()
         self.assertNotIn("DATA1/USDT", self.engine.real_positions)
 
-    async def test_execute_real_order_skips_above_exchange_maximum_amount(self):
+    async def test_execute_real_order_caps_amount_to_exchange_maximum(self):
         """
-        Реальный инцидент (прод, MOODENG/USDT, фьючерсы): retCode 10001
-        "The number of contracts exceeds maximum limit allowed: too large,
-        order_qty:40909500000000 > max_qty:37000000000000" — низкоценовая
-        монета с большим circulating supply на типичный по USDT размер
-        позиции даёт объём в единицах монеты, превышающий maxOrderQty
-        биржи (ccxt/bybit: market["limits"]["amount"]["max"], из
-        lotSizeFilter.maxOrderQty). Раньше проверялся только минимум —
-        такой ордер уходил на биржу и падал оттуда ERROR'ом. Симметрично
-        минимуму, должен отклоняться ДО отправки.
+        Реальный инцидент (прод, MOODENG/USDT и позже GALA/USDT, фьючерсы):
+        retCode 10001 "The number of contracts exceeds maximum limit
+        allowed" — низкоценовая монета с большим circulating supply на
+        типичный по USDT размер позиции даёт объём в единицах монеты,
+        превышающий maxOrderQty биржи (ccxt/bybit: market["limits"]
+        ["amount"]["max"], из lotSizeFilter.maxOrderQty). Раньше объём выше
+        максимума заставлял ЦЕЛИКОМ пропускать сигнал (симметрично
+        минимуму) — но, в отличие от минимума, максимум можно просто
+        урезать и открыть позицию доступного биржей размера, а не терять
+        сигнал канала целиком (та же логика, что и клампинг плеча по
+        risk-limit тирам биржи, см. TestExecuteRealOrderLeverageTiers).
         """
         settings.trading_mode = "real"
         self.engine.is_paper = False
@@ -2389,14 +2391,40 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.engine.exchange.markets = {
             "MOODENG1/USDT": {"limits": {"amount": {"min": 1.0, "max": 37000000000000.0}}}
         }
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "capped-max-1", "filled": 37000000000000.0, "average": 0.00045, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
 
         order = await self.engine.create_order(
             symbol="MOODENG1/USDT", side="buy", amount=40909500000000.0, price=0.00045, order_type="market",
         )
 
+        self.assertIsNotNone(order)
+        self.engine.exchange.create_market_buy_order.assert_awaited_once_with(
+            "MOODENG1/USDT", 37000000000000.0,
+        )
+        self.assertEqual(self.engine.real_positions["MOODENG1/USDT"]["amount"], 37000000000000.0)
+
+    async def test_execute_real_order_still_rejects_amount_below_minimum_after_cap(self):
+        """Урезание до максимума не должно маскировать случай, когда даже
+        максимум биржи ниже минимально допустимого объёма (вырожденный/
+        противоречивый ответ биржи) — ордер всё равно отклоняется."""
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.markets = {
+            "DEGENERATE1/USDT": {"limits": {"amount": {"min": 5.0, "max": 2.0}}}
+        }
+
+        order = await self.engine.create_order(
+            symbol="DEGENERATE1/USDT", side="buy", amount=100.0, price=1.0, order_type="market",
+        )
+
         self.assertIsNone(order)
         self.engine.exchange.create_market_buy_order.assert_not_called()
-        self.assertNotIn("MOODENG1/USDT", self.engine.real_positions)
+        self.assertNotIn("DEGENERATE1/USDT", self.engine.real_positions)
 
     async def test_execute_real_order_allows_amount_within_maximum(self):
         """Регресс: объём в допустимом диапазоне не должен блокироваться новой
@@ -2420,7 +2448,7 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(order)
         self.engine.exchange.create_market_buy_order.assert_awaited_once()
 
-    async def test_execute_real_order_skips_above_market_order_max_qty(self):
+    async def test_execute_real_order_caps_above_market_order_max_qty(self):
         """
         Реальный инцидент (прод, ALT/USDT, фьючерсы): retCode 10001 "The
         number of contracts exceeds maximum limit allowed: too large,
@@ -2432,9 +2460,8 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         maxMktOrderQty (обычно ниже, чем maxOrderQty/maxTradingQty,
         применимые к лимитным ордерам) — ccxt не прокладывает это поле в
         унифицированные limits, только в сырой market["info"]. Объём,
-        прошедший проверку по unified max, должен всё равно блокироваться
-        по этому отдельному лимиту, раз наш execution engine отправляет
-        только market-ордера.
+        прошедший проверку по unified max, но превышающий этот отдельный
+        лимит, тоже должен урезаться до него, а не отклонять сигнал целиком.
         """
         settings.trading_mode = "real"
         self.engine.is_paper = False
@@ -2446,14 +2473,20 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
                 "info": {"lotSizeFilter": {"maxMktOrderQty": "250000000000000"}},
             }
         }
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "capped-mktmax-1", "filled": 250000000000000.0, "average": 0.0000651, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
 
         order = await self.engine.create_order(
             symbol="ALT1/USDT", side="buy", amount=279846200000000.0, price=0.0000651, order_type="market",
         )
 
-        self.assertIsNone(order)
-        self.engine.exchange.create_market_buy_order.assert_not_called()
-        self.assertNotIn("ALT1/USDT", self.engine.real_positions)
+        self.assertIsNotNone(order)
+        self.engine.exchange.create_market_buy_order.assert_awaited_once_with(
+            "ALT1/USDT", 250000000000000.0,
+        )
+        self.assertEqual(self.engine.real_positions["ALT1/USDT"]["amount"], 250000000000000.0)
 
     async def test_execute_real_order_allows_amount_within_market_order_max_qty(self):
         """Регресс: объём в допустимом диапазоне по maxMktOrderQty не должен
@@ -2487,26 +2520,27 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         исполнить ордер на бирже — см. логи" вместо настоящей причины.
         execution_engine.last_order_rejection_reason должен нести ту же
         причину, что и WARNING в логе, чтобы main.py мог прокинуть её в
-        TelegramSignal.reject_reason.
+        TelegramSignal.reject_reason. Объём НИЖЕ минимума (в отличие от
+        объёма выше максимума — см. test_execute_real_order_caps_above_
+        market_order_max_qty — который теперь урезается, а не отклоняет
+        сигнал целиком) по-прежнему остаётся отклонением: увеличивать
+        объём сигнала бот не имеет права.
         """
         settings.trading_mode = "real"
         self.engine.is_paper = False
         self.engine.exchange_id = "bybit"
         self.engine.exchange = AsyncMock()
         self.engine.exchange.markets = {
-            "ALT2/USDT": {
-                "limits": {"amount": {"min": 1.0, "max": 300000000000000.0}},
-                "info": {"lotSizeFilter": {"maxMktOrderQty": "250000000000000"}},
-            }
+            "ALT2/USDT": {"limits": {"amount": {"min": 1.0}, "cost": {"min": 5.0}}}
         }
 
         order = await self.engine.create_order(
-            symbol="ALT2/USDT", side="buy", amount=279846200000000.0, price=0.0000651, order_type="market",
+            symbol="ALT2/USDT", side="buy", amount=0.5, price=0.0000651, order_type="market",
         )
 
         self.assertIsNone(order)
         self.assertIsNotNone(self.engine.last_order_rejection_reason)
-        self.assertIn("больше максимального допустимого биржей", self.engine.last_order_rejection_reason)
+        self.assertIn("меньше минимального", self.engine.last_order_rejection_reason)
 
     async def test_last_order_rejection_reason_reflects_exchange_exception(self):
         """Ошибка биржи (retCode и т.п.), поднятая как исключение из

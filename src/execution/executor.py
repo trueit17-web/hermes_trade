@@ -2194,6 +2194,23 @@ class ExecutionEngine:
             except Exception as e:
                 logger.debug(f"Не удалось установить плечо {leverage_to_set}x для {symbol}: {e}")
 
+        # Объём выше максимума, допустимого биржей по этой паре, — не повод
+        # отказываться от сигнала целиком (в отличие от объёма НИЖЕ
+        # минимума, который уменьшить нельзя): урезаем до максимума и
+        # открываем позицию меньшего размера, как и с плечом выше (риск-
+        # limit тир биржи капается, а не отклоняет ордер целиком). Реальный
+        # инцидент: GALA/USDT (низкая цена, огромный circulating supply) —
+        # запрошенный по проценту от баланса объём регулярно превышал
+        # maxOrderQty/maxMktOrderQty биржи, и сигнал канала молча
+        # пропускался целиком вместо открытия позиции доступного размера.
+        max_amount = self._market_max_amount(symbol, exchange)
+        if isinstance(max_amount, (int, float)) and amount > max_amount:
+            logger.warning(
+                f"⚠️ Объём {amount:.8f} {symbol.split('/')[0]} превышает максимально допустимый "
+                f"биржей ({max_amount}) — используем {max_amount}."
+            )
+            amount = max_amount
+
         outside_limits = self._outside_exchange_amount_limits(symbol, amount, price, exchange)
         if outside_limits:
             logger.warning(f"⚠️ Реальный ордер {symbol} пропущен: {outside_limits}.")
