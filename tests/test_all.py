@@ -4650,6 +4650,81 @@ class TestCerebrasSignalParser(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
 
 
+class TestParserSchemasAllowNullTakeProfits(unittest.IsolatedAsyncioTestCase):
+    """
+    Регресс: во всех 4 LLM-парсерах JSON-схема поля take_profits была
+    {"type": "array", ...} — без "null" в списке допустимых типов (в
+    отличие от entry/stop_loss/leverage/is_market_entry, которые уже
+    допускают null). Модель на сообщении без единого тейка (например,
+    просто "покупаю" без цифр) иногда возвращает take_profits: null
+    вместо пустого списка — Groq/Cerebras валидируют tool-call аргументы
+    строго по схеме и отклоняют такой ответ с "Tool call validation
+    failed: ... /take_profits: expected array, but got null", парсер
+    падает на фолбэк дальше по цепочке вместо использования уже
+    полученного (валидного по сути) ответа. Тот же класс бага, что уже
+    чинили для is_market_entry ранее в этой сессии. Схема должна
+    допускать null — код, читающий data.get("take_profits"), уже
+    трактует None как "нет целей" через `or []` ниже по обработке.
+    """
+
+    def test_groq_schema_allows_null_take_profits(self):
+        from src.telegram.groq_parser import _TOOL
+        tp_schema = _TOOL["function"]["parameters"]["properties"]["take_profits"]
+        self.assertIn("null", tp_schema["type"])
+
+    def test_cerebras_schema_allows_null_take_profits(self):
+        from src.telegram.cerebras_parser import _TOOL
+        tp_schema = _TOOL["function"]["parameters"]["properties"]["take_profits"]
+        self.assertIn("null", tp_schema["type"])
+
+    def test_llm_parser_schema_allows_null_take_profits(self):
+        from src.telegram.llm_parser import _TOOL
+        tp_schema = _TOOL["input_schema"]["properties"]["take_profits"]
+        self.assertIn("null", tp_schema["type"])
+
+    def test_gemini_schema_allows_null_take_profits(self):
+        from src.telegram.gemini_parser import _RESPONSE_SCHEMA
+        tp_schema = _RESPONSE_SCHEMA["properties"]["take_profits"]
+        self.assertIn("null", tp_schema["type"])
+
+    async def test_groq_handles_null_take_profits_in_response(self):
+        """Данные с take_profits=None (как реально вернула модель в проде)
+        не должны ронять парсер — должны трактоваться как отсутствие целей."""
+        import json
+        import src.telegram.groq_parser as groq_parser_module
+
+        settings_saved = (settings.telegram_llm_fallback_enabled, settings.groq_api_key)
+        settings.telegram_llm_fallback_enabled = True
+        settings.groq_api_key = "test-key"
+        try:
+            tool_call = MagicMock()
+            tool_call.function.arguments = json.dumps({
+                "is_signal": True, "base": "BOME", "quote": "USDT", "side": "short",
+                "entry": None, "is_market_entry": True, "take_profits": None,
+                "stop_loss": None, "confidence": 0.9,
+            })
+            message = MagicMock()
+            message.tool_calls = [tool_call]
+            choice = MagicMock()
+            choice.message = message
+            resp = MagicMock()
+            resp.choices = [choice]
+
+            mock_client = MagicMock()
+            mock_client.chat.completions.create = AsyncMock(return_value=resp)
+            groq_parser_module._client = mock_client
+
+            result = await groq_parser_module.parse_with_groq("Заполняю BOME Short")
+        finally:
+            settings.telegram_llm_fallback_enabled, settings.groq_api_key = settings_saved
+            groq_parser_module._client = None
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["take_profits"], [])
+        self.assertIsNone(result["tp"])
+        self.assertIsNone(result["sl"])
+
+
 class TestQualificationScorer(unittest.TestCase):
     """Тесты для scorer качества сигналов."""
 

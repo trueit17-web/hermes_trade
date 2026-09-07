@@ -47,7 +47,7 @@ _RESPONSE_SCHEMA = {
         "side": {"type": ["string", "null"], "enum": ["long", "short", None]},
         "entry": {"type": ["number", "null"]},
         "is_market_entry": {"type": ["boolean", "null"]},
-        "take_profits": {"type": "array", "items": {"type": "number"}},
+        "take_profits": {"type": ["array", "null"], "items": {"type": "number"}},
         "stop_loss": {"type": ["number", "null"]},
         "leverage": {"type": ["number", "null"]},
         "confidence": {"type": "number"},
