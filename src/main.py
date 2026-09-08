@@ -456,21 +456,24 @@ class TradingBot:
             f"Объём: {event.amount:.6f}"
         )
 
-    async def _channel_notification_stats(self, channel_id: str) -> tuple[str, int, int] | None:
+    async def _channel_notification_stats(self, channel_id: str) -> tuple[str, int, int, int] | None:
         """
         Название канала и статистика применённых им сигналов — (заголовок,
-        всего применено, закрыто в плюс) — для строки в уведомлении об
-        открытии позиции. None, если канал не резолвится (удалён из
-        мониторинга/не найден в БД).
+        всего применено, закрыто в плюс, сейчас открыто) — для строки в
+        уведомлении об открытии позиции. None, если канал не резолвится
+        (удалён из мониторинга/не найден в БД).
 
-        Тот же расчёт, что и в GET /telegram/channels/stats (api.py) —
-        applied = сигналы с decision=="executed", closed = те из них, у
-        кого уже проставлен executed_trade, wins = сколько из закрытых
-        завершились outcome=="win". Считается ЖИВЫМ запросом к БД (не из
-        кэша) — статистика открытия должна отражать состояние на текущий
-        момент. Вызывается ДО _save_telegram_signal (см. _on_telegram_signal
-        порядок вызовов) — сама текущая сделка в БД ещё не сохранена,
-        поэтому applied увеличивается на 1 вручную вызывающим кодом.
+        Открыта/закрыта позиция определяется НЕ по TelegramSignal.
+        executed_trade_id — эта ссылка проставляется только на пути
+        обычного закрытия ботом (_link_telegram_signal_trade) и никогда на
+        путях внешнего закрытия (см. тот же фикс и подробный докстринг в
+        GET /telegram/signals, api.py) — а по реальным строкам Trade,
+        агрегированным по order_open_id. Считается ЖИВЫМ запросом к БД (не
+        из кэша) — статистика открытия должна отражать состояние на
+        текущий момент. Вызывается ДО _save_telegram_signal (см.
+        _on_telegram_signal порядок вызовов) — сама текущая сделка в БД ещё
+        не сохранена, поэтому applied увеличивается на 1 вручную вызывающим
+        кодом.
         """
         db_channel_id = self._telegram_channel_db_ids.get(channel_id)
         if db_channel_id is None:
@@ -483,14 +486,43 @@ class TradingBot:
                 signals = (
                     await session.execute(
                         select(TelegramSignal)
-                        .options(selectinload(TelegramSignal.executed_trade))
+                        .options(selectinload(TelegramSignal.executed_order))
                         .where(TelegramSignal.channel_id == db_channel_id)
                     )
                 ).scalars().all()
-                executed = [s for s in signals if s.decision == "executed"]
-                closed_trades = [s.executed_trade for s in executed if s.executed_trade is not None]
-                wins = sum(1 for t in closed_trades if t.outcome == "win")
-                return (channel.channel_title or channel.channel_id), len(executed), wins
+                executed = [s for s in signals if s.decision == "executed" and s.executed_order_id is not None]
+
+                order_ids = [s.executed_order_id for s in executed]
+                trades_by_order: dict[int, list] = {}
+                if order_ids:
+                    raw_trades = (
+                        await session.execute(
+                            select(Trade).where(Trade.order_open_id.in_(order_ids))
+                        )
+                    ).scalars().all()
+                    for t in raw_trades:
+                        trades_by_order.setdefault(t.order_open_id, []).append(t)
+
+                wins = 0
+                open_count = 0
+                for s in executed:
+                    legs = trades_by_order.get(s.executed_order_id)
+                    if not legs:
+                        open_count += 1
+                        continue
+                    order = s.executed_order
+                    order_amount = (
+                        float(order.filled_amount) if order and order.filled_amount else
+                        (float(order.amount) if order else 0.0)
+                    )
+                    total_amount = sum(float(t.amount) for t in legs)
+                    if order_amount - total_amount > max(order_amount * 0.01, 1e-9):
+                        open_count += 1
+                        continue
+                    total_pnl = sum(float(t.pnl) for t in legs)
+                    if total_pnl > 0:
+                        wins += 1
+                return (channel.channel_title or channel.channel_id), len(executed), wins, open_count
         except Exception as e:
             logger.debug(f"Не удалось получить статистику канала {channel_id} для уведомления: {e}")
             return None
@@ -507,22 +539,21 @@ class TradingBot:
             return f"🛑 SL: {sl:.6f} (бумажный режим — только внутренний контроль бота)"
         pos = execution_engine.real_positions.get(symbol) or {}
         if pos.get("sl_order_id"):
-            return f"🛑 SL: {sl:.6f} — ✅ выставлен на бирже"
+            return f"🛑 SL: {sl:.6f} ✅"
         return f"🛑 SL: {sl:.6f} — ⚠️ не подтверждён на бирже, только внутренний контроль"
 
     def _tp_notification_lines(self, take_profits: list[float] | None, tp: float | None) -> str:
         """
-        Строки TP-уровней для уведомления об открытии. TP сознательно
-        никогда не выставляется отдельным ордером на бирже (см. докстринг
-        _place_stop_loss_order — у Bybit нет нативного OCO для частичного
-        выхода по нескольким уровням) — статус здесь общий для всех
-        уровней, а не "на бирже: да/нет" по каждому отдельно, как для SL.
+        Строки TP-уровней для уведомления об открытии. В отличие от SL, TP
+        сознательно никогда не выставляется отдельным ордером на бирже (см.
+        докстринг _place_stop_loss_order — у Bybit нет нативного OCO для
+        частичного выхода по нескольким уровням) — статус на бирже здесь
+        не показывается, только сами уровни.
         """
         levels = list(take_profits) if take_profits else ([tp] if tp else [])
         if not levels:
             return "🎯 TP: не указан"
-        lines = "\n".join(f"🎯 TP{i + 1}: {level:.6f}" for i, level in enumerate(levels))
-        return lines + "\n(TP — внутренний контроль бота, нативного ордера на бирже нет)"
+        return "\n".join(f"🎯 TP{i + 1}: {level:.6f}" for i, level in enumerate(levels))
 
     async def _update_coinglass(self):
         """Обновление данных из CoinGlass."""
@@ -980,11 +1011,12 @@ class TradingBot:
         if channel_id:
             channel_stats = await self._channel_notification_stats(channel_id)
             if channel_stats:
-                title, applied, wins = channel_stats
-                # +1 — эта сделка ещё не сохранена в БД на момент подсчёта
-                # (_save_telegram_signal вызывается ПОСЛЕ _execute_telegram_
-                # signal, см. _on_telegram_signal), но она уже применена.
-                lines.append(f"Канал: {title} (применено {applied + 1}, закрыто в плюс {wins})")
+                title, applied, wins, open_count = channel_stats
+                # +1 к applied и open_count — эта сделка ещё не сохранена в
+                # БД на момент подсчёта (_save_telegram_signal вызывается
+                # ПОСЛЕ _execute_telegram_signal, см. _on_telegram_signal),
+                # но она уже применена и уже открыта.
+                lines.append(f"Канал: {title} (из {applied + 1}/ {wins} в+/{open_count + 1} откр.)")
             else:
                 lines.append(f"Канал: {channel_id}")
 

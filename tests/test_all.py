@@ -5588,6 +5588,70 @@ class TestTradesGrouping(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(row["pnl_pct_leveraged"])
 
 
+class TestTelegramSignalsClosedStatus(unittest.IsolatedAsyncioTestCase):
+    """
+    GET /telegram/signals должен показывать позицию как закрытую по
+    реальным строкам Trade (агрегированным по order_open_id), а не по
+    TelegramSignal.executed_trade_id — эта ссылка проставляется только
+    main.py._link_telegram_signal_trade на пути обычного (внутреннего)
+    закрытия и никогда не проставляется здесь в тесте (как и на реальных
+    путях внешнего закрытия в executor.py) — раньше это заставляло историю
+    сигналов канала показывать "открыта" для давно закрытых позиций.
+    """
+
+    async def test_shows_closed_without_executed_trade_id_link(self):
+        from src.db.models import TelegramChannel, TelegramSignal
+        from src.db.session import get_session
+        from src.execution.executor import ExecutionEngine
+        from src.utils.timeutils import utcnow
+        from src.web.api import list_telegram_signals
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "paper"
+        await engine.initialize("binance")
+
+        symbol = "TGSIGSTATUS1/USDT"
+        order = await engine.create_order(
+            symbol=symbol, side="buy", amount=10.0, price=200.0, order_type="market",
+        )
+        self.assertIsNotNone(order)
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@tgsigstatus_channel", channel_title="TG Status Channel", active=True)
+            session.add(channel)
+            await session.flush()
+            session.add(TelegramSignal(
+                channel_id=channel.id, raw_message="test", message_date=utcnow(),
+                parsed_pair=symbol, parsed_side="long", parsed_entry=200.0,
+                decision="executed", executed_order_id=order.id,
+                # executed_trade_id намеренно НЕ проставлен — именно так
+                # выглядят позиции, закрытые вне обычного цикла main.py.
+            ))
+            db_channel_id = channel.id
+            await session.commit()
+
+        # Первая часть — сработавший TP1, вторая — остаток закрылся по SL
+        # (типичная картина для канала со ступенчатым TP/SL).
+        await engine.close_paper_position(
+            symbol=symbol, side="long", entry_price=200.0, amount=5.0,
+            exit_price=220.0, reason="take_profit_1", entry_fee=1.0,
+            holding_seconds=60, order_open_id=order.id,
+        )
+        await engine.close_paper_position(
+            symbol=symbol, side="long", entry_price=200.0, amount=5.0,
+            exit_price=195.0, reason="stop_loss", entry_fee=1.0,
+            holding_seconds=120, order_open_id=order.id,
+        )
+
+        result = await list_telegram_signals(channel_id=db_channel_id, limit=50)
+        signal = next(s for s in result["signals"] if s["parsed_pair"] == symbol)
+
+        self.assertIsNotNone(signal["trade"])
+        self.assertFalse(signal["trade"]["is_open"], "позиция полностью закрыта — не должна показываться открытой")
+        # Только первая часть была настоящим тейк-профитом, вторая — SL.
+        self.assertEqual(signal["tp_hit_count"], 1)
+
+
 class TestStatusExposesExchangeOrderId(unittest.IsolatedAsyncioTestCase):
     """GET /status должен показывать ID открывающего ордера с биржи для
     каждой открытой реальной позиции — раньше в ответе был только
@@ -12810,10 +12874,14 @@ class TestOnTradeEventFiltering(unittest.IsolatedAsyncioTestCase):
 class TestChannelNotificationStats(unittest.IsolatedAsyncioTestCase):
     """
     _channel_notification_stats — название канала и (применено, закрыто в
-    плюс) для строки в уведомлении об открытии позиции. Тот же расчёт, что
-    и в GET /telegram/channels/stats (api.py): applied = decision=="executed",
-    closed = у кого уже проставлен executed_trade, wins = outcome=="win"
-    среди закрытых.
+    плюс, сейчас открыто) для строки в уведомлении об открытии позиции.
+
+    Открыта/закрыта определяется по реальным строкам Trade, агрегированным
+    по order_open_id (== TelegramSignal.executed_order_id) — НЕ по
+    TelegramSignal.executed_trade_id, которая никогда не проставляется на
+    путях внешнего закрытия позиции (см. тот же фикс в GET /telegram/signals,
+    api.py) — поэтому тестовые сигналы ниже связаны через открывающий Order,
+    как в реальном коде, а не напрямую через executed_trade_id.
     """
 
     def _make_bot(self):
@@ -12823,8 +12891,8 @@ class TestChannelNotificationStats(unittest.IsolatedAsyncioTestCase):
             self.skipTest(f"src.main not importable in this environment: {e}")
         return main_module.TradingBot()
 
-    async def test_computes_applied_and_win_counts(self):
-        from src.db.models import Exchange, Symbol, TelegramChannel, TelegramSignal, Trade
+    async def test_computes_applied_win_and_open_counts(self):
+        from src.db.models import Exchange, Order, Symbol, TelegramChannel, TelegramSignal, Trade
         from src.db.session import get_session
         from src.utils.timeutils import utcnow
 
@@ -12846,23 +12914,36 @@ class TestChannelNotificationStats(unittest.IsolatedAsyncioTestCase):
             await session.flush()
             db_channel_id = channel.id
 
+            def _make_order():
+                order = Order(
+                    exchange_id=exchange.id, symbol_id=symbol.id, side="buy", order_type="market",
+                    amount=1.0, status="filled", filled_amount=1.0, filled_price=100.0,
+                )
+                session.add(order)
+                return order
+
             for outcome, pnl in [("win", 10.0), ("win", 5.0), ("loss", -3.0)]:
+                order = _make_order()
+                await session.flush()
                 trade = Trade(
-                    symbol_id=symbol.id, direction="long", entry_price=100.0, exit_price=101.0,
+                    symbol_id=symbol.id, order_open_id=order.id, direction="long",
+                    entry_price=100.0, exit_price=101.0,
                     amount=1.0, pnl=pnl, pnl_pct=1.0, outcome=outcome, is_open=False, closed_at=utcnow(),
                 )
                 session.add(trade)
-                await session.flush()
                 session.add(TelegramSignal(
                     channel_id=db_channel_id, raw_message="test", message_date=utcnow(),
                     parsed_pair="NOTIFSTATS/USDT", parsed_side="long", parsed_entry=100.0,
-                    decision="executed", executed_trade_id=trade.id,
+                    decision="executed", executed_order_id=order.id,
                 ))
-            # Исполнена, но ещё не закрыта — считается в applied, не в closed/wins.
+            # Исполнена, но ещё не закрыта (нет Trade) — считается в applied
+            # и в open_count, не в wins.
+            open_order = _make_order()
+            await session.flush()
             session.add(TelegramSignal(
                 channel_id=db_channel_id, raw_message="test", message_date=utcnow(),
                 parsed_pair="NOTIFSTATS/USDT", parsed_side="long", parsed_entry=100.0,
-                decision="executed",
+                decision="executed", executed_order_id=open_order.id,
             ))
             # Отклонена — не должна учитываться вовсе.
             session.add(TelegramSignal(
@@ -12878,10 +12959,11 @@ class TestChannelNotificationStats(unittest.IsolatedAsyncioTestCase):
         result = await bot._channel_notification_stats("@notif_stats_channel")
 
         self.assertIsNotNone(result)
-        title, applied, wins = result
+        title, applied, wins, open_count = result
         self.assertEqual(title, "Notif Stats Channel")
         self.assertEqual(applied, 4)
         self.assertEqual(wins, 2)
+        self.assertEqual(open_count, 1)
 
     async def test_unknown_channel_returns_none(self):
         bot = self._make_bot()
@@ -12942,8 +13024,7 @@ class TestNotifySignalOpened(unittest.IsolatedAsyncioTestCase):
         self.assertIn("TP1: 51000.000000", text)
         self.assertIn("TP2: 52000.000000", text)
         self.assertIn("TP3: 53000.000000", text)
-        self.assertIn("SL: 49000.000000", text)
-        self.assertIn("✅ выставлен на бирже", text)
+        self.assertIn("SL: 49000.000000 ✅", text)
         self.assertEqual(bot.open_positions["NOTIFYSIG1/USDT"]["notification_message_id"], 555)
         self.assertEqual(mock_engine.real_positions["NOTIFYSIG1/USDT"]["notification_message_id"], 555)
         mock_engine.set_order_notification_message_id.assert_awaited_once_with(42, 555)

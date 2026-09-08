@@ -2528,9 +2528,16 @@ function renderChannelSignalsTable(signals) {
             } else if (s.decision === "rejected") {
               outcome = `<span class="muted">🚫 ${escapeHtml(s.reject_reason || "причина не записана")}</span>`;
             }
-            const tpDisplay = s.parsed_take_profits && s.parsed_take_profits.length > 1
-              ? s.parsed_take_profits.map(v => fmtPrice(v)).join(" → ")
-              : (s.parsed_tp !== null ? fmtPrice(s.parsed_tp) : "—");
+            const tpList = s.parsed_take_profits && s.parsed_take_profits.length > 1
+              ? s.parsed_take_profits
+              : (s.parsed_tp !== null ? [s.parsed_tp] : []);
+            const tpHitCount = s.tp_hit_count || 0;
+            const tpDisplay = tpList.length
+              ? tpList.map((v, i) => i < tpHitCount
+                  ? `<span style="color:#4caf50;text-decoration:line-through">${fmtPrice(v)}</span>`
+                  : fmtPrice(v)
+                ).join(" → ")
+              : "—";
             // Кредитное плечо, явно указанное каналом в тексте сигнала
             // (см. extract_leverage в channel_monitor.py) — применяется
             // при открытии фьючерсного ордера вместо глобального

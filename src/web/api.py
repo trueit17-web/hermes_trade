@@ -280,12 +280,19 @@ async def root():
     }
 
 
-def _position_source_label(strategy_id: str | None) -> str:
-    """Человекочитаемый источник сигнала по строковому strategy_id (см. executor.py/main.py)."""
+def _position_source_label(strategy_id: str | None, channel_title: str | None = None) -> str:
+    """
+    Человекочитаемый источник сигнала по строковому strategy_id (см.
+    executor.py/main.py). Для telegram_signal, если известно конкретное
+    название канала (см. вызывающие места — TelegramChannel по
+    executed_order_id/order_open_id соответствующей позиции/сделки),
+    показываем его вместо общей пометки "📲 Telegram" — иначе одинаковые
+    сигналы из разных каналов было не отличить друг от друга.
+    """
     if not strategy_id:
         return "—"
     if strategy_id == "telegram_signal":
-        return "📲 Telegram"
+        return f"📲 {channel_title}" if channel_title else "📲 Telegram"
     if strategy_id == "manual":
         return "🖐 Ручная"
     strategy = strategy_registry.get(strategy_id)
@@ -367,6 +374,7 @@ async def get_status():
     if open_positions:
         order_ids = [pos["order_id"] for pos in open_positions.values() if pos.get("order_id")]
         exchange_ids_by_order: dict[int, str | None] = {}
+        channel_titles_by_order: dict[int, str] = {}
         if order_ids:
             async with get_session() as session:
                 rows = (
@@ -375,8 +383,23 @@ async def get_status():
                     )
                 ).all()
                 exchange_ids_by_order = dict(rows)
+                # execution_engine.real_positions/paper_positions не хранят
+                # channel_id (только main.py.open_positions делает это) —
+                # достаём название канала отдельным батч-запросом по
+                # executed_order_id, чтобы источник сигнала в открытых
+                # позициях показывал конкретный канал, а не общее "Telegram".
+                signal_rows = (
+                    await session.execute(
+                        select(TelegramSignal.executed_order_id, TelegramChannel.channel_title)
+                        .join(TelegramChannel, TelegramSignal.channel_id == TelegramChannel.id)
+                        .where(TelegramSignal.executed_order_id.in_(order_ids))
+                    )
+                ).all()
+                channel_titles_by_order = dict(signal_rows)
         for symbol, pos in open_positions.items():
-            pos["source"] = _position_source_label(pos.get("strategy_id"))
+            pos["source"] = _position_source_label(
+                pos.get("strategy_id"), channel_titles_by_order.get(pos.get("order_id"))
+            )
             pos["current_price"] = execution_engine.last_prices.get(symbol)
             pos["order_id_exchange"] = exchange_ids_by_order.get(pos.get("order_id"))
 
@@ -792,7 +815,7 @@ async def get_position_detail(symbol: str):
         "stop_loss": float(pos["stop_loss"]) if pos.get("stop_loss") is not None else None,
         "take_profits": tp_levels,
         "tp_hit_count": tp_hit_count,
-        "source": _position_source_label(pos.get("strategy_id")),
+        "source": _position_source_label(pos.get("strategy_id"), channel["channel_title"] if channel else None),
         "channel": channel,
         "signal": signal,
         "decision_log": decision_log,
@@ -942,6 +965,21 @@ async def list_trades(limit: int = 100, offset: int = 0, strategy_id: str | None
             )
         raw_trades = (await session.execute(query)).scalars().all()
 
+        # Название канала для отображения источника — Trade/Order не хранят
+        # channel_id напрямую, а только через TelegramSignal.executed_order_id
+        # (см. тот же батч-запрос в GET /status и docstring _position_source_label).
+        open_order_ids = [t.order_open_id for t in raw_trades if t.order_open_id is not None]
+        channel_titles_by_order: dict[int, str] = {}
+        if open_order_ids:
+            signal_rows = (
+                await session.execute(
+                    select(TelegramSignal.executed_order_id, TelegramChannel.channel_title)
+                    .join(TelegramChannel, TelegramSignal.channel_id == TelegramChannel.id)
+                    .where(TelegramSignal.executed_order_id.in_(open_order_ids))
+                )
+            ).all()
+            channel_titles_by_order = dict(signal_rows)
+
         groups: dict = {}
         for t in raw_trades:
             key = t.order_open_id if t.order_open_id is not None else f"single-{t.id}"
@@ -992,7 +1030,10 @@ async def list_trades(limit: int = 100, offset: int = 0, strategy_id: str | None
                 "outcome": outcome,
                 "is_open": last.is_open,
                 "parts": len(group),
-                "source": _position_source_label(last.strategy.name if last.strategy else None),
+                "source": _position_source_label(
+                    last.strategy.name if last.strategy else None,
+                    channel_titles_by_order.get(last.order_open_id),
+                ),
                 "order_id_exchange_open": first.order_open.order_id_exchange if first.order_open else None,
                 "order_id_exchange_close": last.order_close.order_id_exchange if last.order_close else None,
                 "created_at": opened_at.isoformat() + "Z" if opened_at else None,
@@ -1099,11 +1140,21 @@ async def get_trade_detail(trade_id: int):
         # связанного открывающего Order.
         opened_at = trade.order_open.created_at if trade.order_open else group[0].created_at
 
+        channel_title = None
+        if trade.order_open_id is not None:
+            channel_title = (
+                await session.execute(
+                    select(TelegramChannel.channel_title)
+                    .join(TelegramSignal, TelegramSignal.channel_id == TelegramChannel.id)
+                    .where(TelegramSignal.executed_order_id == trade.order_open_id)
+                )
+            ).scalar_one_or_none()
+
         return {
             "trade_id": trade_id,
             "symbol": trade.symbol.symbol if trade.symbol else None,
             "direction": trade.direction,
-            "source": _position_source_label(trade.strategy.name if trade.strategy else None),
+            "source": _position_source_label(trade.strategy.name if trade.strategy else None, channel_title),
             "entry_price": entry_price,
             "amount": total_amount,
             "pnl": total_pnl,
@@ -1939,20 +1990,45 @@ async def telegram_channels_stats():
 
 @app.get("/telegram/signals")
 async def list_telegram_signals(channel_id: int | None = None, limit: int = 100):
-    """Список Telegram сигналов (опционально по одному каналу) с данными ордера и исхода сделки."""
+    """
+    Список Telegram сигналов (опционально по одному каналу) с данными
+    ордера и исхода сделки.
+
+    Исход сделки считается НЕ по TelegramSignal.executed_trade_id — эта
+    ссылка проставляется только на пути обычного закрытия позиции самим
+    ботом (_link_telegram_signal_trade в main.py) и НИКОГДА не
+    проставляется на путях закрытия извне (внешнее закрытие на бирже,
+    восстановление после рестарта, phantom-реконсиляция — см. executor.py:
+    _finalize_externally_closed_position/_finalize_via_recent_trade_
+    history/_reconcile_phantom_position). Такие позиции всё равно получают
+    настоящую строку Trade, просто без обратной ссылки от сигнала — из-за
+    чего история сигналов показывала "открыта" для давно закрытых позиций.
+    Вместо этого агрегируем реальные Trade-строки по order_open_id
+    (= executed_order_id сигнала) — тот же приём, что и в GET /trades.
+    """
     async with get_session() as session:
         query = (
             select(TelegramSignal)
-            .options(
-                selectinload(TelegramSignal.executed_order),
-                selectinload(TelegramSignal.executed_trade),
-            )
+            .options(selectinload(TelegramSignal.executed_order))
             .order_by(TelegramSignal.created_at.desc())
             .limit(limit)
         )
         if channel_id is not None:
             query = query.where(TelegramSignal.channel_id == channel_id)
         signals = (await session.execute(query)).scalars().all()
+
+        order_ids = [s.executed_order_id for s in signals if s.executed_order_id is not None]
+        trades_by_order: dict[int, list] = {}
+        if order_ids:
+            raw_trades = (
+                await session.execute(
+                    select(Trade)
+                    .options(selectinload(Trade.order_close))
+                    .where(Trade.order_open_id.in_(order_ids))
+                )
+            ).scalars().all()
+            for t in raw_trades:
+                trades_by_order.setdefault(t.order_open_id, []).append(t)
 
         def _order_data(order):
             if order is None:
@@ -1971,39 +2047,75 @@ async def list_telegram_signals(channel_id: int | None = None, limit: int = 100)
                 "created_at": order.created_at.isoformat() + "Z" if order.created_at else None,
             }
 
-        def _trade_data(trade):
-            if trade is None:
-                return None
+        def _trade_data(order):
+            """
+            Агрегирует все Trade-части позиции, открытой этим ордером
+            (частичные закрытия по TP1/TP2/TP3 — несколько строк Trade на
+            один order_open_id), в единый исход сигнала, вместо одной
+            (возможно никогда не проставленной) ссылки executed_trade_id.
+            """
+            if order is None:
+                return None, 0
+            legs = trades_by_order.get(order.id)
+            if not legs:
+                # Позиция ещё открыта (либо ордер не подтверждён) — Trade
+                # создаётся только при закрытии.
+                return None, 0
+            legs.sort(key=lambda t: t.closed_at or t.created_at)
+            total_pnl = sum(float(t.pnl) for t in legs)
+            total_amount = sum(float(t.amount) for t in legs)
+            entry_price = float(legs[0].entry_price)
+            pnl_pct = (total_pnl / (entry_price * total_amount) * 100) if entry_price and total_amount else 0.0
+            last = legs[-1]
+            # Позиция закрыта полностью, если сумма закрытых по частям
+            # объёмов покрывает весь объём открывающего ордера (частичные
+            # TP не покрывают 100% до последнего закрытия) — filled_amount
+            # приоритетнее amount, т.к. это реально исполненный на бирже
+            # объём (см. подтверждение через историю сделок в executor.py).
+            order_amount = float(order.filled_amount) if order.filled_amount else float(order.amount)
+            is_fully_closed = order_amount - total_amount <= max(order_amount * 0.01, 1e-9)
+            # Число легов Trade — это не то же самое, что число сработавших
+            # TP: последний лег часто закрывает остаток по SL (см. reason в
+            # main.py._check_position_exit -> Order.notes через
+            # _reason_notes_ru в executor.py) — считаем сработавшими TP
+            # только леги, чья закрывающая заметка реально "тейк-профит N".
+            tp_hit_count = sum(
+                1 for t in legs
+                if t.order_close and t.order_close.notes and "тейк-профит" in t.order_close.notes
+            )
             return {
-                "pnl": float(trade.pnl),
-                "pnl_pct": float(trade.pnl_pct) if trade.pnl_pct else 0,
-                "outcome": trade.outcome,
-                "is_open": trade.is_open,
-                "closed_at": trade.closed_at.isoformat() + "Z" if trade.closed_at else None,
-            }
+                "pnl": total_pnl,
+                "pnl_pct": pnl_pct,
+                "outcome": last.outcome,
+                "is_open": not is_fully_closed,
+                "closed_at": last.closed_at.isoformat() + "Z" if last.closed_at else None,
+            }, tp_hit_count
+
+        result = []
+        for s in signals:
+            trade_data, tp_hit_count = _trade_data(s.executed_order)
+            result.append({
+                "id": s.id,
+                "channel_id": s.channel_id,
+                "raw_message": s.raw_message[:200] if s.raw_message else "",
+                "parsed_pair": s.parsed_pair,
+                "parsed_side": s.parsed_side,
+                "parsed_entry": float(s.parsed_entry) if s.parsed_entry else None,
+                "parsed_sl": float(s.parsed_sl) if s.parsed_sl else None,
+                "parsed_tp": float(s.parsed_tp) if s.parsed_tp else None,
+                "parsed_take_profits": s.parsed_take_profits,
+                "parsed_leverage": float(s.parsed_leverage) if s.parsed_leverage else None,
+                "quality_score": s.quality_score,
+                "decision": s.decision,
+                "reject_reason": s.reject_reason,
+                "order": _order_data(s.executed_order),
+                "trade": trade_data,
+                "tp_hit_count": tp_hit_count,
+                "created_at": s.created_at.isoformat() + "Z" if s.created_at else None,
+            })
 
         return {
-            "signals": [
-                {
-                    "id": s.id,
-                    "channel_id": s.channel_id,
-                    "raw_message": s.raw_message[:200] if s.raw_message else "",
-                    "parsed_pair": s.parsed_pair,
-                    "parsed_side": s.parsed_side,
-                    "parsed_entry": float(s.parsed_entry) if s.parsed_entry else None,
-                    "parsed_sl": float(s.parsed_sl) if s.parsed_sl else None,
-                    "parsed_tp": float(s.parsed_tp) if s.parsed_tp else None,
-                    "parsed_take_profits": s.parsed_take_profits,
-                    "parsed_leverage": float(s.parsed_leverage) if s.parsed_leverage else None,
-                    "quality_score": s.quality_score,
-                    "decision": s.decision,
-                    "reject_reason": s.reject_reason,
-                    "order": _order_data(s.executed_order),
-                    "trade": _trade_data(s.executed_trade),
-                    "created_at": s.created_at.isoformat() + "Z" if s.created_at else None,
-                }
-                for s in signals
-            ],
+            "signals": result,
             "total": len(signals),
         }
 
