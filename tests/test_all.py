@@ -1200,6 +1200,35 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
             "SLFULL1/USDT", 100.0, params={"stopLossPrice": 1.8},
         )
 
+    async def test_place_stop_loss_order_syncs_up_when_balance_exceeds_tracked(self):
+        """
+        Реальный вопрос пользователя: почему после срабатывания SL, если до
+        этого прошло несколько частичных TP, на бирже остаётся маленький
+        незащищённый хвост позиции. Причина — SL раньше клампился только
+        ВНИЗ: если реальный остаток на бирже БОЛЬШЕ отслеживаемого объёма
+        (дрейф в другую сторону — например, ордер частичного TP исполнился
+        на бирже чуть меньшим объёмом, чем мы посчитали), SL всё равно
+        выставлялся на заниженный расчётный объём, и reduceOnly-ордер при
+        срабатывании закрывал только его часть, оставляя разницу висеть на
+        бирже. Теперь SL синхронизируется с биржевым остатком в ОБЕ
+        стороны, а не только вниз.
+        """
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"SLSYNCUP1": 105.0}, "SLSYNCUP1": {"free": 105.0, "used": 0, "total": 105.0}}
+        )
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "slsyncup-sl-order-1"}
+
+        order_id = await self.engine._place_stop_loss_order("SLSYNCUP1/USDT", 100.0, 1.8)
+
+        self.assertEqual(order_id, "slsyncup-sl-order-1")
+        self.engine.exchange.create_market_sell_order.assert_called_once_with(
+            "SLSYNCUP1/USDT", 105.0, params={"stopLossPrice": 1.8},
+        )
+
     async def test_execute_real_order_survives_stop_loss_placement_rejection(self):
         """
         Биржа может отклонить условный SL-ордер (например, триггер-цена
@@ -9816,6 +9845,50 @@ class TestCcxtSymbolTranslationForFutures(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order_id, "ccxtfix-sl-1")
         futures_exchange.create_market_sell_order.assert_awaited_once_with(
             "CCXTFIX4/USDT:USDT", 10.0, params={"stopLossPrice": 1.8, "reduceOnly": True},
+        )
+
+    async def test_place_stop_loss_order_syncs_to_futures_position_size(self):
+        """
+        Реальный вопрос пользователя: после SL на фьючерсах, если до этого
+        было несколько частичных TP, на бирже иногда остаётся незащищённый
+        хвост позиции. На фьючерсах SL раньше выставлялся ВСЕГДА на
+        отслеживаемый ботом объём без единой сверки с реальным размером
+        позиции на бирже (в отличие от спота, где сверка с балансом уже
+        была) — расхождение (та же природа, что и в reconcile_real_
+        positions: задержка подтверждения исполнения, округление лота)
+        приводило к тому, что reduceOnly SL-ордер закрывал только часть
+        реальной позиции. Теперь фьючерсный SL тоже синхронизируется с
+        fetch_positions() перед выставлением.
+        """
+        futures_exchange = self._futures_exchange()
+        futures_exchange.fetch_positions = AsyncMock(
+            return_value=[{"symbol": "CCXTFIX4B/USDT:USDT", "contracts": 12.5}]
+        )
+        futures_exchange.create_market_sell_order.return_value = {"id": "ccxtfix-sl-2"}
+
+        order_id = await self.engine._place_stop_loss_order(
+            "CCXTFIX4B/USDT", 10.0, 1.8, futures_exchange, side="long", is_futures=True,
+        )
+
+        self.assertEqual(order_id, "ccxtfix-sl-2")
+        futures_exchange.create_market_sell_order.assert_awaited_once_with(
+            "CCXTFIX4B/USDT:USDT", 12.5, params={"stopLossPrice": 1.8, "reduceOnly": True},
+        )
+
+    async def test_place_stop_loss_order_futures_position_lookup_failure_keeps_tracked_amount(self):
+        """Не удалось получить fetch_positions (сеть/биржа) — best-effort,
+        выставляем SL на отслеживаемый объём, как и раньше."""
+        futures_exchange = self._futures_exchange()
+        futures_exchange.fetch_positions = AsyncMock(side_effect=Exception("network down"))
+        futures_exchange.create_market_sell_order.return_value = {"id": "ccxtfix-sl-3"}
+
+        order_id = await self.engine._place_stop_loss_order(
+            "CCXTFIX4C/USDT", 10.0, 1.8, futures_exchange, side="long", is_futures=True,
+        )
+
+        self.assertEqual(order_id, "ccxtfix-sl-3")
+        futures_exchange.create_market_sell_order.assert_awaited_once_with(
+            "CCXTFIX4C/USDT:USDT", 10.0, params={"stopLossPrice": 1.8, "reduceOnly": True},
         )
 
     async def test_reconcile_futures_position_fetches_suffixed_symbol(self):

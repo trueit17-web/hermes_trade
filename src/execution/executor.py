@@ -1885,30 +1885,49 @@ class ExecutionEngine:
         ex = exchange if exchange is not None else self.exchange
         if ex is None:
             return None
-        # Проверка доступного остатка на кошельке — спот-специфична (на
-        # фьючерсах позиция не выражается остатком монеты на кошельке, там
-        # нечего сверять). Отслеживаемый объём позиции мог немного
-        # разойтись с реальным остатком на бирже — та же причина, что и в
-        # close_real_position (комиссии, округление лота, накопленный
-        # дрейф за несколько частичных закрытий или рестартов процесса):
-        # условный SL-ордер на биржевой остаток, а не на устаревший
-        # расчётный объём — иначе биржа отклоняет ЕГО ЦЕЛИКОМ с
-        # "Insufficient balance", и позиция остаётся вовсе без биржевой
-        # защиты (реальный инцидент: XAUT/USDT, LINK/USDT после нескольких
-        # частичных TP).
+        # Сверка с ФАКТИЧЕСКИМ остатком на бирже (кошелёк на споте,
+        # позиция на фьючерсах) — отслеживаемый ботом объём мог немного
+        # разойтись с реальным (комиссии, округление лота, накопленный
+        # дрейф за несколько частичных закрытий, задержка подтверждения
+        # исполнения при открытии/долитии — та же природа расхождений, что
+        # и в reconcile_real_positions/close_real_position). Раньше
+        # клампили только ВНИЗ (available < amount) — иначе биржа отклоняла
+        # ВЕСЬ SL-ордер целиком с "Insufficient balance", и позиция
+        # оставалась вовсе без биржевой защиты (реальный инцидент: XAUT/
+        # USDT, LINK/USDT после нескольких частичных TP). Но если реальный
+        # остаток БОЛЬШЕ отслеживаемого, старый код всё равно выставлял SL
+        # на заниженный объём — при срабатывании reduceOnly-ордер закрывал
+        # только эту часть, а разница оставалась висеть на бирже маленьким
+        # незащищённым хвостом, который бот уже не отслеживал (реальный
+        # вопрос пользователя: "почему после стоп-лосса после нескольких
+        # тейков остаются мелкие остатки открытые"). Теперь синхронизируем
+        # объём SL с биржевым остатком В ОБЕ СТОРОНЫ, чтобы стоп всегда
+        # закрывал позицию целиком, а не наш возможно устаревший расчёт.
         if not is_futures:
             try:
                 base_currency = symbol.split("/")[0]
                 balance = await ex.fetch_balance()
                 available = self._extract_currency_balance(balance, base_currency)
-                if 0 < available < amount:
+                if available > 0 and abs(available - amount) > 1e-9:
                     logger.debug(
-                        f"SL {symbol}: доступно {available:.8f} {base_currency} < отслеживаемого "
-                        f"{amount:.8f} — выставляем на доступный остаток."
+                        f"SL {symbol}: биржевой остаток {available:.8f} {base_currency} != "
+                        f"отслеживаемого {amount:.8f} — выставляем на биржевой остаток, чтобы "
+                        f"стоп закрыл позицию целиком."
                     )
                     amount = available
             except Exception as e:
                 logger.debug(f"Не удалось сверить баланс перед выставлением SL {symbol}: {e}")
+        else:
+            try:
+                available = await self._fetch_futures_position_contracts(symbol, ex)
+                if available > 0 and abs(available - amount) > 1e-9:
+                    logger.debug(
+                        f"SL {symbol}: биржевой объём позиции {available:.8f} != отслеживаемого "
+                        f"{amount:.8f} — выставляем на биржевой объём, чтобы стоп закрыл позицию целиком."
+                    )
+                    amount = available
+            except Exception as e:
+                logger.debug(f"Не удалось сверить объём позиции перед выставлением SL {symbol}: {e}")
         try:
             params: dict = {"stopLossPrice": stop_loss_price}
             if is_futures:
@@ -2126,7 +2145,9 @@ class ExecutionEngine:
         except Exception as e:
             logger.debug(f"Не удалось получить позицию {symbol} на фьючерсах: {e}")
             return 0.0
-        for pos in positions or []:
+        if not isinstance(positions, list):
+            return 0.0
+        for pos in positions:
             if not isinstance(pos, dict):
                 continue
             contracts = pos.get("contracts")
