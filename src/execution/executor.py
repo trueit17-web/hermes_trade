@@ -2761,11 +2761,26 @@ class ExecutionEngine:
         # уровню TP1/TP2) — см. тот же комментарий в close_paper_position.
         pos = self.real_positions.get(symbol)
         if pos is not None:
-            remaining = pos["amount"] - amount
+            original_amount = pos["amount"]
+            remaining = original_amount - amount
             if remaining <= 1e-9:
                 self.real_positions.pop(symbol, None)
             else:
                 pos["amount"] = remaining
+                # entry_fee тут накоплен на ИСХОДНЫЙ объём позиции и без
+                # пропорционального уменьшения при каждом частичном
+                # закрытии остаётся раздутым навсегда — сам PnL ЭТОГО
+                # закрытия использует entry_fee, переданный параметром
+                # (main.py уже уменьшает его для своей копии позиции), но
+                # _record_external_close (закрытие, обнаруженное вне
+                # цикла бота — см. ниже) берёт entry_fee ИМЕННО из этого
+                # словаря. Реальный инцидент: TAO/USDT — после нескольких
+                # частичных TP от исходных ~66 контрактов остался
+                # хвост 0.001, и при его закрытии биржевым SL сюда
+                # подставилась комиссия за все исходные ~66 контрактов,
+                # раздув PnL% до -6587%.
+                if original_amount:
+                    pos["entry_fee"] = (pos.get("entry_fee") or 0.0) * (remaining / original_amount)
 
         async with get_session() as session:
             exchange_id, symbol_id = await self._resolve_symbol_id(session, symbol)

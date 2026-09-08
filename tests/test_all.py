@@ -9642,6 +9642,73 @@ class TestFinalizeDiagnosticLogging(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("слишком расходятся" in m for m in cm.output))
 
 
+class TestRealPositionEntryFeeSyncedOnPartialClose(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент (прод, TAO/USDT): execution_engine.real_positions[symbol]
+    ["entry_fee"] копится на ИСХОДНЫЙ объём позиции при открытии и никогда не
+    уменьшается при частичных закрытиях — main.py пропорционально уменьшает
+    entry_fee только в СВОЕЙ копии позиции (self.open_positions), а
+    единственное место в executor.py, что читает entry_fee из
+    real_positions[symbol] напрямую — это _record_external_close (закрытие,
+    обнаруженное вне цикла бота, напр. сработавшим самим по себе биржевым
+    SL). После нескольких частичных TP от исходных ~66 контрактов остался
+    хвост 0.001, и когда его закрыл биржевой SL, сюда подставилась комиссия
+    за все исходные ~66 контрактов — PnL% раздулся до -6587%.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+        self._saved_trading_mode = settings.trading_mode
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_partial_close_reduces_tracked_entry_fee_proportionally(self):
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "close-feesync-1", "filled": 65.999, "average": 250.0, "price": None,
+            "fee": {"cost": 0.0, "currency": "USDT"},
+        }
+        self.engine.exchange.fetch_order_trades = AsyncMock(return_value=[
+            {"id": "exec-feesync-1", "amount": 65.999, "price": 250.0, "cost": 65.999 * 250.0,
+             "fee": {"cost": 0.0, "currency": "USDT"}},
+        ])
+
+        symbol = "FEESYNC1/USDT"
+        self.engine.real_positions[symbol] = {
+            "amount": 66.0, "entry_price": 250.0, "side": "short",
+            "entry_fee": 6.6, "market_type": "futures", "sl_order_id": None,
+        }
+
+        result = await self.engine.close_real_position(
+            symbol=symbol, side="short", entry_price=250.0, amount=65.999,
+            reason="take_profit_1", entry_fee=6.5934, holding_seconds=60,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertIn(symbol, self.engine.real_positions)
+        remaining_pos = self.engine.real_positions[symbol]
+        self.assertAlmostEqual(remaining_pos["amount"], 0.001, places=6)
+        # entry_fee должен уменьшиться пропорционально ОСТАВШЕМУСЯ объёму
+        # (0.001/66 от исходных 6.6), а не остаться на исходных 6.6 —
+        # иначе следующее закрытие этого крошечного хвоста (например,
+        # сработавшим самим по себе биржевым SL — см. _record_external_close)
+        # спишет комиссию за всю исходную позицию.
+        expected_fee = 6.6 * (0.001 / 66.0)
+        self.assertAlmostEqual(remaining_pos["entry_fee"], expected_fee, places=8)
+
+
 class TestWatchOrdersTask(unittest.IsolatedAsyncioTestCase):
     """
     WebSocket-слушатель исполнений ордеров (ccxt.pro watch_orders) —
