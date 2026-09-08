@@ -9508,6 +9508,11 @@ class TestFinalizeDiagnosticLogging(unittest.IsolatedAsyncioTestCase):
         settings.market_type = "futures"
         self.engine.exchange = AsyncMock()
         self.engine.exchange.fetch_order = AsyncMock(side_effect=Exception("order vanished"))
+        # fetch_order упал И по этому order_id в истории сделок ничего нет —
+        # действительно нечем финализировать, должны честно вернуть False
+        # (а не молча повиснуть на AsyncMock-заглушке).
+        self.engine.exchange.fetch_order_trades = AsyncMock(return_value=None)
+        self.engine.exchange.fetch_my_trades = AsyncMock(return_value=[])
         pos = {
             "amount": 100.0, "entry_price": 4.5, "side": "long",
             "market_type": "futures", "sl_order_id": "sl-sui-2",
@@ -9516,6 +9521,76 @@ class TestFinalizeDiagnosticLogging(unittest.IsolatedAsyncioTestCase):
             result = await self.engine._finalize_externally_closed_position("SUI/USDT", pos)
         self.assertFalse(result)
         self.assertTrue(any("order vanished" in m for m in cm.output))
+
+    async def test_finalize_by_sl_order_falls_back_to_trade_history_when_fetch_order_raises(self):
+        """
+        Реальный инцидент (прод, TRUMP/USDT, ARB/USDT): fetch_order падает с
+        ограничением Bybit "fetchOrder() can only access an order if it is
+        in last 500 orders" на активном мультиканальном аккаунте — раньше
+        это сразу считалось "не удалось проверить" и падало в fuzzy-сверку
+        по символу (_finalize_via_recent_trade_history), которая часто
+        отбраковывает совпадение по объёму и теряет реальный PnL. Если же
+        по ТОЧНОМУ order_id находятся сделки в истории — закрытие должно
+        финализироваться с реальными ценой/объёмом/комиссией, не проваливаясь
+        в фантомное списание без PnL.
+        """
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Order, Trade
+
+        settings.market_type = "futures"
+        saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "real"
+        try:
+            self.engine.is_paper = False
+            self.engine.exchange_id = "bybit"
+            self.engine.exchange = AsyncMock()
+            self.engine.exchange.fetch_order = AsyncMock(
+                side_effect=Exception(
+                    "bybit fetchOrder() can only access an order if it is in last 500 orders"
+                )
+            )
+            self.engine.exchange.fetch_order_trades = AsyncMock(return_value=[
+                {"id": "exec-slhist-1", "amount": 5961.2, "price": 2.2, "cost": 13114.64,
+                 "fee": {"cost": 1.5, "currency": "USDT"}},
+            ])
+
+            symbol = "SLHIST1/USDT"
+            async with get_session() as session:
+                exchange_id, symbol_id = await self.engine._resolve_symbol_id(session, symbol)
+                opening_order = Order(
+                    exchange_id=exchange_id, symbol_id=symbol_id,
+                    side="sell", order_type="market", amount=5961.2, price=2.266,
+                    status="filled", filled_amount=5961.2, filled_price=2.266,
+                    fee=0.0, fee_currency="USDT",
+                    client_order_id="slhist1-open",
+                )
+                session.add(opening_order)
+                await session.commit()
+                opening_order_id = opening_order.id
+
+            pos = {
+                "amount": 5961.2, "entry_price": 2.266, "side": "short",
+                "strategy_id": None, "entry_fee": 0.0, "order_id": opening_order_id,
+                "opened_at": datetime.now(), "sl_order_id": "sl-slhist-1",
+                "market_type": "futures",
+            }
+            self.engine.real_positions[symbol] = pos
+
+            result = await self.engine._finalize_externally_closed_position(symbol, pos)
+        finally:
+            settings.trading_mode = saved_trading_mode
+
+        self.assertTrue(result)
+        self.assertNotIn(symbol, self.engine.real_positions)
+        async with get_session() as session:
+            trade = (
+                await session.execute(select(Trade).where(Trade.order_open_id == opening_order_id))
+            ).scalar_one()
+        self.assertAlmostEqual(float(trade.amount), 5961.2, places=4)
+        self.assertAlmostEqual(float(trade.exit_price), 2.2, places=4)
+        # short: pnl = (entry - exit) * amount - fee = (2.266-2.2)*5961.2 - 1.5
+        self.assertAlmostEqual(float(trade.pnl), (2.266 - 2.2) * 5961.2 - 1.5, places=2)
 
     async def test_finalize_by_trade_history_logs_when_no_trades_returned(self):
         settings.market_type = "futures"

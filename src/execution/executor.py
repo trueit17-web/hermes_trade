@@ -3482,33 +3482,68 @@ class ExecutionEngine:
                 f"проверки биржевого SL-ордера {sl_order_id}."
             )
             return False
+        order = None
         try:
             order = await exchange.fetch_order(sl_order_id, self._ccxt_symbol(exchange, symbol))
         except Exception as e:
-            logger.warning(f"⚠️ Не удалось проверить биржевой SL-ордер {sl_order_id} ({symbol}): {e}")
-            return False
-        status = str(order.get("status") or "").lower()
-        if status not in ("closed", "filled"):
+            # Bybit's fetch_order (v5 API через ccxt) не видит ордера старше
+            # примерно последних 500 ордеров аккаунта ("fetchOrder() can
+            # only access an order if it is in last 500 orders") — на
+            # активном мультиканальном аккаунте SL-ордер может выпасть из
+            # этого окна уже за несколько часов. Раньше это сразу считалось
+            # "не удалось проверить" и падало в fuzzy-сверку по истории
+            # сделок (_finalize_via_recent_trade_history), которая матчит
+            # ЛЮБУЮ недавнюю сделку по символу/стороне и часто отбраковывает
+            # её как "расходится с отслеживаемым объёмом" (реальные
+            # инциденты: TRUMP/USDT, ARB/USDT — PnL реально закрытой позиции
+            # молча терялся). Вместо этого пробуем найти сделки ИМЕННО этого
+            # order_id через историю сделок (fetch_order_trades/fetch_my_
+            # trades с фильтром по order) — точный поиск по ID, не зависящий
+            # от окна видимости статус-эндпоинта ордера.
             logger.warning(
-                f"⚠️ Сверка {symbol}: биржевой SL-ордер {sl_order_id} имеет статус {status!r} "
-                f"(не closed/filled) — не он закрыл позицию, пробуем историю сделок."
+                f"⚠️ Не удалось проверить статус биржевого SL-ордера {sl_order_id} ({symbol}) "
+                f"через fetch_order ({e}) — пробуем подтвердить по истории сделок этого же ордера."
             )
-            return False
 
-        amount = float(order.get("filled") or pos.get("amount") or 0)
-        if amount <= 0:
-            logger.warning(
-                f"⚠️ Сверка {symbol}: биржевой SL-ордер {sl_order_id} закрыт, но filled-объём "
-                f"равен 0 — пробуем историю сделок."
-            )
-            return False
+        if order is not None:
+            status = str(order.get("status") or "").lower()
+            if status not in ("closed", "filled"):
+                logger.warning(
+                    f"⚠️ Сверка {symbol}: биржевой SL-ордер {sl_order_id} имеет статус {status!r} "
+                    f"(не closed/filled) — не он закрыл позицию, пробуем историю сделок."
+                )
+                return False
 
-        trade_fill = await self._fetch_fill_details_via_trades(str(sl_order_id), symbol, exchange)
+            amount = float(order.get("filled") or pos.get("amount") or 0)
+            if amount <= 0:
+                logger.warning(
+                    f"⚠️ Сверка {symbol}: биржевой SL-ордер {sl_order_id} закрыт, но filled-объём "
+                    f"равен 0 — пробуем историю сделок."
+                )
+                return False
+
+        # Ретраи с паузой (дефолт attempts=6/delay=1.5с) нужны, когда ордер
+        # ТОЛЬКО ЧТО подтверждён закрытым/исполненным (order is not None) —
+        # история сделок биржи иногда на пару секунд отстаёт от статуса
+        # ордера (см. докстринг _fetch_fill_details_via_trades). Если же
+        # fetch_order вообще упал (order is None, ордер вне окна видимости
+        # статус-эндпоинта), это почти наверняка старый ордер — если сделки
+        # по нему уже есть в истории, они там независимо от задержки;
+        # ждать и повторять нечего, а 6 попыток по 1.5с задержки за раз
+        # ощутимо тормозили бы всю сверку позиций при активном аккаунте.
+        trade_fill = await self._fetch_fill_details_via_trades(
+            str(sl_order_id), symbol, exchange, **({} if order is not None else {"attempts": 1})
+        )
         if trade_fill:
             exit_price = trade_fill["average"]
             amount = trade_fill["amount"]
             exit_fee = trade_fill["fee"].get("cost") or 0
             exit_fee_currency = trade_fill["fee"].get("currency")
+        elif order is None:
+            # fetch_order упал, И по этому order_id в истории сделок ничего
+            # не нашлось — про этот SL-ордер действительно ничего не
+            # известно, пусть решает fuzzy-сверка по символу.
+            return False
         else:
             exit_price = order.get("average") or order.get("price")
             if not exit_price:
