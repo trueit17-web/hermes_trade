@@ -2052,6 +2052,22 @@ class TradingBot:
             del self.open_positions[symbol]
             return False
 
+        # Периодическая сверка (_reconcile_futures_position/_reconcile_spot_
+        # position) могла увеличить execution_engine.<real|paper>_positions
+        # [symbol]["amount"] за пределами этой итерации (неподтверждённый
+        # при открытии ордер всё же исполнился) — но эта, отдельная копия
+        # позиции в self.open_positions про это не узнаёт. Полное закрытие
+        # по SL/последнему TP ниже читает объём именно ОТСЮДА (position
+        # ["amount"]): без синхронизации оно продавало бы только устаревший
+        # меньший объём, а реальный остаток на бирже (с уже удалённым из
+        # self.open_positions символом) навсегда переставал бы отслеживаться
+        # SL/TP-циклом. Реальный инцидент (прод): SOL/USDT — сверка подняла
+        # объём 0.24 -> 0.50, полное закрытие по SL тут же продало только
+        # 0.24, оставив ~0.26 контракта открытыми без SL и вне видимости бота.
+        authoritative_amount = tracked[symbol].get("amount")
+        if isinstance(authoritative_amount, (int, float)) and authoritative_amount > position["amount"]:
+            position["amount"] = authoritative_amount
+
         side = position["side"]
         sl = position.get("sl")
         tp_hit_count = position.get("tp_hit_count", 0)

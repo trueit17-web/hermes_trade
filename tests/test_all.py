@@ -6903,6 +6903,81 @@ class TestCheckPositionExitCleansStaleEntryOnFailedClose(unittest.IsolatedAsynci
         self.assertIn("DUSTCLOSE2/USDT", bot.open_positions)
 
 
+class TestCheckPositionExitSyncsAmountFromExecutionEngineBeforeFullClose(unittest.IsolatedAsyncioTestCase):
+    """
+    Регресс на прод-инцидент (SOL/USDT): периодическая сверка
+    (_reconcile_futures_position) подняла execution_engine.real_positions
+    [symbol]["amount"] с 0.24 до 0.50 (неподтверждённый при открытии ордер
+    всё же исполнился), но self.open_positions[symbol]["amount"] — отдельная
+    копия в main.py — этого не узнала. Полное закрытие по SL закрыло только
+    устаревшие 0.24, оставив ~0.26 контракта реально открытыми на бирже без
+    SL и вне видимости бота (main.py уже удалил символ из open_positions,
+    посчитав закрытие полным). _check_position_exit должен синхронизировать
+    объём из execution_engine ПЕРЕД тем, как решать, сколько закрывать.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot(), main_module.execution_engine
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "paper"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_full_close_uses_authoritative_amount_not_stale_copy(self):
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        engine.paper_positions["SOLSYNC/USDT"] = {
+            "side": "long", "entry_price": 104.13, "amount": 0.50,
+        }
+        bot.open_positions["SOLSYNC/USDT"] = {
+            "side": "long", "entry_price": 104.13, "amount": 0.24, "sl": 104.87864, "tp": None,
+            "tp_hit_count": 2, "strategy_id": "telegram_signal", "opened_at": utcnow(),
+        }
+
+        close_mock = AsyncMock(return_value={
+            "pnl": -0.1, "pnl_pct": -0.4, "outcome": "loss", "trade_id": 1,
+        })
+        with patch.object(engine, "close_paper_position", close_mock):
+            closed = await bot._check_position_exit("SOLSYNC/USDT", 103.97)
+
+        self.assertTrue(closed)
+        close_mock.assert_awaited_once()
+        self.assertAlmostEqual(close_mock.await_args.kwargs["amount"], 0.50)
+        self.assertNotIn("SOLSYNC/USDT", bot.open_positions)
+
+    async def test_partial_tp_close_unaffected_when_amounts_already_match(self):
+        """Регресс-предохранитель: без расхождения объёмов поведение частичного TP не меняется."""
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        engine.paper_positions["SOLSYNC2/USDT"] = {
+            "side": "long", "entry_price": 100.0, "amount": 1.0,
+        }
+        bot.open_positions["SOLSYNC2/USDT"] = {
+            "side": "long", "entry_price": 100.0, "amount": 1.0, "sl": 95.0, "tp": 110.0,
+            "take_profits": [105.0, 110.0], "tp_hit_count": 0, "strategy_id": "telegram_signal",
+            "opened_at": utcnow(), "original_amount": 1.0,
+        }
+
+        close_mock = AsyncMock(return_value={
+            "pnl": 5.0, "pnl_pct": 5.0, "outcome": "win", "trade_id": 2,
+        })
+        with patch.object(engine, "close_paper_position", close_mock):
+            closed = await bot._check_position_exit("SOLSYNC2/USDT", 105.0)
+
+        self.assertFalse(closed)  # частичное закрытие — позиция остаётся
+        self.assertAlmostEqual(close_mock.await_args.kwargs["amount"], 0.5)
+        self.assertIn("SOLSYNC2/USDT", bot.open_positions)
+
+
 class TestExpectancySizing(unittest.IsolatedAsyncioTestCase):
     """
     Expectancy-based sizing (портировано из clonerbot: scoring/channel_scorer.py):
