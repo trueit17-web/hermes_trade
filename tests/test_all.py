@@ -639,6 +639,56 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result)
         self.assertNotIn("BALDIFFCLOSE1/USDT", self.engine.real_positions)
 
+    async def test_close_real_position_confirms_via_futures_position_diff_when_status_never_confirms(self):
+        """
+        Фьючерсный аналог теста выше — раньше у close_real_position НЕ было
+        такого фолбэка вообще (только балансовый, спот-специфичный):
+        реальный инцидент (прод, HYPE/USDT и другие) — закрывающий ордер
+        реально исполнялся на бирже (виден по объёму позиции в
+        fetch_positions()), но ни fetch_order-поллинг, ни история сделок не
+        успевали подтвердить его за отведённое окно, и закрытие считалось
+        проваленным. main.py на следующих итерациях слал НОВЫЙ закрывающий
+        ордер поверх уже закрытой позиции — суммарный проданный на бирже
+        объём расходился с тем, что бот когда-либо вычитал из
+        отслеживаемого объёма.
+        """
+        saved_market_type = settings.market_type
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        try:
+            self.engine.is_paper = False
+            self.engine.exchange_id = "bybit"
+            self.engine.exchange = AsyncMock()
+            self.engine.exchange.fetch_positions = AsyncMock(side_effect=[
+                [{"symbol": "FUTCLOSEDIFF1/USDT:USDT", "contracts": 100.0}],
+                [],
+            ])
+            self.engine.exchange.create_market_sell_order.return_value = {
+                "id": "never-confirms-fut-close-1", "filled": None, "average": None, "price": None,
+            }
+            self.engine.exchange.fetch_order = AsyncMock(return_value={
+                "id": "never-confirms-fut-close-1", "filled": None, "average": None, "price": None, "status": "open",
+            })
+            self.engine.exchange.fetch_order_trades = AsyncMock(return_value=None)
+            self.engine.exchange.fetch_my_trades = AsyncMock(return_value=[])
+
+            symbol = "FUTCLOSEDIFF1/USDT"
+            self.engine.real_positions[symbol] = {
+                "amount": 100.0, "entry_price": 10.0, "side": "long",
+                "entry_fee": 0.0, "market_type": "futures", "sl_order_id": None,
+            }
+
+            with patch("src.execution.executor.asyncio.sleep", new=AsyncMock()):
+                result = await self.engine.close_real_position(
+                    symbol=symbol, side="long", entry_price=10.0, amount=100.0,
+                    reason="stop_loss", entry_fee=0.0, holding_seconds=60,
+                )
+        finally:
+            settings.market_type = saved_market_type
+
+        self.assertIsNotNone(result)
+        self.assertNotIn(symbol, self.engine.real_positions)
+
     async def test_fetch_fill_details_via_trades_returns_weighted_average_and_fee(self):
         """
         Юнит-тест самого хелпера: несколько частичных сделок по одному

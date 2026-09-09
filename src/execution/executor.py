@@ -2177,9 +2177,23 @@ class ExecutionEngine:
         бирже она реально висела, попадая только в отдельный аудит
         "открыта позиция, которую бот не отслеживает" (без авто-подхвата)
         на каждом цикле сверки, пока кто-то не разберётся вручную.
+
+        Симметрично используется и для ЗАКРЫТИЯ (close_real_position) —
+        там contracts_after < contracts_before, поэтому сравниваем по
+        модулю разницы, а не только рост. Реальный инцидент того же
+        класса, но на закрытии (HYPE/USDT и другие): close_real_position
+        не имел такого фолбэка вовсе (только балансовый, спот-специфичный)
+        — неподтверждённое, но реально исполнившееся закрытие считалось
+        проваленным и НЕ снималось с учёта, из-за чего main.py на
+        следующих итерациях раз за разом посылал НОВЫЕ закрывающие ордера
+        на ту же (уже частично или полностью закрытую) позицию, реально
+        продавая на бирже больше, чем бот когда-либо вычитал из
+        отслеживаемого объёма — суммарный проданный объём расходился с
+        учтённым, и финализация закрытия по истории сделок отбраковывала
+        его как "слишком расходится", теряя PnL целиком.
         """
         contracts_after = await self._fetch_futures_position_contracts(symbol, exchange)
-        diff = contracts_after - contracts_before
+        diff = abs(contracts_after - contracts_before)
         if diff >= expected_amount * 0.5:
             return diff
         return None
@@ -2593,6 +2607,15 @@ class ExecutionEngine:
         # закрыть контракт — сверять тут нечего, closing_amount = amount.
         closing_amount = amount
         available = None
+        futures_contracts_before = 0.0
+        if is_futures:
+            # Снимок ДО отправки закрывающего ордера — второй, независимый
+            # от статуса ордера способ подтвердить закрытие, если ни
+            # fetch_order-поллинг, ни история сделок не успеют за отведённое
+            # окно (см. _confirm_fill_via_futures_position и её докстринг
+            # про то же самое уже для ОТКРЫТИЯ — здесь тот же фолбэк для
+            # закрытия, которого раньше не было вовсе).
+            futures_contracts_before = await self._fetch_futures_position_contracts(symbol, exchange)
         if not is_futures:
             try:
                 base_currency = symbol.split("/")[0]
@@ -2686,13 +2709,24 @@ class ExecutionEngine:
         elif not (order.get("filled") or 0) > 0:
             # История сделок недоступна, и fetch_order так и не показал
             # filled — второй, независимый от статуса ордера способ
-            # подтверждения (см. _confirm_fill_via_balance): available уже
-            # снят с биржи чуть выше (до отправки sell), так что здесь не
-            # нужен ещё один запрос баланса "до".
-            confirmed_amount = (
-                await self._confirm_fill_via_balance(symbol, closing_side, available, closing_amount, exchange)
-                if available is not None else None
-            )
+            # подтверждения: на споте — по изменению баланса (available уже
+            # снят с биржи чуть выше, до отправки sell, так что здесь не
+            # нужен ещё один запрос "до"); на фьючерсах — по изменению
+            # объёма самой позиции (см. futures_contracts_before выше и
+            # докстринг _confirm_fill_via_futures_position про тот же
+            # фолбэк для закрытия — реальный инцидент: HYPE/USDT и другие,
+            # без этого неподтверждённое, но реально исполнившееся закрытие
+            # считалось проваленным, и main.py слал новый закрывающий ордер
+            # поверх уже закрытой/частично закрытой позиции).
+            if is_futures:
+                confirmed_amount = await self._confirm_fill_via_futures_position(
+                    symbol, futures_contracts_before, closing_amount, exchange,
+                )
+            else:
+                confirmed_amount = (
+                    await self._confirm_fill_via_balance(symbol, closing_side, available, closing_amount, exchange)
+                    if available is not None else None
+                )
             if confirmed_amount is None:
                 logger.error(
                     f"❌ Закрывающий ордер {order.get('id')} ({symbol}) не подтверждён как "
@@ -2700,9 +2734,10 @@ class ExecutionEngine:
                     f"НЕ засчитывается, данные должны быть идентичны бирже."
                 )
                 return None
+            confirm_method = "изменению объёма позиции" if is_futures else "изменению баланса"
             logger.warning(
-                f"⚠️ Закрывающий ордер {order.get('id')} ({symbol}) подтверждён по изменению "
-                f"баланса на бирже ({confirmed_amount:.8f} {symbol.split('/')[0]}), хотя "
+                f"⚠️ Закрывающий ордер {order.get('id')} ({symbol}) подтверждён по {confirm_method} "
+                f"на бирже ({confirmed_amount:.8f} {symbol.split('/')[0]}), хотя "
                 f"fetch_order так и не показал filled — цена исполнения оценивается по цене "
                 f"открытия, не биржевой."
             )
