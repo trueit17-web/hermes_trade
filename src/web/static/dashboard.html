@@ -2589,13 +2589,10 @@ function renderChannelSignalsTable(signals) {
       <table class="nested-table">
         <thead><tr>
           <th>Время</th><th>Пара</th><th>Сторона</th><th>Entry</th><th>SL</th><th>TP</th>
-          <th>Качество</th><th>Решение</th><th>Ордер</th><th>Итог сделки</th>
+          <th>Качество</th><th>Решение</th><th>Итог сделки</th>
         </tr></thead>
         <tbody>
           ${signals.map(s => {
-            const order = s.order
-              ? `<span class="${s.order.side === 'sell' ? 'side-sell' : 'side-buy'}">${s.order.side.toUpperCase()}</span> ${fmt(s.order.amount, 6)} @ ${fmtPrice(s.order.filled_price ?? s.order.price)} <span class="muted">(${s.order.status})</span>`
-              : "—";
             let outcome = "—";
             if (s.trade) {
               const cls = s.trade.pnl >= 0 ? "pnl-pos" : "pnl-neg";
@@ -2646,7 +2643,6 @@ function renderChannelSignalsTable(signals) {
               <td>${tpDisplay}</td>
               <td>${s.quality_score !== null ? fmt(s.quality_score, 2) : "—"}</td>
               <td>${decisionCell}</td>
-              <td>${order}</td>
               <td>${outcome}</td>
             </tr>
           `;
