@@ -1319,7 +1319,7 @@ function renderPositions(status) {
       : "";
     return `
     <tr class="trade-row" data-position-symbol="${symbol}" title="Показать подробности позиции">
-      <td><span class="expand-arrow">▸</span>${symbol}${leverageBadge}</td>
+      <td class="side-${pos.side === 'long' ? 'long' : 'short'}"><span class="expand-arrow">▸</span>${symbol}${leverageBadge}</td>
       <td class="side-${pos.side === 'long' ? 'long' : 'short'}">${(pos.side || '').toUpperCase()}</td>
       <td>${fmt(pos.amount, 6)}</td>
       <td>${fmtPrice(pos.entry_price)}</td>
@@ -1819,7 +1819,7 @@ async function renderTrades() {
         : "";
       return `
       <tr class="trade-row" data-trade-id="${t.id}" title="Показать подробности сделки">
-        <td><span class="expand-arrow">▸</span>${t.symbol || ("#" + t.symbol_id)}${leverageBadge}</td>
+        <td class="side-${t.direction === 'long' ? 'long' : 'short'}"><span class="expand-arrow">▸</span>${t.symbol || ("#" + t.symbol_id)}${leverageBadge}</td>
         <td class="side-${t.direction === 'long' ? 'long' : 'short'}">${(t.direction || '').toUpperCase()}</td>
         <td>${fmtPrice(t.entry_price)}</td>
         <td>${t.exit_price !== null ? fmtPrice(t.exit_price) : "—"}</td>
@@ -2345,7 +2345,11 @@ async function renderTelegram() {
       const sizingClass = mult === 0 ? "pnl-neg" : (mult > 1 ? "pnl-pos" : "");
       return `
       <tr class="channel-row" data-channel-id="${c.id}" title="Показать историю сигналов">
-        <td><span class="expand-arrow">▸</span>${c.channel_title || "—"}</td>
+        <td>
+          <span class="expand-arrow">▸</span>
+          <input type="text" class="channel-title-input" data-channel-id="${c.id}"
+                 value="${escapeHtml(c.channel_title || "")}" placeholder="Название" style="width:140px;">
+        </td>
         <td class="muted">${c.channel_id}</td>
         <td>
           <input type="number" class="channel-threshold-input" data-channel-id="${c.id}"
@@ -2404,6 +2408,27 @@ async function renderTelegram() {
       if (expandedChannels.has(id)) {
         restoreExpandedChannel(row);
       }
+    });
+
+    body.querySelectorAll(".channel-title-input").forEach(input => {
+      input.closest("td").classList.add("channel-editable");
+      input.addEventListener("click", (e) => e.stopPropagation());
+      input.addEventListener("change", async () => {
+        const id = input.dataset.channelId;
+        const value = input.value.trim();
+        if (!value) {
+          showToast("Название канала не может быть пустым", true);
+          return;
+        }
+        try {
+          await api(`/telegram/channels/${id}`, {
+            method: "PATCH", body: JSON.stringify({ channel_title: value }),
+          });
+          showToast("Название канала обновлено");
+        } catch (err) {
+          showToast(`Ошибка: ${err.message}`, true);
+        }
+      });
     });
 
     body.querySelectorAll(".channel-threshold-input").forEach(input => {
@@ -2589,7 +2614,7 @@ function renderChannelSignalsTable(signals) {
       <table class="nested-table">
         <thead><tr>
           <th>Время</th><th>Пара</th><th>Сторона</th><th>Entry</th><th>SL</th><th>TP</th>
-          <th>Качество</th><th>Решение</th><th>Итог сделки</th>
+          <th>Качество</th><th>Итог сделки</th>
         </tr></thead>
         <tbody>
           ${signals.map(s => {
@@ -2616,7 +2641,7 @@ function renderChannelSignalsTable(signals) {
             } else if (s.order) {
               outcome = "открыта";
             } else if (s.decision === "rejected") {
-              outcome = `<span class="muted">🚫 ${escapeHtml(s.reject_reason || "причина не записана")}</span>`;
+              outcome = `<span class="muted">${escapeHtml(s.reject_reason || "причина не записана")}</span>`;
             }
             const tpList = s.parsed_take_profits && s.parsed_take_profits.length > 1
               ? s.parsed_take_profits
@@ -2636,21 +2661,25 @@ function renderChannelSignalsTable(signals) {
             const leverageBadge = s.parsed_leverage
               ? ` <span class="muted" title="Плечо, указанное каналом">⚡${s.parsed_leverage}x</span>`
               : "";
-            const decisionCell = s.decision === "pending"
+            const sideCls = `side-${s.parsed_side === 'long' ? 'long' : 'short'}`;
+            // Решение и итог сделки раньше были двумя отдельными колонками —
+            // объединены в одну: пиктограмма решения в начале ячейки, сразу
+            // за ней сам итог (для "ожидает подтверждения" вместо итога пока
+            // ставятся кнопки исполнить/отклонить — итогу неоткуда взяться).
+            const decisionOutcomeCell = s.decision === "pending"
               ? `<button type="button" class="btn-icon signal-decide-btn" data-signal-id="${s.id}" data-action="execute" title="Исполнить">✅</button>
                  <button type="button" class="btn-icon signal-decide-btn" data-signal-id="${s.id}" data-action="reject" title="Отклонить">🚫</button>`
-              : signalDecisionBadge(s.decision);
+              : `${s.decision === "executed" ? "✅" : "🚫"} ${outcome}`;
             return `
             <tr>
               <td class="muted">${s.created_at ? new Date(s.created_at).toLocaleString("ru-RU") : "—"}</td>
-              <td>${s.parsed_pair || "—"}${leverageBadge}</td>
-              <td class="side-${s.parsed_side === 'long' ? 'long' : 'short'}">${(s.parsed_side || "—").toUpperCase()}</td>
+              <td class="${sideCls}">${s.parsed_pair || "—"}${leverageBadge}</td>
+              <td class="${sideCls}">${(s.parsed_side || "—").toUpperCase()}</td>
               <td>${s.parsed_entry !== null ? fmtPrice(s.parsed_entry) : "—"}</td>
               <td>${s.parsed_sl !== null ? fmtPrice(s.parsed_sl) : "—"}</td>
               <td>${tpDisplay}</td>
               <td>${s.quality_score !== null ? fmt(s.quality_score, 2) : "—"}</td>
-              <td>${decisionCell}</td>
-              <td>${outcome}</td>
+              <td>${decisionOutcomeCell}</td>
             </tr>
           `;
           }).join("")}
