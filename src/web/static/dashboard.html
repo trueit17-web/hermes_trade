@@ -2596,9 +2596,16 @@ function renderChannelSignalsTable(signals) {
             let outcome = "—";
             if (s.trade) {
               const cls = s.trade.pnl >= 0 ? "pnl-pos" : "pnl-neg";
+              const pnlText = `<span class="${cls}">${s.trade.pnl >= 0 ? "+" : ""}${fmt(s.trade.pnl)} (${fmt(s.trade.pnl_pct, 2)}%)</span>`;
+              // is_open=true с существующим s.trade означает, что часть
+              // объёма уже закрыта по TP (см. _trade_data в api.py — Trade
+              // появляется при первом же частичном закрытии), а остаток всё
+              // ещё открыт. Раньше это просто писалось как "открыта",
+              // выбрасывая уже зафиксированный PnL сработавших TP —
+              // теперь показываем и то, и другое.
               outcome = s.trade.is_open
-                ? "открыта"
-                : `<span class="${cls}">${s.trade.pnl >= 0 ? "+" : ""}${fmt(s.trade.pnl)} (${fmt(s.trade.pnl_pct, 2)}%)</span>`;
+                ? `открыта <span class="muted">(частично закрыта: ${pnlText})</span>`
+                : pnlText;
             } else if (s.order && s.order.status === "rejected") {
               // order.status становится "rejected" ЗАДНИМ ЧИСЛОМ, когда бот не
               // смог продать позицию на бирже (пыль/ниже минимального объёма) и
