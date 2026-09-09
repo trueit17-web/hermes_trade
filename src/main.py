@@ -827,10 +827,28 @@ class TradingBot:
                 decision = "rejected"
                 signal_event["reject_reason"] = f"по {pair} уже есть открытая позиция"
                 logger.info(f"🚫 Сигнал по {pair} отклонён: уже есть открытая позиция")
+            elif risk_manager.state.check_max_positions():
+                # По явному запросу пользователя лимит открытых позиций
+                # (risk_max_open_positions) теперь распространяется и на
+                # Telegram-сигналы — раньше (см. комментарий ниже про
+                # остальные Protections) он проверялся только на
+                # стратегийном пути (risk_manager.check_signal), и канал
+                # мог безостановочно открывать позиции сверх лимита из
+                # шапки дашборда (реальный инцидент: лимит 12, открытых
+                # позиций 29).
+                decision = "rejected"
+                signal_event["reject_reason"] = (
+                    f"достигнут лимит открытых позиций "
+                    f"({risk_manager.state.open_positions_count}/{risk_manager.state.max_open_positions})"
+                )
+                logger.info(
+                    f"🚫 Сигнал по {pair} отклонён: достигнут лимит открытых позиций "
+                    f"({risk_manager.state.open_positions_count}/{risk_manager.state.max_open_positions})"
+                )
             else:
-                # Protections (кулдаун источника после закрытия, StoplossGuard,
-                # LosingStreak) сюда намеренно НЕ применяются: по явному
-                # запросу автоисполнение канала должно срабатывать
+                # Остальные Protections (кулдаун источника после закрытия,
+                # StoplossGuard, LosingStreak) сюда намеренно НЕ применяются:
+                # по явному запросу автоисполнение канала должно срабатывать
                 # безусловно, пока оно включено — это осознанное решение
                 # доверять сигналам канала, а не автоматическая защита от
                 # серии убытков внутри самого бота. Kill switch и ручная

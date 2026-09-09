@@ -12356,10 +12356,19 @@ class TestTradingSourceModeGatesTelegramSignals(unittest.IsolatedAsyncioTestCase
         return main_module.TradingBot()
 
     def setUp(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
         self._saved_mode = settings.active_trading_mode
+        # Изолируем от лимита открытых позиций (см. TestTelegramSignal
+        # RespectsMaxOpenPositions) — глобальный risk_manager может нести
+        # счётчик, накопленный другими тестами в этом же прогоне, а эти
+        # тесты проверяют совсем другой гейт (переключатель сигналы/алго).
+        self._saved_count = global_risk_manager.state.open_positions_count
+        global_risk_manager.state.open_positions_count = 0
 
     def tearDown(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
         settings.active_trading_mode = self._saved_mode
+        global_risk_manager.state.open_positions_count = self._saved_count
 
     async def test_algo_mode_rejects_auto_execute_telegram_signal(self):
         settings.active_trading_mode = "algo"
@@ -12406,6 +12415,83 @@ class TestTradingSourceModeGatesTelegramSignals(unittest.IsolatedAsyncioTestCase
         self.assertEqual(bot._save_telegram_signal.await_args.args[2], "executed")
 
 
+class TestTelegramSignalRespectsMaxOpenPositions(unittest.IsolatedAsyncioTestCase):
+    """
+    По явному запросу пользователя ("лимит позиций распространи и на
+    сигналы телеграмма") risk_max_open_positions теперь блокирует и
+    автоисполнение Telegram-сигналов, а не только стратегийный путь
+    (risk_manager.check_signal). Реальный инцидент: лимит настроен на 12,
+    но канал продолжал открывать позиции без остановки (29 открытых) —
+    Telegram-исполнение шло напрямую в execution_engine, минуя
+    risk_manager.check_signal целиком.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        self._saved_count = global_risk_manager.state.open_positions_count
+        self._saved_max = global_risk_manager.state.max_open_positions
+
+    def tearDown(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        global_risk_manager.state.open_positions_count = self._saved_count
+        global_risk_manager.state.max_open_positions = self._saved_max
+
+    async def test_rejects_signal_when_limit_reached(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        global_risk_manager.state.max_open_positions = 2
+        global_risk_manager.state.open_positions_count = 2
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        with patch.object(bot, "_execute_telegram_signal", new=AsyncMock()) as exec_mock:
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "MAXPOS1/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 50000.0,
+                "parsed_sl": 48000.0,
+                "raw_message": "test",
+            })
+
+        exec_mock.assert_not_awaited()
+        self.assertEqual(bot._save_telegram_signal.await_args.args[2], "rejected")
+        self.assertIn("лимит", bot._save_telegram_signal.await_args.args[0]["reject_reason"])
+
+    async def test_executes_signal_when_under_limit(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        global_risk_manager.state.max_open_positions = 5
+        global_risk_manager.state.open_positions_count = 2
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        fake_order = MagicMock(id=1)
+        with patch.object(bot, "_execute_telegram_signal", new=AsyncMock(return_value=fake_order)) as exec_mock:
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "MAXPOS2/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 50000.0,
+                "parsed_sl": 48000.0,
+                "raw_message": "test",
+            })
+
+        exec_mock.assert_awaited_once()
+        self.assertEqual(bot._save_telegram_signal.await_args.args[2], "executed")
+
+
 class TestTelegramSignalMarketEntryResolution(unittest.IsolatedAsyncioTestCase):
     """
     Реальный формат сигнала без фиксированной цены входа ("Диапазон входа:
@@ -12426,11 +12512,16 @@ class TestTelegramSignalMarketEntryResolution(unittest.IsolatedAsyncioTestCase):
         return main_module.TradingBot()
 
     def setUp(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
         self._saved_mode = settings.active_trading_mode
         settings.active_trading_mode = "signals"
+        self._saved_count = global_risk_manager.state.open_positions_count
+        global_risk_manager.state.open_positions_count = 0
 
     def tearDown(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
         settings.active_trading_mode = self._saved_mode
+        global_risk_manager.state.open_positions_count = self._saved_count
 
     async def test_market_entry_resolved_via_reference_price(self):
         bot = self._make_bot()
@@ -12539,11 +12630,16 @@ class TestTelegramSignalRejectsMessagesWithNoPriceData(unittest.IsolatedAsyncioT
         return main_module.TradingBot()
 
     def setUp(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
         self._saved_mode = settings.active_trading_mode
         settings.active_trading_mode = "signals"
+        self._saved_count = global_risk_manager.state.open_positions_count
+        global_risk_manager.state.open_positions_count = 0
 
     def tearDown(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
         settings.active_trading_mode = self._saved_mode
+        global_risk_manager.state.open_positions_count = self._saved_count
 
     async def test_no_sl_and_no_tp_rejected_before_execution(self):
         bot = self._make_bot()
@@ -12829,11 +12925,16 @@ class TestTelegramChannelPositionSizePct(unittest.IsolatedAsyncioTestCase):
         return main_module.TradingBot()
 
     def setUp(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
         self._saved_trading_mode = settings.trading_mode
         settings.trading_mode = "real"
+        self._saved_count = global_risk_manager.state.open_positions_count
+        global_risk_manager.state.open_positions_count = 0
 
     def tearDown(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
         settings.trading_mode = self._saved_trading_mode
+        global_risk_manager.state.open_positions_count = self._saved_count
 
     async def test_execute_uses_channel_specific_position_size_pct(self):
         bot = self._make_bot()
@@ -13445,14 +13546,19 @@ class TestTelegramSignalRejectReasonReflectsExchangeFailure(unittest.IsolatedAsy
         return main_module.TradingBot()
 
     def setUp(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
         self._saved_mode = settings.active_trading_mode
         self._saved_trading_mode = settings.trading_mode
         settings.active_trading_mode = "signals"
         settings.trading_mode = "real"
+        self._saved_count = global_risk_manager.state.open_positions_count
+        global_risk_manager.state.open_positions_count = 0
 
     def tearDown(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
         settings.active_trading_mode = self._saved_mode
         settings.trading_mode = self._saved_trading_mode
+        global_risk_manager.state.open_positions_count = self._saved_count
 
     async def test_reject_reason_uses_execution_engine_specific_reason(self):
         bot = self._make_bot()
