@@ -5702,6 +5702,67 @@ class TestTelegramSignalsClosedStatus(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(signal["tp_hit_count"], 1)
 
 
+class TestChannelStatsIncludesPartialClosePnl(unittest.IsolatedAsyncioTestCase):
+    """
+    GET /telegram/channels/stats считал total_pnl только по
+    TelegramSignal.executed_trade (ссылка на Trade, проставляемая
+    ИСКЛЮЧИТЕЛЬНО main.py._link_telegram_signal_trade на финальном полном
+    закрытии позиции) — тот же класс проблемы, что и в
+    TestTelegramSignalsClosedStatus выше, только на уровне агрегированной
+    статистики канала: PnL уже сработавшего частичного TP у ещё ОТКРЫТОЙ
+    позиции нигде не учитывался, пока позиция не закроется целиком.
+    """
+
+    async def test_total_pnl_counts_partial_leg_of_still_open_position(self):
+        from src.db.models import TelegramChannel, TelegramSignal
+        from src.db.session import get_session
+        from src.execution.executor import ExecutionEngine
+        from src.utils.timeutils import utcnow
+        from src.web.api import telegram_channels_stats
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "paper"
+        await engine.initialize("binance")
+
+        symbol = "CHANSTATSPARTIAL1/USDT"
+        order = await engine.create_order(
+            symbol=symbol, side="buy", amount=10.0, price=200.0, order_type="market",
+        )
+        self.assertIsNotNone(order)
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@chanstats_partial_channel", channel_title="Partial PnL Channel", active=True)
+            session.add(channel)
+            await session.flush()
+            session.add(TelegramSignal(
+                channel_id=channel.id, raw_message="test", message_date=utcnow(),
+                parsed_pair=symbol, parsed_side="long", parsed_entry=200.0,
+                decision="executed", executed_order_id=order.id,
+                # executed_trade_id намеренно НЕ проставлен — позиция ещё
+                # открыта (закрылась только часть по TP1), как и в проде.
+            ))
+            db_channel_id = channel.id
+            await session.commit()
+
+        # Только TP1 сработал (5 из 10) — остаток всё ещё открыт, Trade для
+        # финального закрытия ещё не существует.
+        result = await engine.close_paper_position(
+            symbol=symbol, side="long", entry_price=200.0, amount=5.0,
+            exit_price=220.0, reason="take_profit_1", entry_fee=1.0,
+            holding_seconds=60, order_open_id=order.id,
+        )
+        self.assertIsNotNone(result)
+
+        stats = await telegram_channels_stats()
+        channel_stats = next(s for s in stats["channels"] if s["channel_id"] == db_channel_id)
+
+        self.assertIsNotNone(channel_stats["total_pnl"])
+        self.assertAlmostEqual(channel_stats["total_pnl"], result["pnl"], places=2)
+        # closed_trades/win_rate остаются про ПОЛНОСТЬЮ закрытые позиции —
+        # эта ещё не закрыта целиком, менять их семантику не нужно.
+        self.assertEqual(channel_stats["closed_trades"], 0)
+
+
 class TestStatusExposesExchangeOrderId(unittest.IsolatedAsyncioTestCase):
     """GET /status должен показывать ID открывающего ордера с биржи для
     каждой открытой реальной позиции — раньше в ответе был только

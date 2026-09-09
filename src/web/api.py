@@ -1974,13 +1974,30 @@ async def telegram_channels_stats():
             wins = sum(1 for t in closed_trades if t.outcome == "win")
             scored = [s.quality_score for s in signals if s.quality_score is not None]
 
+            # total_pnl раньше суммировал только s.executed_trade — а эта
+            # ссылка проставляется ИСКЛЮЧИТЕЛЬНО на финальном закрытии
+            # позиции целиком (_link_telegram_signal_trade вызывается из
+            # main.py только в ветке is_partial=False), поэтому PnL уже
+            # сработавших частичных TP у ещё открытых позиций канала нигде
+            # не учитывался — тот же класс бага, что и в истории сигналов
+            # (см. renderChannelSignalsTable/_trade_data), только на уровне
+            # агрегированной статистики канала. Берём ВСЕ Trade-леги по всем
+            # исполненным ордерам канала (частичные закрытия по TP1/TP2/...
+            # и финальное), а не только финально-связанный.
+            order_ids = [s.executed_order_id for s in executed if s.executed_order_id is not None]
+            all_legs = []
+            if order_ids:
+                all_legs = (
+                    await session.execute(select(Trade).where(Trade.order_open_id.in_(order_ids)))
+                ).scalars().all()
+
             result.append({
                 "channel_id": c.id,
                 "total_signals": len(signals),
                 "executed": len(executed),
                 "closed_trades": len(closed_trades),
                 "win_rate": round(wins / len(closed_trades) * 100, 1) if closed_trades else None,
-                "total_pnl": round(sum(float(t.pnl) for t in closed_trades), 2) if closed_trades else None,
+                "total_pnl": round(sum(float(t.pnl) for t in all_legs), 2) if all_legs else None,
                 "avg_quality": round(sum(scored) / len(scored), 2) if scored else None,
                 "size_multiplier": await expectancy_sizing.size_multiplier(channel_key(c.channel_id)),
             })
