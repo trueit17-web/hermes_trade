@@ -8,6 +8,7 @@ from src.config import settings
 logger = logging.getLogger(__name__)
 
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
+TELEGRAM_EDIT_API_URL = "https://api.telegram.org/bot{token}/editMessageText"
 
 
 async def send_notification(text: str, reply_to_message_id: int | None = None) -> int | None:
@@ -60,3 +61,41 @@ async def send_notification(text: str, reply_to_message_id: int | None = None) -
     except Exception as e:
         logger.warning(f"Не удалось отправить Telegram-уведомление: {e}")
         return None
+
+
+async def edit_notification(message_id: int, text: str) -> bool:
+    """
+    Отредактировать уже отправленное уведомление (editMessageText) вместо
+    отправки нового сообщения-ответа — по запросу пользователя закрытие
+    позиции по TP/SL обновляет исходное сообщение об открытии на месте
+    (зачёркнутые уровни + PnL), а не плодит цепочку ответов.
+
+    Возвращает False при любом сбое (сообщение удалено пользователем,
+    старше ~48ч — Telegram запрещает редактирование, текст не изменился —
+    "message is not modified", токен/чат не настроены) — вызывающий код
+    сам решает, откатываться ли на send_notification(reply_to_message_id=...).
+    """
+    if not settings.telegram_bot_token or not settings.telegram_chat_id:
+        return False
+
+    url = TELEGRAM_EDIT_API_URL.format(token=settings.telegram_bot_token)
+    payload = {
+        "chat_id": settings.telegram_chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(url, json=payload)
+            if response.status_code >= 400:
+                logger.debug(
+                    f"Не удалось отредактировать сообщение {message_id} (вероятно, оно "
+                    f"удалено/устарело для редактирования): {response.status_code} {response.text[:200]}"
+                )
+                return False
+            return True
+    except Exception as e:
+        logger.warning(f"Не удалось отредактировать Telegram-уведомление {message_id}: {e}")
+        return False

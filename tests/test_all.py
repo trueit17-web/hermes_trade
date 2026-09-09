@@ -13518,6 +13518,49 @@ class TestSendNotificationReplyThreading(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(message_id)
 
+    async def test_edit_notification_success(self):
+        from src.telegram import notifier
+        response = self._mock_response(200, {"ok": True, "result": {"message_id": 555}})
+        cm, client = self._mock_client_cm([response])
+
+        with patch("src.telegram.notifier.httpx.AsyncClient", return_value=cm):
+            ok = await notifier.edit_notification(555, "новый текст")
+
+        self.assertTrue(ok)
+        self.assertEqual(client.post.call_args.kwargs["json"]["message_id"], 555)
+        self.assertEqual(client.post.call_args.kwargs["json"]["text"], "новый текст")
+        self.assertNotIn("reply_to_message_id", client.post.call_args.kwargs["json"])
+
+    async def test_edit_notification_returns_false_on_api_error(self):
+        """Например "message to edit not found" — сообщение удалено/старше 48ч."""
+        from src.telegram import notifier
+        response = self._mock_response(400, {"ok": False, "description": "message to edit not found"})
+        cm, client = self._mock_client_cm([response])
+
+        with patch("src.telegram.notifier.httpx.AsyncClient", return_value=cm):
+            ok = await notifier.edit_notification(555, "новый текст")
+
+        self.assertFalse(ok)
+
+    async def test_edit_notification_returns_false_when_not_configured(self):
+        from src.telegram import notifier
+        settings.telegram_bot_token = None
+        ok = await notifier.edit_notification(555, "новый текст")
+        self.assertFalse(ok)
+
+    async def test_edit_notification_returns_false_on_exception(self):
+        from src.telegram import notifier
+        client = MagicMock()
+        client.post = AsyncMock(side_effect=Exception("network error"))
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=client)
+        cm.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("src.telegram.notifier.httpx.AsyncClient", return_value=cm):
+            ok = await notifier.edit_notification(555, "новый текст")
+
+        self.assertFalse(ok)
+
 
 class TestOnTradeEventFiltering(unittest.IsolatedAsyncioTestCase):
     """
@@ -13891,6 +13934,115 @@ class TestCheckPositionExitNotificationReplyThreading(unittest.IsolatedAsyncioTe
             await bot._check_position_exit(symbol, 110.0)
 
         self.assertIsNone(mock_send.await_args.kwargs["reply_to_message_id"])
+
+
+class TestCheckPositionExitEditsOriginalNotification(unittest.IsolatedAsyncioTestCase):
+    """
+    По запросу пользователя: закрытие по TP/SL должно РЕДАКТИРОВАТЬ исходное
+    сообщение об открытии (editMessageText) вместо ответа новым — сработавший
+    TP зачёркнут и помечен ✅ с PnL БЕЗ валюты, при SL все ещё не достигнутые
+    TP зачёркнуты ❌. Работает только когда позиция несёт _notif_header (см.
+    _notify_signal_opened) — без него (например, после рестарта процесса)
+    код падает на старое поведение (см. TestCheckPositionExitNotificationReplyThreading).
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot(), main_module.execution_engine
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "paper"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    def _base_position(self, symbol):
+        from src.utils.timeutils import utcnow
+        return {
+            "side": "long", "entry_price": 100.0, "amount": 3.0,
+            "original_amount": 3.0, "strategy_id": "telegram_signal",
+            "sl": 90.0, "tp": None, "take_profits": [110.0, 120.0, 130.0],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+            "notification_message_id": 555,
+            "_notif_header": "📲 Сигнал: LONG 📈 " + symbol,
+            "_notif_sl_value": 90.0,
+            "_notif_tp_values": [110.0, 120.0, 130.0],
+        }
+
+    async def test_partial_tp_hit_edits_message_with_strikethrough_and_pnl(self):
+        bot, engine = self._make_bot()
+        symbol = "EDITMSG1/USDT"
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": 100.0, "amount": 3.0}
+        bot.open_positions[symbol] = self._base_position(symbol)
+
+        async def fake_close(**kwargs):
+            engine.paper_positions[symbol]["amount"] -= kwargs["amount"]
+            return {"pnl": 3.33, "pnl_pct": 10.0, "outcome": "win", "trade_id": 1}
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close), \
+             patch("src.main.edit_notification", new=AsyncMock(return_value=True)) as mock_edit, \
+             patch("src.main.send_notification", new=AsyncMock()) as mock_send:
+            closed = await bot._check_position_exit(symbol, 110.0)
+
+        self.assertFalse(closed)
+        mock_send.assert_not_awaited()
+        mock_edit.assert_awaited_once()
+        message_id, text = mock_edit.await_args.args
+        self.assertEqual(message_id, 555)
+        self.assertIn("🎯 TP1: <s>110.000000</s> ✅ +3.33 (+10.00%)", text)
+        self.assertIn("🎯 TP2: 120.000000", text)
+        self.assertIn("🎯 TP3: 130.000000", text)
+
+    async def test_stop_loss_strikes_through_all_unreached_tp_levels(self):
+        bot, engine = self._make_bot()
+        symbol = "EDITMSG2/USDT"
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": 100.0, "amount": 3.0}
+        pos = self._base_position(symbol)
+        pos["_tp_pnls"] = {0: (3.33, 10.0)}  # TP1 уже был достигнут ранее
+        pos["tp_hit_count"] = 1
+        pos["amount"] = 2.0
+        bot.open_positions[symbol] = pos
+
+        async def fake_close(**kwargs):
+            engine.paper_positions.pop(symbol, None)
+            return {"pnl": -20.0, "pnl_pct": -10.0, "outcome": "loss", "trade_id": 2}
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close), \
+             patch("src.main.edit_notification", new=AsyncMock(return_value=True)) as mock_edit, \
+             patch("src.main.send_notification", new=AsyncMock()) as mock_send:
+            closed = await bot._check_position_exit(symbol, 90.0)
+
+        self.assertTrue(closed)
+        mock_send.assert_not_awaited()
+        text = mock_edit.await_args.args[1]
+        self.assertIn("🛑 SL: <s>90.000000</s> ❌ -20.00 (-10.00%)", text)
+        # TP1 уже был достигнут раньше — остаётся ✅ со своим PnL, не ❌.
+        self.assertIn("🎯 TP1: <s>110.000000</s> ✅ +3.33 (+10.00%)", text)
+        # TP2/TP3 не были достигнуты — зачёркнуты как упущенные, без PnL.
+        self.assertIn("🎯 TP2: <s>120.000000</s> ❌", text)
+        self.assertIn("🎯 TP3: <s>130.000000</s> ❌", text)
+
+    async def test_edit_failure_falls_back_to_reply(self):
+        bot, engine = self._make_bot()
+        symbol = "EDITMSG3/USDT"
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": 100.0, "amount": 3.0}
+        bot.open_positions[symbol] = self._base_position(symbol)
+
+        async def fake_close(**kwargs):
+            engine.paper_positions[symbol]["amount"] -= kwargs["amount"]
+            return {"pnl": 3.33, "pnl_pct": 10.0, "outcome": "win", "trade_id": 1}
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close), \
+             patch("src.main.edit_notification", new=AsyncMock(return_value=False)), \
+             patch("src.main.send_notification", new=AsyncMock()) as mock_send:
+            await bot._check_position_exit(symbol, 110.0)
+
+        mock_send.assert_awaited_once()
+        self.assertEqual(mock_send.await_args.kwargs["reply_to_message_id"], 555)
 
 
 class TestExecuteTelegramSignalStoresRealTakeProfits(unittest.IsolatedAsyncioTestCase):

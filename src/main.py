@@ -51,7 +51,7 @@ from src.telegram.channel_monitor import (
     remove_channel_from_monitoring,
     subscribe_telegram_signal,
 )
-from src.telegram.notifier import send_notification
+from src.telegram.notifier import edit_notification, send_notification
 from src.utils.logging import drain_pending_log_records, logger, setup_logging
 from src.utils.timeutils import utcnow
 from src.web.api import app as web_app
@@ -555,6 +555,61 @@ class TradingBot:
             return "🎯 TP: не указан"
         return "\n".join(f"🎯 TP{i + 1}: {level:.6f}" for i, level in enumerate(levels))
 
+    def _render_signal_message(self, symbol: str, position: dict) -> str | None:
+        """
+        Пересобрать текст уведомления об открытии с учётом того, какие
+        TP/SL уже сработали — используется вместо send_notification(reply_
+        to_message_id=...) при закрытии по TP/SL (см. _check_position_exit):
+        по запросу пользователя закрытие должно РЕДАКТИРОВАТЬ исходное
+        сообщение (editMessageText), а не отвечать новым. Сработавший TP —
+        зачёркнут, отмечен ✅ и рядом фактический PnL этой части БЕЗ валюты
+        (только число и %, как и просили). Если сработал SL — сам SL так
+        же зачёркнут и помечен ❌ с PnL, а ВСЕ ещё не достигнутые TP-уровни
+        зачёркиваются ❌ без PnL (уровня не было, считать нечего) — они уже
+        никогда не будут достигнуты для ЭТОЙ позиции.
+
+        Telegram НЕ поддерживает произвольный цвет текста в сообщениях
+        (только b/i/u/s/code/spoiler и т.п.) — зачёркивание есть (<s>), а
+        "зелёным"/"красным" здесь можно передать только эмодзи ✅/❌ рядом
+        с зачёркнутым текстом, не самим цветом шрифта.
+
+        Возвращает None, если сообщение открытия не сохранено в структуре,
+        пригодной для пересборки (например, позиция восстановлена после
+        рестарта процесса — _notif_header не персистится в БД) — тогда
+        вызывающий код сам решает откатиться на старое поведение (reply).
+        """
+        header = position.get("_notif_header")
+        if header is None:
+            return None
+
+        lines = [header]
+
+        sl = position.get("_notif_sl_value")
+        sl_pnl = position.get("_sl_pnl")
+        if sl is None:
+            lines.append("🛑 SL: не указан")
+        elif sl_pnl is not None:
+            lines.append(f"🛑 SL: <s>{sl:.6f}</s> ❌ {sl_pnl[0]:+.2f} ({sl_pnl[1]:+.2f}%)")
+        else:
+            lines.append(self._sl_notification_line(symbol, sl))
+
+        tp_values = position.get("_notif_tp_values") or []
+        if not tp_values:
+            lines.append("🎯 TP: не указан")
+        else:
+            tp_pnls: dict[int, tuple[float, float]] = position.get("_tp_pnls") or {}
+            sl_hit = sl_pnl is not None
+            for i, level in enumerate(tp_values):
+                hit_pnl = tp_pnls.get(i)
+                if hit_pnl is not None:
+                    lines.append(f"🎯 TP{i + 1}: <s>{level:.6f}</s> ✅ {hit_pnl[0]:+.2f} ({hit_pnl[1]:+.2f}%)")
+                elif sl_hit:
+                    lines.append(f"🎯 TP{i + 1}: <s>{level:.6f}</s> ❌")
+                else:
+                    lines.append(f"🎯 TP{i + 1}: {level:.6f}")
+
+        return "\n".join(lines)
+
     async def _update_coinglass(self):
         """Обновление данных из CoinGlass."""
         try:
@@ -1023,7 +1078,7 @@ class TradingBot:
         после рестарта процесса (см. _load_open_positions_from_db).
         """
         side_label = "LONG 📈" if side == "long" else "SHORT 📉"
-        lines = [f"📲 Сигнал: {side_label} {symbol}"]
+        header_lines = [f"📲 Сигнал: {side_label} {symbol}"]
 
         channel_id = signal_event.get("channel_id")
         if channel_id:
@@ -1034,18 +1089,32 @@ class TradingBot:
                 # БД на момент подсчёта (_save_telegram_signal вызывается
                 # ПОСЛЕ _execute_telegram_signal, см. _on_telegram_signal),
                 # но она уже применена и уже открыта.
-                lines.append(f"Канал: {title} (из {applied + 1}/ {wins} в+/{open_count + 1} откр.)")
+                header_lines.append(f"Канал: {title} (из {applied + 1}/ {wins} в+/{open_count + 1} откр.)")
             else:
-                lines.append(f"Канал: {channel_id}")
+                header_lines.append(f"Канал: {channel_id}")
 
-        lines.append(f"Вход: {entry:.6f}")
-        lines.append(self._sl_notification_line(symbol, sl))
-        lines.append(self._tp_notification_lines(take_profits, tp))
+        header_lines.append(f"Вход: {entry:.6f}")
+
+        lines = [*header_lines, self._sl_notification_line(symbol, sl), self._tp_notification_lines(take_profits, tp)]
 
         message_id = await send_notification("\n".join(lines))
         if message_id is None:
             return
-        self.open_positions[symbol]["notification_message_id"] = message_id
+        pos = self.open_positions[symbol]
+        pos["notification_message_id"] = message_id
+        # Сохраняем неизменную "шапку" (сторона/канал/вход) и голые
+        # значения SL/TP отдельно от готового текста — по запросу
+        # пользователя закрытие по TP/SL теперь РЕДАКТИРУЕТ это же
+        # сообщение (зачёркнутые уровни + PnL), а не отвечает новым, а для
+        # editMessageText нужно каждый раз пересобирать ПОЛНЫЙ текст
+        # заново (см. _render_signal_message). Без этих полей (например,
+        # позиция восстановлена после рестарта процесса — они не
+        # персистятся в БД) _render_signal_message возвращает None, и
+        # _check_position_exit сам откатывается на старое поведение
+        # (reply_to_message_id).
+        pos["_notif_header"] = "\n".join(header_lines)
+        pos["_notif_sl_value"] = sl
+        pos["_notif_tp_values"] = list(take_profits) if take_profits else ([tp] if tp else [])
         tracked = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
         if symbol in tracked:
             tracked[symbol]["notification_message_id"] = message_id
@@ -2159,6 +2228,17 @@ class TradingBot:
         risk_manager.on_trade_closed(result["pnl"])
         self.daily_pnl = getattr(risk_manager.state, "daily_pnl", 0.0)
 
+        # Для _render_signal_message (редактирование исходного уведомления
+        # вместо ответа новым сообщением) — какой именно уровень сработал
+        # и с каким PnL. level_hit проставлен циклом поиска reason/level_hit
+        # выше ДЛЯ ЛЮБОГО срабатывания TP (и частичного, и финального,
+        # закрывающего последний уровень целиком) — не привязано к
+        # is_partial, в отличие от tp_hit_count ниже.
+        if reason == "stop_loss":
+            position["_sl_pnl"] = (result["pnl"], result["pnl_pct"])
+        elif level_hit is not None:
+            position.setdefault("_tp_pnls", {})[level_hit] = (result["pnl"], result["pnl_pct"])
+
         if is_partial:
             position["amount"] -= close_amount
             position["entry_fee"] = entry_fee_total - entry_fee_portion
@@ -2211,12 +2291,18 @@ class TradingBot:
                 "partial": is_partial,
             },
         )
-        await send_notification(
-            f"{emoji} {'Частично закрыта' if is_partial else 'Закрыта'} {side.upper()} {symbol}\n"
-            f"Причина: {reason_ru}\n"
-            f"PnL: {result['pnl']:+.2f} USDT ({result['pnl_pct']:+.2f}%)",
-            reply_to_message_id=position.get("notification_message_id"),
-        )
+        message_id = position.get("notification_message_id")
+        edited_text = self._render_signal_message(symbol, position)
+        edited = False
+        if edited_text is not None and message_id is not None:
+            edited = await edit_notification(message_id, edited_text)
+        if not edited:
+            await send_notification(
+                f"{emoji} {'Частично закрыта' if is_partial else 'Закрыта'} {side.upper()} {symbol}\n"
+                f"Причина: {reason_ru}\n"
+                f"PnL: {result['pnl']:+.2f} USDT ({result['pnl_pct']:+.2f}%)",
+                reply_to_message_id=message_id,
+            )
         return not is_partial
 
     async def _link_telegram_signal_trade(
