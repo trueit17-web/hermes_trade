@@ -171,10 +171,12 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "telegram_chat_id", "label": "Telegram chat id (уведомления)", "group": "Telegram уведомления", "type": "secret",
      "description": "ID чата/пользователя, куда бот отправляет уведомления. Обычно ваш личный chat id."},
 
-    {"key": "active_exchange", "label": "Активная биржа (real-режим)", "group": "Биржи", "type": "select", "options": ["binance", "bybit", "okx"],
+    {"key": "active_exchange", "label": "Активная биржа (real-режим)", "group": "Биржи", "type": "select",
+     "options": ["binance", "bybit", "okx", "kucoin", "bingx", "bitget", "bitmex", "hyperliquid"],
      "description": "На какой бирже исполняются реальные ордера в real-режиме. Требует заполненных ключей этой биржи ниже. Смена применяется сразу, без перезапуска бота."},
     {"key": "use_exchange_sandbox", "label": "Демо-счёт (sandbox/testnet)", "group": "Биржи", "type": "bool",
-     "description": "Торговать на демо/testnet-счету биржи вместо реальных денег, тем же API-ключом. Рекомендуется держать включённым, пока не проверили бота вживую."},
+     "description": "Торговать на демо/testnet-счету биржи вместо реальных денег, тем же API-ключом. Рекомендуется держать включённым, пока не проверили бота вживую. "
+                     "KuCoin исключение: демо-счёт для него не поддержан текущей интеграцией — при активной бирже KuCoin этот тумблер игнорируется, бот откажется подключаться."},
     {"key": "market_type", "label": "Тип рынка (real-режим)", "group": "Биржи", "type": "select", "options": ["spot", "futures"],
      "description": "spot — обычный спот-рынок (шорт не поддерживается). futures — USDT-перпетуалы (linear swap), "
                      "открытие/закрытие long и short, биржевой SL, дуст-сверка позиций — всё уже работает. "
@@ -186,20 +188,87 @@ SETTINGS_SCHEMA: list[dict] = [
                      "Применяется через set_leverage перед каждым открытием позиции — если только Telegram-канал "
                      "не указал своё плечо прямо в тексте сигнала (например «Кредитное плечо: х35») — тогда "
                      "используется именно оно для этого ордера."},
+
+    # Ключей теперь 8 бирж × 2-3 поля — все сразу на экране были бы почти
+    # нечитаемы. credentials_exchange_ui — чисто UI-переключатель (не влияет
+    # на торговлю, отдельно от active_exchange выше, см. её докстринг в
+    # config.py): выбирает, ключи КАКОЙ биржи показаны ниже, остальные
+    # скрыты через тот же depends_on-механизм, что и, например, ATR-поля
+    # ниже — только гейт здесь не чекбокс, а select (см. depends_on_value:
+    # UI показывает поле, только если ЗНАЧЕНИЕ гейта равно ему, а не просто
+    # "гейт включён").
+    {"key": "credentials_exchange_ui", "label": "Ввести ключи для биржи", "group": "Биржи", "type": "select",
+     "options": ["binance", "bybit", "okx", "kucoin", "bingx", "bitget", "bitmex", "hyperliquid"],
+     "description": "Только выбор, какие поля ключей показаны ниже — не переключает, какая биржа реально торгует "
+                     "(это делает 'Активная биржа' выше)."},
+
     {"key": "binance_api_key", "label": "Binance API key", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "binance",
      "description": "Ключ API Binance для торговли в real-режиме. Выдавайте права только на торговлю, без вывода средств."},
     {"key": "binance_api_secret", "label": "Binance API secret", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "binance",
      "description": "Секрет API Binance, в паре с ключом выше."},
+
     {"key": "bybit_api_key", "label": "Bybit API key", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "bybit",
      "description": "Ключ API Bybit для торговли в real-режиме. Выдавайте права только на торговлю, без вывода средств."},
     {"key": "bybit_api_secret", "label": "Bybit API secret", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "bybit",
      "description": "Секрет API Bybit, в паре с ключом выше."},
+
     {"key": "okx_api_key", "label": "OKX API key", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "okx",
      "description": "Ключ API OKX для торговли в real-режиме. Выдавайте права только на торговлю, без вывода средств."},
     {"key": "okx_api_secret", "label": "OKX API secret", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "okx",
      "description": "Секрет API OKX, в паре с ключом выше."},
     {"key": "okx_passphrase", "label": "OKX passphrase", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "okx",
      "description": "Passphrase, заданный при создании API-ключа OKX — обязателен для подписи запросов, отдельно от ключа и секрета."},
+
+    {"key": "kucoin_api_key", "label": "KuCoin API key", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "kucoin",
+     "description": "Ключ API KuCoin для торговли в real-режиме. Выдавайте права только на торговлю, без вывода средств."},
+    {"key": "kucoin_api_secret", "label": "KuCoin API secret", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "kucoin",
+     "description": "Секрет API KuCoin, в паре с ключом выше."},
+    {"key": "kucoin_passphrase", "label": "KuCoin passphrase", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "kucoin",
+     "description": "Passphrase, заданный при создании API-ключа KuCoin — обязателен для подписи запросов. "
+                     "Демо-счёт для KuCoin не поддержан — торговля этой биржей возможна только реальными деньгами."},
+
+    {"key": "bingx_api_key", "label": "BingX API key", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "bingx",
+     "description": "Ключ API BingX для торговли в real-режиме. Выдавайте права только на торговлю, без вывода средств."},
+    {"key": "bingx_api_secret", "label": "BingX API secret", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "bingx",
+     "description": "Секрет API BingX, в паре с ключом выше."},
+
+    {"key": "bitget_api_key", "label": "Bitget API key", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "bitget",
+     "description": "Ключ API Bitget для торговли в real-режиме. Выдавайте права только на торговлю, без вывода средств."},
+    {"key": "bitget_api_secret", "label": "Bitget API secret", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "bitget",
+     "description": "Секрет API Bitget, в паре с ключом выше."},
+    {"key": "bitget_passphrase", "label": "Bitget passphrase", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "bitget",
+     "description": "Passphrase, заданный при создании API-ключа Bitget — обязателен для подписи запросов."},
+
+    {"key": "bitmex_api_key", "label": "BitMEX API key", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "bitmex",
+     "description": "Ключ API BitMEX для торговли в real-режиме. Выдавайте права только на торговлю, без вывода средств."},
+    {"key": "bitmex_api_secret", "label": "BitMEX API secret", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "bitmex",
+     "description": "Секрет API BitMEX, в паре с ключом выше."},
+
+    {"key": "hyperliquid_wallet_address", "label": "HyperLiquid: адрес кошелька", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "hyperliquid",
+     "description": "Публичный адрес кошелька HyperLiquid (DEX — не обычная биржа с API-ключом)."},
+    {"key": "hyperliquid_private_key", "label": "HyperLiquid: приватный ключ", "group": "Биржи", "type": "secret",
+     "depends_on": "credentials_exchange_ui", "depends_on_value": "hyperliquid",
+     "description": "Приватный ключ этого кошелька — им подписываются ордера. В отличие от обычного API-ключа, "
+                     "даёт полный доступ к средствам кошелька, а не только к торговле — храните с той же осторожностью, "
+                     "что и сам кошелёк, и по возможности используйте отдельный кошелёк только для торговли ботом."},
 ]
 
 _SCHEMA_BY_KEY = {f["key"]: f for f in SETTINGS_SCHEMA}

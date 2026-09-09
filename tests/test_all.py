@@ -7817,6 +7817,294 @@ class TestMultiExchangeCredentials(unittest.IsolatedAsyncioTestCase):
         mock_exchange.set_sandbox_mode.assert_not_called()
 
 
+class TestNewExchangesCredentials(unittest.IsolatedAsyncioTestCase):
+    """
+    Поддержка 5 новых бирж (KuCoin, BingX, Bitget, BitMEX, HyperLiquid) по
+    запросу пользователя, добавлена вместе с уже существующими Binance/
+    Bybit/OKX. KuCoin/Bitget, как и OKX, требуют passphrase (ccxt "password").
+    HyperLiquid — DEX на базе кошелька: авторизация приватным ключом
+    кошелька (walletAddress/privateKey), а не парой apiKey/secret, поэтому
+    у него отдельная ветка сборки credentials (см.
+    ExecutionEngine._exchange_credentials_config).
+    """
+
+    def setUp(self):
+        self._saved = {
+            k: getattr(settings, k) for k in (
+                "trading_mode", "use_exchange_sandbox",
+                "kucoin_api_key", "kucoin_api_secret", "kucoin_passphrase",
+                "bingx_api_key", "bingx_api_secret",
+                "bitget_api_key", "bitget_api_secret", "bitget_passphrase",
+                "bitmex_api_key", "bitmex_api_secret",
+                "hyperliquid_wallet_address", "hyperliquid_private_key",
+            )
+        }
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        self._saved_risk_state = dict(global_risk_manager.state.__dict__)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(settings, k, v)
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        global_risk_manager.state.__dict__.update(self._saved_risk_state)
+
+    async def test_bitget_passes_passphrase_as_password(self):
+        settings.trading_mode = "real"
+        settings.bitget_api_key = "bitget-key"
+        settings.bitget_api_secret = "bitget-secret"
+        settings.bitget_passphrase = "bitget-passphrase"
+        settings.use_exchange_sandbox = True
+
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        mock_exchange = AsyncMock()
+        mock_exchange.fetch_balance = AsyncMock(return_value={})
+        mock_exchange.set_sandbox_mode = MagicMock()
+        with patch("src.execution.executor.ccxt.bitget", return_value=mock_exchange) as mock_cls:
+            await engine.initialize("bitget")
+
+        config = mock_cls.call_args.args[0]
+        self.assertEqual(config["apiKey"], "bitget-key")
+        self.assertEqual(config["secret"], "bitget-secret")
+        self.assertEqual(config["password"], "bitget-passphrase")
+        self.assertFalse(engine.is_paper)
+
+    async def test_kucoin_missing_passphrase_falls_back_to_paper(self):
+        settings.trading_mode = "real"
+        settings.kucoin_api_key = "kucoin-key"
+        settings.kucoin_api_secret = "kucoin-secret"
+        settings.kucoin_passphrase = None
+
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        await engine.initialize("kucoin")
+
+        self.assertTrue(engine.is_paper)
+
+    async def test_kucoin_sandbox_refuses_instead_of_corrupting_urls(self):
+        """
+        KuCoin в установленной версии ccxt не переопределяет ни
+        set_sandbox_mode, ни enable_demo_trading — обе используют базовую
+        реализацию, которая перезаписывает exchange.urls["api"] значением
+        urls["test"]/urls["demo"], а у KuCoin оба None. _connect_exchange
+        должен явно отказаться (RuntimeError, перехватывается в initialize()
+        -> paper режим), а не тихо ломать все последующие запросы.
+        """
+        settings.trading_mode = "real"
+        settings.kucoin_api_key = "kucoin-key"
+        settings.kucoin_api_secret = "kucoin-secret"
+        settings.kucoin_passphrase = "kucoin-passphrase"
+        settings.use_exchange_sandbox = True
+
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        await engine.initialize("kucoin")
+
+        # initialize() перехватывает исключение _connect_exchange и падает
+        # обратно в paper режим — тот же контракт, что и у любой другой
+        # ошибки инициализации биржи.
+        self.assertTrue(engine.is_paper)
+
+    async def test_kucoin_real_account_connects_without_sandbox(self):
+        settings.trading_mode = "real"
+        settings.kucoin_api_key = "kucoin-key"
+        settings.kucoin_api_secret = "kucoin-secret"
+        settings.kucoin_passphrase = "kucoin-passphrase"
+        settings.use_exchange_sandbox = False
+
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        mock_exchange = AsyncMock()
+        mock_exchange.fetch_balance = AsyncMock(return_value={})
+        with patch("src.execution.executor.ccxt.kucoin", return_value=mock_exchange):
+            await engine.initialize("kucoin")
+
+        mock_exchange.set_sandbox_mode.assert_not_called()
+        mock_exchange.enable_demo_trading.assert_not_called()
+        self.assertFalse(engine.is_paper)
+
+    async def test_hyperliquid_uses_wallet_credentials_not_api_key(self):
+        settings.trading_mode = "real"
+        settings.hyperliquid_wallet_address = "0xWALLET"
+        settings.hyperliquid_private_key = "priv-key"
+        settings.use_exchange_sandbox = True
+
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        mock_exchange = AsyncMock()
+        mock_exchange.fetch_balance = AsyncMock(return_value={})
+        mock_exchange.set_sandbox_mode = MagicMock()
+        with patch("src.execution.executor.ccxt.hyperliquid", return_value=mock_exchange) as mock_cls:
+            await engine.initialize("hyperliquid")
+
+        config = mock_cls.call_args.args[0]
+        self.assertEqual(config["walletAddress"], "0xWALLET")
+        self.assertEqual(config["privateKey"], "priv-key")
+        self.assertNotIn("apiKey", config)
+        self.assertFalse(engine.is_paper)
+
+    async def test_hyperliquid_missing_private_key_falls_back_to_paper(self):
+        settings.trading_mode = "real"
+        settings.hyperliquid_wallet_address = "0xWALLET"
+        settings.hyperliquid_private_key = None
+
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        await engine.initialize("hyperliquid")
+
+        self.assertTrue(engine.is_paper)
+
+    async def test_bingx_bitmex_do_not_require_passphrase(self):
+        settings.trading_mode = "real"
+        settings.bingx_api_key = "bingx-key"
+        settings.bingx_api_secret = "bingx-secret"
+
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        mock_exchange = AsyncMock()
+        mock_exchange.fetch_balance = AsyncMock(return_value={})
+        mock_exchange.set_sandbox_mode = MagicMock()
+        with patch("src.execution.executor.ccxt.bingx", return_value=mock_exchange):
+            await engine.initialize("bingx")
+
+        self.assertFalse(engine.is_paper)
+
+
+class TestSettingsSchemaNewExchanges(unittest.TestCase):
+    """
+    active_exchange/credentials_exchange_ui должны предлагать все 8 бирж
+    (не только исходные Binance/Bybit/OKX), а поля ключей новых бирж —
+    быть гейтнуты через depends_on/depends_on_value на
+    credentials_exchange_ui (выпадающее меню выбора биржи для ввода
+    ключей, см. dashboard.html applySettingsDependencies), а не показаны
+    всегда одновременно, как было для исходных 3 бирж.
+    """
+
+    def test_active_exchange_options_include_all_8(self):
+        from src.web.settings_store import SETTINGS_SCHEMA
+        field = next(f for f in SETTINGS_SCHEMA if f["key"] == "active_exchange")
+        self.assertEqual(
+            set(field["options"]),
+            {"binance", "bybit", "okx", "kucoin", "bingx", "bitget", "bitmex", "hyperliquid"},
+        )
+
+    def test_credentials_picker_field_exists_with_same_options(self):
+        from src.web.settings_store import SETTINGS_SCHEMA
+        field = next(f for f in SETTINGS_SCHEMA if f["key"] == "credentials_exchange_ui")
+        self.assertEqual(field["type"], "select")
+        self.assertEqual(
+            set(field["options"]),
+            {"binance", "bybit", "okx", "kucoin", "bingx", "bitget", "bitmex", "hyperliquid"},
+        )
+
+    def test_new_exchange_key_fields_are_gated_on_picker(self):
+        from src.web.settings_store import SETTINGS_SCHEMA
+        by_key = {f["key"]: f for f in SETTINGS_SCHEMA}
+        expected = {
+            "kucoin_api_key": "kucoin", "kucoin_api_secret": "kucoin", "kucoin_passphrase": "kucoin",
+            "bingx_api_key": "bingx", "bingx_api_secret": "bingx",
+            "bitget_api_key": "bitget", "bitget_api_secret": "bitget", "bitget_passphrase": "bitget",
+            "bitmex_api_key": "bitmex", "bitmex_api_secret": "bitmex",
+            "hyperliquid_wallet_address": "hyperliquid", "hyperliquid_private_key": "hyperliquid",
+        }
+        for key, expected_value in expected.items():
+            field = by_key[key]
+            self.assertEqual(field.get("depends_on"), "credentials_exchange_ui", key)
+            self.assertEqual(field.get("depends_on_value"), expected_value, key)
+
+    def test_snapshot_reflects_new_fields_current_values(self):
+        from src.web.settings_store import get_settings_snapshot
+        saved = settings.bingx_api_key
+        try:
+            settings.bingx_api_key = "some-key"
+            snap = {f["key"]: f for f in get_settings_snapshot()}
+            self.assertTrue(snap["bingx_api_key"]["configured"])
+        finally:
+            settings.bingx_api_key = saved
+
+
+class TestConnectionsStatusPerExchange(unittest.IsolatedAsyncioTestCase):
+    """
+    connections_status раньше возвращал ОДНУ запись "Биржа (исполнение)"
+    только про settings.active_exchange — заранее заведённые ключи
+    остальных бирж были не видны в дашборде. Теперь одна запись на каждую
+    из 8 поддержанных бирж (group="exchange" — дашборд рисует их отдельной
+    сеткой карточек), плюс статусы LLM-фолбэк парсеров (Anthropic/Groq/
+    Gemini/Cerebras), которые раньше не отображались вовсе, хотя давно
+    поддержаны кодом.
+    """
+
+    def setUp(self):
+        self._saved = {
+            k: getattr(settings, k) for k in (
+                "active_exchange", "bybit_api_key", "bybit_api_secret",
+                "kucoin_api_key", "kucoin_api_secret", "kucoin_passphrase",
+                "telegram_llm_fallback_enabled", "anthropic_api_key",
+            )
+        }
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(settings, k, v)
+
+    async def test_all_8_exchanges_present_with_group_tag(self):
+        from src.web.connections_status import get_connections_status
+        statuses = await get_connections_status()
+        exchange_entries = [s for s in statuses if s.get("group") == "exchange"]
+        self.assertEqual(len(exchange_entries), 8)
+        keys = {s["key"] for s in exchange_entries}
+        self.assertEqual(
+            keys,
+            {f"exchange_{ex}" for ex in
+             ("binance", "bybit", "okx", "kucoin", "bingx", "bitget", "bitmex", "hyperliquid")},
+        )
+
+    async def test_configured_but_inactive_exchange_shows_configured_not_connected(self):
+        settings.active_exchange = "binance"
+        settings.kucoin_api_key = "k"
+        settings.kucoin_api_secret = "s"
+        settings.kucoin_passphrase = "p"
+
+        from src.web.connections_status import get_connections_status
+        statuses = await get_connections_status()
+        kucoin_entry = next(s for s in statuses if s["key"] == "exchange_kucoin")
+        self.assertEqual(kucoin_entry["status"], "configured")
+
+    async def test_exchange_without_credentials_shows_not_configured(self):
+        from src.web.connections_status import get_connections_status
+        settings_backup = (settings.bitmex_api_key, settings.bitmex_api_secret)
+        settings.bitmex_api_key = None
+        settings.bitmex_api_secret = None
+        try:
+            statuses = await get_connections_status()
+            entry = next(s for s in statuses if s["key"] == "exchange_bitmex")
+            self.assertEqual(entry["status"], "not_configured")
+        finally:
+            settings.bitmex_api_key, settings.bitmex_api_secret = settings_backup
+
+    async def test_llm_providers_present_and_reflect_enabled_flag(self):
+        from src.web.connections_status import get_connections_status
+
+        settings.telegram_llm_fallback_enabled = False
+        statuses = await get_connections_status()
+        anthropic_entry = next(s for s in statuses if s["key"] == "llm_anthropic")
+        self.assertEqual(anthropic_entry["status"], "disabled")
+
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = None
+        statuses = await get_connections_status()
+        anthropic_entry = next(s for s in statuses if s["key"] == "llm_anthropic")
+        self.assertEqual(anthropic_entry["status"], "not_configured")
+
+        settings.anthropic_api_key = "sk-ant-something"
+        statuses = await get_connections_status()
+        anthropic_entry = next(s for s in statuses if s["key"] == "llm_anthropic")
+        self.assertEqual(anthropic_entry["status"], "configured")
+
+        llm_keys = {s["key"] for s in statuses if s["key"].startswith("llm_")}
+        self.assertEqual(llm_keys, {"llm_anthropic", "llm_groq", "llm_gemini", "llm_cerebras"})
+
+
 class TestExtractUsdtBalance(unittest.TestCase):
     """
     ccxt fetch_balance() кладёт баланс валюты во ВЛОЖЕННЫЙ словарь

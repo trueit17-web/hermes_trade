@@ -193,6 +193,57 @@ class ExecutionEngine:
         """
         return _shared_ccxt_symbol(exchange, symbol)
 
+    # Биржи, требующие третий секрет (passphrase, задаётся при создании
+    # API-ключа) в каждом запросе — ccxt называет его "password". HyperLiquid
+    # сюда не входит: у него совсем другая модель авторизации (см. ниже).
+    _PASSPHRASE_EXCHANGES = frozenset({"okx", "kucoin", "bitget"})
+
+    @staticmethod
+    def _exchange_credentials_config(exchange_id: str) -> dict:
+        """
+        Собрать kwargs для конструктора ccxt-клиента конкретной биржи —
+        общая логика между initialize() (проверка "заданы ли ключи") и
+        _connect_exchange() (сам конструктор), вынесенная в одно место,
+        чтобы добавление новой биржи не требовало правки в двух местах
+        синхронно (раньше словарь credentials был продублирован буквально).
+
+        HyperLiquid — DEX на базе кошелька, а не обычная биржа с API-ключом:
+        ccxt авторизует его запросы приватным ключом кошелька (walletAddress/
+        privateKey), а не парой apiKey/secret — отдельная ветка вместо общей
+        таблицы (api_key, api_secret, passphrase).
+        """
+        if exchange_id == "hyperliquid":
+            return {
+                "walletAddress": settings.hyperliquid_wallet_address,
+                "privateKey": settings.hyperliquid_private_key,
+            }
+        creds: dict[str, tuple[str | None, str | None, str | None]] = {
+            "binance": (settings.binance_api_key, settings.binance_api_secret, None),
+            "bybit": (settings.bybit_api_key, settings.bybit_api_secret, None),
+            "okx": (settings.okx_api_key, settings.okx_api_secret, settings.okx_passphrase),
+            "kucoin": (settings.kucoin_api_key, settings.kucoin_api_secret, settings.kucoin_passphrase),
+            "bingx": (settings.bingx_api_key, settings.bingx_api_secret, None),
+            "bitget": (settings.bitget_api_key, settings.bitget_api_secret, settings.bitget_passphrase),
+            "bitmex": (settings.bitmex_api_key, settings.bitmex_api_secret, None),
+        }
+        api_key, api_secret, passphrase = creds.get(exchange_id, (None, None, None))
+        config: dict = {"apiKey": api_key, "secret": api_secret}
+        if passphrase:
+            config["password"] = passphrase
+        return config
+
+    @classmethod
+    def _exchange_credentials_present(cls, exchange_id: str) -> bool:
+        """Заданы ли в settings все секреты, обязательные именно для этой биржи."""
+        if exchange_id == "hyperliquid":
+            return bool(settings.hyperliquid_wallet_address and settings.hyperliquid_private_key)
+        config = cls._exchange_credentials_config(exchange_id)
+        if not (config.get("apiKey") and config.get("secret")):
+            return False
+        if exchange_id in cls._PASSPHRASE_EXCHANGES and not config.get("password"):
+            return False
+        return True
+
     def get_open_positions(self) -> dict:
         """Открытые позиции для текущего режима (paper или real)."""
         return dict(self.paper_positions if self.is_paper else self.real_positions)
@@ -264,17 +315,7 @@ class ExecutionEngine:
             # независимо от exchange_id — подключение к Bybit реально шло по
             # Binance-ключам (или падало в paper, если их не было), а
             # собственные ключи Bybit нигде не читались вообще.
-            credentials: dict[str, tuple[str | None, str | None, str | None]] = {
-                "binance": (settings.binance_api_key, settings.binance_api_secret, None),
-                "bybit": (settings.bybit_api_key, settings.bybit_api_secret, None),
-                # OKX, в отличие от Binance/Bybit, требует третий секрет
-                # (passphrase) в каждом запросе — ccxt называет его "password".
-                "okx": (settings.okx_api_key, settings.okx_api_secret, settings.okx_passphrase),
-            }
-            api_key, api_secret, passphrase = credentials.get(exchange_id, (None, None, None))
-            missing_passphrase = exchange_id == "okx" and not passphrase
-
-            if not api_key or not api_secret or missing_passphrase:
+            if not self._exchange_credentials_present(exchange_id):
                 logger.warning(f"⚠️ API ключи {exchange_id} не указаны, переключаемся в paper режим")
                 self.is_paper = True
                 await self._restore_paper_state_from_db()
@@ -376,12 +417,6 @@ class ExecutionEngine:
         на ДРУГОМ рынке (см. initialize()). Ключи и sandbox-настройки
         читаются из settings — они общие для аккаунта независимо от рынка.
         """
-        credentials: dict[str, tuple[str | None, str | None, str | None]] = {
-            "binance": (settings.binance_api_key, settings.binance_api_secret, None),
-            "bybit": (settings.bybit_api_key, settings.bybit_api_secret, None),
-            "okx": (settings.okx_api_key, settings.okx_api_secret, settings.okx_passphrase),
-        }
-        api_key, api_secret, passphrase = credentials.get(exchange_id, (None, None, None))
         exchange_class = getattr(ccxt, exchange_id)
 
         # market_type=="futures" переключает ccxt на linear-swap рынок
@@ -394,13 +429,10 @@ class ExecutionEngine:
             else {"defaultType": "spot"}
         )
         exchange_config: dict = {
-            "apiKey": api_key,
-            "secret": api_secret,
+            **self._exchange_credentials_config(exchange_id),
             "enableRateLimit": True,
             "options": market_options,
         }
-        if passphrase:
-            exchange_config["password"] = passphrase
         exchange = exchange_class(exchange_config)
 
         if settings.use_exchange_sandbox:
@@ -419,11 +451,29 @@ class ExecutionEngine:
                 # падает с NotSupported, если до этого уже включён
                 # set_sandbox_mode.
                 exchange.enable_demo_trading(True)
+            elif exchange_id == "kucoin":
+                # KuCoin в установленной версии ccxt не имеет ни urls["test"]
+                # (значение None при наличии самого ключа), ни urls["demo"] —
+                # ни set_sandbox_mode(True), ни enable_demo_trading(True) не
+                # переопределены у KuCoin и используют дефолтную реализацию
+                # базового класса, которая слепо перезаписывает
+                # self.urls["api"] значением из urls["test"]/urls["demo"].
+                # Для KuCoin это None — экспортировали бы КАЖДЫЙ запрос на
+                # адрес None, ломая всё подключение без внятной причины в
+                # логах. Явный отказ вместо необъяснимых сетевых ошибок —
+                # тот же принцип, что и "ключи не заданы -> paper режим".
+                raise RuntimeError(
+                    "KuCoin: демо/sandbox-счёt не поддержан текущей версией ccxt — "
+                    "включите реальный счёт (выключите 'Демо-счёт (sandbox/testnet)' "
+                    "в настройках) только когда точно готовы торговать KuCoin реальными "
+                    "деньгами, либо выберите другую биржу для теста."
+                )
             else:
                 # Тот же API-ключ, но запросы идут на demo/testnet-счёт
                 # биржи вместо реального — ccxt сам подменяет нужные
                 # адреса (testnet.binance.vision для Binance, demo-режим
-                # OKX).
+                # OKX/Bitget, VST-счёт BingX, testnet.bitmex.com,
+                # hyperliquid-testnet.xyz).
                 exchange.set_sandbox_mode(True)
 
         await exchange.load_markets()

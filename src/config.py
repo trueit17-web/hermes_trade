@@ -75,6 +75,33 @@ class Settings(BaseSettings):
     # OKX, в отличие от Binance/Bybit, требует третий секрет (passphrase,
     # задаётся при создании API-ключа на бирже) в каждом запросе.
     okx_passphrase: str | None = None
+    kucoin_api_key: str | None = None
+    kucoin_api_secret: str | None = None
+    # Как и OKX, KuCoin требует passphrase (задаётся при создании ключа).
+    kucoin_passphrase: str | None = None
+    bingx_api_key: str | None = None
+    bingx_api_secret: str | None = None
+    bitget_api_key: str | None = None
+    bitget_api_secret: str | None = None
+    # Как и OKX/KuCoin, Bitget требует passphrase.
+    bitget_passphrase: str | None = None
+    bitmex_api_key: str | None = None
+    bitmex_api_secret: str | None = None
+    # HyperLiquid — DEX на базе кошелька, а не обычная биржа с API-ключом:
+    # ccxt авторизует запросы приватным ключом кошелька (подписывает
+    # ордера как ончейн-транзакции), а не парой apiKey/secret. walletAddress —
+    # публичный адрес аккаунта, private_key — ключ этого кошелька. Оба поля
+    # эквивалентны доступу к средствам кошелька напрямую (шире, чем обычный
+    # торговый API-ключ) — выдавайте их с тем же вниманием, что и сам кошелёк.
+    hyperliquid_wallet_address: str | None = None
+    hyperliquid_private_key: str | None = None
+    # UI-состояние (какая биржа сейчас выбрана в выпадающем меню на вкладке
+    # Настроек для ввода её ключей) — не влияет на торговлю, только на то,
+    # какой из наборов полей credentials показан. Отдельно от active_exchange
+    # (та биржа реально торгует в real-режиме) — иначе просмотр ключей другой
+    # биржи на экране настроек незаметно переключал бы, где торгуются реальные
+    # деньги.
+    credentials_exchange_ui: str = "binance"
 
     # === CoinGlass API ===
     coinglass_api_key: str | None = None

@@ -4,6 +4,23 @@ from sqlalchemy import text
 from src.config import settings
 from src.db.session import get_session
 
+# Все биржи, поддержанные ExecutionEngine (см. _exchange_credentials_present
+# в executor.py) — используется и здесь (по одной статус-записи на биржу,
+# не только на активную), и как источник правды для UI-дропдауна в
+# settings_store.py (SETTINGS_SCHEMA.active_exchange/credentials_exchange_ui).
+SUPPORTED_EXCHANGES = ("binance", "bybit", "okx", "kucoin", "bingx", "bitget", "bitmex", "hyperliquid")
+
+_EXCHANGE_LABELS = {
+    "binance": "Binance",
+    "bybit": "Bybit",
+    "okx": "OKX",
+    "kucoin": "KuCoin",
+    "bingx": "BingX",
+    "bitget": "Bitget",
+    "bitmex": "BitMEX",
+    "hyperliquid": "HyperLiquid",
+}
+
 
 async def get_connections_status() -> list[dict]:
     """Собрать статус каждого внешнего подключения (дёшево, без лишних сетевых вызовов)."""
@@ -18,27 +35,33 @@ async def get_connections_status() -> list[dict]:
         db_status, db_detail = "error", str(e)
     statuses.append({"key": "database", "name": "База данных", "status": db_status, "detail": db_detail})
 
-    # Биржа (исполнение ордеров) — раньше здесь всегда проверялись только
-    # binance_api_key/secret независимо от активной биржи: подключив только
-    # Bybit или OKX, "not_configured" показывался бы и при полностью
-    # заведённых ключах нужной биржи.
+    # Биржи — раньше здесь была ОДНА запись "Биржа (исполнение)" только про
+    # активную биржу (settings.active_exchange): подключив ключи сразу
+    # нескольких бирж заранее (чтобы потом переключаться между ними без
+    # похода в настройки), остальные были попросту не видны в дашборде —
+    # только текущая. Теперь показывается статус КАЖДОЙ поддержанной
+    # биржи отдельной записью (см. group="exchange" — дашборд рисует их
+    # отдельным блоком карточек, а не общим списком).
     from src.execution.executor import execution_engine
-    _exchange_credentials = {
-        "binance": (settings.binance_api_key, settings.binance_api_secret),
-        "bybit": (settings.bybit_api_key, settings.bybit_api_secret),
-        "okx": (settings.okx_api_key, settings.okx_api_secret),
-    }
-    active_key, active_secret = _exchange_credentials.get(settings.active_exchange, (None, None))
-    if execution_engine.exchange is not None:
-        sandbox_suffix = " (демо)" if settings.use_exchange_sandbox else ""
-        ex_status, ex_detail = "connected", f"{execution_engine.exchange_id or ''}{sandbox_suffix}"
-    elif settings.is_paper:
-        ex_status, ex_detail = "paper_mode", "живое подключение не требуется"
-    elif not (active_key and active_secret):
-        ex_status, ex_detail = "not_configured", f"API ключи {settings.active_exchange} не заданы"
-    else:
-        ex_status, ex_detail = "error", "инициализация не удалась, см. логи"
-    statuses.append({"key": "exchange", "name": "Биржа (исполнение)", "status": ex_status, "detail": ex_detail})
+    for exchange_id in SUPPORTED_EXCHANGES:
+        is_active = exchange_id == settings.active_exchange
+        credentials_present = execution_engine._exchange_credentials_present(exchange_id)
+        if is_active and execution_engine.exchange is not None and not execution_engine.is_paper:
+            sandbox_suffix = " (демо)" if settings.use_exchange_sandbox else ""
+            ex_status, ex_detail = "connected", f"активная{sandbox_suffix}"
+        elif is_active and settings.is_paper:
+            ex_status, ex_detail = "paper_mode", "активная, но бот в paper-режиме"
+        elif not credentials_present:
+            ex_status, ex_detail = "not_configured", "ключи не заданы"
+        else:
+            ex_status, ex_detail = "configured", "ключи заданы, сейчас не активна"
+        statuses.append({
+            "key": f"exchange_{exchange_id}",
+            "name": _EXCHANGE_LABELS[exchange_id],
+            "status": ex_status,
+            "detail": ex_detail,
+            "group": "exchange",
+        })
 
     # Telegram — мониторинг каналов (Telethon)
     from src.telegram.channel_monitor import get_telegram_client
@@ -68,5 +91,25 @@ async def get_connections_status() -> list[dict]:
     else:
         cg_status, cg_detail = "not_configured", "COINGLASS_API_KEY не задан (публичные лимиты)"
     statuses.append({"key": "coinglass", "name": "CoinGlass API", "status": cg_status, "detail": cg_detail})
+
+    # LLM-фолбэк парсинга Telegram-сигналов (Anthropic/Groq/Gemini/Cerebras) —
+    # уже давно поддержаны (см. src/telegram/*_parser.py, settings.
+    # telegram_llm_fallback_enabled), но статус их ключей нигде не был виден
+    # в дашборде — единственным способом узнать, что, например, у Anthropic
+    # закончился баланс, а у Gemini исчерпана квота, было читать /logs.
+    llm_providers = (
+        ("anthropic", "Anthropic (LLM-фолбэк)", settings.anthropic_api_key),
+        ("groq", "Groq (LLM-фолбэк)", settings.groq_api_key),
+        ("gemini", "Gemini (LLM-фолбэк)", settings.gemini_api_key),
+        ("cerebras", "Cerebras (LLM-фолбэк)", settings.cerebras_api_key),
+    )
+    for key, name, api_key in llm_providers:
+        if not settings.telegram_llm_fallback_enabled:
+            llm_status, llm_detail = "disabled", "LLM-фолбэк парсинга выключен в настройках"
+        elif not api_key:
+            llm_status, llm_detail = "not_configured", "API ключ не задан"
+        else:
+            llm_status, llm_detail = "configured", ""
+        statuses.append({"key": f"llm_{key}", "name": name, "status": llm_status, "detail": llm_detail})
 
     return statuses

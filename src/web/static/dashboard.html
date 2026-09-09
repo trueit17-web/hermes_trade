@@ -599,8 +599,29 @@
   .conn-paper_mode { background: var(--blue); }
   .conn-not_configured, .conn-not_connected { background: var(--yellow); }
   .conn-error { background: var(--red); }
+  .conn-disabled { background: var(--text-dim); }
   .conn-name { font-weight: 600; }
   .conn-detail { font-size: 12px; }
+  /* Биржи — отдельной сеткой колонок, а не строками общего списка ниже:
+     их 8, и в общем списке они терялись бы среди остальных сервисов, а
+     сравнить статусы сразу нескольких бирж (какая настроена, какая
+     активна) построчно неудобно. */
+  .conn-exchanges-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 1px;
+    background: var(--panel-border);
+    border-top: 1px solid var(--panel-border);
+    border-bottom: 1px solid var(--panel-border);
+  }
+  .conn-exchange-card {
+    background: var(--panel);
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .conn-exchange-card .conn-name-row { display: flex; align-items: center; gap: 6px; }
 
   .log-filters {
     display: flex;
@@ -2846,17 +2867,28 @@ function renderSettingsField(f) {
   }
   const descHtml = f.description ? `<div class="settings-field-desc">${escapeHtml(f.description)}</div>` : "";
   const dependsAttr = f.depends_on ? ` data-depends-on="${f.depends_on}"` : "";
-  return `<div class="settings-field"${dependsAttr}><label for="${id}">${f.label}</label>${inputHtml}${descHtml}</div>`;
+  // depends_on_value — гейт не чекбокс, а select (например
+  // credentials_exchange_ui): поле видимо, только пока ЗНАЧЕНИЕ гейта
+  // равно этому, а не просто "гейт включён" (см. applySettingsDependencies).
+  const dependsValueAttr = f.depends_on_value !== undefined ? ` data-depends-on-value="${escapeHtml(String(f.depends_on_value))}"` : "";
+  return `<div class="settings-field"${dependsAttr}${dependsValueAttr}><label for="${id}">${f.label}</label>${inputHtml}${descHtml}</div>`;
 }
 
 // Поля с depends_on (например ATR-множители, видимые только пока включён
 // "ATR-адаптивный SL/TP") показываются, только когда чекбокс-переключатель,
 // от которого они зависят, включён — иначе на экране постоянно висели
 // настройки, не имеющие вообще никакого эффекта при выключенной функции.
+// depends_on_value расширяет это на select-гейты (например
+// credentials_exchange_ui — выбор биржи для ввода ключей): поле видимо,
+// только пока значение гейта совпадает с depends_on_value, а не просто
+// "гейт включён" — иначе ключи всех 8 бирж показывались бы одновременно.
 function applySettingsDependencies() {
   document.querySelectorAll("#settingsGroups [data-depends-on]").forEach(el => {
     const gate = document.getElementById(`set_${el.dataset.dependsOn}`);
-    el.style.display = gate && gate.checked ? "" : "none";
+    if (!gate) { el.style.display = "none"; return; }
+    const expectedValue = el.dataset.dependsOnValue;
+    const visible = expectedValue !== undefined ? gate.value === expectedValue : gate.checked;
+    el.style.display = visible ? "" : "none";
   });
 }
 
@@ -2880,6 +2912,12 @@ async function loadSettings() {
     applySettingsDependencies();
     container.querySelectorAll('input[type="checkbox"][data-key]').forEach(cb => {
       cb.addEventListener("change", applySettingsDependencies);
+    });
+    // select-гейты (например credentials_exchange_ui) тоже должны
+    // переприменять видимость зависимых полей сразу при выборе биржи,
+    // а не только чекбоксы, как раньше.
+    container.querySelectorAll('select[data-key]').forEach(sel => {
+      sel.addEventListener("change", applySettingsDependencies);
     });
   } catch (err) {
     container.innerHTML = `<div class="muted">Ошибка загрузки: ${err.message}</div>`;
@@ -2927,20 +2965,40 @@ const CONN_STATUS_LABELS = {
   not_configured: "Не настроено",
   not_connected: "Не подключено",
   error: "Ошибка",
+  disabled: "Выключено",
 };
+
+function renderConnRow(c) {
+  return `
+    <div class="conn-row">
+      <span class="conn-dot conn-${c.status}"></span>
+      <span class="conn-name">${c.name}</span>
+      <span class="conn-detail muted">${CONN_STATUS_LABELS[c.status] || c.status}${c.detail ? " — " + escapeHtml(c.detail) : ""}</span>
+    </div>
+  `;
+}
 
 async function loadConnections() {
   const body = document.getElementById("connectionsBody");
   try {
     const data = await api("/connections/status");
     const items = data.connections || [];
-    body.innerHTML = items.map(c => `
-      <div class="conn-row">
-        <span class="conn-dot conn-${c.status}"></span>
-        <span class="conn-name">${c.name}</span>
-        <span class="conn-detail muted">${CONN_STATUS_LABELS[c.status] || c.status}${c.detail ? " — " + escapeHtml(c.detail) : ""}</span>
+    const exchanges = items.filter(c => c.group === "exchange");
+    const rest = items.filter(c => c.group !== "exchange");
+    const exchangesHtml = exchanges.length ? `
+      <div class="conn-exchanges-grid">
+        ${exchanges.map(c => `
+          <div class="conn-exchange-card">
+            <div class="conn-name-row">
+              <span class="conn-dot conn-${c.status}"></span>
+              <span class="conn-name">${c.name}</span>
+            </div>
+            <span class="conn-detail muted">${CONN_STATUS_LABELS[c.status] || c.status}${c.detail ? " — " + escapeHtml(c.detail) : ""}</span>
+          </div>
+        `).join("")}
       </div>
-    `).join("");
+    ` : "";
+    body.innerHTML = exchangesHtml + rest.map(renderConnRow).join("");
   } catch (err) {
     body.innerHTML = `<div class="conn-row muted">Ошибка загрузки: ${err.message}</div>`;
   }
