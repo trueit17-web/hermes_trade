@@ -2646,7 +2646,15 @@ function renderChannelSignalsTable(signals) {
             let outcome = "—";
             if (s.trade) {
               const cls = s.trade.pnl >= 0 ? "pnl-pos" : "pnl-neg";
-              const pnlText = `<span class="${cls}">${s.trade.pnl >= 0 ? "+" : ""}${fmt(s.trade.pnl)} (${fmt(s.trade.pnl_pct, 2)}%)</span>`;
+              // pnl_pct — от полной номинальной стоимости позиции;
+              // pnl_pct_leveraged — от маржи (см. _trade_data в api.py и
+              // тот же расчёт в /trades) — без неё сигнал с плечом x25
+              // показывал бы в разы меньший процент, чем канал сам заявляет
+              // в тексте сигнала.
+              const leveragedSuffix = s.trade.pnl_pct_leveraged !== null && s.trade.pnl_pct_leveraged !== undefined
+                ? ` (${s.trade.pnl_pct_leveraged >= 0 ? "+" : ""}${fmt(s.trade.pnl_pct_leveraged, 2)}%)`
+                : "";
+              const pnlText = `<span class="${cls}">${s.trade.pnl >= 0 ? "+" : ""}${fmt(s.trade.pnl)} (${fmt(s.trade.pnl_pct, 2)}%)${leveragedSuffix}</span>`;
               // is_open=true с существующим s.trade означает, что часть
               // объёма уже закрыта по TP (см. _trade_data в api.py — Trade
               // появляется при первом же частичном закрытии), а остаток всё

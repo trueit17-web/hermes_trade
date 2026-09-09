@@ -5700,6 +5700,95 @@ class TestTelegramSignalsClosedStatus(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(signal["trade"]["is_open"], "позиция полностью закрыта — не должна показываться открытой")
         # Только первая часть была настоящим тейк-профитом, вторая — SL.
         self.assertEqual(signal["tp_hit_count"], 1)
+        # Paper-режим не отслеживает реальное плечо биржи (см. Trade.leverage).
+        self.assertIsNone(signal["trade"]["leverage"])
+        self.assertIsNone(signal["trade"]["pnl_pct_leveraged"])
+
+
+class TestChannelHistoryExposesLeveragedPnl(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный вопрос пользователя: сумма/процент дохода по сделке в истории
+    сигналов канала считались без учёта плеча — pnl_pct там всегда был %
+    от полной номинальной стоимости позиции, а не от маржи, в отличие от
+    GET /trades (см. TestTradesList.test_exposes_leverage_and_margin_
+    adjusted_pnl_pct), который для той же самой сделки уже отдаёт готовый
+    pnl_pct_leveraged. GET /telegram/signals теперь считает его так же.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module  # noqa: F401
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        self._saved_market_type = settings.market_type
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+        settings.market_type = self._saved_market_type
+
+    async def test_channel_history_exposes_leveraged_pnl_pct(self):
+        self._make_bot()
+        from src.db.models import TelegramChannel, TelegramSignal
+        from src.db.session import get_session
+        from src.execution.executor import ExecutionEngine
+        from src.utils.timeutils import utcnow
+        from src.web.api import list_telegram_signals
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "paper"
+        await engine.initialize("binance")
+
+        symbol = "TGLEVCHAN1/USDT"
+        order = await engine.create_order(
+            symbol=symbol, side="buy", amount=10.0, price=2.0, order_type="market",
+        )
+        self.assertIsNotNone(order)
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@tglevchan_channel", channel_title="Lev Channel", active=True)
+            session.add(channel)
+            await session.flush()
+            session.add(TelegramSignal(
+                channel_id=channel.id, raw_message="test", message_date=utcnow(),
+                parsed_pair=symbol, parsed_side="long", parsed_entry=2.0,
+                decision="executed", executed_order_id=order.id,
+            ))
+            db_channel_id = channel.id
+            await session.commit()
+
+        settings.trading_mode = "real"
+        settings.market_type = "futures"
+        engine.is_paper = False
+        engine.exchange_id = "bybit"
+        engine.exchange = AsyncMock()
+        engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0}}
+        )
+        engine.exchange.create_market_sell_order.return_value = {
+            "id": "tglev-close-1", "filled": 10.0, "average": 2.2, "price": None,
+            "fee": {"cost": 0.0, "currency": "USDT"},
+        }
+        engine.exchange.fetch_order_trades = AsyncMock(return_value=None)
+        engine.real_positions[symbol] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long", "leverage": 25.0,
+            "market_type": "futures", "sl_order_id": None,
+        }
+
+        result = await engine.close_real_position(
+            symbol=symbol, side="long", entry_price=2.0, amount=10.0,
+            reason="take_profit_1", entry_fee=0.0, holding_seconds=60, order_open_id=order.id,
+        )
+        self.assertIsNotNone(result)
+
+        listed = await list_telegram_signals(channel_id=db_channel_id, limit=50)
+        signal = next(s for s in listed["signals"] if s["parsed_pair"] == symbol)
+
+        self.assertIsNotNone(signal["trade"])
+        self.assertEqual(signal["trade"]["leverage"], 25.0)
+        self.assertAlmostEqual(signal["trade"]["pnl_pct_leveraged"], signal["trade"]["pnl_pct"] * 25.0)
 
 
 class TestChannelStatsIncludesPartialClosePnl(unittest.IsolatedAsyncioTestCase):

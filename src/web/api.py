@@ -2100,9 +2100,19 @@ async def list_telegram_signals(channel_id: int | None = None, limit: int = 100)
                 1 for t in legs
                 if t.order_close and t.order_close.notes and "тейк-профит" in t.order_close.notes
             )
+            # Тот же расчёт, что и в /trades выше (см. её комментарий про
+            # Trade.leverage) — pnl_pct здесь от полной номинальной
+            # стоимости позиции, а не от маржи, поэтому без leverage
+            # история сигналов канала показывала процент в разы скромнее
+            # того, чем канал сам хвастается в своих сообщениях (например,
+            # "+50%" при x25 — это как раз pnl_pct_leveraged, а не pnl_pct).
+            leverage = float(last.leverage) if last.leverage else None
+            pnl_pct_leveraged = pnl_pct * leverage if leverage else None
             return {
                 "pnl": total_pnl,
                 "pnl_pct": pnl_pct,
+                "leverage": leverage,
+                "pnl_pct_leveraged": pnl_pct_leveraged,
                 "outcome": last.outcome,
                 "is_open": not is_fully_closed,
                 "closed_at": last.closed_at.isoformat() + "Z" if last.closed_at else None,
