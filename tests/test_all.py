@@ -5637,6 +5637,31 @@ class TestTradesGrouping(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(row["leverage"])
         self.assertIsNone(row["pnl_pct_leveraged"])
 
+    async def test_pair_filter_matches_case_insensitive_substring(self):
+        from src.execution.executor import ExecutionEngine
+        from src.web.api import list_trades
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "paper"
+        await engine.initialize("binance")
+
+        symbol = "TRADESPAIRFILT1/USDT"
+        order = await engine.create_order(
+            symbol=symbol, side="buy", amount=10.0, price=200.0, order_type="market",
+        )
+        self.assertIsNotNone(order)
+        await engine.close_paper_position(
+            symbol=symbol, side="long", entry_price=200.0, amount=10.0,
+            exit_price=220.0, reason="take_profit_1", entry_fee=1.0,
+            holding_seconds=60, order_open_id=order.id,
+        )
+
+        matched = await list_trades(limit=200, offset=0, pair="tradespairfilt1")
+        self.assertTrue(any(t["symbol"] == symbol for t in matched["trades"]))
+
+        unmatched = await list_trades(limit=200, offset=0, pair="NOPAIRLIKETHIS")
+        self.assertFalse(any(t["symbol"] == symbol for t in unmatched["trades"]))
+
 
 class TestTelegramSignalsClosedStatus(unittest.IsolatedAsyncioTestCase):
     """
@@ -5703,6 +5728,119 @@ class TestTelegramSignalsClosedStatus(unittest.IsolatedAsyncioTestCase):
         # Paper-режим не отслеживает реальное плечо биржи (см. Trade.leverage).
         self.assertIsNone(signal["trade"]["leverage"])
         self.assertIsNone(signal["trade"]["pnl_pct_leveraged"])
+
+
+class TestTelegramSignalsFilters(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент: разворот истории сигналов канала показывал их все
+    подряд без возможности отфильтровать по паре/дате/решению — с большим
+    числом сигналов канала (пример: Vipka) найти конкретный вручную
+    неудобно. GET /telegram/signals теперь принимает pair (частичное
+    совпадение), date (YYYY-MM-DD, календарный день по created_at) и
+    decision ("executed"/"rejected"/"all" или не задан — без фильтра).
+    """
+
+    async def test_pair_filter_matches_case_insensitive_substring(self):
+        from datetime import datetime
+
+        from src.db.models import TelegramChannel, TelegramSignal
+        from src.db.session import get_session
+        from src.web.api import list_telegram_signals
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@tgfilter_pair_channel", channel_title="Filter Pair Channel", active=True)
+            session.add(channel)
+            await session.flush()
+            session.add(TelegramSignal(
+                channel_id=channel.id, raw_message="a", message_date=datetime(2026, 1, 1),
+                parsed_pair="BTC/USDT", parsed_side="long", parsed_entry=1.0, decision="executed",
+            ))
+            session.add(TelegramSignal(
+                channel_id=channel.id, raw_message="b", message_date=datetime(2026, 1, 1),
+                parsed_pair="ETH/USDT", parsed_side="long", parsed_entry=1.0, decision="executed",
+            ))
+            db_channel_id = channel.id
+            await session.commit()
+
+        result = await list_telegram_signals(channel_id=db_channel_id, limit=50, pair="btc")
+        pairs = {s["parsed_pair"] for s in result["signals"]}
+        self.assertEqual(pairs, {"BTC/USDT"})
+
+    async def test_date_filter_matches_calendar_day(self):
+        from datetime import datetime
+
+        from src.db.models import TelegramChannel, TelegramSignal
+        from src.db.session import get_session
+        from src.web.api import list_telegram_signals
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@tgfilter_date_channel", channel_title="Filter Date Channel", active=True)
+            session.add(channel)
+            await session.flush()
+            session.add(TelegramSignal(
+                channel_id=channel.id, raw_message="a", message_date=datetime(2026, 3, 5),
+                parsed_pair="DATEFILT1/USDT", parsed_side="long", parsed_entry=1.0, decision="executed",
+                created_at=datetime(2026, 3, 5, 10, 0),
+            ))
+            session.add(TelegramSignal(
+                channel_id=channel.id, raw_message="b", message_date=datetime(2026, 3, 6),
+                parsed_pair="DATEFILT2/USDT", parsed_side="long", parsed_entry=1.0, decision="executed",
+                created_at=datetime(2026, 3, 6, 10, 0),
+            ))
+            db_channel_id = channel.id
+            await session.commit()
+
+        result = await list_telegram_signals(channel_id=db_channel_id, limit=50, date="2026-03-05")
+        pairs = {s["parsed_pair"] for s in result["signals"]}
+        self.assertEqual(pairs, {"DATEFILT1/USDT"})
+
+    async def test_decision_filter_executed_vs_rejected_vs_all(self):
+        from datetime import datetime
+
+        from src.db.models import TelegramChannel, TelegramSignal
+        from src.db.session import get_session
+        from src.web.api import list_telegram_signals
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@tgfilter_decision_channel", channel_title="Filter Decision Channel", active=True)
+            session.add(channel)
+            await session.flush()
+            session.add(TelegramSignal(
+                channel_id=channel.id, raw_message="a", message_date=datetime(2026, 1, 1),
+                parsed_pair="DECFILTEXEC/USDT", parsed_side="long", parsed_entry=1.0, decision="executed",
+            ))
+            session.add(TelegramSignal(
+                channel_id=channel.id, raw_message="b", message_date=datetime(2026, 1, 1),
+                parsed_pair="DECFILTREJ/USDT", parsed_side="long", parsed_entry=1.0, decision="rejected",
+                reject_reason="test",
+            ))
+            db_channel_id = channel.id
+            await session.commit()
+
+        executed_only = await list_telegram_signals(channel_id=db_channel_id, limit=50, decision="executed")
+        self.assertEqual({s["parsed_pair"] for s in executed_only["signals"]}, {"DECFILTEXEC/USDT"})
+
+        rejected_only = await list_telegram_signals(channel_id=db_channel_id, limit=50, decision="rejected")
+        self.assertEqual({s["parsed_pair"] for s in rejected_only["signals"]}, {"DECFILTREJ/USDT"})
+
+        all_signals = await list_telegram_signals(channel_id=db_channel_id, limit=50, decision="all")
+        self.assertEqual(
+            {s["parsed_pair"] for s in all_signals["signals"]}, {"DECFILTEXEC/USDT", "DECFILTREJ/USDT"},
+        )
+
+        no_decision_param = await list_telegram_signals(channel_id=db_channel_id, limit=50)
+        self.assertEqual(
+            {s["parsed_pair"] for s in no_decision_param["signals"]}, {"DECFILTEXEC/USDT", "DECFILTREJ/USDT"},
+        )
+
+    async def test_invalid_date_format_rejected(self):
+        from fastapi import HTTPException
+
+        from src.web.api import list_telegram_signals
+
+        with self.assertRaises(HTTPException) as ctx:
+            await list_telegram_signals(channel_id=1, limit=50, date="not-a-date")
+        self.assertEqual(ctx.exception.status_code, 400)
 
 
 class TestChannelHistoryExposesLeveragedPnl(unittest.IsolatedAsyncioTestCase):
@@ -5850,6 +5988,68 @@ class TestChannelStatsIncludesPartialClosePnl(unittest.IsolatedAsyncioTestCase):
         # closed_trades/win_rate остаются про ПОЛНОСТЬЮ закрытые позиции —
         # эта ещё не закрыта целиком, менять их семантику не нужно.
         self.assertEqual(channel_stats["closed_trades"], 0)
+
+
+class TestChannelStatsOpenNowCount(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент: канал (пример — "Vipka") показывал "24 исполнено",
+    хотя реально открытых позиций по нему было 13 — "исполнено" считает
+    ВСЕ сигналы канала за всё время (включая давно закрытые), легко
+    спутать со "сколько открыто сейчас". open_now — отдельный, точный
+    счётчик: сколько из исполненных ордеров канала реально числится в
+    execution_engine.*_positions прямо сейчас.
+    """
+
+    async def test_open_now_excludes_already_closed_positions(self):
+        from src.db.models import TelegramChannel, TelegramSignal
+        from src.db.session import get_session
+        from src.execution.executor import ExecutionEngine
+        from src.utils.timeutils import utcnow
+        from src.web.api import telegram_channels_stats
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "paper"
+        await engine.initialize("binance")
+
+        still_open_symbol = "CHANOPENNOW1/USDT"
+        already_closed_symbol = "CHANOPENNOW2/USDT"
+        open_order = await engine.create_order(
+            symbol=still_open_symbol, side="buy", amount=10.0, price=100.0, order_type="market",
+        )
+        closed_order = await engine.create_order(
+            symbol=already_closed_symbol, side="buy", amount=10.0, price=100.0, order_type="market",
+        )
+        self.assertIsNotNone(open_order)
+        self.assertIsNotNone(closed_order)
+        await engine.close_paper_position(
+            symbol=already_closed_symbol, side="long", entry_price=100.0, amount=10.0,
+            exit_price=110.0, reason="take_profit_1", entry_fee=0.0,
+            holding_seconds=60, order_open_id=closed_order.id,
+        )
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@chanopennow_channel", channel_title="Open Now Channel", active=True)
+            session.add(channel)
+            await session.flush()
+            session.add(TelegramSignal(
+                channel_id=channel.id, raw_message="a", message_date=utcnow(),
+                parsed_pair=still_open_symbol, parsed_side="long", parsed_entry=100.0,
+                decision="executed", executed_order_id=open_order.id,
+            ))
+            session.add(TelegramSignal(
+                channel_id=channel.id, raw_message="b", message_date=utcnow(),
+                parsed_pair=already_closed_symbol, parsed_side="long", parsed_entry=100.0,
+                decision="executed", executed_order_id=closed_order.id,
+            ))
+            db_channel_id = channel.id
+            await session.commit()
+
+        with patch("src.web.api.execution_engine", engine):
+            stats = await telegram_channels_stats()
+        channel_stats = next(s for s in stats["channels"] if s["channel_id"] == db_channel_id)
+
+        self.assertEqual(channel_stats["executed"], 2)
+        self.assertEqual(channel_stats["open_now"], 1)
 
 
 class TestStatusExposesExchangeOrderId(unittest.IsolatedAsyncioTestCase):

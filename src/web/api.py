@@ -3,7 +3,7 @@ import asyncio
 import logging
 import os
 import signal
-from datetime import UTC
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,7 @@ from src.db.models import (
     LogEntry,
     Order,
     PerformanceSnapshot,
+    Symbol,
     TelegramChannel,
     TelegramSignal,
     Trade,
@@ -943,7 +944,9 @@ async def update_strategy(strategy_id: str, request: StrategyUpdateRequest):
 
 
 @app.get("/trades")
-async def list_trades(limit: int = 100, offset: int = 0, strategy_id: str | None = None):
+async def list_trades(
+    limit: int = 100, offset: int = 0, strategy_id: str | None = None, pair: str | None = None,
+):
     """
     Список сделок, сгруппированных по позиции (order_open_id): частичные
     закрытия одной позиции по уровням TP1/TP2/TP3 показываются одной
@@ -954,6 +957,9 @@ async def list_trades(limit: int = 100, offset: int = 0, strategy_id: str | None
     "telegram_signal" для Telegram-сигналов) — сверяется с именем
     связанной Strategy, под которым его создаёт
     ExecutionEngine._resolve_strategy_id().
+
+    pair — частичное совпадение по паре (без учёта регистра), например
+    "BTC" найдёт и "BTC/USDT".
     """
     async with get_session() as session:
         # Берём сырые Trade-строки с запасом, чтобы после группировки (до
@@ -971,6 +977,8 @@ async def list_trades(limit: int = 100, offset: int = 0, strategy_id: str | None
             query = query.join(StrategyModel, Trade.strategy_id == StrategyModel.id).where(
                 StrategyModel.name == strategy_id
             )
+        if pair:
+            query = query.join(Symbol, Trade.symbol_id == Symbol.id).where(Symbol.symbol.ilike(f"%{pair}%"))
         raw_trades = (await session.execute(query)).scalars().all()
 
         # Название канала для отображения источника — Trade/Order не хранят
@@ -1964,6 +1972,17 @@ async def telegram_channel_backfill_summary(channel_id: int):
 @app.get("/telegram/channels/stats")
 async def telegram_channels_stats():
     """Статистика по каждому Telegram-каналу: сигналы, исполнение, win rate, PnL."""
+    # "Исполнено" (executed) — счётчик ЗА ВСЁ ВРЕМЯ (сколько сигналов канала
+    # когда-либо было исполнено, включая давно закрытые) — легко спутать с
+    # "сколько открыто прямо сейчас". Реальный инцидент: канал показывал
+    # "24 исполнено", хотя реально открытых позиций по нему было 13 — разница
+    # это уже закрытые сделки, которые никуда не делись из счётчика.
+    # open_now считается отдельно, по факту наличия позиции в
+    # execution_engine.*_positions с order_id из числа исполненных ордеров
+    # канала.
+    tracked = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
+    open_order_ids_global = {pos.get("order_id") for pos in tracked.values() if pos.get("order_id") is not None}
+
     async with get_session() as session:
         channels = (await session.execute(select(TelegramChannel))).scalars().all()
 
@@ -1999,10 +2018,13 @@ async def telegram_channels_stats():
                     await session.execute(select(Trade).where(Trade.order_open_id.in_(order_ids)))
                 ).scalars().all()
 
+            open_now = sum(1 for oid in order_ids if oid in open_order_ids_global)
+
             result.append({
                 "channel_id": c.id,
                 "total_signals": len(signals),
                 "executed": len(executed),
+                "open_now": open_now,
                 "closed_trades": len(closed_trades),
                 "win_rate": round(wins / len(closed_trades) * 100, 1) if closed_trades else None,
                 "total_pnl": round(sum(float(t.pnl) for t in all_legs), 2) if all_legs else None,
@@ -2014,7 +2036,13 @@ async def telegram_channels_stats():
 
 
 @app.get("/telegram/signals")
-async def list_telegram_signals(channel_id: int | None = None, limit: int = 100):
+async def list_telegram_signals(
+    channel_id: int | None = None,
+    limit: int = 100,
+    pair: str | None = None,
+    date: str | None = None,
+    decision: str | None = None,
+):
     """
     Список Telegram сигналов (опционально по одному каналу) с данными
     ордера и исхода сделки.
@@ -2030,6 +2058,11 @@ async def list_telegram_signals(channel_id: int | None = None, limit: int = 100)
     чего история сигналов показывала "открыта" для давно закрытых позиций.
     Вместо этого агрегируем реальные Trade-строки по order_open_id
     (= executed_order_id сигнала) — тот же приём, что и в GET /trades.
+
+    pair — частичное совпадение по паре (без учёта регистра), date —
+    конкретный календарный день (YYYY-MM-DD) по TelegramSignal.created_at,
+    decision — "executed"/"rejected" (пропущено или "all" — без фильтра по
+    решению; "pending" сигналы попадают только в "all").
     """
     async with get_session() as session:
         query = (
@@ -2040,6 +2073,19 @@ async def list_telegram_signals(channel_id: int | None = None, limit: int = 100)
         )
         if channel_id is not None:
             query = query.where(TelegramSignal.channel_id == channel_id)
+        if pair:
+            query = query.where(TelegramSignal.parsed_pair.ilike(f"%{pair}%"))
+        if date:
+            try:
+                day_start = datetime.strptime(date, "%Y-%m-%d")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="date должен быть в формате YYYY-MM-DD")
+            query = query.where(
+                TelegramSignal.created_at >= day_start,
+                TelegramSignal.created_at < day_start + timedelta(days=1),
+            )
+        if decision and decision != "all":
+            query = query.where(TelegramSignal.decision == decision)
         signals = (await session.execute(query)).scalars().all()
 
         order_ids = [s.executed_order_id for s in signals if s.executed_order_id is not None]

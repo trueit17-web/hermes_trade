@@ -805,6 +805,9 @@
 
   <section>
     <h2>Последние сделки</h2>
+    <div class="log-filters" style="padding:0 0 12px">
+      <input type="text" id="tradesPairFilter" placeholder="Фильтр по паре (напр. BTC)" style="flex:0 0 200px">
+    </div>
     <div class="table-wrap">
       <table>
         <thead><tr><th>Символ</th><th>Вход</th><th>Выход</th><th>Сумма сделки</th><th>PnL</th><th>Итог</th><th>Источник</th><th>В сделке</th><th>Закрыта</th><th>ID ордера</th></tr></thead>
@@ -812,16 +815,6 @@
       </table>
     </div>
     <div class="pagination" id="tradesPagination"></div>
-  </section>
-
-  <section>
-    <h2>Стратегии</h2>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>Название</th><th>ID</th><th>Вес</th><th>Активна</th></tr></thead>
-        <tbody id="strategiesBody"><tr class="empty-row"><td colspan="4">Загрузка…</td></tr></tbody>
-      </table>
-    </div>
   </section>
 
   <section>
@@ -847,8 +840,8 @@
     </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Канал</th><th>ID</th><th>Порог</th><th>Размер (%)</th><th>Рынок</th><th>Автоисполнение</th><th>Сигналов</th><th>Исполнено</th><th>Win rate</th><th>PnL</th><th>Sizing</th><th>Активен</th><th></th></tr></thead>
-        <tbody id="telegramBody"><tr class="empty-row"><td colspan="13">Загрузка…</td></tr></tbody>
+        <thead><tr><th>Канал</th><th>ID</th><th>Порог</th><th>Размер (%)</th><th>Рынок</th><th>Автоисполнение</th><th>Сигналов</th><th>Исполнено всего</th><th title="Сколько из исполненных сигналов канала сейчас реально открыто">Открыто сейчас</th><th>Win rate</th><th>PnL</th><th>Sizing</th><th>Активен</th><th></th></tr></thead>
+        <tbody id="telegramBody"><tr class="empty-row"><td colspan="14">Загрузка…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -919,6 +912,15 @@
   <div class="settings-save-bar">
     <button id="btnSaveSettings" class="btn-primary">💾 Сохранить настройки</button>
   </div>
+  <section>
+    <h2>Стратегии</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Название</th><th>ID</th><th>Вес</th><th>Активна</th></tr></thead>
+        <tbody id="strategiesBody"><tr class="empty-row"><td colspan="4">Загрузка…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
   <div id="settingsGroups"><div class="muted">Загрузка…</div></div>
 </div>
 
@@ -1785,6 +1787,7 @@ async function renderStrategies() {
 
 const TRADES_PAGE_SIZE = 10;
 let tradesPage = 0;
+let tradesPairFilter = "";
 
 // Развёрнутые строки истории сделок закрываются ТОЛЬКО по клику
 // пользователя — id -> кэш HTML подробностей (или null, ещё не
@@ -1799,12 +1802,13 @@ async function renderTrades() {
   const pagination = document.getElementById("tradesPagination");
   try {
     const offset = tradesPage * TRADES_PAGE_SIZE;
-    const data = await api(`/trades?limit=${TRADES_PAGE_SIZE}&offset=${offset}`);
+    const pairParam = tradesPairFilter ? `&pair=${encodeURIComponent(tradesPairFilter)}` : "";
+    const data = await api(`/trades?limit=${TRADES_PAGE_SIZE}&offset=${offset}${pairParam}`);
     const trades = data.trades || [];
     const total = data.total || 0;
 
     if (!total) {
-      body.innerHTML = `<tr class="empty-row"><td colspan="10">Сделок пока нет</td></tr>`;
+      body.innerHTML = `<tr class="empty-row"><td colspan="10">${tradesPairFilter ? "Нет сделок по этой паре" : "Сделок пока нет"}</td></tr>`;
       pagination.innerHTML = "";
       return trades;
     }
@@ -2354,6 +2358,16 @@ document.getElementById("btnTrainSignalQuality").addEventListener("click", async
 // обновлении, а не только по клику на своей же строке.
 const expandedChannels = new Map();
 
+// Фильтры истории сигналов канала (пара/дата/решение) — по каналу
+// отдельно, т.к. развёрнуто может быть несколько строк каналов сразу.
+const channelSignalFilters = new Map();
+function getChannelSignalFilters(id) {
+  if (!channelSignalFilters.has(id)) {
+    channelSignalFilters.set(id, { pair: "", date: "", decision: "all" });
+  }
+  return channelSignalFilters.get(id);
+}
+
 // Поля канала (название/порог/размер/рынок/автоисполнение) редактируются
 // только после клика по карандашику — id канала в этом Set рендерится с
 // инпутами вместо обычного текста. Тот же принцип, что и у expandedChannels
@@ -2372,7 +2386,7 @@ async function renderTelegram() {
     const statsById = Object.fromEntries((statsData.channels || []).map(s => [s.channel_id, s]));
 
     if (!channels.length) {
-      body.innerHTML = `<tr class="empty-row"><td colspan="13">Каналы не настроены</td></tr>`;
+      body.innerHTML = `<tr class="empty-row"><td colspan="14">Каналы не настроены</td></tr>`;
       return;
     }
     body.innerHTML = channels.map(c => {
@@ -2420,6 +2434,7 @@ async function renderTelegram() {
         <td>${autoexecCell}</td>
         <td>${s.total_signals ?? c.signals_count}</td>
         <td>${s.executed ?? 0}</td>
+        <td>${s.open_now ?? 0}</td>
         <td>${winRate}</td>
         <td class="${pnlClass}">${pnl}</td>
         <td class="${sizingClass}" title="Множитель к базовому размеру позиции (колонка «Размер») по мат. ожиданию канала (expectancy sizing)">${sizing}</td>
@@ -2429,7 +2444,7 @@ async function renderTelegram() {
           <button class="btn-icon-danger" data-delete-channel="${c.id}" title="Удалить">✕</button>
         </td>
       </tr>
-      <tr class="channel-signals-row" data-channel-signals="${c.id}" style="display:none"><td colspan="13"></td></tr>
+      <tr class="channel-signals-row" data-channel-signals="${c.id}" style="display:none"><td colspan="14"></td></tr>
     `;
     }).join("");
 
@@ -2572,7 +2587,7 @@ async function renderTelegram() {
       });
     });
   } catch (err) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="13">Ошибка загрузки: ${err.message}</td></tr>`;
+    body.innerHTML = `<tr class="empty-row"><td colspan="14">Ошибка загрузки: ${err.message}</td></tr>`;
   }
 }
 
@@ -2598,22 +2613,76 @@ async function toggleChannelSignals(row) {
   await loadChannelSignals(id, cell);
 }
 
+// Оболочка с фильтрами (пара/дата/решение) рендерится ОДИН раз при
+// разворачивании строки и дальше не перестраивается целиком — иначе
+// каждое изменение фильтра (особенно ввод в текстовое поле пары) сбивало
+// бы фокус с инпута. Сама таблица сигналов живёт в отдельном вложенном
+// div и перестраивается независимо, см. refreshChannelSignalsTable().
+function renderChannelSignalsShell(id) {
+  const f = getChannelSignalFilters(id);
+  return `
+    <div class="log-filters" style="padding:10px 16px 0">
+      <input type="text" class="channel-signal-pair-filter" placeholder="Пара (напр. BTC)" value="${escapeHtml(f.pair)}" style="flex:0 0 140px">
+      <input type="date" class="channel-signal-date-filter" value="${f.date}" style="flex:0 0 150px" title="Дата сигнала">
+      <select class="channel-signal-decision-filter" style="flex:0 0 160px">
+        <option value="all" ${f.decision === "all" ? "selected" : ""}>Все решения</option>
+        <option value="executed" ${f.decision === "executed" ? "selected" : ""}>Принятые</option>
+        <option value="rejected" ${f.decision === "rejected" ? "selected" : ""}>Отклонённые</option>
+      </select>
+    </div>
+    <div class="channel-signal-table-wrap"></div>
+  `;
+}
+
+function wireChannelSignalFilters(id, cell) {
+  const pairInput = cell.querySelector(".channel-signal-pair-filter");
+  const dateInput = cell.querySelector(".channel-signal-date-filter");
+  const decisionSelect = cell.querySelector(".channel-signal-decision-filter");
+  let pairTimer = null;
+  pairInput.addEventListener("input", (e) => {
+    clearTimeout(pairTimer);
+    pairTimer = setTimeout(() => {
+      getChannelSignalFilters(id).pair = e.target.value.trim();
+      refreshChannelSignalsTable(id, cell);
+    }, 300);
+  });
+  dateInput.addEventListener("change", (e) => {
+    getChannelSignalFilters(id).date = e.target.value;
+    refreshChannelSignalsTable(id, cell);
+  });
+  decisionSelect.addEventListener("change", (e) => {
+    getChannelSignalFilters(id).decision = e.target.value;
+    refreshChannelSignalsTable(id, cell);
+  });
+}
+
+async function refreshChannelSignalsTable(id, cell) {
+  const tableWrap = cell.querySelector(".channel-signal-table-wrap");
+  tableWrap.innerHTML = `<div class="muted" style="padding:10px 16px">Загрузка…</div>`;
+  try {
+    const f = getChannelSignalFilters(id);
+    const params = new URLSearchParams({ channel_id: id, limit: "50" });
+    if (f.pair) params.set("pair", f.pair);
+    if (f.date) params.set("date", f.date);
+    if (f.decision && f.decision !== "all") params.set("decision", f.decision);
+    const data = await api(`/telegram/signals?${params.toString()}`);
+    tableWrap.innerHTML = renderChannelSignalsTable(data.signals || []);
+    cell.dataset.loaded = "1";
+    if (expandedChannels.has(id)) expandedChannels.set(id, cell.innerHTML);
+    wireSignalDecisionButtons(cell, id);
+  } catch (err) {
+    tableWrap.innerHTML = `<div class="muted" style="padding:10px 16px">Ошибка загрузки: ${err.message}</div>`;
+  }
+}
+
 // Общая логика загрузки истории сигналов канала — вынесена из
 // toggleChannelSignals(), чтобы её же можно было вызвать повторно после
 // ручного решения по pending-сигналу (обновить только эту таблицу, не
 // весь дашборд).
 async function loadChannelSignals(id, cell) {
-  cell.innerHTML = `<div class="muted" style="padding:10px 16px">Загрузка…</div>`;
-  try {
-    const data = await api(`/telegram/signals?channel_id=${id}&limit=50`);
-    const html = renderChannelSignalsTable(data.signals || []);
-    cell.innerHTML = html;
-    cell.dataset.loaded = "1";
-    if (expandedChannels.has(id)) expandedChannels.set(id, html);
-    wireSignalDecisionButtons(cell, id);
-  } catch (err) {
-    cell.innerHTML = `<div class="muted" style="padding:10px 16px">Ошибка загрузки: ${err.message}</div>`;
-  }
+  cell.innerHTML = renderChannelSignalsShell(id);
+  wireChannelSignalFilters(id, cell);
+  await refreshChannelSignalsTable(id, cell);
 }
 
 // "⏳ Ожидает подтверждения" раньше было тупиковым статусом: сигнал
@@ -2632,7 +2701,7 @@ function wireSignalDecisionButtons(cell, channelId) {
           method: "POST", body: JSON.stringify({ action }),
         });
         showToast(action === "execute" ? "Сигнал исполнен" : "Сигнал отклонён");
-        await loadChannelSignals(channelId, cell);
+        await refreshChannelSignalsTable(channelId, cell);
         await renderTelegram();
       } catch (err) {
         showToast(`Ошибка: ${err.message}`, true);
@@ -2658,6 +2727,7 @@ function restoreExpandedChannel(row) {
     const cell = detailsRow.querySelector("td");
     cell.innerHTML = cachedHtml;
     cell.dataset.loaded = "1";
+    wireChannelSignalFilters(id, cell);
     wireSignalDecisionButtons(cell, id);
   }
 }
@@ -2757,6 +2827,16 @@ function renderChannelSignalsTable(signals) {
     </div>
   `;
 }
+
+let tradesPairFilterTimer = null;
+document.getElementById("tradesPairFilter").addEventListener("input", (e) => {
+  clearTimeout(tradesPairFilterTimer);
+  tradesPairFilterTimer = setTimeout(() => {
+    tradesPairFilter = e.target.value.trim();
+    tradesPage = 0;
+    renderTrades();
+  }, 300);
+});
 
 document.getElementById("addChannelForm").addEventListener("submit", async (e) => {
   e.preventDefault();
