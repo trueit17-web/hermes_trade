@@ -1039,6 +1039,16 @@ function fmtPrice(n) {
   return Number(n).toLocaleString("ru-RU", { minimumFractionDigits: 0, maximumFractionDigits: 7 });
 }
 
+// Расстояние SL от цены входа в % — тот же знаковый принцип, что и у PnL%
+// (dir=1 для long, -1 для short): для типичного стопа (ниже входа на long,
+// выше входа на short) даёт отрицательное число — это риск, а не прибыль.
+function slPctHtml(stopLoss, entryPrice, side) {
+  if (stopLoss === null || stopLoss === undefined || !entryPrice) return "";
+  const dir = side === "short" ? -1 : 1;
+  const pct = dir * (stopLoss - entryPrice) / entryPrice * 100;
+  return ` <span class="muted">(${pct >= 0 ? "+" : ""}${fmt(pct, 2)}%)</span>`;
+}
+
 // Логи показывались как сырой UTC-таймстамп (просто вырезали "HH:MM:SS" из
 // ISO-строки, без учёта часового пояса) — на 3 часа раньше реального
 // московского времени. Приводим явно к Europe/Moscow (GMT+3, без перехода
@@ -1323,7 +1333,7 @@ function renderPositions(status) {
       <td>${fmt(pos.amount, 6)}</td>
       <td>${fmtPrice(pos.entry_price)}</td>
       <td>${cur !== null && cur !== undefined ? fmtPrice(cur) : "—"}</td>
-      <td class="muted">${pos.stop_loss ? fmtPrice(pos.stop_loss) : "—"}${slBadge}</td>
+      <td class="muted">${pos.stop_loss ? fmtPrice(pos.stop_loss) : "—"}${pos.stop_loss ? slPctHtml(pos.stop_loss, pos.entry_price, pos.side) : ""}${slBadge}</td>
       <td class="muted">${pos.take_profit ? fmtPrice(pos.take_profit) : "—"}</td>
       <td>${tradeValue !== null ? "$" + fmt(tradeValue) : "—"}</td>
       <td>${pnlHtml}</td>
@@ -1559,7 +1569,7 @@ function renderManualPositions(status) {
       <td>${fmt(pos.amount, 6)}</td>
       <td>${fmtPrice(pos.entry_price)}</td>
       <td>${cur !== null && cur !== undefined ? fmtPrice(cur) : "—"}</td>
-      <td><input type="number" class="inline-edit-input" data-sl-input="${symbol}" value="${pos.stop_loss ?? ''}" step="any" placeholder="—">${slBadge}</td>
+      <td><input type="number" class="inline-edit-input" data-sl-input="${symbol}" value="${pos.stop_loss ?? ''}" step="any" placeholder="—">${pos.stop_loss ? slPctHtml(pos.stop_loss, pos.entry_price, pos.side) : ""}${slBadge}</td>
       <td><input type="number" class="inline-edit-input" data-tp-input="${symbol}" value="${pos.take_profit ?? ''}" step="any" placeholder="—"></td>
       <td>${pnlHtml}</td>
       <td class="muted">${pos.order_id_exchange ? escapeHtml(fmtOrderId(pos.order_id_exchange)) : "—"}</td>
@@ -1955,7 +1965,7 @@ function comparedPairHtml(requested, filled, fmtFn) {
   return `${reqHtml} / ${filledHtml}`;
 }
 
-function orderCardHtml(o, title) {
+function orderCardHtml(o, title, direction) {
   if (!o) {
     return `<div class="order-card"><h5>${title}</h5><div class="muted">Данные ордера недоступны</div></div>`;
   }
@@ -1971,7 +1981,12 @@ function orderCardHtml(o, title) {
     ["Комиссия", o.fee !== null ? `${fmt(o.fee, 6)}${o.fee_currency ? " " + escapeHtml(o.fee_currency) : ""}` : "—"],
   ];
   if (o.stop_loss !== null || o.take_profit !== null) {
-    rows.push(["SL / TP", `${o.stop_loss !== null ? fmtPrice(o.stop_loss) : "—"} / ${o.take_profit !== null ? fmtPrice(o.take_profit) : "—"}`]);
+    // % от входа этого же ордера (его собственная filled/requested цена) —
+    // корректно только для открывающего ордера, у закрывающего SL/TP
+    // обычно и так null.
+    const entryRef = o.filled_price ?? o.price_requested;
+    const slSuffix = o.stop_loss !== null ? slPctHtml(o.stop_loss, entryRef, direction) : "";
+    rows.push(["SL / TP", `${o.stop_loss !== null ? fmtPrice(o.stop_loss) + slSuffix : "—"} / ${o.take_profit !== null ? fmtPrice(o.take_profit) : "—"}`]);
   }
   rows.push(["Время", o.created_at ? new Date(o.created_at).toLocaleString("ru-RU") : "—"]);
   if (o.notes) rows.push(["Заметка", escapeHtml(o.notes)]);
@@ -1986,7 +2001,7 @@ function orderCardHtml(o, title) {
   `;
 }
 
-function orderCardsRowHtml(openingOrder, leg, label, showOpeningCard = true) {
+function orderCardsRowHtml(openingOrder, leg, label, showOpeningCard = true, direction) {
   const openPrice = openingOrder ? openingOrder.filled_price : null;
   const closePrice = leg.closing_order ? leg.closing_order.filled_price : leg.exit_price;
   const openFee = openingOrder && openingOrder.fee !== null ? openingOrder.fee : 0;
@@ -2004,8 +2019,8 @@ function orderCardsRowHtml(openingOrder, leg, label, showOpeningCard = true) {
     <div class="trade-detail-block">
       ${label ? `<h4>${label}</h4>` : ""}
       <div class="order-cards-row${showOpeningCard ? "" : " order-cards-row--single"}">
-        ${showOpeningCard ? orderCardHtml(openingOrder, "Открывающий ордер") : ""}
-        ${orderCardHtml(leg.closing_order, "Закрывающий ордер")}
+        ${showOpeningCard ? orderCardHtml(openingOrder, "Открывающий ордер", direction) : ""}
+        ${orderCardHtml(leg.closing_order, "Закрывающий ордер", direction)}
       </div>
       ${breakdown}
     </div>
@@ -2019,9 +2034,9 @@ function renderTradeDetail(d) {
   // частичном закрытии TP1/TP2/TP3.
   const ordersHtml = d.legs && d.legs.length
     ? d.legs.map((leg, i) => orderCardsRowHtml(
-        d.opening_order, leg, d.legs.length > 1 ? `Ордера — частичное закрытие #${i + 1}` : "Ордера", i === 0
+        d.opening_order, leg, d.legs.length > 1 ? `Ордера — частичное закрытие #${i + 1}` : "Ордера", i === 0, d.direction
       )).join("")
-    : orderCardsRowHtml(d.opening_order, {}, "Ордера");
+    : orderCardsRowHtml(d.opening_order, {}, "Ордера", true, d.direction);
 
   const legsHtml = d.legs && d.legs.length > 1 ? `
     <div class="trade-detail-block">
