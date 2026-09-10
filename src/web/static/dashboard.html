@@ -2680,10 +2680,42 @@ function renderChannelSignalsShell(id) {
   `;
 }
 
+// Таблица каналов на телефоне шире экрана и скроллится горизонтально
+// внутри .table-wrap — это ожидаемо. Но панель фильтров рендерится в
+// начале широкой развёрнутой строки, и когда на телефоне тапаешь select
+// (например, чтобы выбрать "Принятые"), браузер сам скроллит .table-wrap,
+// чтобы полностью показать элемент в фокусе — со стороны это выглядит как
+// "вся таблица скроллит вправо". position:sticky здесь не работает (в
+// цепочке предков есть section{overflow:hidden} для скругления углов
+// карточки, а он ломает sticky для всех вложенных элементов в Chromium и
+// Firefox), поэтому просто откатываем скролл .table-wrap назад сразу
+// после того, как браузер попытался его сдвинуть при фокусе.
+function preventFocusAutoScroll(el, tableWrap) {
+  if (!tableWrap) return;
+  // Браузер скроллит элемент в область видимости КАК ЧАСТЬ получения им
+  // фокуса, ДО того как успевает сработать наш обработчик "focus" — то
+  // есть к моменту "focus" scrollLeft уже испорчен, и заново прочитать
+  // оттуда старое значение нельзя. Поэтому запоминаем scrollLeft раньше,
+  // на pointerdown/touchstart (эти события гарантированно происходят до
+  // фокуса и скролла-в-видимость).
+  let preScroll = null;
+  const capture = () => { preScroll = tableWrap.scrollLeft; };
+  el.addEventListener("pointerdown", capture);
+  el.addEventListener("touchstart", capture, { passive: true });
+  el.addEventListener("focus", () => {
+    if (preScroll === null) return;
+    const target = preScroll;
+    preScroll = null;
+    requestAnimationFrame(() => { tableWrap.scrollLeft = target; });
+  });
+}
+
 function wireChannelSignalFilters(id, cell) {
   const pairInput = cell.querySelector(".channel-signal-pair-filter");
   const dateInput = cell.querySelector(".channel-signal-date-filter");
   const decisionSelect = cell.querySelector(".channel-signal-decision-filter");
+  const tableWrap = cell.closest(".table-wrap");
+  [pairInput, dateInput, decisionSelect].forEach(el => preventFocusAutoScroll(el, tableWrap));
   let pairTimer = null;
   pairInput.addEventListener("input", (e) => {
     clearTimeout(pairTimer);
