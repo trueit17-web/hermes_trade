@@ -119,14 +119,6 @@
     padding-bottom: 20px;
     border-bottom: 1px solid var(--panel-border);
   }
-  @media (max-width: 860px) {
-    .sidebar { position: static; width: 100%; height: auto; flex-direction: row; flex-wrap: wrap; }
-    .nav { display: flex; flex-wrap: wrap; padding: 8px; }
-    .nav-section { display: none; }
-    .tab-btn.nav-item { width: auto; }
-    main { margin-left: 0; }
-  }
-
   .stats {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -256,13 +248,19 @@
     margin: 0;
     padding: 14px 16px 10px;
   }
-  table { width: 100%; border-collapse: collapse; }
+  /* Таблица не растягивается на всю ширину контейнера — каждая колонка
+     занимает ровно столько места, сколько нужно её содержимому (+1 символ
+     горизонтального отступа с каждой стороны ячейки, см. th/td ниже), а не
+     делит между собой всю ширину секции поровну/пропорционально. */
+  table { width: auto; border-collapse: collapse; }
   /* Ячейка не растягивает колонку/таблицу под самый длинный текст — вместо
      этого обрезается многоточием, полный текст доступен в подсказке при
      наведении (см. applyCellTooltip в скрипте ниже). Сама таблица по-прежнему
      может быть шире контейнера из-за числа колонок — .table-wrap скроллит её
      целиком (наведением курсора на край, см. edge-scroll в скрипте). */
-  th, td { text-align: left; padding: 8px 16px; font-size: 13px; white-space: nowrap; max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
+  th, td { text-align: left; padding: 8px 0.5ch; font-size: 13px; white-space: nowrap; max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
+  th:first-child, td:first-child { padding-left: 16px; }
+  th:last-child, td:last-child { padding-right: 16px; }
   thead th { color: var(--text-dim); font-weight: 600; border-bottom: 1px solid var(--panel-border); }
   tbody tr { border-bottom: 1px solid var(--panel-border); }
   tbody tr:last-child { border-bottom: none; }
@@ -328,8 +326,10 @@
     color: var(--text-dim);
   }
   .channel-signals-row td { background: rgba(0,0,0,.15); padding: 0; }
-  .nested-table { width: 100%; border-collapse: collapse; }
-  .nested-table th, .nested-table td { padding: 6px 14px; font-size: 12px; white-space: nowrap; max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+  .nested-table { width: auto; border-collapse: collapse; }
+  .nested-table th, .nested-table td { padding: 6px 0.5ch; font-size: 12px; white-space: nowrap; max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+  .nested-table th:first-child, .nested-table td:first-child { padding-left: 14px; }
+  .nested-table th:last-child, .nested-table td:last-child { padding-right: 14px; }
   .nested-table thead th { color: var(--text-dim); font-weight: 600; border-bottom: 1px solid var(--panel-border); }
   .nested-table tbody tr { border-bottom: 1px solid rgba(255,255,255,.03); }
   .nested-table tbody tr:last-child { border-bottom: none; }
@@ -715,6 +715,52 @@
   .log-INFO .log-level { color: var(--blue); }
   .log-WARNING .log-level { color: var(--yellow); }
   .log-ERROR .log-level, .log-CRITICAL .log-level { color: var(--red); }
+
+  /* На узких экранах сайдбар ложится верхним баром: логотип слева,
+     кнопки вкладок — в один ряд с горизонтальной прокруткой (а не
+     переносом на несколько строк — раньше 6 пунктов навигации съедали
+     заметную часть высоты экрана телефона ещё до какого-либо контента),
+     бейджи режима/статуса и кнопка выхода — справа, той же строкой, если
+     помещаются, иначе переносятся отдельной строкой (flex-wrap на самом
+     .sidebar, а не внутри .nav — сам список вкладок никогда не переносится
+     построчно, только скроллится).
+     Эти два media-блока намеренно размещены в САМОМ КОНЦЕ <style>, после
+     всех безусловных правил компонентов (.stats/.controls/section и т.д.) —
+     при равной специфичности позднее правило в исходнике побеждает
+     независимо от viewport, так что переопределения обязаны идти последними. */
+  @media (max-width: 860px) {
+    .sidebar {
+      position: static; width: 100%; height: auto;
+      flex-direction: row; flex-wrap: wrap; align-items: center;
+      padding: 6px 0;
+    }
+    .logo { padding: 6px 14px; border-bottom: none; border-right: 1px solid var(--panel-border); flex-shrink: 0; }
+    .nav {
+      display: flex; flex-wrap: nowrap; overflow-x: auto;
+      align-items: center; flex: 1 1 auto; min-width: 0;
+      padding: 4px 8px; gap: 2px;
+    }
+    .nav-section { display: none; }
+    .tab-btn.nav-item { width: auto; flex-shrink: 0; white-space: nowrap; }
+    .nav-bottom {
+      display: flex; align-items: center; gap: 10px;
+      padding: 4px 14px; border-top: none; flex-shrink: 0; width: auto;
+    }
+    .badges { padding: 0; }
+    .logout-btn { width: auto; white-space: nowrap; }
+    main { margin-left: 0; }
+  }
+  /* Отдельный, более тесный уровень для телефонов — бокового отступа
+     32px (десктопный) на экране в 360-400px не остаётся места под сам
+     контент; таблицы и так скроллятся отдельно (.table-wrap), поэтому
+     сужать боковые поля main можно безопасно. */
+  @media (max-width: 480px) {
+    main { padding: 14px 12px 40px; }
+    .topbar { gap: 8px; margin-bottom: 16px; padding-bottom: 14px; }
+    .stats { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
+    .controls { gap: 8px; margin-bottom: 16px; }
+    section { margin-bottom: 14px; }
+  }
 </style>
 </head>
 <body>
