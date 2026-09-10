@@ -1162,6 +1162,30 @@ class TradingBot:
                 f"{settings.telegram_signals_default_sl_pct:.1f}% ({sl:.6f})"
             )
 
+        # Капаем SL по % от маржи (см. докстринг telegram_signals_max_sl_pct_of_margin
+        # в config.py) — только на фьючерсах, только когда СЛИШКОМ далёкий SL
+        # (более консервативный SL канала/фоллбэка выше не трогаем). Плечо —
+        # то же, что реально применится к ордеру (см. leverage_to_set в
+        # executor._execute_real_order): указанное каналом, иначе глобальный
+        # дефолт.
+        if (
+            sl is not None
+            and market_type == "futures"
+            and settings.telegram_signals_max_sl_pct_of_margin > 0
+        ):
+            effective_leverage = leverage or settings.futures_leverage
+            if effective_leverage and effective_leverage > 0:
+                max_distance = (settings.telegram_signals_max_sl_pct_of_margin / 100) / effective_leverage
+                capped_sl = entry * (1 - max_distance) if side == "long" else entry * (1 + max_distance)
+                sl_too_far = sl < capped_sl if side == "long" else sl > capped_sl
+                if sl_too_far:
+                    logger.info(
+                        f"⚠️ Сигнал по {pair}: SL {sl:.6f} превышает "
+                        f"{settings.telegram_signals_max_sl_pct_of_margin:.0f}% маржи при плече "
+                        f"{effective_leverage:.0f}x — урезан до {capped_sl:.6f}"
+                    )
+                    sl = capped_sl
+
         if not settings.is_paper and market_type == "spot" and side == "short":
             # Тот же случай, что и для стратегийных сигналов (см.
             # _trading_iteration): на споте в реальном режиме шорт
