@@ -10411,6 +10411,146 @@ class TestWarnUntrackedFuturesPositions(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(balance, 500.0)
 
 
+class TestAutoAdoptUntrackedFuturesPosition(unittest.IsolatedAsyncioTestCase):
+    """
+    ExecutionEngine._auto_adopt_untracked_futures_position — реальный
+    инцидент (прод, ATOM/USDT): _warn_about_untracked_futures_positions
+    писал одно и то же предупреждение НЕПРЕРЫВНО больше двух суток, пока
+    позиция всё это время оставалась вообще без SL, потому что раньше
+    авто-подхват не делался вовсе (не было надёжного источника цены входа).
+    fetch_positions() уже отдаёт side/entryPrice/leverage самой биржи —
+    этого достаточно для безопасного подхвата с дефолтным защитным SL
+    (тем же % от входа, что и для Telegram-сигнала без указанного каналом
+    SL, см. settings.telegram_signals_default_sl_pct).
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        self.risk_manager = global_risk_manager
+        self._saved_default_sl_pct = settings.telegram_signals_default_sl_pct
+        self._saved_market_type = settings.market_type
+        self._saved_trading_mode = settings.trading_mode
+
+    def tearDown(self):
+        settings.telegram_signals_default_sl_pct = self._saved_default_sl_pct
+        settings.market_type = self._saved_market_type
+        settings.trading_mode = self._saved_trading_mode
+        self.risk_manager.state.open_positions.pop("AUTOADOPT1/USDT", None)
+        self.risk_manager.state.open_positions.pop("AUTOADOPT2/USDT", None)
+        self.risk_manager.state.open_positions.pop("AUTOADOPT3/USDT", None)
+        self.risk_manager.state.open_positions_count = len(self.risk_manager.state.open_positions)
+
+    async def test_adopts_short_position_with_full_exchange_data(self):
+        self.engine.exchange_id = "bybit"
+        settings.telegram_signals_default_sl_pct = 3.0
+        exchange = AsyncMock()
+        exchange.create_market_buy_order.return_value = {"id": "auto-sl-1"}  # закрывающая сторона шорта
+        self.engine._exchanges["futures"] = exchange
+
+        raw = {
+            "symbol": "AUTOADOPT1/USDT:USDT", "contracts": 5.0, "side": "short",
+            "entryPrice": 100.0, "leverage": 10.0, "initialMargin": 50.0,
+        }
+        await self.engine._auto_adopt_untracked_futures_position("AUTOADOPT1/USDT", raw)
+
+        self.assertIn("AUTOADOPT1/USDT", self.engine.real_positions)
+        pos = self.engine.real_positions["AUTOADOPT1/USDT"]
+        self.assertEqual(pos["side"], "short")
+        self.assertAlmostEqual(pos["amount"], 5.0)
+        self.assertAlmostEqual(pos["entry_price"], 100.0)
+        self.assertEqual(pos["leverage"], 10.0)
+        self.assertEqual(pos["margin_usdt"], 50.0)
+        self.assertAlmostEqual(pos["stop_loss"], 103.0)  # short: +3% от входа
+        self.assertIsNone(pos["take_profit"])
+        self.assertEqual(pos["sl_order_id"], "auto-sl-1")
+        exchange.create_market_buy_order.assert_awaited_once()
+
+        self.assertIn("AUTOADOPT1/USDT", self.risk_manager.state.open_positions)
+
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Order
+
+        async with get_session() as session:
+            order = (
+                await session.execute(select(Order).where(Order.id == pos["order_id"]))
+            ).scalar_one()
+            self.assertEqual(order.status, "filled")
+            self.assertAlmostEqual(float(order.filled_amount), 5.0)
+            self.assertAlmostEqual(float(order.filled_price), 100.0)
+            self.assertIn("Автоподхват", order.notes)
+
+    async def test_falls_back_to_warning_when_side_missing(self):
+        self.engine.exchange_id = "bybit"
+        raw = {"symbol": "AUTOADOPT2/USDT:USDT", "contracts": 3.0, "entryPrice": 50.0}
+
+        with self.assertLogs("src.execution.executor", level="WARNING") as cm:
+            await self.engine._auto_adopt_untracked_futures_position("AUTOADOPT2/USDT", raw)
+
+        self.assertTrue(any("AUTOADOPT2/USDT" in m and "НЕ отслеживает" in m for m in cm.output))
+        self.assertNotIn("AUTOADOPT2/USDT", self.engine.real_positions)
+        self.assertNotIn("AUTOADOPT2/USDT", self.risk_manager.state.open_positions)
+
+    async def test_falls_back_to_warning_when_entry_price_missing(self):
+        self.engine.exchange_id = "bybit"
+        raw = {"symbol": "AUTOADOPT2/USDT:USDT", "contracts": 3.0, "side": "long", "entryPrice": None}
+
+        with self.assertLogs("src.execution.executor", level="WARNING") as cm:
+            await self.engine._auto_adopt_untracked_futures_position("AUTOADOPT2/USDT", raw)
+
+        self.assertTrue(any("НЕ отслеживает" in m for m in cm.output))
+        self.assertNotIn("AUTOADOPT2/USDT", self.engine.real_positions)
+
+    async def test_no_sl_placed_when_default_sl_pct_disabled(self):
+        self.engine.exchange_id = "bybit"
+        settings.telegram_signals_default_sl_pct = 0
+        exchange = AsyncMock()
+        self.engine._exchanges["futures"] = exchange
+
+        raw = {
+            "symbol": "AUTOADOPT3/USDT:USDT", "contracts": 2.0, "side": "long",
+            "entryPrice": 20.0, "leverage": 5.0,
+        }
+        await self.engine._auto_adopt_untracked_futures_position("AUTOADOPT3/USDT", raw)
+
+        self.assertIn("AUTOADOPT3/USDT", self.engine.real_positions)
+        pos = self.engine.real_positions["AUTOADOPT3/USDT"]
+        self.assertIsNone(pos["stop_loss"])
+        self.assertIsNone(pos["sl_order_id"])
+        exchange.create_market_buy_order.assert_not_called()
+        exchange.create_market_sell_order.assert_not_called()
+        self.assertIn("AUTOADOPT3/USDT", self.risk_manager.state.open_positions)
+
+    async def test_reconcile_real_positions_auto_adopts_end_to_end(self):
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        settings.telegram_signals_default_sl_pct = 3.0
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(return_value={
+            "free": {"USDT": 500.0}, "USDT": {"free": 500.0, "used": 0, "total": 500.0},
+        })
+        self.engine.exchange.fetch_positions = AsyncMock(return_value=[
+            {
+                "symbol": "AUTOADOPT1/USDT:USDT", "contracts": 1.0, "side": "long",
+                "entryPrice": 10.0, "leverage": 2.0,
+            },
+        ])
+        self.engine.exchange.create_market_sell_order.return_value = {"id": "auto-sl-e2e"}
+
+        await self.engine.reconcile_real_positions()
+
+        self.assertIn("AUTOADOPT1/USDT", self.engine.real_positions)
+        self.assertIn("AUTOADOPT1/USDT", self.risk_manager.state.open_positions)
+
+
 class TestFinalizeDiagnosticLogging(unittest.IsolatedAsyncioTestCase):
     """
     Реальный инцидент (прод, SUI/USDT): позиция реально закрылась на бирже,

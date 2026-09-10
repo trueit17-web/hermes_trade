@@ -3313,13 +3313,15 @@ class ExecutionEngine:
         та в принципе не смотрит на символы вне self.real_positions.
 
         Реальный инцидент (прод): на бирже оказалось 8 открытых позиций и 7
-        ордеров, когда бот отслеживал только 5. Здесь нет ни исправления
-        причины (не видна без доступа к самой бирже), ни авто-подхвата
-        (у бота нет надёжных данных о реальной цене входа этой позиции,
-        чтобы безопасно взять её под управление и выставить SL) — только
-        явное предупреждение с именами символов, чтобы расхождение было
-        видно в /logs, а не оставалось незамеченным до следующего ручного
-        сравнения с биржей.
+        ордеров, когда бот отслеживал только 5. Второй инцидент (прод,
+        ATOM/USDT): предупреждение без авто-подхвата писалось на каждой
+        сверке (~раз в минуту) НЕПРЕРЫВНО больше двух суток, пока позиция
+        всё это время оставалась без SL — раньше здесь не было авто-подхвата
+        из-за отсутствия надёжных данных о цене входа, но fetch_positions()
+        уже возвращает entryPrice/side/leverage САМОЙ биржи (тот же источник
+        истины, что и "adopt excess" в _reconcile_futures_position) — этого
+        достаточно, чтобы безопасно взять позицию под защиту, см.
+        _auto_adopt_untracked_futures_position.
         """
         exchange = self._exchanges.get("futures")
         if exchange is None:
@@ -3347,9 +3349,83 @@ class ExecutionEngine:
             canonical = exchange_symbol.split(":")[0]
             if canonical in tracked:
                 continue
+            await self._auto_adopt_untracked_futures_position(canonical, raw)
+
+    async def _auto_adopt_untracked_futures_position(self, symbol: str, raw: dict) -> None:
+        """
+        Взять под защиту фьючерсную позицию, которую бот никогда не открывал
+        сам (не осталось ни исходного Telegram-сигнала, ни ордера в БД —
+        в отличие от adopt_unconfirmed_futures_position, где known intended
+        SL/TP берётся из ОТКЛОНЁННОГО TelegramSignal). Единственный источник
+        данных — сама позиция с биржи (raw, уже получен вызывающим кодом
+        через fetch_positions() — второй запрос не нужен): side/entryPrice/
+        leverage/initialMargin — тот же набор полей, что использует "adopt
+        excess" в _reconcile_futures_position для уже отслеживаемых позиций.
+
+        SL считается тем же дефолтным % от входа, что и для Telegram-сигнала
+        без указанного каналом SL (settings.telegram_signals_default_sl_pct)
+        — разумный защитный минимум, раз собственного intended SL здесь нет
+        и быть не может. Take-profit НЕ проставляется: у чужой позиции нет
+        известного намерения по цели — оставляем на усмотрение того, кто её
+        открыл (см. changelog/отчёт пользователю), бот только не даёт ей
+        остаться без стоп-лосса.
+
+        Если биржа не вернула side/entryPrice — данных недостаточно для
+        безопасного подхвата, откатываемся на старое поведение (только
+        предупреждение, без изменений в БД/real_positions).
+        """
+        contracts = float(raw.get("contracts") or 0)
+        side = raw.get("side")
+        entry_price = raw.get("entryPrice")
+        if side not in ("long", "short") or not isinstance(entry_price, (int, float)) or entry_price <= 0:
             logger.warning(
-                f"⚠️ На бирже открыта позиция {canonical} ({contracts} контрактов), которую "
+                f"⚠️ На бирже открыта позиция {symbol} ({contracts} контрактов), которую "
                 f"бот НЕ отслеживает — она не защищена SL/TP ботом. Проверьте вручную на бирже."
+            )
+            return
+
+        stop_loss = None
+        if settings.telegram_signals_default_sl_pct > 0:
+            pct = settings.telegram_signals_default_sl_pct / 100
+            stop_loss = entry_price * (1 - pct) if side == "long" else entry_price * (1 + pct)
+
+        async with get_session() as session:
+            exchange_id, symbol_id = await self._resolve_symbol_id(session, symbol)
+            order = Order(
+                exchange_id=exchange_id, symbol_id=symbol_id, strategy_id=None,
+                side="buy" if side == "long" else "sell", order_type="market",
+                amount=contracts, price=entry_price, status="filled",
+                filled_amount=contracts, filled_price=entry_price, fee=0.0,
+                stop_loss=stop_loss, market_type="futures",
+                client_order_id=str(uuid.uuid4())[:12],
+                notes="Автоподхват: позиция обнаружена на бирже через fetch_positions(), бот её не открывал",
+            )
+            session.add(order)
+            await session.commit()
+
+        self.real_positions[symbol] = {
+            "amount": contracts, "entry_price": entry_price, "side": side,
+            "strategy_id": None, "stop_loss": stop_loss, "take_profit": None,
+            "order_id": order.id, "entry_fee": 0.0, "opened_at": utcnow(),
+            "sl_order_id": None, "market_type": "futures",
+            "leverage": raw.get("leverage"), "margin_usdt": raw.get("initialMargin"),
+        }
+        if stop_loss:
+            await self.sync_stop_loss_order(symbol, contracts, stop_loss)
+        risk_manager.on_position_added(symbol, 0.0)
+
+        if stop_loss:
+            logger.warning(
+                f"♻️ Позиция {symbol} автоматически подхвачена ботом: {contracts} контрактов "
+                f"({side}) @ {entry_price} — выставлен защитный SL {stop_loss:.6f} "
+                f"({settings.telegram_signals_default_sl_pct:.1f}% от входа). Бот её не открывал, "
+                f"тейк-профит не выставлен — исходное намерение по цели неизвестно."
+            )
+        else:
+            logger.warning(
+                f"♻️ Позиция {symbol} автоматически подхвачена ботом: {contracts} контрактов "
+                f"({side}) @ {entry_price} — БЕЗ SL (telegram_signals_default_sl_pct=0). "
+                f"Бот её не открывал, проверьте вручную."
             )
 
     async def _reconcile_spot_position(self, symbol: str, pos: dict, balance: dict) -> None:
