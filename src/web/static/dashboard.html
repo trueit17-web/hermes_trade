@@ -253,6 +253,16 @@
      горизонтального отступа с каждой стороны ячейки, см. th/td ниже), а не
      делит между собой всю ширину секции поровну/пропорционально. */
   table { width: auto; border-collapse: collapse; }
+  /* .table-fill — противоположность базового правила выше: для таблиц
+     "Открытые позиции"/"Последние сделки"/каналов, где важнее заполнить
+     всю ширину окна без горизонтальной прокрутки, а не минимизировать
+     ширину под контент. table-layout:fixed обязателен — c table-layout:
+     auto браузер всё равно раздувает таблицу под min-content колонок
+     (см. overflow:hidden на ячейках ниже — оно НЕ останавливает auto-
+     раскладку от переполнения контейнера, проверено), процент ширины
+     соблюдается только в fixed-режиме. Ширина каждой колонки задаётся
+     процентом на th (fixed-layout берёт пропорции из первой строки). */
+  table.table-fill { width: 100%; table-layout: fixed; }
   /* Ячейка не растягивает колонку/таблицу под самый длинный текст — вместо
      этого обрезается многоточием, полный текст доступен в подсказке при
      наведении (см. applyCellTooltip в скрипте ниже). Сама таблица по-прежнему
@@ -842,9 +852,13 @@
   <section>
     <h2>Открытые позиции</h2>
     <div class="table-wrap">
-      <table>
-        <thead><tr><th>Символ</th><th>Кол-во</th><th>Цена входа</th><th>Текущая цена</th><th>Stop Loss</th><th>Take Profit</th><th>Сумма сделки</th><th>PnL</th><th>Источник</th><th>ID ордера</th><th></th></tr></thead>
-        <tbody id="positionsBody"><tr class="empty-row"><td colspan="11">Загрузка…</td></tr></tbody>
+      <table class="table-fill">
+        <thead><tr>
+          <th style="width:11%">Символ</th><th style="width:9%">Кол-во</th><th style="width:10%">Цена входа</th>
+          <th style="width:10%">Текущая цена</th><th style="width:10%">Stop Loss</th><th style="width:10%">Take Profit</th>
+          <th style="width:10%">Сумма сделки</th><th style="width:10%">PnL</th><th style="width:16%">Источник</th><th style="width:4%"></th>
+        </tr></thead>
+        <tbody id="positionsBody"><tr class="empty-row"><td colspan="10">Загрузка…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -855,9 +869,13 @@
       <input type="text" id="tradesPairFilter" placeholder="Фильтр по паре (напр. BTC)" style="flex:0 0 200px">
     </div>
     <div class="table-wrap">
-      <table>
-        <thead><tr><th>Символ</th><th>Вход</th><th>Выход</th><th>Сумма сделки</th><th>PnL</th><th>Итог</th><th>Источник</th><th>В сделке</th><th>Закрыта</th><th>ID ордера</th></tr></thead>
-        <tbody id="tradesBody"><tr class="empty-row"><td colspan="10">Загрузка…</td></tr></tbody>
+      <table class="table-fill">
+        <thead><tr>
+          <th style="width:11%">Символ</th><th style="width:11%">Вход</th><th style="width:11%">Выход</th>
+          <th style="width:11%">Сумма сделки</th><th style="width:12%">PnL</th><th style="width:10%">Итог</th>
+          <th style="width:16%">Источник</th><th style="width:9%">В сделке</th><th style="width:9%">Закрыта</th>
+        </tr></thead>
+        <tbody id="tradesBody"><tr class="empty-row"><td colspan="9">Загрузка…</td></tr></tbody>
       </table>
     </div>
     <div class="pagination" id="tradesPagination"></div>
@@ -885,8 +903,15 @@
       <button type="button" id="btnRestartBot" class="btn-warn">🔄 Перезапустить бота</button>
     </div>
     <div class="table-wrap">
-      <table>
-        <thead><tr><th>Канал</th><th>ID</th><th>Порог</th><th>Размер (%)</th><th>Рынок</th><th>Автоисполнение</th><th>Сигналов</th><th>Исполнено всего</th><th title="Сколько из исполненных сигналов канала сейчас реально открыто">Открыто сейчас</th><th>Win rate</th><th>PnL</th><th>Sizing</th><th>Активен</th><th></th></tr></thead>
+      <table class="table-fill">
+        <thead><tr>
+          <th style="width:14%">Канал</th><th style="width:8%">ID</th><th style="width:6%">Порог</th>
+          <th style="width:7%">Размер (%)</th><th style="width:7%">Рынок</th><th style="width:8%">Автоисполнение</th>
+          <th style="width:6%">Сигналов</th><th style="width:8%">Исполнено всего</th>
+          <th style="width:8%" title="Сколько из исполненных сигналов канала сейчас реально открыто">Открыто сейчас</th>
+          <th style="width:6%">Win rate</th><th style="width:7%">PnL</th><th style="width:6%">Sizing</th>
+          <th style="width:6%">Активен</th><th style="width:3%"></th>
+        </tr></thead>
         <tbody id="telegramBody"><tr class="empty-row"><td colspan="14">Загрузка…</td></tr></tbody>
       </table>
     </div>
@@ -1341,7 +1366,7 @@ function renderPositions(status) {
   const positions = status.paper_positions || {};
   const rows = Object.entries(positions);
   if (!rows.length) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="11">Нет открытых позиций</td></tr>`;
+    body.innerHTML = `<tr class="empty-row"><td colspan="10">Нет открытых позиций</td></tr>`;
     return;
   }
   body.innerHTML = rows.map(([symbol, pos]) => {
@@ -1386,10 +1411,9 @@ function renderPositions(status) {
       <td>${tradeValue !== null ? "$" + fmt(tradeValue) : "—"}</td>
       <td>${pnlHtml}</td>
       <td class="muted">${pos.source || "—"}</td>
-      <td class="muted">${pos.order_id_exchange ? escapeHtml(fmtOrderId(pos.order_id_exchange)) : "—"}</td>
       <td><button class="btn-icon-danger" data-close-position="${symbol}" title="Закрыть по рынку">✕</button></td>
     </tr>
-    <tr class="trade-detail-row" data-position-detail="${escapeHtml(symbol)}" style="display:none"><td colspan="11"></td></tr>
+    <tr class="trade-detail-row" data-position-detail="${escapeHtml(symbol)}" style="display:none"><td colspan="10"></td></tr>
   `;
   }).join("");
 
@@ -1854,7 +1878,7 @@ async function renderTrades() {
     const total = data.total || 0;
 
     if (!total) {
-      body.innerHTML = `<tr class="empty-row"><td colspan="10">${tradesPairFilter ? "Нет сделок по этой паре" : "Сделок пока нет"}</td></tr>`;
+      body.innerHTML = `<tr class="empty-row"><td colspan="9">${tradesPairFilter ? "Нет сделок по этой паре" : "Сделок пока нет"}</td></tr>`;
       pagination.innerHTML = "";
       return trades;
     }
@@ -1869,7 +1893,6 @@ async function renderTrades() {
 
     body.innerHTML = trades.map(t => {
       const tradeValue = t.amount && t.entry_price ? t.amount * t.entry_price : null;
-      const orderId = fmtOrderId(t.order_id_exchange_open || t.order_id_exchange_close);
       // Плечо, реально подтверждённое биржей на момент закрытия (см.
       // Trade.leverage) — None для спота/paper. pnl_pct_leveraged — тот
       // же PnL, но в % от МАРЖИ (pnl_pct*leverage), а не полной
@@ -1892,9 +1915,8 @@ async function renderTrades() {
         <td class="muted">${t.source || "—"}</td>
         <td class="muted">${fmtDuration(t.holding_seconds)}</td>
         <td class="muted">${t.closed_at ? new Date(t.closed_at).toLocaleString("ru-RU") : "—"}</td>
-        <td class="muted">${orderId ? escapeHtml(orderId) : "—"}</td>
       </tr>
-      <tr class="trade-detail-row" data-trade-detail="${t.id}" style="display:none"><td colspan="10"></td></tr>
+      <tr class="trade-detail-row" data-trade-detail="${t.id}" style="display:none"><td colspan="9"></td></tr>
     `;
     }).join("");
 
@@ -1921,7 +1943,7 @@ async function renderTrades() {
 
     return trades;
   } catch (err) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="10">Ошибка загрузки: ${err.message}</td></tr>`;
+    body.innerHTML = `<tr class="empty-row"><td colspan="9">Ошибка загрузки: ${err.message}</td></tr>`;
     return [];
   }
 }
@@ -3768,6 +3790,12 @@ connectWebSocket();
 
 refreshAll();
 setInterval(refreshAll, REFRESH_MS);
+// Заголовки таблиц (th) — статичный HTML, присутствуют в документе уже на
+// момент загрузки страницы, а не появляются через innerHTML — их не видит
+// MutationObserver в applyCellTooltips (ловит только НОВЫЕ узлы). Без этого
+// подсказка на усечённый заголовок (актуально для узких процентных колонок
+// .table-fill) появлялась бы только после переключения вкладки туда-обратно.
+recheckCellTooltips();
 </script>
 
 </body>
