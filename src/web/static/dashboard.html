@@ -253,27 +253,6 @@
      горизонтального отступа с каждой стороны ячейки, см. th/td ниже), а не
      делит между собой всю ширину секции поровну/пропорционально. */
   table { width: auto; border-collapse: collapse; }
-  /* .table-fill — противоположность базового правила выше: для таблиц
-     "Открытые позиции"/"Последние сделки"/каналов, где важнее заполнить
-     всю ширину окна без горизонтальной прокрутки, а не минимизировать
-     ширину под контент. table-layout:fixed обязателен — c table-layout:
-     auto браузер всё равно раздувает таблицу под min-content колонок
-     (см. overflow:hidden на ячейках ниже — оно НЕ останавливает auto-
-     раскладку от переполнения контейнера, проверено), процент ширины
-     соблюдается только в fixed-режиме. Ширина каждой колонки задаётся
-     процентом на th (fixed-layout берёт пропорции из первой строки). */
-  table.table-fill { width: 100%; table-layout: fixed; }
-  /* Перетаскиваемая граница колонки — внутри правого края th (right:0), а
-     не выступающая за него: th обрезает переполнение (overflow:hidden для
-     многоточия), выступающий за пределы элемент был бы обрезан вместе с
-     текстом. См. makeColumnsResizable в скрипте ниже — таскает не саму
-     границу визуально, а живьём двигает width соседних th. */
-  table.table-fill thead th { position: relative; }
-  .col-resize-handle {
-    position: absolute; top: 0; right: 0; width: 6px; height: 100%;
-    cursor: col-resize; touch-action: none; z-index: 1;
-  }
-  .col-resize-handle:hover, .col-resize-handle.resizing { background: rgba(255,255,255,.15); }
   /* Ячейка не растягивает колонку/таблицу под самый длинный текст — вместо
      этого обрезается многоточием, полный текст доступен в подсказке при
      наведении (см. applyCellTooltip в скрипте ниже). Сама таблица по-прежнему
@@ -782,78 +761,6 @@
     .controls { gap: 8px; margin-bottom: 16px; }
     section { margin-bottom: 14px; }
   }
-  /* .table-fill (Открытые позиции/Последние сделки/каналы) на телефоне —
-     процентная ширина колонок при 7-14 колонках на узком экране означала
-     бы либо нечитаемое усечение почти каждой ячейки, либо (при отказе от
-     table-layout:fixed) горизонтальный скролл — то, чего явно просили
-     избежать. Вместо этого на узких экранах строка превращается в
-     "карточку": заголовки колонок скрываются, каждая ячейка — своя строка
-     вида "подпись: значение" (подпись — content: attr(data-label), см.
-     data-label на td в renderPositions/renderTrades/renderTelegram/
-     renderChannelSignalsTable/renderTradeDetail). То же самое для вложенных
-     .nested-table (история сигналов канала, разбивка частичных закрытий) —
-     они настолько же нечитаемы при усечении на узком экране, просто без
-     привилегии первой колонки (там нет однозначного "заголовка карточки",
-     как символ/канал в основных таблицах). Ячейки с colspan (разворачиваемые
-     подробности/история) не участвуют — там уже своя вложенная разметка, а
-     не пара подпись-значение. */
-  @media (max-width: 720px) {
-    table.table-fill thead, table.nested-table thead { display: none; }
-    table.table-fill, table.table-fill tbody, table.table-fill tr,
-    table.nested-table, table.nested-table tbody, table.nested-table tr {
-      display: block; width: 100%;
-    }
-    table.table-fill tbody tr:not(.empty-row) {
-      border: 1px solid var(--panel-border);
-      border-radius: 10px;
-      margin-bottom: 8px;
-      padding: 4px 0;
-    }
-    table.table-fill tbody tr.trade-detail-row,
-    table.table-fill tbody tr.channel-signals-row {
-      border: none; margin-bottom: 0; padding: 0;
-    }
-    table.nested-table tbody tr:not(.empty-row) {
-      border-bottom: 1px solid var(--panel-border);
-      padding: 6px 0;
-    }
-    table.table-fill td:not([colspan]), table.nested-table td {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      text-align: right;
-      white-space: normal;
-      max-width: none;
-      overflow: visible;
-      text-overflow: clip;
-      padding: 6px 14px;
-    }
-    table.table-fill td:not([colspan])::before, table.nested-table td::before {
-      content: attr(data-label);
-      color: var(--text-dim);
-      font-weight: 600;
-      text-align: left;
-      flex-shrink: 0;
-    }
-    table.table-fill td:first-child:not([colspan]) {
-      display: block;
-      text-align: left;
-      font-weight: 600;
-      padding: 8px 14px;
-      border-bottom: 1px solid var(--panel-border);
-    }
-    table.table-fill td:first-child:not([colspan])::before { content: none; }
-    table.table-fill td[colspan] {
-      display: block;
-      text-align: left;
-      white-space: normal;
-      max-width: none;
-      overflow: visible;
-    }
-    /* Ручки изменения ширины колонок бессмысленны, пока thead скрыт. */
-    table.table-fill .col-resize-handle { display: none; }
-  }
 </style>
 </head>
 <body>
@@ -935,12 +842,8 @@
   <section>
     <h2>Открытые позиции</h2>
     <div class="table-wrap">
-      <table class="table-fill">
-        <thead><tr>
-          <th style="width:11%">Символ</th><th style="width:9%">Кол-во</th><th style="width:10%">Цена входа</th>
-          <th style="width:10%">Текущая цена</th><th style="width:10%">Stop Loss</th><th style="width:10%">Take Profit</th>
-          <th style="width:10%">Сумма сделки</th><th style="width:10%">PnL</th><th style="width:16%">Источник</th><th style="width:4%"></th>
-        </tr></thead>
+      <table>
+        <thead><tr><th>Символ</th><th>Кол-во</th><th>Цена входа</th><th>Текущая цена</th><th>Stop Loss</th><th>Take Profit</th><th>Сумма сделки</th><th>PnL</th><th>Источник</th><th></th></tr></thead>
         <tbody id="positionsBody"><tr class="empty-row"><td colspan="10">Загрузка…</td></tr></tbody>
       </table>
     </div>
@@ -952,12 +855,8 @@
       <input type="text" id="tradesPairFilter" placeholder="Фильтр по паре (напр. BTC)" style="flex:0 0 200px">
     </div>
     <div class="table-wrap">
-      <table class="table-fill">
-        <thead><tr>
-          <th style="width:11%">Символ</th><th style="width:11%">Вход</th><th style="width:11%">Выход</th>
-          <th style="width:11%">Сумма сделки</th><th style="width:12%">PnL</th><th style="width:10%">Итог</th>
-          <th style="width:16%">Источник</th><th style="width:9%">В сделке</th><th style="width:9%">Закрыта</th>
-        </tr></thead>
+      <table>
+        <thead><tr><th>Символ</th><th>Вход</th><th>Выход</th><th>Сумма сделки</th><th>PnL</th><th>Итог</th><th>Источник</th><th>В сделке</th><th>Закрыта</th></tr></thead>
         <tbody id="tradesBody"><tr class="empty-row"><td colspan="9">Загрузка…</td></tr></tbody>
       </table>
     </div>
@@ -986,15 +885,8 @@
       <button type="button" id="btnRestartBot" class="btn-warn">🔄 Перезапустить бота</button>
     </div>
     <div class="table-wrap">
-      <table class="table-fill">
-        <thead><tr>
-          <th style="width:14%">Канал</th><th style="width:8%">ID</th><th style="width:6%">Порог</th>
-          <th style="width:7%">Размер (%)</th><th style="width:7%">Рынок</th><th style="width:8%">Автоисполнение</th>
-          <th style="width:6%">Сигналов</th><th style="width:8%">Исполнено всего</th>
-          <th style="width:8%" title="Сколько из исполненных сигналов канала сейчас реально открыто">Открыто сейчас</th>
-          <th style="width:6%">Win rate</th><th style="width:7%">PnL</th><th style="width:6%">Sizing</th>
-          <th style="width:6%">Активен</th><th style="width:3%"></th>
-        </tr></thead>
+      <table>
+        <thead><tr><th>Канал</th><th>ID</th><th>Порог</th><th>Размер (%)</th><th>Рынок</th><th>Автоисполнение</th><th>Сигналов</th><th>Исполнено всего</th><th title="Сколько из исполненных сигналов канала сейчас реально открыто">Открыто сейчас</th><th>Win rate</th><th>PnL</th><th>Sizing</th><th>Активен</th><th></th></tr></thead>
         <tbody id="telegramBody"><tr class="empty-row"><td colspan="14">Загрузка…</td></tr></tbody>
       </table>
     </div>
@@ -1324,80 +1216,6 @@ function recheckCellTooltips() {
   applyCellTooltips(document);
 }
 
-// Ручное изменение ширины колонок таблиц (.table-fill) перетаскиванием
-// границы в заголовке — сохраняется в localStorage per-таблица (переживает
-// редеплой: это браузерное хранилище конкретного пользователя, сервер его
-// не трогает и не может сбросить рестартом/git pull). Таблица заполняет
-// всю ширину без горизонтальной прокрутки (table-layout:fixed, см. CSS
-// .table-fill), поэтому колонки хранятся и таскаются в ПРОЦЕНТАХ от
-// ширины таблицы, а не в пикселях: перетаскивание одной границы всегда
-// одновременно уменьшает соседнюю справа колонку на ту же величину, чтобы
-// сумма процентов (и, соответственно, суммарная ширина) не менялась.
-function loadColumnWidths(key) {
-  try {
-    const raw = localStorage.getItem("colWidths:" + key);
-    return raw ? JSON.parse(raw) : null;
-  } catch (e) {
-    return null;
-  }
-}
-
-function saveColumnWidths(key, widths) {
-  try {
-    localStorage.setItem("colWidths:" + key, JSON.stringify(widths));
-  } catch (e) { /* приватный режим/квота — тихо игнорируем, просто не сохранится */ }
-}
-
-function makeColumnsResizable(table, storageKey) {
-  const ths = Array.from(table.querySelectorAll("thead th"));
-  if (ths.length < 2) return;
-
-  const saved = loadColumnWidths(storageKey);
-  if (saved && saved.length === ths.length) {
-    ths.forEach((th, i) => { th.style.width = saved[i] + "%"; });
-  }
-
-  // У последней колонки нет ручки справа — тащить её было бы некуда (за
-  // пределы таблицы), её ширина всегда остаток от суммы остальных.
-  ths.slice(0, -1).forEach((th, i) => {
-    const nextTh = ths[i + 1];
-    const handle = document.createElement("div");
-    handle.className = "col-resize-handle";
-    th.appendChild(handle);
-
-    handle.addEventListener("pointerdown", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      handle.setPointerCapture(e.pointerId);
-      handle.classList.add("resizing");
-      const tableWidth = table.getBoundingClientRect().width;
-      const startX = e.clientX;
-      const startWidth = th.getBoundingClientRect().width;
-      const startNextWidth = nextTh.getBoundingClientRect().width;
-      const minPx = 40;
-
-      const onMove = (moveEvent) => {
-        const dx = moveEvent.clientX - startX;
-        let newWidth = startWidth + dx;
-        let newNextWidth = startNextWidth - dx;
-        if (newWidth < minPx) { newWidth = minPx; newNextWidth = startWidth + startNextWidth - minPx; }
-        if (newNextWidth < minPx) { newNextWidth = minPx; newWidth = startWidth + startNextWidth - minPx; }
-        th.style.width = (newWidth / tableWidth * 100) + "%";
-        nextTh.style.width = (newNextWidth / tableWidth * 100) + "%";
-      };
-      const onUp = (upEvent) => {
-        handle.releasePointerCapture(upEvent.pointerId);
-        handle.classList.remove("resizing");
-        handle.removeEventListener("pointermove", onMove);
-        handle.removeEventListener("pointerup", onUp);
-        saveColumnWidths(storageKey, ths.map(t => parseFloat(t.style.width) || 0));
-      };
-      handle.addEventListener("pointermove", onMove);
-      handle.addEventListener("pointerup", onUp);
-    });
-  });
-}
-
 // Горизонтальная прокрутка широких таблиц (.table-wrap) — наведением
 // курсора на край контейнера, без необходимости цеплять скроллбар/крутить
 // колесо с Shift. Работает через делегирование на document, а не отдельные
@@ -1560,14 +1378,14 @@ function renderPositions(status) {
     return `
     <tr class="trade-row" data-position-symbol="${symbol}" title="Показать подробности позиции">
       <td class="side-${pos.side === 'long' ? 'long' : 'short'}"><span class="expand-arrow">▸</span>${symbol}${leverageBadge}</td>
-      <td data-label="Кол-во">${fmt(pos.amount, 6)}</td>
-      <td data-label="Цена входа">${fmtPrice(pos.entry_price)}</td>
-      <td data-label="Текущая цена">${cur !== null && cur !== undefined ? fmtPrice(cur) : "—"}</td>
-      <td class="muted" data-label="Stop Loss">${pos.stop_loss ? fmtPrice(pos.stop_loss) : "—"}${pos.stop_loss ? slPctHtml(pos.stop_loss, pos.entry_price, pos.side) : ""}${slBadge}</td>
-      <td class="muted" data-label="Take Profit">${pos.take_profit ? fmtPrice(pos.take_profit) : "—"}</td>
-      <td data-label="Сумма сделки">${tradeValue !== null ? "$" + fmt(tradeValue) : "—"}</td>
-      <td data-label="PnL">${pnlHtml}</td>
-      <td class="muted" data-label="Источник">${pos.source || "—"}</td>
+      <td>${fmt(pos.amount, 6)}</td>
+      <td>${fmtPrice(pos.entry_price)}</td>
+      <td>${cur !== null && cur !== undefined ? fmtPrice(cur) : "—"}</td>
+      <td class="muted">${pos.stop_loss ? fmtPrice(pos.stop_loss) : "—"}${pos.stop_loss ? slPctHtml(pos.stop_loss, pos.entry_price, pos.side) : ""}${slBadge}</td>
+      <td class="muted">${pos.take_profit ? fmtPrice(pos.take_profit) : "—"}</td>
+      <td>${tradeValue !== null ? "$" + fmt(tradeValue) : "—"}</td>
+      <td>${pnlHtml}</td>
+      <td class="muted">${pos.source || "—"}</td>
       <td><button class="btn-icon-danger" data-close-position="${symbol}" title="Закрыть по рынку">✕</button></td>
     </tr>
     <tr class="trade-detail-row" data-position-detail="${escapeHtml(symbol)}" style="display:none"><td colspan="10"></td></tr>
@@ -2064,14 +1882,14 @@ async function renderTrades() {
       return `
       <tr class="trade-row" data-trade-id="${t.id}" title="Показать подробности сделки">
         <td class="side-${t.direction === 'long' ? 'long' : 'short'}"><span class="expand-arrow">▸</span>${t.symbol || ("#" + t.symbol_id)}${leverageBadge}</td>
-        <td data-label="Вход">${fmtPrice(t.entry_price)}</td>
-        <td data-label="Выход">${t.exit_price !== null ? fmtPrice(t.exit_price) : "—"}</td>
-        <td data-label="Сумма сделки">${tradeValue !== null ? "$" + fmt(tradeValue) : "—"}</td>
-        <td class="${t.pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}" data-label="PnL">${t.pnl >= 0 ? "+" : ""}${fmt(t.pnl)} (${fmt(t.pnl_pct, 2)}%)${leveragedPnl}</td>
-        <td data-label="Итог">${fmtOutcome(t.outcome, t.is_open)}</td>
-        <td class="muted" data-label="Источник">${t.source || "—"}</td>
-        <td class="muted" data-label="В сделке">${fmtDuration(t.holding_seconds)}</td>
-        <td class="muted" data-label="Закрыта">${t.closed_at ? new Date(t.closed_at).toLocaleString("ru-RU") : "—"}</td>
+        <td>${fmtPrice(t.entry_price)}</td>
+        <td>${t.exit_price !== null ? fmtPrice(t.exit_price) : "—"}</td>
+        <td>${tradeValue !== null ? "$" + fmt(tradeValue) : "—"}</td>
+        <td class="${t.pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${t.pnl >= 0 ? "+" : ""}${fmt(t.pnl)} (${fmt(t.pnl_pct, 2)}%)${leveragedPnl}</td>
+        <td>${fmtOutcome(t.outcome, t.is_open)}</td>
+        <td class="muted">${t.source || "—"}</td>
+        <td class="muted">${fmtDuration(t.holding_seconds)}</td>
+        <td class="muted">${t.closed_at ? new Date(t.closed_at).toLocaleString("ru-RU") : "—"}</td>
       </tr>
       <tr class="trade-detail-row" data-trade-detail="${t.id}" style="display:none"><td colspan="9"></td></tr>
     `;
@@ -2283,14 +2101,14 @@ function renderTradeDetail(d) {
           <tbody>
             ${d.legs.map((leg, i) => `
               <tr>
-                <td class="muted" data-label="#">${i + 1}</td>
-                <td data-label="Цена выхода">${leg.exit_price !== null ? fmtPrice(leg.exit_price) : "—"}</td>
-                <td data-label="Объём">${fmt(leg.amount, 6)}</td>
-                <td class="${leg.pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}" data-label="PnL">${leg.pnl >= 0 ? "+" : ""}${fmt(leg.pnl)} (${fmt(leg.pnl_pct, 2)}%)</td>
-                <td data-label="Итог">${fmtOutcome(leg.outcome, false)}</td>
-                <td class="muted" data-label="В сделке">${fmtDuration(leg.holding_seconds)}</td>
-                <td class="muted" data-label="Закрыта">${leg.closed_at ? new Date(leg.closed_at).toLocaleString("ru-RU") : "—"}</td>
-                <td class="muted" data-label="ID ордера">${leg.order_id_exchange_close ? escapeHtml(fmtOrderId(leg.order_id_exchange_close)) : "—"}</td>
+                <td class="muted">${i + 1}</td>
+                <td>${leg.exit_price !== null ? fmtPrice(leg.exit_price) : "—"}</td>
+                <td>${fmt(leg.amount, 6)}</td>
+                <td class="${leg.pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${leg.pnl >= 0 ? "+" : ""}${fmt(leg.pnl)} (${fmt(leg.pnl_pct, 2)}%)</td>
+                <td>${fmtOutcome(leg.outcome, false)}</td>
+                <td class="muted">${fmtDuration(leg.holding_seconds)}</td>
+                <td class="muted">${leg.closed_at ? new Date(leg.closed_at).toLocaleString("ru-RU") : "—"}</td>
+                <td class="muted">${leg.order_id_exchange_close ? escapeHtml(fmtOrderId(leg.order_id_exchange_close)) : "—"}</td>
               </tr>
             `).join("")}
           </tbody>
@@ -2652,18 +2470,18 @@ async function renderTelegram() {
       return `
       <tr class="channel-row" data-channel-id="${c.id}" title="Показать историю сигналов">
         <td><span class="expand-arrow">▸</span>${titleCell}</td>
-        <td class="muted" data-label="ID">${c.channel_id}</td>
-        <td data-label="Порог">${thresholdCell}</td>
-        <td data-label="Размер (%)">${sizepctCell}</td>
-        <td data-label="Рынок">${marketCell}</td>
-        <td data-label="Автоисполнение">${autoexecCell}</td>
-        <td data-label="Сигналов">${s.total_signals ?? c.signals_count}</td>
-        <td data-label="Исполнено всего">${s.executed ?? 0}</td>
-        <td data-label="Открыто сейчас">${s.open_now ?? 0}</td>
-        <td data-label="Win rate">${winRate}</td>
-        <td class="${pnlClass}" data-label="PnL">${pnl}</td>
-        <td class="${sizingClass}" data-label="Sizing" title="Множитель к базовому размеру позиции (колонка «Размер») по мат. ожиданию канала (expectancy sizing)">${sizing}</td>
-        <td data-label="Активен">${c.active ? "✅" : "—"}</td>
+        <td class="muted">${c.channel_id}</td>
+        <td>${thresholdCell}</td>
+        <td>${sizepctCell}</td>
+        <td>${marketCell}</td>
+        <td>${autoexecCell}</td>
+        <td>${s.total_signals ?? c.signals_count}</td>
+        <td>${s.executed ?? 0}</td>
+        <td>${s.open_now ?? 0}</td>
+        <td>${winRate}</td>
+        <td class="${pnlClass}">${pnl}</td>
+        <td class="${sizingClass}" title="Множитель к базовому размеру позиции (колонка «Размер») по мат. ожиданию канала (expectancy sizing)">${sizing}</td>
+        <td>${c.active ? "✅" : "—"}</td>
         <td class="row-actions">
           <button class="btn-ghost" data-edit-channel="${c.id}" title="${editing ? 'Готово' : 'Редактировать'}">${editing ? "✔️" : "✏️"}</button>
           <button class="btn-icon-danger" data-delete-channel="${c.id}" title="Удалить">✕</button>
@@ -3069,13 +2887,13 @@ function renderChannelSignalsTable(signals) {
               : `${s.decision === "executed" ? "✅" : "🚫"} ${outcome}`;
             return `
             <tr>
-              <td class="muted" data-label="Время">${s.created_at ? new Date(s.created_at).toLocaleString("ru-RU") : "—"}</td>
-              <td class="${sideCls}" data-label="Пара">${s.parsed_pair || "—"}${leverageBadge}</td>
-              <td data-label="Entry">${s.parsed_entry !== null ? fmtPrice(s.parsed_entry) : "—"}</td>
-              <td data-label="SL">${s.parsed_sl !== null ? fmtPrice(s.parsed_sl) : "—"}</td>
-              <td data-label="TP">${tpDisplay}</td>
-              <td data-label="Качество">${s.quality_score !== null ? fmt(s.quality_score, 2) : "—"}</td>
-              <td data-label="Итог сделки">${decisionOutcomeCell}</td>
+              <td class="muted">${s.created_at ? new Date(s.created_at).toLocaleString("ru-RU") : "—"}</td>
+              <td class="${sideCls}">${s.parsed_pair || "—"}${leverageBadge}</td>
+              <td>${s.parsed_entry !== null ? fmtPrice(s.parsed_entry) : "—"}</td>
+              <td>${s.parsed_sl !== null ? fmtPrice(s.parsed_sl) : "—"}</td>
+              <td>${tpDisplay}</td>
+              <td>${s.quality_score !== null ? fmt(s.quality_score, 2) : "—"}</td>
+              <td>${decisionOutcomeCell}</td>
             </tr>
           `;
           }).join("")}
@@ -3950,17 +3768,9 @@ setInterval(refreshAll, REFRESH_MS);
 // Заголовки таблиц (th) — статичный HTML, присутствуют в документе уже на
 // момент загрузки страницы, а не появляются через innerHTML — их не видит
 // MutationObserver в applyCellTooltips (ловит только НОВЫЕ узлы). Без этого
-// подсказка на усечённый заголовок (актуально для узких процентных колонок
-// .table-fill) появлялась бы только после переключения вкладки туда-обратно.
+// подсказка на усечённый заголовок появлялась бы только после переключения
+// вкладки туда-обратно.
 recheckCellTooltips();
-
-// Ширина колонок .table-fill таскается мышью/тачем и запоминается на этот
-// браузер (localStorage) — заголовки статичны и не пересоздаются при
-// обновлении данных, поэтому один вызов на каждую таблицу при загрузке.
-document.querySelectorAll("table.table-fill").forEach(table => {
-  const bodyId = table.querySelector("tbody")?.id || "";
-  makeColumnsResizable(table, bodyId || `table-${Array.from(document.querySelectorAll("table.table-fill")).indexOf(table)}`);
-});
 </script>
 
 </body>
