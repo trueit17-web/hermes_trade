@@ -6973,6 +6973,76 @@ class TestSymbolBlacklistSkipsProcessing(unittest.IsolatedAsyncioTestCase):
         bot.feature_engine.compute_all_indicators.assert_called_once()
 
 
+class TestTelegramSignalBlacklistRejected(unittest.IsolatedAsyncioTestCase):
+    """
+    symbol_blacklist раньше проверялся только в стратегийном пути
+    (_process_symbol) — Telegram-сигналы шли из _on_telegram_signal прямо в
+    _execute_telegram_signal в обход этой проверки, то есть добавление пары
+    в блэклист не мешало каналу продолжать открывать по ней позиции.
+    Реальный инцидент: AAOI/USDT (токенизированная акция на Bybit, биржа
+    отклоняет ордер с retCode 110126, требуя ручного подписания соглашения)
+    добавлялась в блэклист, но сигналы канала по ней всё равно исполнялись.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        self._saved_blacklist = settings.symbol_blacklist
+        self._saved_count = global_risk_manager.state.open_positions_count
+        global_risk_manager.state.open_positions_count = 0
+
+    def tearDown(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        settings.symbol_blacklist = self._saved_blacklist
+        global_risk_manager.state.open_positions_count = self._saved_count
+
+    async def test_blacklisted_pair_rejected_before_execution(self):
+        settings.symbol_blacklist = ["AAOI/USDT"]
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._save_telegram_signal = AsyncMock()
+
+        with patch.object(bot, "_execute_telegram_signal", new=AsyncMock()) as exec_mock:
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "AAOI/USDT", "parsed_side": "long",
+                "parsed_entry": 20.0, "parsed_sl": 18.0, "parsed_tp": 22.0,
+            })
+
+        exec_mock.assert_not_awaited()
+        bot._save_telegram_signal.assert_awaited_once()
+        self.assertEqual(bot._save_telegram_signal.await_args.args[2], "rejected")
+        self.assertEqual(
+            bot._save_telegram_signal.await_args.args[0]["reject_reason"],
+            "пара в блэклисте (symbol_blacklist)",
+        )
+
+    async def test_non_blacklisted_pair_not_affected(self):
+        settings.symbol_blacklist = ["AAOI/USDT"]
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        fake_order = MagicMock(id=1)
+        with patch.object(bot, "_execute_telegram_signal", new=AsyncMock(return_value=fake_order)) as exec_mock:
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 52000.0,
+            })
+
+        exec_mock.assert_awaited_once()
+
+
 class TestCheckPositionExitCleansStaleEntryOnFailedClose(unittest.IsolatedAsyncioTestCase):
     """
     Регресс на прод-инцидент: close_real_position/close_paper_position могут
@@ -8993,6 +9063,94 @@ class TestExecuteRealOrderOpensLongAndShortOnFutures(unittest.IsolatedAsyncioTes
 
         self.assertIsNotNone(order)
         self.engine.exchange.set_leverage.assert_not_called()
+
+
+class TestExecuteRealOrderAutoBlacklistsAgreementRequiredSymbol(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент: AAOI/USDT (токенизированная акция на Bybit) —
+    биржа отклоняет ЛЮБОЙ ордер retCode 110126 "You must sign the required
+    agreement before trading this contract.", пока согласие не подписано
+    вручную через сайт/приложение биржи (API этого не умеет). Без
+    автодобавления в symbol_blacklist КАЖДЫЙ новый сигнал канала по такому
+    символу заново бился бы в ту же стену — теперь такой символ
+    добавляется в блэклист (персистентно, через apply_settings_update)
+    сразу при первом столкновении с этой ошибкой.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+        self._saved_trading_mode = settings.trading_mode
+        self._saved_blacklist = settings.symbol_blacklist
+        settings.symbol_blacklist = []
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+        settings.trading_mode = self._saved_trading_mode
+        settings.symbol_blacklist = self._saved_blacklist
+
+    async def test_symbol_added_to_blacklist_on_required_agreement_error(self):
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order = AsyncMock(
+            side_effect=Exception(
+                'bybit {"retCode":110126,"retMsg":"You must sign the required agreement '
+                'before trading this contract.","result":{},"retExtInfo":{},"time":123}'
+            )
+        )
+
+        with patch("src.web.settings_store.apply_settings_update", new=AsyncMock()) as apply_mock:
+            order = await self.engine.create_order(
+                symbol="AAOI/USDT", side="buy", amount=5.0, price=20.0, order_type="market",
+            )
+
+        self.assertIsNone(order)
+        apply_mock.assert_awaited_once_with({"symbol_blacklist": ["AAOI/USDT"]})
+
+    async def test_already_blacklisted_symbol_not_re_added(self):
+        settings.symbol_blacklist = ["AAOI/USDT"]
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order = AsyncMock(
+            side_effect=Exception('bybit {"retCode":110126,"retMsg":"You must sign the required agreement"}')
+        )
+
+        with patch("src.web.settings_store.apply_settings_update", new=AsyncMock()) as apply_mock:
+            await self.engine.create_order(
+                symbol="AAOI/USDT", side="buy", amount=5.0, price=20.0, order_type="market",
+            )
+
+        apply_mock.assert_not_awaited()
+
+    async def test_unrelated_exchange_error_does_not_touch_blacklist(self):
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order = AsyncMock(
+            side_effect=Exception("Insufficient balance")
+        )
+
+        with patch("src.web.settings_store.apply_settings_update", new=AsyncMock()) as apply_mock:
+            order = await self.engine.create_order(
+                symbol="RANDOM1/USDT", side="buy", amount=5.0, price=20.0, order_type="market",
+            )
+
+        self.assertIsNone(order)
+        apply_mock.assert_not_awaited()
+        self.assertEqual(settings.symbol_blacklist, [])
 
 
 class TestExecuteRealOrderAppliesPerSignalLeverage(unittest.IsolatedAsyncioTestCase):

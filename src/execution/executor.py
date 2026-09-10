@@ -2553,6 +2553,26 @@ class ExecutionEngine:
             return order_obj
 
         except Exception as e:
+            error_str = str(e)
+            if "110126" in error_str or "must sign the required agreement" in error_str.lower():
+                # Bybit retCode 110126 — отдельные контракты (например,
+                # токенизированные акции: AAOI/USDT и похожие) требуют
+                # ручного подписания соглашения на самом сайте/в приложении
+                # биржи — через API это не обойти, и повтор попытки для
+                # этого символа будет упираться в ту же стену бесконечно.
+                # Реальный инцидент: AAOI/USDT, канал продолжал слать
+                # сигналы, каждый заново падал с этой же ошибкой.
+                # Автодобавление в symbol_blacklist (персистентно, через
+                # apply_settings_update — та же таблица BotConfig, что и
+                # ручное редактирование на дашборде) избавляет от повторов
+                # без необходимости заранее угадывать список таких пар.
+                if symbol not in settings.symbol_blacklist:
+                    from src.web.settings_store import apply_settings_update
+                    await apply_settings_update({"symbol_blacklist": [*settings.symbol_blacklist, symbol]})
+                    logger.warning(
+                        f"⚠️ {symbol} требует ручного подписания соглашения на бирже (retCode 110126) — "
+                        f"добавлен в symbol_blacklist автоматически."
+                    )
             logger.error(f"❌ Ошибка исполнения реального ордера {symbol}: {e}")
             self.last_order_rejection_reason = f"ошибка биржи: {e}"
             return None

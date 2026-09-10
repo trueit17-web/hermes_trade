@@ -773,6 +773,21 @@ class TradingBot:
         if not pair or not side:
             return
 
+        if pair in settings.symbol_blacklist:
+            # symbol_blacklist раньше проверялся только в стратегийном пути
+            # (_process_symbol) — Telegram-сигналы шли напрямую в
+            # _execute_telegram_signal в обход этой проверки вообще.
+            # Реальный инцидент: AAOI/USDT (токенизированная акция на
+            # Bybit, требует отдельного подписания соглашения на бирже —
+            # см. авто-добавление в блэклист при retCode 110126 в
+            # executor._execute_real_order) добавлялась в блэклист, но
+            # канал продолжал слать по ней сигналы, и они всё равно
+            # исполнялись.
+            signal_event["reject_reason"] = "пара в блэклисте (symbol_blacklist)"
+            logger.info(f"🚫 Сигнал по {pair} отклонён: пара в блэклисте")
+            await self._save_telegram_signal(signal_event, None, "rejected", None)
+            return
+
         quality_threshold, auto_execute, position_size_pct, market_type = await self._get_channel_settings(channel_id)
         signal_event["channel_position_size_pct"] = position_size_pct
         signal_event["channel_market_type"] = market_type
