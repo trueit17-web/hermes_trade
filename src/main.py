@@ -467,13 +467,20 @@ class TradingBot:
         executed_trade_id — эта ссылка проставляется только на пути
         обычного закрытия ботом (_link_telegram_signal_trade) и никогда на
         путях внешнего закрытия (см. тот же фикс и подробный докстринг в
-        GET /telegram/signals, api.py) — а по реальным строкам Trade,
-        агрегированным по order_open_id. Считается ЖИВЫМ запросом к БД (не
-        из кэша) — статистика открытия должна отражать состояние на
-        текущий момент. Вызывается ДО _save_telegram_signal (см.
-        _on_telegram_signal порядок вызовов) — сама текущая сделка в БД ещё
-        не сохранена, поэтому applied увеличивается на 1 вручную вызывающим
-        кодом.
+        GET /telegram/signals, api.py) — а по факту наличия позиции в
+        execution_engine.*_positions с этим order_id (тот же приём, что и
+        open_now в GET /telegram/channels/stats). Реальный инцидент: канал
+        Vipka показывал в уведомлении "22 откр.", хотя реально открытых
+        позиций по нему было 12 — раньше "открыта" определялось эвристикой
+        "сумма Trade-легов меньше исполненного объёма ордера", которая
+        считала позицию открытой при ЛЮБОМ отсутствии соответствующих
+        Trade-строк (в т.ч. для давно закрытых внешним путём позиций, по
+        которым Trade так и не был создан) — а не по факту, отслеживает ли
+        её бот прямо сейчас. Считается ЖИВЫМ запросом к БД (не из кэша) —
+        статистика открытия должна отражать состояние на текущий момент.
+        Вызывается ДО _save_telegram_signal (см. _on_telegram_signal
+        порядок вызовов) — сама текущая сделка в БД ещё не сохранена,
+        поэтому applied увеличивается на 1 вручную вызывающим кодом.
         """
         db_channel_id = self._telegram_channel_db_ids.get(channel_id)
         if db_channel_id is None:
@@ -485,9 +492,7 @@ class TradingBot:
                     return None
                 signals = (
                     await session.execute(
-                        select(TelegramSignal)
-                        .options(selectinload(TelegramSignal.executed_order))
-                        .where(TelegramSignal.channel_id == db_channel_id)
+                        select(TelegramSignal).where(TelegramSignal.channel_id == db_channel_id)
                     )
                 ).scalars().all()
                 executed = [s for s in signals if s.decision == "executed" and s.executed_order_id is not None]
@@ -503,21 +508,17 @@ class TradingBot:
                     for t in raw_trades:
                         trades_by_order.setdefault(t.order_open_id, []).append(t)
 
+                tracked = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
+                open_order_ids = {pos.get("order_id") for pos in tracked.values() if pos.get("order_id") is not None}
+
                 wins = 0
                 open_count = 0
                 for s in executed:
-                    legs = trades_by_order.get(s.executed_order_id)
-                    if not legs:
+                    if s.executed_order_id in open_order_ids:
                         open_count += 1
                         continue
-                    order = s.executed_order
-                    order_amount = (
-                        float(order.filled_amount) if order and order.filled_amount else
-                        (float(order.amount) if order else 0.0)
-                    )
-                    total_amount = sum(float(t.amount) for t in legs)
-                    if order_amount - total_amount > max(order_amount * 0.01, 1e-9):
-                        open_count += 1
+                    legs = trades_by_order.get(s.executed_order_id)
+                    if not legs:
                         continue
                     total_pnl = sum(float(t.pnl) for t in legs)
                     if total_pnl > 0:

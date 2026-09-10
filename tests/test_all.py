@@ -14644,12 +14644,14 @@ class TestChannelNotificationStats(unittest.IsolatedAsyncioTestCase):
     _channel_notification_stats — название канала и (применено, закрыто в
     плюс, сейчас открыто) для строки в уведомлении об открытии позиции.
 
-    Открыта/закрыта определяется по реальным строкам Trade, агрегированным
-    по order_open_id (== TelegramSignal.executed_order_id) — НЕ по
-    TelegramSignal.executed_trade_id, которая никогда не проставляется на
-    путях внешнего закрытия позиции (см. тот же фикс в GET /telegram/signals,
-    api.py) — поэтому тестовые сигналы ниже связаны через открывающий Order,
-    как в реальном коде, а не напрямую через executed_trade_id.
+    "Сейчас открыто" определяется по факту наличия позиции в
+    execution_engine.paper_positions/real_positions с этим order_id (тот же
+    приём, что и open_now в GET /telegram/channels/stats) — НЕ по
+    отсутствию Trade-строк: реальный инцидент — уведомление показывало "22
+    откр." для канала, где реально было открыто 12, потому что старая
+    эвристика "нет соответствующего Trade" считала открытой ЛЮБУЮ позицию
+    без Trade, включая давно закрытые внешним путём, для которых Trade так
+    и не был создан.
     """
 
     def _make_bot(self):
@@ -14662,6 +14664,7 @@ class TestChannelNotificationStats(unittest.IsolatedAsyncioTestCase):
     async def test_computes_applied_win_and_open_counts(self):
         from src.db.models import Exchange, Order, Symbol, TelegramChannel, TelegramSignal, Trade
         from src.db.session import get_session
+        from src.execution.executor import execution_engine
         from src.utils.timeutils import utcnow
 
         async with get_session() as session:
@@ -14724,7 +14727,15 @@ class TestChannelNotificationStats(unittest.IsolatedAsyncioTestCase):
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {"@notif_stats_channel": db_channel_id}
 
-        result = await bot._channel_notification_stats("@notif_stats_channel")
+        # "Открыта" определяется по факту наличия позиции в execution_engine.
+        # paper_positions с этим order_id — не по отсутствию Trade (см.
+        # докстринг класса), поэтому реально открытую позицию для open_order
+        # нужно явно зарегистрировать здесь, как это делает сам бот.
+        execution_engine.paper_positions["NOTIFSTATS_OPEN/USDT"] = {"order_id": open_order.id}
+        try:
+            result = await bot._channel_notification_stats("@notif_stats_channel")
+        finally:
+            execution_engine.paper_positions.pop("NOTIFSTATS_OPEN/USDT", None)
 
         self.assertIsNotNone(result)
         title, applied, wins, open_count = result
@@ -14732,6 +14743,59 @@ class TestChannelNotificationStats(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(applied, 4)
         self.assertEqual(wins, 2)
         self.assertEqual(open_count, 1)
+
+    async def test_position_without_trade_and_not_tracked_counts_as_neither(self):
+        """
+        Позиция без Trade-строки, которая ТАКЖЕ не отслеживается ботом
+        прямо сейчас (закрыта внешним путём, для которого Trade не был
+        создан) — не должна попадать ни в open_count, ни в wins. Это и был
+        сам баг: раньше отсутствие Trade автоматически считалось "открыта".
+        """
+        from src.db.models import Exchange, Order, Symbol, TelegramChannel, TelegramSignal
+        from src.db.session import get_session
+        from src.utils.timeutils import utcnow
+
+        async with get_session() as session:
+            exchange = Exchange(name="notif_stats_test_exchange2", is_paper=True)
+            session.add(exchange)
+            await session.flush()
+            symbol = Symbol(
+                exchange_id=exchange.id, symbol="NOTIFSTATS2/USDT",
+                base_asset="NOTIFSTATS2", quote_asset="USDT",
+            )
+            session.add(symbol)
+            await session.flush()
+
+            channel = TelegramChannel(
+                channel_id="@notif_stats_channel2", channel_title="Notif Stats Channel 2", active=True,
+            )
+            session.add(channel)
+            await session.flush()
+            db_channel_id = channel.id
+
+            order = Order(
+                exchange_id=exchange.id, symbol_id=symbol.id, side="buy", order_type="market",
+                amount=1.0, status="filled", filled_amount=1.0, filled_price=100.0,
+            )
+            session.add(order)
+            await session.flush()
+            session.add(TelegramSignal(
+                channel_id=db_channel_id, raw_message="test", message_date=utcnow(),
+                parsed_pair="NOTIFSTATS2/USDT", parsed_side="long", parsed_entry=100.0,
+                decision="executed", executed_order_id=order.id,
+            ))
+            await session.commit()
+
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {"@notif_stats_channel2": db_channel_id}
+
+        result = await bot._channel_notification_stats("@notif_stats_channel2")
+
+        self.assertIsNotNone(result)
+        title, applied, wins, open_count = result
+        self.assertEqual(applied, 1)
+        self.assertEqual(wins, 0)
+        self.assertEqual(open_count, 0)
 
     async def test_unknown_channel_returns_none(self):
         bot = self._make_bot()
