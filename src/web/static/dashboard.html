@@ -263,6 +263,17 @@
      соблюдается только в fixed-режиме. Ширина каждой колонки задаётся
      процентом на th (fixed-layout берёт пропорции из первой строки). */
   table.table-fill { width: 100%; table-layout: fixed; }
+  /* Перетаскиваемая граница колонки — внутри правого края th (right:0), а
+     не выступающая за него: th обрезает переполнение (overflow:hidden для
+     многоточия), выступающий за пределы элемент был бы обрезан вместе с
+     текстом. См. makeColumnsResizable в скрипте ниже — таскает не саму
+     границу визуально, а живьём двигает width соседних th. */
+  table.table-fill thead th { position: relative; }
+  .col-resize-handle {
+    position: absolute; top: 0; right: 0; width: 6px; height: 100%;
+    cursor: col-resize; touch-action: none; z-index: 1;
+  }
+  .col-resize-handle:hover, .col-resize-handle.resizing { background: rgba(255,255,255,.15); }
   /* Ячейка не растягивает колонку/таблицу под самый длинный текст — вместо
      этого обрезается многоточием, полный текст доступен в подсказке при
      наведении (см. applyCellTooltip в скрипте ниже). Сама таблица по-прежнему
@@ -1239,6 +1250,80 @@ cellTooltipObserver.observe(document.body, { childList: true, subtree: true });
 // усечения не видно, тултип не назначился. Досчитываем при показе вкладки.
 function recheckCellTooltips() {
   applyCellTooltips(document);
+}
+
+// Ручное изменение ширины колонок таблиц (.table-fill) перетаскиванием
+// границы в заголовке — сохраняется в localStorage per-таблица (переживает
+// редеплой: это браузерное хранилище конкретного пользователя, сервер его
+// не трогает и не может сбросить рестартом/git pull). Таблица заполняет
+// всю ширину без горизонтальной прокрутки (table-layout:fixed, см. CSS
+// .table-fill), поэтому колонки хранятся и таскаются в ПРОЦЕНТАХ от
+// ширины таблицы, а не в пикселях: перетаскивание одной границы всегда
+// одновременно уменьшает соседнюю справа колонку на ту же величину, чтобы
+// сумма процентов (и, соответственно, суммарная ширина) не менялась.
+function loadColumnWidths(key) {
+  try {
+    const raw = localStorage.getItem("colWidths:" + key);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveColumnWidths(key, widths) {
+  try {
+    localStorage.setItem("colWidths:" + key, JSON.stringify(widths));
+  } catch (e) { /* приватный режим/квота — тихо игнорируем, просто не сохранится */ }
+}
+
+function makeColumnsResizable(table, storageKey) {
+  const ths = Array.from(table.querySelectorAll("thead th"));
+  if (ths.length < 2) return;
+
+  const saved = loadColumnWidths(storageKey);
+  if (saved && saved.length === ths.length) {
+    ths.forEach((th, i) => { th.style.width = saved[i] + "%"; });
+  }
+
+  // У последней колонки нет ручки справа — тащить её было бы некуда (за
+  // пределы таблицы), её ширина всегда остаток от суммы остальных.
+  ths.slice(0, -1).forEach((th, i) => {
+    const nextTh = ths[i + 1];
+    const handle = document.createElement("div");
+    handle.className = "col-resize-handle";
+    th.appendChild(handle);
+
+    handle.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      handle.setPointerCapture(e.pointerId);
+      handle.classList.add("resizing");
+      const tableWidth = table.getBoundingClientRect().width;
+      const startX = e.clientX;
+      const startWidth = th.getBoundingClientRect().width;
+      const startNextWidth = nextTh.getBoundingClientRect().width;
+      const minPx = 40;
+
+      const onMove = (moveEvent) => {
+        const dx = moveEvent.clientX - startX;
+        let newWidth = startWidth + dx;
+        let newNextWidth = startNextWidth - dx;
+        if (newWidth < minPx) { newWidth = minPx; newNextWidth = startWidth + startNextWidth - minPx; }
+        if (newNextWidth < minPx) { newNextWidth = minPx; newWidth = startWidth + startNextWidth - minPx; }
+        th.style.width = (newWidth / tableWidth * 100) + "%";
+        nextTh.style.width = (newNextWidth / tableWidth * 100) + "%";
+      };
+      const onUp = (upEvent) => {
+        handle.releasePointerCapture(upEvent.pointerId);
+        handle.classList.remove("resizing");
+        handle.removeEventListener("pointermove", onMove);
+        handle.removeEventListener("pointerup", onUp);
+        saveColumnWidths(storageKey, ths.map(t => parseFloat(t.style.width) || 0));
+      };
+      handle.addEventListener("pointermove", onMove);
+      handle.addEventListener("pointerup", onUp);
+    });
+  });
 }
 
 // Горизонтальная прокрутка широких таблиц (.table-wrap) — наведением
@@ -3796,6 +3881,14 @@ setInterval(refreshAll, REFRESH_MS);
 // подсказка на усечённый заголовок (актуально для узких процентных колонок
 // .table-fill) появлялась бы только после переключения вкладки туда-обратно.
 recheckCellTooltips();
+
+// Ширина колонок .table-fill таскается мышью/тачем и запоминается на этот
+// браузер (localStorage) — заголовки статичны и не пересоздаются при
+// обновлении данных, поэтому один вызов на каждую таблицу при загрузке.
+document.querySelectorAll("table.table-fill").forEach(table => {
+  const bodyId = table.querySelector("tbody")?.id || "";
+  makeColumnsResizable(table, bodyId || `table-${Array.from(document.querySelectorAll("table.table-fill")).indexOf(table)}`);
+});
 </script>
 
 </body>
