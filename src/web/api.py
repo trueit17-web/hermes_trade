@@ -755,8 +755,15 @@ async def get_position_detail(symbol: str):
     order_id = pos.get("order_id")
     channel = None
     signal = None
+    signal_changes = None
     if order_id is not None:
         async with get_session() as session:
+            # Order.notes — журнал автоправок исходного сигнала канала
+            # (дефолтный SL, капы SL/плеча — см. _execute_telegram_signal в
+            # main.py), показывается первой строкой в развороте подробностей.
+            signal_changes = (
+                await session.execute(select(Order.notes).where(Order.id == order_id))
+            ).scalar_one_or_none()
             ts = (
                 await session.execute(
                     select(TelegramSignal)
@@ -818,6 +825,7 @@ async def get_position_detail(symbol: str):
         "source": _position_source_label(pos.get("strategy_id"), channel["channel_title"] if channel else None),
         "channel": channel,
         "signal": signal,
+        "signal_changes": signal_changes,
         "decision_log": decision_log,
     }
 

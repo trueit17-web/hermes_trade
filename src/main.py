@@ -1160,6 +1160,35 @@ class TradingBot:
         # канала, см. POST /telegram/signals/{id}/decide) — global fallback.
         market_type = signal_event.get("channel_market_type", settings.market_type)
 
+        # Человекочитаемый журнал автоматических правок исходного сигнала
+        # канала (дефолтный SL, капы SL/плеча ниже) — попадает в Order.notes
+        # и показывается первой строкой в развороте подробностей на
+        # дашборде (см. renderPositionDetail/renderTradeDetail), чтобы было
+        # видно, что именно и почему бот изменил относительно того, что
+        # реально написал канал.
+        signal_changes: list[str] = []
+
+        if (
+            leverage
+            and market_type == "futures"
+            and settings.telegram_signals_max_leverage > 0
+            and leverage > settings.telegram_signals_max_leverage
+        ):
+            # Слишком высокое плечо канала не только рискованно само по
+            # себе, но и сжимает ценовую дистанцию капа SL ниже (та же %
+            # маржи при более высоком плече — меньшая дистанция в цене) до
+            # уровня, на котором биржа отклоняет сам SL-ордер как слишком
+            # близкий к цене. Урезаем плечо ДО расчёта капа SL — это сразу
+            # расширяет зазор у обоих механизмов.
+            logger.info(
+                f"⚠️ Сигнал по {pair}: плечо {leverage:.0f}x канала превышает лимит "
+                f"{settings.telegram_signals_max_leverage:.0f}x — урезано."
+            )
+            signal_changes.append(
+                f"плечо {leverage:.0f}x → {settings.telegram_signals_max_leverage:.0f}x (лимит)"
+            )
+            leverage = settings.telegram_signals_max_leverage
+
         if sl is None and settings.telegram_signals_default_sl_pct > 0:
             # Канал не указал SL — без него позиция открылась бы вообще без
             # биржевого защитного ордера (sync_stop_loss_order пропускает
@@ -1176,13 +1205,14 @@ class TradingBot:
                 f"⚠️ Сигнал по {pair} без SL — применён дефолтный защитный SL "
                 f"{settings.telegram_signals_default_sl_pct:.1f}% ({sl:.6f})"
             )
+            signal_changes.append(f"SL не указан каналом → применён дефолтный {settings.telegram_signals_default_sl_pct:.1f}% ({sl:.6f})")
 
         # Капаем SL по % от маржи (см. докстринг telegram_signals_max_sl_pct_of_margin
         # в config.py) — только на фьючерсах, только когда СЛИШКОМ далёкий SL
         # (более консервативный SL канала/фоллбэка выше не трогаем). Плечо —
         # то же, что реально применится к ордеру (см. leverage_to_set в
-        # executor._execute_real_order): указанное каналом, иначе глобальный
-        # дефолт.
+        # executor._execute_real_order): указанное каналом (уже урезанное
+        # выше, если превышало лимит), иначе глобальный дефолт.
         if (
             sl is not None
             and market_type == "futures"
@@ -1198,6 +1228,10 @@ class TradingBot:
                         f"⚠️ Сигнал по {pair}: SL {sl:.6f} превышает "
                         f"{settings.telegram_signals_max_sl_pct_of_margin:.0f}% маржи при плече "
                         f"{effective_leverage:.0f}x — урезан до {capped_sl:.6f}"
+                    )
+                    signal_changes.append(
+                        f"SL {sl:.6f} → {capped_sl:.6f} (лимит {settings.telegram_signals_max_sl_pct_of_margin:.0f}% "
+                        f"маржи при плече {effective_leverage:.0f}x)"
                     )
                     sl = capped_sl
 
@@ -1244,6 +1278,7 @@ class TradingBot:
             strategy_id="telegram_signal",
             market_type=market_type,
             leverage=leverage,
+            notes="; ".join(signal_changes) if signal_changes else None,
         )
         if order:
             logger.info(f"✅ Ордер исполнен: {order.client_order_id}")

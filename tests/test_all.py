@@ -9064,6 +9064,39 @@ class TestExecuteRealOrderOpensLongAndShortOnFutures(unittest.IsolatedAsyncioTes
         self.assertIsNotNone(order)
         self.engine.exchange.set_leverage.assert_not_called()
 
+    async def test_notes_param_stored_on_order(self):
+        """
+        create_order(notes=...) — журнал автоправок исходного сигнала
+        канала (_execute_telegram_signal в main.py) — должен попасть в
+        Order.notes как есть на real-режиме.
+        """
+        from sqlalchemy import select
+        from src.db.models import Order
+        from src.db.session import get_session
+
+        settings.market_type = "spot"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"NOTESREAL1": 0.0}, "NOTESREAL1": {"free": 0.0, "used": 0, "total": 0.0}}
+        )
+        self.engine.exchange.create_market_buy_order.return_value = {
+            "id": "notes-real-1", "filled": 10.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+
+        order = await self.engine.create_order(
+            symbol="NOTESREAL1/USDT", side="buy", amount=10.0, price=2.0, order_type="market",
+            notes="плечо 50x → 25x (лимит)",
+        )
+
+        self.assertIsNotNone(order)
+        async with get_session() as session:
+            db_order = (await session.execute(select(Order).where(Order.id == order.id))).scalar_one()
+        self.assertEqual(db_order.notes, "плечо 50x → 25x (лимит)")
+
 
 class TestExecuteRealOrderAutoBlacklistsAgreementRequiredSymbol(unittest.IsolatedAsyncioTestCase):
     """
@@ -11678,6 +11711,42 @@ class TestManualTrading(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail["signal"]["decision"], "executed")
         self.assertEqual(detail["signal"]["parsed_take_profits"], [1.2, 1.35, 1.5])
         self.assertIsNone(detail["decision_log"])
+        self.assertIsNone(detail["signal_changes"])
+
+    async def test_position_detail_includes_signal_changes_note(self):
+        """
+        Order.notes хранит журнал автоправок исходного сигнала канала (см.
+        _execute_telegram_signal в main.py: дефолтный SL, капы SL/плеча) —
+        /positions/detail должен вернуть его как signal_changes, чтобы
+        дашборд показал первой строкой разворота, что именно бот изменил.
+        """
+        from src.db.models import Order
+        from src.db.session import get_session
+
+        engine, bot = await self._install_engine_and_bot(is_paper=True)
+
+        async with get_session() as session:
+            exchange_id, symbol_id = await engine._resolve_symbol_id(session, "DETAILNOTES1/USDT")
+            order = Order(
+                exchange_id=exchange_id, symbol_id=symbol_id,
+                side="buy", order_type="market", amount=10.0, price=1.0,
+                status="filled", filled_amount=10.0, filled_price=1.0, fee=0.01,
+                client_order_id="detailnotes1-open",
+                notes="SL 0.5 → 0.9 (лимит 20% маржи при плече 20x)",
+            )
+            session.add(order)
+            await session.flush()
+            order_id = order.id
+            await session.commit()
+
+        engine.paper_positions["DETAILNOTES1/USDT"] = {
+            "amount": 10.0, "entry_price": 1.0, "side": "long",
+            "strategy_id": "telegram_signal", "order_id": order_id, "tp_hit_count": 0,
+        }
+
+        detail = await self.api_module.get_position_detail("DETAILNOTES1/USDT")
+
+        self.assertEqual(detail["signal_changes"], "SL 0.5 → 0.9 (лимит 20% маржи при плече 20x)")
 
     async def test_position_detail_includes_in_memory_decision_log_for_non_telegram_position(self):
         from src.execution.decision_logger import decision_logger
@@ -13603,6 +13672,7 @@ class TestTelegramSignalMaxSlPctOfMargin(unittest.IsolatedAsyncioTestCase):
             "telegram_signals_max_sl_pct_of_margin": settings.telegram_signals_max_sl_pct_of_margin,
             "telegram_signals_default_sl_pct": settings.telegram_signals_default_sl_pct,
             "futures_leverage": settings.futures_leverage,
+            "telegram_signals_max_leverage": settings.telegram_signals_max_leverage,
         }
         settings.trading_mode = "real"
         settings.telegram_signals_max_sl_pct_of_margin = 20.0
@@ -13711,9 +13781,15 @@ class TestTelegramSignalMaxSlPctOfMargin(unittest.IsolatedAsyncioTestCase):
 
     async def test_default_sl_pct_fallback_also_gets_capped(self):
         # Даже дефолтный фоллбэк-SL (telegram_signals_default_sl_pct=3%)
-        # может оказаться слишком далёким при экстремальном плече: 50x ->
+        # может оказаться слишком далёким при высоком плече. Плечо канала
+        # (50x) само по себе выше лимита telegram_signals_max_leverage
+        # (дефолт 25x) и урезается ДО расчёта капа SL (см.
+        # TestTelegramSignalMaxLeverage) — здесь лимит плеча отключён
+        # (0 = не ограничивать), чтобы изолированно проверить именно
+        # взаимодействие фоллбэка с капом SL при "сыром" плече 50x:
         # 20%/50 = 0.4% < 3% -> фоллбэк-SL должен быть урезан дальше.
         settings.telegram_signals_default_sl_pct = 3.0
+        settings.telegram_signals_max_leverage = 0
         bot = self._make_bot()
         with patch("src.main.execution_engine") as mock_engine:
             mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
@@ -13727,6 +13803,200 @@ class TestTelegramSignalMaxSlPctOfMargin(unittest.IsolatedAsyncioTestCase):
 
         applied_sl = mock_engine.create_order.await_args.kwargs["stop_loss"]
         self.assertAlmostEqual(applied_sl, 49800.0)
+
+
+class TestTelegramSignalMaxLeverage(unittest.IsolatedAsyncioTestCase):
+    """
+    Каналы иногда указывают очень высокое плечо (35x, 50x) — та же % маржи
+    капа SL (telegram_signals_max_sl_pct_of_margin) на таком плече даёт
+    ценовую дистанцию на грани минимального шага цены/минимальной
+    дистанции SL биржи, и биржа отклоняет сам SL-ордер как слишком
+    близкий к цене. telegram_signals_max_leverage урезает плечо канала ДО
+    расчёта капа SL — это расширяет зазор у обоих механизмов разом.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved = {
+            "trading_mode": settings.trading_mode,
+            "telegram_signals_max_leverage": settings.telegram_signals_max_leverage,
+            "telegram_signals_max_sl_pct_of_margin": settings.telegram_signals_max_sl_pct_of_margin,
+        }
+        settings.trading_mode = "real"
+        settings.telegram_signals_max_leverage = 25.0
+        settings.telegram_signals_max_sl_pct_of_margin = 0  # изолируем от капа SL в этих тестах
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            setattr(settings, key, value)
+
+    async def test_excessive_leverage_capped_on_futures(self):
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 55000.0,
+                "parsed_leverage": 50, "channel_market_type": "futures",
+                "channel_id": "@test_channel",
+            })
+
+        applied_leverage = mock_engine.create_order.await_args.kwargs["leverage"]
+        self.assertEqual(applied_leverage, 25.0)
+
+    async def test_leverage_under_limit_not_touched(self):
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 55000.0,
+                "parsed_leverage": 15, "channel_market_type": "futures",
+                "channel_id": "@test_channel",
+            })
+
+        applied_leverage = mock_engine.create_order.await_args.kwargs["leverage"]
+        self.assertEqual(applied_leverage, 15)
+
+    async def test_zero_limit_disables_cap(self):
+        settings.telegram_signals_max_leverage = 0
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 55000.0,
+                "parsed_leverage": 50, "channel_market_type": "futures",
+                "channel_id": "@test_channel",
+            })
+
+        applied_leverage = mock_engine.create_order.await_args.kwargs["leverage"]
+        self.assertEqual(applied_leverage, 50)
+
+    async def test_spot_leverage_not_touched(self):
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 55000.0,
+                "parsed_leverage": 50, "channel_market_type": "spot",
+                "channel_id": "@test_channel",
+            })
+
+        applied_leverage = mock_engine.create_order.await_args.kwargs["leverage"]
+        self.assertEqual(applied_leverage, 50)
+
+    async def test_capping_leverage_widens_sl_margin_cap_gap(self):
+        # Взаимодействие двух настроек: плечо 50x капается до 25x, и это же
+        # (уже урезанное) плечо используется расчётом капа SL по марже —
+        # итоговая дистанция до SL шире, чем была бы при "сыром" плече 50x.
+        settings.telegram_signals_max_sl_pct_of_margin = 20.0
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 30000.0, "parsed_tp": 55000.0,
+                "parsed_leverage": 50, "channel_market_type": "futures",
+                "channel_id": "@test_channel",
+            })
+
+        kwargs = mock_engine.create_order.await_args.kwargs
+        self.assertEqual(kwargs["leverage"], 25.0)
+        # 20%/25 = 0.8% -> 50000*0.992 = 49600 (шире, чем 20%/50=0.4% -> 49800)
+        self.assertAlmostEqual(kwargs["stop_loss"], 49600.0)
+
+
+class TestTelegramSignalChangesNote(unittest.IsolatedAsyncioTestCase):
+    """
+    Order.notes хранит человекочитаемый журнал автоправок исходного
+    сигнала канала (дефолтный SL, капы SL/плеча) — показывается на
+    дашборде первой строкой в развороте подробностей позиции/сделки (см.
+    renderPositionDetail/renderTradeDetail), чтобы было видно, что именно
+    бот изменил относительно того, что реально написал канал.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved = {
+            "trading_mode": settings.trading_mode,
+            "telegram_signals_max_leverage": settings.telegram_signals_max_leverage,
+            "telegram_signals_max_sl_pct_of_margin": settings.telegram_signals_max_sl_pct_of_margin,
+            "telegram_signals_default_sl_pct": settings.telegram_signals_default_sl_pct,
+        }
+        settings.trading_mode = "real"
+        settings.telegram_signals_max_leverage = 25.0
+        settings.telegram_signals_max_sl_pct_of_margin = 20.0
+        settings.telegram_signals_default_sl_pct = 3.0
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            setattr(settings, key, value)
+
+    async def test_no_notes_when_nothing_adjusted(self):
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 55000.0,
+                "parsed_leverage": 10, "channel_market_type": "futures",
+                "channel_id": "@test_channel",
+            })
+
+        self.assertIsNone(mock_engine.create_order.await_args.kwargs["notes"])
+
+    async def test_notes_mention_leverage_cap(self):
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49700.0, "parsed_tp": 55000.0,
+                "parsed_leverage": 50, "channel_market_type": "futures",
+                "channel_id": "@test_channel",
+            })
+
+        notes = mock_engine.create_order.await_args.kwargs["notes"]
+        self.assertIn("плечо 50x → 25x", notes)
+
+    async def test_notes_mention_default_sl_and_margin_cap(self):
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": None, "parsed_tp": 55000.0,
+                "parsed_leverage": 50, "channel_market_type": "futures",
+                "channel_id": "@test_channel",
+            })
+
+        notes = mock_engine.create_order.await_args.kwargs["notes"]
+        self.assertIn("SL не указан каналом", notes)
+        self.assertIn("плечо 50x → 25x", notes)
+        # Оба сообщения объединены в одну строку через "; ".
+        self.assertIn("; ", notes)
 
 
 class TestTelegramChannelPositionSizePct(unittest.IsolatedAsyncioTestCase):
@@ -14839,10 +15109,16 @@ class TestExecuteTelegramSignalPassesParsedLeverage(unittest.IsolatedAsyncioTest
 
     def setUp(self):
         self._saved_trading_mode = settings.trading_mode
+        self._saved_max_leverage = settings.telegram_signals_max_leverage
         settings.trading_mode = "real"
+        # Изолируем от telegram_signals_max_leverage (см.
+        # TestTelegramSignalMaxLeverage) — этот класс проверяет только
+        # доставку "сырого" значения канала до create_order, не капы.
+        settings.telegram_signals_max_leverage = 0
 
     def tearDown(self):
         settings.trading_mode = self._saved_trading_mode
+        settings.telegram_signals_max_leverage = self._saved_max_leverage
 
     async def test_parsed_leverage_forwarded_to_create_order(self):
         bot = self._make_bot()
@@ -16917,6 +17193,26 @@ class TestOrderNotesTranslatedToRussian(unittest.IsolatedAsyncioTestCase):
         async with get_session() as session:
             refreshed = await session.get(Order, order.id)
         self.assertEqual(refreshed.notes, "Открыт (paper)")
+
+    async def test_paper_open_order_notes_combines_signal_changes(self):
+        """
+        create_order(notes=...) на paper — журнал автоправок исходного
+        сигнала (_execute_telegram_signal) должен быть виден рядом со
+        штатной пометкой "Открыт (paper)", а не заменять/теряться.
+        """
+        from src.db.session import get_session
+        from src.db.models import Order
+
+        settings.trading_mode = "paper"
+        self.engine.is_paper = True
+        order = await self.engine.create_order(
+            symbol="NOTESRU2/USDT", side="buy", amount=10.0, price=1.0, order_type="market",
+            notes="плечо 50x → 25x (лимит)",
+        )
+        self.assertIsNotNone(order)
+        async with get_session() as session:
+            refreshed = await session.get(Order, order.id)
+        self.assertEqual(refreshed.notes, "Открыт (paper) | плечо 50x → 25x (лимит)")
 
     async def test_paper_close_order_notes_in_russian(self):
         from sqlalchemy import select

@@ -1467,6 +1467,12 @@ function tpLevelsHtml(levels) {
 }
 
 function renderPositionDetail(d) {
+  const changesBlock = d.signal_changes ? `
+    <div style="background:rgba(99,102,241,.1); border-radius:6px; padding:8px 10px; margin-bottom:12px; font-size:13px">
+      ✏️ <strong>Изменено ботом:</strong> ${escapeHtml(d.signal_changes)}
+    </div>
+  ` : "";
+
   const tpBlock = `
     <div class="trade-detail-block">
       <h4>Take Profit (${d.tp_hit_count || 0} из ${d.take_profits.length} достигнуто)</h4>
@@ -1520,6 +1526,7 @@ function renderPositionDetail(d) {
 
   return `
     <div class="trade-detail">
+      ${changesBlock}
       ${tpBlock}
       ${channelBlock}
       ${signalBlock}
@@ -2087,8 +2094,23 @@ function renderTradeDetail(d) {
   const canRecalculate = !d.is_open && d.order_id_exchange_open;
   const recalcBtn = canRecalculate
     ? `<button type="button" class="btn-ghost" id="btnRecalcTrade">🔄 Пересчитать по бирже</button>` : "";
+  // Order.notes хранит журнал автоправок исходного сигнала канала (см.
+  // _execute_telegram_signal в main.py) — в paper-режиме идёт с префиксом
+  // "Открыт (paper) | ...", который здесь не нужен показывать отдельной
+  // строкой изменений; если правок не было, notes — это просто штатная
+  // пометка "Открыт (paper)"/"Открыт (real)" без содержательной инфы.
+  const openingNotes = d.opening_order && d.opening_order.notes;
+  const signalChanges = openingNotes
+    ? openingNotes.replace(/^Открыт \(paper\) \| /, "")
+    : null;
+  const changesBlock = (signalChanges && signalChanges !== "Открыт (paper)") ? `
+    <div style="background:rgba(99,102,241,.1); border-radius:6px; padding:8px 10px; margin-bottom:12px; font-size:13px">
+      ✏️ <strong>Изменено ботом:</strong> ${escapeHtml(signalChanges)}
+    </div>
+  ` : "";
   return `
     <div class="trade-detail">
+      ${changesBlock}
       <div class="trade-detail-block">
         <div class="trade-detail-header">
           <h4>Сделка</h4>

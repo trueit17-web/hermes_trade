@@ -1177,6 +1177,7 @@ class ExecutionEngine:
         signal_data: dict | None = None,
         market_type: str | None = None,
         leverage: float | None = None,
+        notes: str | None = None,
     ) -> Order | None:
         """
         Создать ордер.
@@ -1194,6 +1195,12 @@ class ExecutionEngine:
         settings.futures_leverage (см. _execute_real_order). Игнорируется
         на споте (там плеча не существует) и в paper-режиме (там нет
         реального маржинального механизма — см. _execute_paper_order).
+
+        notes — записывается в Order.notes как есть (real) или добавляется
+        к штатной пометке "Открыт (paper)" (paper) — сейчас используется
+        _execute_telegram_signal для журнала автоправок исходного сигнала
+        канала (дефолтный SL, капы SL/плеча), показывается на дашборде в
+        развороте подробностей позиции/сделки.
         """
         self.last_order_rejection_reason = None
 
@@ -1254,6 +1261,7 @@ class ExecutionEngine:
             "signal_data": signal_data,
             "market_type": order_market_type,
             "leverage": leverage,
+            "notes": notes,
         }
 
         sl_str = f"{stop_loss:.2f}" if stop_loss is not None else "—"
@@ -1366,7 +1374,9 @@ class ExecutionEngine:
                 stop_loss=order_data["stop_loss"],
                 take_profit=order_data["take_profit"],
                 client_order_id=order_data["client_order_id"],
-                notes="Открыт (paper)",
+                notes=(
+                    f"Открыт (paper) | {order_data['notes']}" if order_data.get("notes") else "Открыт (paper)"
+                ),
             )
             session.add(order)
             await session.flush()
@@ -2486,6 +2496,7 @@ class ExecutionEngine:
                     market_type=order_market_type,
                     order_id_exchange=",".join(trade_ids) if trade_ids else order["id"],
                     client_order_id=order_data["client_order_id"],
+                    notes=order_data.get("notes"),
                 )
                 session.add(order_obj)
                 await session.flush()
