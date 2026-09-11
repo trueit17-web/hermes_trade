@@ -2725,6 +2725,27 @@ class ExecutionEngine:
             else:
                 order = await exchange.create_market_sell_order(ccxt_symbol, closing_amount)
         except Exception as e:
+            # Гонка между биржевым SL (сработал сам, вне цикла бота) и этой
+            # же попыткой закрытия из main.py, узнавшей о пробитии SL по
+            # устаревшей на цикл-другой цене: к моменту нашего ордера
+            # позиция на бирже уже нулевая, reduceOnly-ордер продавать
+            # нечего — Bybit прямо говорит об этом ("current position is
+            # zero, cannot fix reduce-only order qty"), а не о реальном сбое.
+            # ERROR тут был неверно тревожным: PnL всё равно корректно
+            # фиксируется на следующей сверке через _finalize_via_recent_
+            # trade_history/_finalize_externally_closed_position (см.
+            # _reconcile_futures_position) — эта попытка просто избыточна.
+            already_closed_on_exchange = is_futures and (
+                "position is zero" in str(e).lower() or "reduce-only" in str(e).lower()
+            )
+            if already_closed_on_exchange:
+                logger.warning(
+                    f"⚠️ Закрытие {symbol} не потребовалось: позиция уже закрыта на бирже "
+                    f"(вероятно, сработал биржевой SL/TP независимо от цикла бота) — {e}. "
+                    f"PnL зафиксируется на следующей сверке."
+                )
+                return None
+
             # available логируется прямо здесь (а не только по debug выше) —
             # без этого "Insufficient balance" от биржи ни разу не говорил,
             # ЧТО именно бот считает доступным по СВОЕЙ проверке: 0 (актив

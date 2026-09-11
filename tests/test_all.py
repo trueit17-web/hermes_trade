@@ -9940,6 +9940,74 @@ class TestCloseRealPositionOnFutures(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
         self.assertIn("FUTCLOSE4/USDT", self.engine.real_positions)
 
+    async def test_position_already_closed_on_exchange_logs_warning_not_error(self):
+        """
+        Реальный инцидент (прод, KAVA/USDT затем VET/USDT): биржевой SL
+        срабатывает сам, вне цикла бота, а затем бот (по устаревшей на
+        цикл-другой цене) тоже пытается закрыть ту же позицию — Bybit
+        отклоняет reduceOnly-ордер с "current position is zero, cannot fix
+        reduce-only order qty", так как продавать уже нечего. Это не сбой:
+        PnL уже корректно фиксируется отдельно через reconcile-цепочку
+        (_reconcile_futures_position -> _finalize_via_recent_trade_history).
+        Раньше это логировалось как ERROR, что было ложной тревогой.
+        """
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_sell_order = AsyncMock(
+            side_effect=Exception(
+                'bybit {"retCode":10001,"retMsg":"current position is zero, '
+                'cannot fix reduce-only order qty",'
+                '"result":{},"retExtInfo":{},"time":1787843738428}'
+            )
+        )
+        self.engine.real_positions["FUTCLOSE5/USDT"] = {
+            "amount": 10.0, "entry_price": 2.0, "side": "long", "sl_order_id": None,
+            "market_type": "futures",
+        }
+
+        with self.assertLogs("src.execution.executor", level="WARNING") as logs:
+            result = await self.engine.close_real_position(
+                symbol="FUTCLOSE5/USDT", side="long", entry_price=2.0, amount=10.0,
+                reason="stop_loss", entry_fee=0.0, holding_seconds=10,
+            )
+
+        self.assertIsNone(result)
+        self.assertIn("FUTCLOSE5/USDT", self.engine.real_positions)
+        self.assertTrue(any("не потребовалось" in msg for msg in logs.output))
+        self.assertFalse(any(rec.levelname == "ERROR" for rec in logs.records))
+
+    async def test_spot_position_is_zero_error_still_logged_as_error(self):
+        """
+        Гонка "позиция уже закрыта на бирже" в принципе невозможна на споте
+        (нет reduceOnly-ордеров/чужих условных SL на кошелёк) — текст
+        "position is zero" в ошибке на споте должен по-прежнему считаться
+        обычным сбоем (ERROR), а не тихо проглатываться веткой фьючерсной
+        гонки.
+        """
+        settings.market_type = "spot"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"SPOTZERO": 10.0}, "SPOTZERO": {"free": 10.0, "used": 0, "total": 10.0}}
+        )
+        self.engine.exchange.create_market_sell_order = AsyncMock(
+            side_effect=Exception('bybit {"retCode":10001,"retMsg":"current position is zero"}')
+        )
+
+        with self.assertLogs("src.execution.executor", level="ERROR") as logs:
+            result = await self.engine.close_real_position(
+                symbol="SPOTZERO/USDT", side="long", entry_price=2.0, amount=10.0,
+                reason="stop_loss", entry_fee=0.0, holding_seconds=10,
+            )
+
+        self.assertIsNone(result)
+        self.assertTrue(any("Не удалось закрыть" in msg for msg in logs.output))
+
 
 class TestReconcileFuturesPositions(unittest.IsolatedAsyncioTestCase):
     """
