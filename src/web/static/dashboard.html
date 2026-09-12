@@ -307,15 +307,22 @@
   input:checked + .slider:before { transform: translateX(18px); }
 
   .table-wrap { overflow-x: auto; }
+  /* На десктопе (выше breakpoint'а сворачивания сайдбара, см. media-блок
+     в конце style) таблица растягивается на всю ширину блока, в котором
+     находится, вместо того чтобы съёживаться по контенту с пустым местом
+     справа — table-layout остаётся auto (не fixed), поэтому колонки
+     по-прежнему берут ширину по содержимому: правило просто ЗАПОЛНЯЕТ
+     остаток, не мешая таблице стать шире контейнера и уйти в
+     горизонтальный скролл (.table-wrap), когда контента и так много. */
+  @media (min-width: 861px) {
+    .table-wrap table { width: 100%; }
+  }
   .muted { color: var(--text-dim); }
   .restart-hint {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    flex-wrap: wrap;
+    justify-content: flex-end;
     padding: 0 16px 14px;
-    font-size: 12px;
   }
   .restart-hint button { flex-shrink: 0; }
   .channel-row { cursor: pointer; }
@@ -878,15 +885,14 @@
         <input type="checkbox" id="channelAutoExecuteInput">
         Автоисполнение
       </label>
-      <button type="submit" class="btn-primary">+ Добавить канал</button>
+      <button type="submit" class="btn-primary" title="Добавить канал">+</button>
     </form>
     <div class="restart-hint">
-      <span class="muted">Добавление/удаление канала начинает действовать сразу, без перезапуска. Рестарт нужен только если канал не удалось найти (см. тост при добавлении) или изменились ключи API Telegram.</span>
-      <button type="button" id="btnRestartBot" class="btn-warn">🔄 Перезапустить бота</button>
+      <button type="button" id="btnRestartBot" class="btn-warn" title="Перезапустить бота">🔄</button>
     </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Канал</th><th>ID</th><th>Порог</th><th>Размер (%)</th><th>Рынок</th><th>Автоисполнение</th><th>Сигналов</th><th>Исполнено всего</th><th title="Сколько из исполненных сигналов канала сейчас реально открыто">Открыто сейчас</th><th>Win rate</th><th>PnL</th><th>Sizing</th><th>Активен</th><th></th></tr></thead>
+        <thead><tr><th>Канал</th><th>ID</th><th>Порог</th><th>Размер (%)</th><th>Рынок</th><th>Авто</th><th>Сигналов</th><th>Исполнено</th><th title="Сколько из исполненных сигналов канала сейчас реально открыто">Открытых</th><th>Win rate</th><th>PnL</th><th>Sizing</th><th>Активен</th><th></th></tr></thead>
         <tbody id="telegramBody"><tr class="empty-row"><td colspan="14">Загрузка…</td></tr></tbody>
       </table>
     </div>
@@ -2999,14 +3005,14 @@ document.getElementById("btnRestartBot").addEventListener("click", async () => {
 
   const btn = document.getElementById("btnRestartBot");
   btn.disabled = true;
-  btn.textContent = "Перезапуск…";
+  btn.textContent = "⏳";
   try {
     await api("/system/restart", { method: "POST" });
     showToast("Бот перезапускается…");
   } catch (err) {
     showToast(`Ошибка: ${err.message}`, true);
     btn.disabled = false;
-    btn.textContent = "🔄 Перезапустить бота";
+    btn.textContent = "🔄";
     return;
   }
 
@@ -3027,7 +3033,7 @@ document.getElementById("btnRestartBot").addEventListener("click", async () => {
     if (attempts > 60) {
       clearInterval(poll);
       btn.disabled = false;
-      btn.textContent = "🔄 Перезапустить бота";
+      btn.textContent = "🔄";
       showToast("Бот долго не отвечает — проверьте логи на сервере", true);
     }
   }, 2000);
