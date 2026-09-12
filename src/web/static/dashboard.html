@@ -318,13 +318,6 @@
     .table-wrap table { width: 100%; }
   }
   .muted { color: var(--text-dim); }
-  .restart-hint {
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    padding: 0 16px 14px;
-  }
-  .restart-hint button { flex-shrink: 0; }
   .channel-row { cursor: pointer; }
   .channel-row:hover { background: rgba(255,255,255,.04); }
   .expand-arrow {
@@ -886,10 +879,8 @@
         Автоисполнение
       </label>
       <button type="submit" class="btn-primary" title="Добавить канал">+</button>
-    </form>
-    <div class="restart-hint">
       <button type="button" id="btnRestartBot" class="btn-warn" title="Перезапустить бота">🔄</button>
-    </div>
+    </form>
     <div class="table-wrap">
       <table>
         <thead><tr><th>Канал</th><th>ID</th><th>Порог</th><th>Размер (%)</th><th>Рынок</th><th>Авто</th><th>Сигналов</th><th>Исполнено</th><th title="Сколько из исполненных сигналов канала сейчас реально открыто">Открытых</th><th>Win rate</th><th>PnL</th><th>Sizing</th><th>Активен</th><th></th></tr></thead>
