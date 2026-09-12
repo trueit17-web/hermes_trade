@@ -33,6 +33,7 @@ from src.event_bus import (
 from src.risk.risk_manager import risk_manager
 from src.utils.ccxt_helpers import ccxt_symbol as _shared_ccxt_symbol
 from src.utils.timeutils import utcnow, utcnow_timestamp
+from src.utils.trading_math import breakeven_stop_price
 
 logger = logging.getLogger(__name__)
 
@@ -880,10 +881,12 @@ class ExecutionEngine:
                 take_profits_by_order_id.get(pos.get("order_id")),
             )
             level_hit = pos["tp_hit_count"] - 1
-            pos["stop_loss"] = (
-                pos["entry_price"] if level_hit == 0 or level_hit - 1 >= len(tp_levels)
-                else tp_levels[level_hit - 1]
-            )
+            if level_hit == 0 or level_hit - 1 >= len(tp_levels):
+                notional = pos["entry_price"] * pos["amount"] if pos["amount"] else 0.0
+                entry_fee_rate = (pos["entry_fee"] / notional) if notional else 0.0
+                pos["stop_loss"] = breakeven_stop_price(pos["entry_price"], pos["side"], entry_fee_rate)
+            else:
+                pos["stop_loss"] = tp_levels[level_hit - 1]
 
         return positions, float(realized_pnl), cost_basis
 

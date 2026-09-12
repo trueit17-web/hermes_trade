@@ -54,6 +54,7 @@ from src.telegram.channel_monitor import (
 from src.telegram.notifier import edit_notification, send_notification
 from src.utils.logging import drain_pending_log_records, logger, setup_logging
 from src.utils.timeutils import utcnow
+from src.utils.trading_math import breakeven_stop_price
 from src.web.api import app as web_app
 from src.web.settings_store import load_settings_overrides
 from src.web.websocket import setup_websocket_broadcast
@@ -2328,7 +2329,12 @@ class TradingBot:
             # ИМЕННО этого сработавшего уровня (0 = TP1), а не счётчик — верно
             # и в случае гэпа, перепрыгнувшего сразу через несколько уровней
             # (см. цикл поиска reason/level_hit выше).
-            position["sl"] = position["entry_price"] if level_hit == 0 else tp_levels[level_hit - 1]
+            if level_hit == 0:
+                notional = position["entry_price"] * position["amount"] if position["amount"] else 0.0
+                entry_fee_rate = (position["entry_fee"] / notional) if notional else 0.0
+                position["sl"] = breakeven_stop_price(position["entry_price"], side, entry_fee_rate)
+            else:
+                position["sl"] = tp_levels[level_hit - 1]
             if not settings.is_paper:
                 # Биржевой SL-ордер (см. close_real_position — старый уже
                 # отменён им) продавал бы неверный объём и/или устаревшую

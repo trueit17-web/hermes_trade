@@ -1958,8 +1958,17 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         restored = positions["RESTORECOIN/USDT"]
         self.assertAlmostEqual(restored["amount"], 4.0)
         self.assertEqual(restored["tp_hit_count"], 1)
-        # После TP1 остаток должен восстановиться с SL в безубытке
-        self.assertAlmostEqual(restored["stop_loss"], restored["entry_price"])
+        # После TP1 остаток должен восстановиться с SL в безубытке — с
+        # реальной положительной комиссией входа это НЕ ровно entry_price
+        # (см. breakeven_stop_price/ONDO-инцидент), а entry_price + буфер
+        # на комиссии полного круга, отсюда > вместо ==.
+        self.assertGreater(restored["stop_loss"], restored["entry_price"])
+        from src.utils.trading_math import breakeven_stop_price
+        expected_fee_rate = restored["entry_fee"] / (restored["entry_price"] * restored["amount"])
+        self.assertAlmostEqual(
+            restored["stop_loss"],
+            breakeven_stop_price(restored["entry_price"], "long", expected_fee_rate),
+        )
 
     async def test_restore_steps_trailing_sl_to_previous_tp_level_after_multiple_hits(self):
         """
@@ -7002,6 +7011,37 @@ class TestTpLevels(unittest.TestCase):
         self.assertAlmostEqual(levels[0], 90.0)
         self.assertAlmostEqual(levels[1], 80.0)
         self.assertAlmostEqual(levels[2], 70.0)
+
+
+class TestBreakevenStopPrice(unittest.TestCase):
+    """
+    breakeven_stop_price (src/utils/trading_math.py) — общая для main.py
+    (_check_position_exit) и executor.py (реконструкция SL после
+    рестарта) формула переноса SL в безубыток после TP1: реальный
+    инцидент, прод ONDO/USDT — SL ровно на entry_price при возврате цены
+    к этой же отметке реализовал гарантированный убыток на комиссиях
+    (-16.49 USDT) при нулевом фактическом движении цены против позиции.
+    """
+
+    def test_long_adds_buffer_above_entry(self):
+        from src.utils.trading_math import breakeven_stop_price
+        # ставка комиссии входа 0.1% -> буфер = 2 * 0.1% = 0.2% от entry
+        sl = breakeven_stop_price(100.0, "long", 0.001)
+        self.assertAlmostEqual(sl, 100.2)
+
+    def test_short_subtracts_buffer_below_entry(self):
+        from src.utils.trading_math import breakeven_stop_price
+        sl = breakeven_stop_price(100.0, "short", 0.001)
+        self.assertAlmostEqual(sl, 99.8)
+
+    def test_zero_fee_rate_keeps_bare_entry_price(self):
+        from src.utils.trading_math import breakeven_stop_price
+        self.assertEqual(breakeven_stop_price(100.0, "long", 0.0), 100.0)
+        self.assertEqual(breakeven_stop_price(100.0, "short", 0.0), 100.0)
+
+    def test_non_positive_entry_price_returned_unchanged(self):
+        from src.utils.trading_math import breakeven_stop_price
+        self.assertEqual(breakeven_stop_price(0.0, "long", 0.001), 0.0)
 
 
 class TestTpLevelsUsesRealChannelTargets(unittest.TestCase):
@@ -15534,6 +15574,74 @@ class TestCheckPositionExitRatchetsStopLossToPriorTpLevel(unittest.IsolatedAsync
             await bot._check_position_exit(symbol, 130.0)  # прыжок сразу к TP3
 
         self.assertAlmostEqual(bot.open_positions[symbol]["sl"], 120.0)  # уровень TP2
+
+    async def test_breakeven_after_tp1_includes_fee_buffer_not_bare_entry_price(self):
+        """
+        Реальный инцидент (прод, ONDO/USDT): TP1 сработал через 26с после
+        входа, SL остатка переставился РОВНО на entry_price, откат цены к
+        той же отметке (без какого-либо фактического движения против
+        позиции) закрыл сделку в минус на -16.49 USDT чисто на комиссиях
+        входа+выхода. "Безубыток" ровно на entry_price не является
+        безубытком, если есть ненулевая комиссия — нужен буфер сверху (см.
+        breakeven_stop_price).
+        """
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        symbol = "RATCHETFEE1/USDT"
+        entry_price = 100.0
+        amount = 8.0
+        entry_fee = 4.0  # 0.5% от notional (100*8=800) — заведомо ненулевая ставка
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": entry_price, "amount": amount}
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": entry_price, "amount": amount,
+            "original_amount": amount, "strategy_id": "telegram_signal",
+            "sl": 90.0, "tp": 140.0, "take_profits": [110.0, 120.0, 130.0, 140.0],
+            "tp_hit_count": 0, "entry_fee": entry_fee, "order_id": None, "opened_at": utcnow(),
+        }
+
+        async def fake_close(**kwargs):
+            engine.paper_positions[symbol]["amount"] -= kwargs["amount"]
+            return {"pnl": 1.0, "pnl_pct": 1.0, "outcome": "win", "trade_id": 1}
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close):
+            await bot._check_position_exit(symbol, 110.0)  # TP1
+
+        new_sl = bot.open_positions[symbol]["sl"]
+        self.assertGreater(new_sl, entry_price)
+        # Оставшаяся (после списания доли TP1) комиссия входа для остатка
+        # объёма — 3/4 от исходной (TP1 закрыл 1/4 объёма на 4 уровнях).
+        remaining_amount = bot.open_positions[symbol]["amount"]
+        remaining_fee = bot.open_positions[symbol]["entry_fee"]
+        expected_fee_rate = remaining_fee / (entry_price * remaining_amount)
+        from src.utils.trading_math import breakeven_stop_price
+        expected_sl = breakeven_stop_price(entry_price, "long", expected_fee_rate)
+        self.assertAlmostEqual(new_sl, expected_sl)
+
+    async def test_breakeven_after_tp1_stays_at_entry_price_when_fee_is_zero(self):
+        """Регресс: при entry_fee=0 (например, paper-режим без комиссий)
+        буфер не должен появляться из ниоткуда — прежнее поведение (SL
+        ровно на entry_price) сохраняется."""
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        symbol = "RATCHETFEE2/USDT"
+        engine.paper_positions[symbol] = {"side": "short", "entry_price": 100.0, "amount": 4.0}
+        bot.open_positions[symbol] = {
+            "side": "short", "entry_price": 100.0, "amount": 4.0,
+            "original_amount": 4.0, "strategy_id": "telegram_signal",
+            "sl": 110.0, "tp": 70.0, "take_profits": [90.0, 80.0, 70.0],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+        }
+
+        async def fake_close(**kwargs):
+            engine.paper_positions[symbol]["amount"] -= kwargs["amount"]
+            return {"pnl": 1.0, "pnl_pct": 1.0, "outcome": "win", "trade_id": 1}
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close):
+            await bot._check_position_exit(symbol, 90.0)  # TP1
+
+        self.assertAlmostEqual(bot.open_positions[symbol]["sl"], 100.0)
 
     async def test_real_mode_resyncs_exchange_stop_loss_order(self):
         """На реальном рынке новый SL должен переставляться на бирже, а не
