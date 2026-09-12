@@ -15225,6 +15225,163 @@ class TestCheckPositionExitEditsOriginalNotification(unittest.IsolatedAsyncioTes
         self.assertEqual(mock_send.await_args.kwargs["reply_to_message_id"], 555)
 
 
+class TestCheckPositionExitEditsNotificationOnExternalClose(unittest.IsolatedAsyncioTestCase):
+    """
+    По запросу пользователя: когда позиция закрывается СНАРУЖИ обычного
+    цикла бота (биржевой SL сработал сам по себе — см. _record_external_
+    close в executor.py), исходное Telegram-уведомление раньше не
+    редактировалось вообще — символ просто тихо пропадал из self.open_
+    positions при следующей проверке (см. "символ не в tracked" в
+    _check_position_exit). TP на бирже никогда не становится настоящим
+    условным ордером (только SL), поэтому ЛЮБОЕ обнаруженное так внешнее
+    закрытие — это стоп-лосс, а не тейк.
+
+    Ручное закрытие с дашборда (POST /positions/close) уже отправляет
+    своё отдельное уведомление — здесь распознаём его по тексту Order.
+    notes закрывающего ордера и НЕ трогаем исходное сообщение.
+    """
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "real"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    def _make_bot(self):
+        import src.main as main_module
+        return main_module.TradingBot(), main_module.execution_engine
+
+    async def test_exchange_side_sl_edits_original_message_with_loss(self):
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        symbol = "EXTCLOSE1/USDT"
+        engine.is_paper = False
+        engine.exchange_id = "bybit"
+        engine.exchange = AsyncMock()
+        engine.exchange.create_market_buy_order.return_value = {
+            "id": "extclose1-open", "filled": 10.0, "average": 100.0, "price": None,
+            "fee": {"cost": 0.0, "currency": "USDT"},
+        }
+
+        order = await engine.create_order(
+            symbol=symbol, side="buy", amount=10.0, price=100.0, order_type="market",
+        )
+        self.assertIsNotNone(order)
+
+        pos = {
+            "amount": 10.0, "entry_price": 100.0, "side": "long", "sl_order_id": None,
+            "order_id": order.id,
+        }
+        await engine._record_external_close(
+            symbol, pos, exit_price=89.5, amount=10.0, exit_fee=0.0,
+            order_id_exchange="ext-notif-1", log_note="test",
+        )
+        # Позиция НЕ добавлена обратно в engine.real_positions — как и
+        # было бы на самом деле после срабатывания биржевого SL.
+        self.assertNotIn(symbol, engine.real_positions)
+
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 100.0, "amount": 10.0,
+            "original_amount": 10.0, "strategy_id": "telegram_signal",
+            "sl": 90.0, "tp": None, "take_profits": [110.0, 120.0, 130.0],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": order.id, "opened_at": utcnow(),
+            "notification_message_id": 777,
+            "_notif_header": "📲 Сигнал: LONG 📈 " + symbol,
+            "_notif_sl_value": 90.0,
+            "_notif_tp_values": [110.0, 120.0, 130.0],
+        }
+
+        with patch("src.main.edit_notification", new=AsyncMock(return_value=True)) as mock_edit, \
+             patch("src.main.send_notification", new=AsyncMock()) as mock_send:
+            closed = await bot._check_position_exit(symbol, 89.5)
+
+        self.assertFalse(closed)  # обнаружено внешнее закрытие -> False, не полноценное закрытие ЗДЕСЬ
+        self.assertNotIn(symbol, bot.open_positions)
+        mock_send.assert_not_awaited()
+        mock_edit.assert_awaited_once()
+        message_id, text = mock_edit.await_args.args
+        self.assertEqual(message_id, 777)
+        self.assertIn("❌", text)
+        self.assertIn("🛑 SL: <s>90.000000</s>", text)
+        # Все TP не были достигнуты — зачёркнуты как упущенные.
+        self.assertIn("🎯 TP1: <s>110.000000</s> ❌", text)
+        self.assertIn("🎯 TP2: <s>120.000000</s> ❌", text)
+        self.assertIn("🎯 TP3: <s>130.000000</s> ❌", text)
+
+    async def test_manual_close_via_dashboard_does_not_touch_original_message(self):
+        """Ручное закрытие (POST /positions/close) уже прислало своё
+        уведомление "Закрыта вручную..." — редактировать исходное
+        сообщение здесь не нужно (и неверно было бы подписывать его как
+        стоп-лосс)."""
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        symbol = "EXTCLOSE2/USDT"
+        engine.is_paper = False
+        engine.exchange_id = "bybit"
+        engine.exchange = AsyncMock()
+        engine.exchange.create_market_buy_order.return_value = {
+            "id": "extclose2-open", "filled": 10.0, "average": 100.0, "price": None,
+            "fee": {"cost": 0.0, "currency": "USDT"},
+        }
+
+        order = await engine.create_order(
+            symbol=symbol, side="buy", amount=10.0, price=100.0, order_type="market",
+        )
+        self.assertIsNotNone(order)
+
+        # Симулируем то, что делает close_position_manually в api.py:
+        # close_real_position с reason="manual" -> notes "... вручную".
+        engine.exchange.fetch_balance = AsyncMock(
+            return_value={"free": {"EXTCLOSE2": 10.0}, "EXTCLOSE2": {"free": 10.0, "used": 0, "total": 10.0}}
+        )
+        engine.exchange.create_market_sell_order.return_value = {
+            "id": "extclose2-close", "filled": 10.0, "average": 100.0, "price": None,
+            "fee": {"cost": 0.0, "currency": "USDT"},
+        }
+        result = await engine.close_real_position(
+            symbol=symbol, side="long", entry_price=100.0, amount=10.0,
+            reason="manual", entry_fee=0.0, holding_seconds=60, order_open_id=order.id,
+        )
+        self.assertIsNotNone(result)
+
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 100.0, "amount": 10.0,
+            "original_amount": 10.0, "strategy_id": "telegram_signal",
+            "sl": 90.0, "tp": None, "take_profits": [110.0, 120.0, 130.0],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": order.id, "opened_at": utcnow(),
+            "notification_message_id": 888,
+            "_notif_header": "📲 Сигнал: LONG 📈 " + symbol,
+            "_notif_sl_value": 90.0,
+            "_notif_tp_values": [110.0, 120.0, 130.0],
+        }
+
+        with patch("src.main.edit_notification", new=AsyncMock(return_value=True)) as mock_edit, \
+             patch("src.main.send_notification", new=AsyncMock()) as mock_send:
+            await bot._check_position_exit(symbol, 105.0)
+
+        mock_edit.assert_not_awaited()
+        mock_send.assert_not_awaited()
+        self.assertNotIn(symbol, bot.open_positions)
+
+    async def test_no_order_id_is_a_noop(self):
+        bot, engine = self._make_bot()
+        symbol = "EXTCLOSE3/USDT"
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 100.0, "amount": 10.0,
+            "order_id": None, "notification_message_id": 999,
+            "_notif_header": "📲 Сигнал: LONG 📈 " + symbol,
+        }
+
+        with patch("src.main.edit_notification", new=AsyncMock()) as mock_edit:
+            await bot._check_position_exit(symbol, 100.0)
+
+        mock_edit.assert_not_awaited()
+        self.assertNotIn(symbol, bot.open_positions)
+
+
 class TestExecuteTelegramSignalStoresRealTakeProfits(unittest.IsolatedAsyncioTestCase):
     """_execute_telegram_signal() должен сохранять реальные цели канала
     (parsed_take_profits) в open_positions — иначе _check_position_exit

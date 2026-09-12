@@ -2166,6 +2166,56 @@ class TradingBot:
 
         return new_sl, new_tp
 
+    async def _notify_externally_closed_position(self, symbol: str, position: dict) -> None:
+        """
+        Отредактировать исходное уведомление об открытии, когда позиция
+        пропала из execution_engine между итерациями цикла НЕ через
+        close_real_position/close_paper_position внутри самого
+        _check_position_exit (тот редактирует сообщение сам, см. конец
+        метода) — единственный такой путь для сработавшего SL, поскольку
+        бот выставляет на бирже условным ордером ТОЛЬКО SL: TP никогда не
+        становится настоящим ордером биржи (проверяется только по цене
+        закрытия свечи внутри самого бота), поэтому обнаруженное здесь
+        внешнее закрытие (см. _record_external_close в executor.py) — это
+        всегда именно стоп-лосс, а не тейк.
+
+        Ручное закрытие с дашборда (POST /positions/close) тоже проходит
+        этим путём (там нет своего вызова del self.open_positions), но у
+        него уже есть отдельное уведомление ("Закрыта вручную...") — здесь
+        отличаем по тексту Order.notes закрывающего ордера и НЕ трогаем
+        исходное сообщение, чтобы не задваивать/не подписывать ручное
+        закрытие как стоп-лосс.
+        """
+        order_id = position.get("order_id")
+        message_id = position.get("notification_message_id")
+        if not order_id or message_id is None:
+            return
+        try:
+            async with get_session() as session:
+                trade = (
+                    await session.execute(
+                        select(Trade)
+                        .options(selectinload(Trade.order_close))
+                        .where(Trade.order_open_id == order_id)
+                        .order_by(Trade.closed_at.desc())
+                    )
+                ).scalars().first()
+        except Exception as e:
+            logger.debug(f"Не удалось определить причину внешнего закрытия {symbol} для уведомления: {e}")
+            return
+        if trade is None or trade.order_close is None:
+            return
+        if "обнаружено на бирже вне цикла бота" not in (trade.order_close.notes or ""):
+            return
+
+        position["_sl_pnl"] = (float(trade.pnl), float(trade.pnl_pct))
+        edited_text = self._render_signal_message(symbol, position)
+        if edited_text is None:
+            return
+        edited = await edit_notification(message_id, edited_text)
+        if not edited:
+            await send_notification(edited_text)
+
     async def _check_position_exit(self, symbol: str, current_price: float) -> bool:
         """
         Проверить открытую позицию на достижение SL или одного из уровней
@@ -2189,11 +2239,18 @@ class TradingBot:
             return False
 
         # Позиция могла быть закрыта в обход основного цикла (кнопка
-        # "Закрыть" в дашборде, POST /positions/close) — execution_engine
-        # уже не знает о ней, но self.open_positions ещё не подчищен.
-        # Без этой проверки мы бы попытались закрыть её второй раз здесь.
+        # "Закрыть" в дашборде, POST /positions/close, или биржевой SL,
+        # сработавший вне цикла бота, см. _record_external_close в
+        # executor.py) — execution_engine уже не знает о ней, но
+        # self.open_positions ещё не подчищен. Без этой проверки мы бы
+        # попытались закрыть её второй раз здесь. Перед подчисткой
+        # пытаемся отразить в исходном Telegram-уведомлении реальную
+        # причину закрытия (см. _notify_externally_closed_position) —
+        # раньше такие закрытия проходили полностью молча, сообщение так
+        # и оставалось со старыми, не зачёркнутыми SL/TP.
         tracked = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
         if symbol not in tracked:
+            await self._notify_externally_closed_position(symbol, position)
             del self.open_positions[symbol]
             return False
 
