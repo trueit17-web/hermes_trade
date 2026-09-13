@@ -1347,6 +1347,7 @@ function renderPositions(status) {
     if (cur !== null && cur !== undefined && pos.entry_price) {
       const dir = pos.side === "short" ? -1 : 1;
       const pnlPct = dir * (cur - pos.entry_price) / pos.entry_price * 100;
+      const pnlAmount = dir * (cur - pos.entry_price) * pos.amount;
       // Плечо — реальное значение с биржи (pos.leverage, см. leverageBadge
       // ниже) — pnlPct выше это % от полной номинальной стоимости позиции,
       // pnlPctLeveraged — % от МАРЖИ (то, как обычно считает доходность
@@ -1354,7 +1355,7 @@ function renderPositions(status) {
       const leveragedSuffix = !status.is_paper && pos.market_type === "futures" && pos.leverage
         ? ` (${(pnlPct * pos.leverage) >= 0 ? "+" : ""}${fmt(pnlPct * pos.leverage, 2)}%)`
         : "";
-      pnlHtml = `<span class="${pnlPct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${pnlPct >= 0 ? "+" : ""}${fmt(pnlPct, 2)}%${leveragedSuffix}</span>`;
+      pnlHtml = `<span class="${pnlPct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${pnlAmount >= 0 ? "+" : ""}${fmt(pnlAmount)} (${pnlPct >= 0 ? "+" : ""}${fmt(pnlPct, 2)}%)${leveragedSuffix}</span>`;
     }
     const tradeValue = pos.entry_price ? pos.amount * pos.entry_price : null;
     // В real-режиме SL дублируется отдельным условным ордером на самой
@@ -1596,6 +1597,7 @@ function renderManualPositions(status) {
     if (cur !== null && cur !== undefined && pos.entry_price) {
       const dir = pos.side === "short" ? -1 : 1;
       const pnlPct = dir * (cur - pos.entry_price) / pos.entry_price * 100;
+      const pnlAmount = dir * (cur - pos.entry_price) * pos.amount;
       // Плечо — реальное значение с биржи (pos.leverage, см. leverageBadge
       // ниже) — pnlPct выше это % от полной номинальной стоимости позиции,
       // pnlPctLeveraged — % от МАРЖИ (то, как обычно считает доходность
@@ -1603,7 +1605,7 @@ function renderManualPositions(status) {
       const leveragedSuffix = !status.is_paper && pos.market_type === "futures" && pos.leverage
         ? ` (${(pnlPct * pos.leverage) >= 0 ? "+" : ""}${fmt(pnlPct * pos.leverage, 2)}%)`
         : "";
-      pnlHtml = `<span class="${pnlPct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${pnlPct >= 0 ? "+" : ""}${fmt(pnlPct, 2)}%${leveragedSuffix}</span>`;
+      pnlHtml = `<span class="${pnlPct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${pnlAmount >= 0 ? "+" : ""}${fmt(pnlAmount)} (${pnlPct >= 0 ? "+" : ""}${fmt(pnlPct, 2)}%)${leveragedSuffix}</span>`;
     }
     const slBadge = !status.is_paper && pos.stop_loss
       ? (pos.sl_order_id ? ` <span title="SL выставлен на бирже">🛡️</span>` : ` <span title="SL НЕ подтверждён биржей — защита только внутри бота">⚠️</span>`)
