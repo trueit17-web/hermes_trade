@@ -4481,6 +4481,45 @@ class TestGroqSignalParser(unittest.IsolatedAsyncioTestCase):
         result = await groq_parser_module.parse_with_groq("сегодня биток вырос на 3%, отличный день")
         self.assertIsNone(result)
 
+    async def test_not_a_signal_without_confidence_key_returns_none(self):
+        """
+        Реальный прод-инцидент: на "не сигнал" модель отдаёт только
+        {"is_signal": false} без confidence вообще — раньше "confidence"
+        был в required у emit_signal, и Groq отклонял сам tool-call 400
+        ошибкой ДО того, как код вообще увидел данные (см. _TOOL в
+        groq_parser.py) — воспроизвести это через мок ответа нельзя (ошибка
+        была на стороне Groq до генерации ответа), поэтому здесь проверяем
+        итог уже ПОСЛЕ фикса: модель отвечает без confidence, и парсер
+        должен тихо вернуть None (как и с confidence=0.95 в тесте выше),
+        а не упасть на отсутствующем ключе.
+        """
+        import src.telegram.groq_parser as groq_parser_module
+        settings.telegram_llm_fallback_enabled = True
+        settings.groq_api_key = "test-key"
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=self._mock_response({
+            "is_signal": False,
+        }))
+        groq_parser_module._client = mock_client
+
+        result = await groq_parser_module.parse_with_groq("апдейт по открытой сделке, держим позицию")
+        self.assertIsNone(result)
+
+    def test_emit_signal_schema_does_not_require_confidence(self):
+        """
+        confidence НЕ должен быть в required схемы emit_signal — иначе Groq
+        серверно отклоняет каждый tool-call с is_signal=false, где модель
+        закономерно не проставляет confidence (см. докстринг фикса в
+        groq_parser.py и test_not_a_signal_without_confidence_key_returns_none
+        выше). Прямая проверка самой схемы, а не только поведения парсера,
+        чтобы регресс (возврат "confidence" в required) ловился явно.
+        """
+        from src.telegram.groq_parser import _TOOL
+        required = _TOOL["function"]["parameters"]["required"]
+        self.assertIn("is_signal", required)
+        self.assertNotIn("confidence", required)
+
     async def test_api_error_returns_none_not_raises(self):
         import src.telegram.groq_parser as groq_parser_module
         settings.telegram_llm_fallback_enabled = True
