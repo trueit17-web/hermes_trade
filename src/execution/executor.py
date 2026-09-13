@@ -2568,6 +2568,7 @@ class ExecutionEngine:
 
         except Exception as e:
             error_str = str(e)
+            permanent_reason = None
             if "110126" in error_str or "must sign the required agreement" in error_str.lower():
                 # Bybit retCode 110126 — отдельные контракты (например,
                 # токенизированные акции: AAOI/USDT и похожие) требуют
@@ -2576,6 +2577,20 @@ class ExecutionEngine:
                 # этого символа будет упираться в ту же стену бесконечно.
                 # Реальный инцидент: AAOI/USDT, канал продолжал слать
                 # сигналы, каждый заново падал с этой же ошибкой.
+                permanent_reason = "требует ручного подписания соглашения на бирже (retCode 110126)"
+            elif "does not have market symbol" in error_str:
+                # ccxt.BadSymbol — символ прошёл отбор в торговую вселенную
+                # (обычно по спотовому объёму, см. _refresh_symbol_universe в
+                # main.py) или пришёл сигналом канала, но у биржи нет
+                # соответствующего ФЬЮЧЕРСНОГО рынка под этим тикером
+                # (перманентно, не временный сбой — рынок либо есть в
+                # exchange.markets, либо его в принципе нет). Реальный
+                # инцидент (прод): PUMP/USDT, VTHO/USDT, PEPE/USDT — десятки
+                # повторов той же ошибки на каждой итерации на протяжении
+                # часа, ни одна попытка не может увенчаться успехом.
+                permanent_reason = f"нет фьючерсного рынка на бирже ({error_str})"
+
+            if permanent_reason is not None:
                 # Автодобавление в symbol_blacklist (персистентно, через
                 # apply_settings_update — та же таблица BotConfig, что и
                 # ручное редактирование на дашборде) избавляет от повторов
@@ -2584,8 +2599,7 @@ class ExecutionEngine:
                     from src.web.settings_store import apply_settings_update
                     await apply_settings_update({"symbol_blacklist": [*settings.symbol_blacklist, symbol]})
                     logger.warning(
-                        f"⚠️ {symbol} требует ручного подписания соглашения на бирже (retCode 110126) — "
-                        f"добавлен в symbol_blacklist автоматически."
+                        f"⚠️ {symbol} {permanent_reason} — добавлен в symbol_blacklist автоматически."
                     )
             logger.error(f"❌ Ошибка исполнения реального ордера {symbol}: {e}")
             self.last_order_rejection_reason = f"ошибка биржи: {e}"

@@ -9465,6 +9465,72 @@ class TestExecuteRealOrderAutoBlacklistsAgreementRequiredSymbol(unittest.Isolate
         self.assertEqual(settings.symbol_blacklist, [])
 
 
+class TestExecuteRealOrderAutoBlacklistsMissingFuturesMarket(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент (прод): PUMP/USDT, VTHO/USDT, PEPE/USDT прошли отбор
+    в торговую вселенную (по спотовому объёму), но у Bybit нет фьючерсного
+    (linear swap) рынка под этим тикером — ccxt.BadSymbol "bybit does not
+    have market symbol X:USDT" повторялся на каждой итерации десятки раз за
+    час, ни одна попытка не могла увенчаться успехом (рынок либо есть в
+    exchange.markets, либо его в принципе нет — не временный сбой). Та же
+    автоблэклист-логика, что и для retCode 110126 выше, только с другим
+    условием срабатывания.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved_market_type = settings.market_type
+        self._saved_trading_mode = settings.trading_mode
+        self._saved_blacklist = settings.symbol_blacklist
+        settings.symbol_blacklist = []
+
+    def tearDown(self):
+        settings.market_type = self._saved_market_type
+        settings.trading_mode = self._saved_trading_mode
+        settings.symbol_blacklist = self._saved_blacklist
+
+    async def test_symbol_added_to_blacklist_on_missing_futures_market(self):
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order = AsyncMock(
+            side_effect=Exception("bybit does not have market symbol PUMP/USDT:USDT")
+        )
+
+        with patch("src.web.settings_store.apply_settings_update", new=AsyncMock()) as apply_mock:
+            order = await self.engine.create_order(
+                symbol="PUMP/USDT", side="buy", amount=5.0, price=0.005, order_type="market",
+            )
+
+        self.assertIsNone(order)
+        apply_mock.assert_awaited_once_with({"symbol_blacklist": ["PUMP/USDT"]})
+
+    async def test_already_blacklisted_missing_market_symbol_not_re_added(self):
+        settings.symbol_blacklist = ["PUMP/USDT"]
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.create_market_buy_order = AsyncMock(
+            side_effect=Exception("bybit does not have market symbol PUMP/USDT:USDT")
+        )
+
+        with patch("src.web.settings_store.apply_settings_update", new=AsyncMock()) as apply_mock:
+            await self.engine.create_order(
+                symbol="PUMP/USDT", side="buy", amount=5.0, price=0.005, order_type="market",
+            )
+
+        apply_mock.assert_not_awaited()
+
+
 class TestExecuteRealOrderAppliesPerSignalLeverage(unittest.IsolatedAsyncioTestCase):
     """
     Некоторые Telegram-каналы указывают плечо прямо в тексте сигнала
