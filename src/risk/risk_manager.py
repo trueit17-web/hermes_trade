@@ -20,6 +20,9 @@ class RiskProfile:
         self.max_drawdown_pct = self.params.get("max_drawdown_pct", settings.risk_max_drawdown_pct)
         self.cooldown_seconds = self.params.get("cooldown_seconds", settings.risk_cooldown_seconds)
         self.max_correlation_pairs = self.params.get("max_correlation_pairs", 3)
+        self.max_total_notional_pct = self.params.get(
+            "max_total_notional_pct", settings.risk_max_total_notional_pct
+        )
 
     def update(self, new_params: dict):
         """Обновить параметры профиля."""
@@ -30,6 +33,7 @@ class RiskProfile:
         self.max_drawdown_pct = new_params.get("max_drawdown_pct", self.max_drawdown_pct)
         self.cooldown_seconds = new_params.get("cooldown_seconds", self.cooldown_seconds)
         self.max_correlation_pairs = new_params.get("max_correlation_pairs", self.max_correlation_pairs)
+        self.max_total_notional_pct = new_params.get("max_total_notional_pct", self.max_total_notional_pct)
         logger.info(f"RiskProfile обновлён: {self.params}")
 
 
@@ -61,6 +65,7 @@ class RiskState:
         self.daily_loss_limit_usd = settings.risk_daily_loss_limit_usd
         self.max_drawdown_pct = settings.risk_max_drawdown_pct
         self.cooldown_seconds = settings.risk_cooldown_seconds
+        self.max_total_notional_pct = settings.risk_max_total_notional_pct
 
     def update_balance(self, balance: float):
         """Обновить текущий баланс."""
@@ -130,6 +135,33 @@ class RiskState:
         """Проверить, не превышен ли лимит открытых позиций."""
         return self.open_positions_count >= self.max_open_positions
 
+    def total_notional_pct(self) -> float:
+        """
+        Суммарная % от баланса, занятая всеми отслеживаемыми открытыми
+        позициями (сумма size_pct, с которым каждая была зарегистрирована
+        через add_open_position/on_position_added) — в отличие от
+        open_positions_count не отражает только число позиций, а именно
+        объём. Позиции, добавленные с size_pct=0.0 (ручные через дашборд,
+        "подхваченные" неподтверждённые — см. register_manual_position/
+        adopt_unconfirmed_telegram_position в main.py), в сумму не входят —
+        их фактический размер здесь не отслеживается.
+        """
+        return sum(self.open_positions.values())
+
+    def check_max_total_notional(self, additional_pct: float = 0.0) -> bool:
+        """
+        Проверить, не превысит ли ЕЩЁ НЕ ОТКРЫТАЯ позиция размером
+        additional_pct суммарную notional-экспозицию портфеля сверх
+        max_total_notional_pct. Дополняет check_max_positions/
+        max_position_size_pct (те считают каждую позицию изолированно) —
+        реальный инцидент (прод, эта же сессия): алго-режим открыл 20
+        позиций почти на 90% баланса одновременно, per-position лимиты
+        каждую пропускали по отдельности. 0 — не ограничивать.
+        """
+        if self.max_total_notional_pct <= 0:
+            return False
+        return (self.total_notional_pct() + additional_pct) > self.max_total_notional_pct
+
     def check_daily_loss(self) -> bool:
         """Проверить, достигнут ли дневной лимит убытков."""
         return self.daily_loss_limit_reached or self.paused or self.kill_switch_active
@@ -182,6 +214,7 @@ class RiskManager:
         self.state.daily_loss_limit_usd = self.profile.daily_loss_limit_usd
         self.state.max_drawdown_pct = self.profile.max_drawdown_pct
         self.state.cooldown_seconds = self.profile.cooldown_seconds
+        self.state.max_total_notional_pct = self.profile.max_total_notional_pct
 
     def reload_from_settings(self):
         """
@@ -202,6 +235,7 @@ class RiskManager:
         self.profile.max_position_size_pct = settings.risk_max_position_size_pct
         self.profile.max_drawdown_pct = settings.risk_max_drawdown_pct
         self.profile.cooldown_seconds = settings.risk_cooldown_seconds
+        self.profile.max_total_notional_pct = settings.risk_max_total_notional_pct
         self._sync_state_from_profile()
 
     async def restore_daily_pnl_from_db(self):
@@ -294,6 +328,8 @@ class RiskManager:
             "open_positions_count": self.state.open_positions_count,
             "open_positions": dict(self.state.open_positions),
             "max_position_size_pct": self.profile.max_position_size_pct,
+            "max_total_notional_pct": self.profile.max_total_notional_pct,
+            "total_notional_pct": self.state.total_notional_pct(),
             "max_drawdown_pct": self.profile.max_drawdown_pct,
             "total_drawdown_pct": self.state.total_drawdown_pct,
             "max_drawdown_reached": self.state.max_drawdown_reached,
@@ -349,6 +385,15 @@ class RiskManager:
         size_pct = signal.position_size_pct if hasattr(signal, 'position_size_pct') else signal.get("position_size_pct", 0)
         if size_pct > self.profile.max_position_size_pct:
             return False, f"Размер позиции {size_pct:.1f}% превышает лимит {self.profile.max_position_size_pct:.1f}%"
+
+        # Проверка суммарной notional-экспозиции портфеля — см. докстринг
+        # check_max_total_notional (дополняет проверку размера ОДНОЙ
+        # позиции выше проверкой СУММЫ уже открытых плюс эта).
+        if self.state.check_max_total_notional(size_pct):
+            return False, (
+                f"Суммарная экспозиция портфеля превысит лимит "
+                f"({self.state.total_notional_pct() + size_pct:.1f}% > {self.profile.max_total_notional_pct:.1f}%)"
+            )
 
         # Проверка корреляции
         symbol = signal.symbol if hasattr(signal, 'symbol') else signal.get("symbol", "")

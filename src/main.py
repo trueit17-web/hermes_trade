@@ -790,6 +790,30 @@ class TradingBot:
             await self._save_telegram_signal(signal_event, None, "rejected", None)
             return
 
+        if settings.telegram_signals_max_age_seconds > 0:
+            # Реальный риск (см. докстринг telegram_signals_max_age_seconds
+            # в config.py): при деградации цепочки LLM-фолбэков обработка
+            # сообщения может занять заметно дольше обычного, и к моменту
+            # исполнения цена уже могла уйти от контекста сигнала. Ручное
+            # одобрение старого pending-сигнала (POST /telegram/signals/
+            # {id}/decide в api.py) идёт напрямую в _execute_telegram_signal,
+            # минуя эту проверку — оператор уже сознательно смотрит на
+            # возраст сигнала перед подтверждением.
+            posted_at = signal_event.get("signal_posted_at")
+            if posted_at is not None:
+                age_seconds = (utcnow() - posted_at).total_seconds()
+                if age_seconds > settings.telegram_signals_max_age_seconds:
+                    signal_event["reject_reason"] = (
+                        f"сигнал устарел: сообщению канала {age_seconds:.0f}с "
+                        f"(лимит {settings.telegram_signals_max_age_seconds:.0f}с)"
+                    )
+                    logger.info(
+                        f"🚫 Сигнал по {pair} отклонён: устарел ({age_seconds:.0f}с > "
+                        f"{settings.telegram_signals_max_age_seconds:.0f}с)"
+                    )
+                    await self._save_telegram_signal(signal_event, None, "rejected", None)
+                    return
+
         quality_threshold, auto_execute, position_size_pct, market_type = await self._get_channel_settings(channel_id)
         signal_event["channel_position_size_pct"] = position_size_pct
         signal_event["channel_market_type"] = market_type
@@ -917,6 +941,24 @@ class TradingBot:
                     f"🚫 Сигнал по {pair} отклонён: достигнут лимит открытых позиций "
                     f"({risk_manager.state.open_positions_count}/{risk_manager.state.max_open_positions})"
                 )
+            elif risk_manager.state.check_max_total_notional(position_size_pct):
+                # Тот же класс защиты, что и check_max_positions выше, но
+                # по СУММЕ размера позиций, а не по их числу — см. докстринг
+                # risk_max_total_notional_pct в config.py (реальный
+                # инцидент: 20 позиций почти на 90% баланса, per-position
+                # лимиты каждую пропускали по отдельности). position_size_pct
+                # здесь — базовый % канала ДО применения expectancy sizing
+                # (тот же момент проверки, что и у check_max_positions —
+                # до асинхронного вызова expectancy_sizing.size_multiplier
+                # в _execute_telegram_signal), поэтому оценка консервативная
+                # сверху, если множитель канала < 1.
+                decision = "rejected"
+                signal_event["reject_reason"] = (
+                    f"суммарная экспозиция портфеля превысит лимит "
+                    f"({risk_manager.state.total_notional_pct() + position_size_pct:.1f}% > "
+                    f"{risk_manager.profile.max_total_notional_pct:.1f}%)"
+                )
+                logger.info(f"🚫 Сигнал по {pair} отклонён: {signal_event['reject_reason']}")
             else:
                 # Остальные Protections (кулдаун источника после закрытия,
                 # StoplossGuard, LosingStreak) сюда намеренно НЕ применяются:

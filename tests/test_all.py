@@ -205,6 +205,42 @@ class TestRiskState(unittest.TestCase):
         state.clear_kill_switch()
         self.assertFalse(state.kill_switch_active)
 
+    def test_total_notional_pct_sums_open_positions(self):
+        """
+        total_notional_pct() — сумма size_pct всех отслеживаемых позиций,
+        а не их количество (в отличие от open_positions_count/
+        check_max_positions). Позиции с size_pct=0.0 (ручные/подхваченные —
+        см. register_manual_position в main.py) вносят 0 в сумму.
+        """
+        state = RiskState()
+        state.add_open_position("BTC/USDT", 10.0)
+        state.add_open_position("ETH/USDT", 15.0)
+        state.add_open_position("MANUAL/USDT", 0.0)
+        self.assertEqual(state.total_notional_pct(), 25.0)
+
+    def test_check_max_total_notional(self):
+        """
+        Реальный инцидент (прод, эта сессия): алго-режим открыл 20 позиций
+        почти на 90% баланса — ни max_open_positions, ни
+        max_position_size_pct поодиночке это не остановили, потому что
+        считали каждую позицию изолированно, а не сумму.
+        """
+        state = RiskState()
+        state.max_total_notional_pct = 30.0
+        state.add_open_position("BTC/USDT", 10.0)
+        state.add_open_position("ETH/USDT", 15.0)
+        # 10+15=25, +новая 4 = 29 <= 30 — ещё можно
+        self.assertFalse(state.check_max_total_notional(4.0))
+        # +новая 6 = 31 > 30 — уже нельзя
+        self.assertTrue(state.check_max_total_notional(6.0))
+
+    def test_check_max_total_notional_disabled_when_zero(self):
+        """0 — лимит выключен (как и у остальных 0-дефолтов в этом коде)."""
+        state = RiskState()
+        state.max_total_notional_pct = 0.0
+        state.add_open_position("BTC/USDT", 500.0)
+        self.assertFalse(state.check_max_total_notional(500.0))
+
 
 class TestRiskManager(unittest.IsolatedAsyncioTestCase):
     """Тесты для RiskManager."""
@@ -248,6 +284,33 @@ class TestRiskManager(unittest.IsolatedAsyncioTestCase):
         can_execute, reason = self.risk.check_signal(signal)
         self.assertFalse(can_execute)
         self.assertIn("превышает", reason)
+
+    async def test_check_signal_total_notional_exceeded(self):
+        """
+        Сигнал в пределах лимита размера ОДНОЙ позиции, но сумма с уже
+        открытыми превышает max_total_notional_pct — дополняет проверку
+        выше (та ловит только слишком большую ОДНУ позицию).
+        """
+        self.risk.profile.max_total_notional_pct = 20.0
+        self.risk.state.max_total_notional_pct = 20.0
+        self.risk.state.add_open_position("ETH/USDT", 15.0)
+        signal = MagicMock()
+        signal.symbol = "BTC/USDT"
+        signal.position_size_pct = 8.0
+        can_execute, reason = self.risk.check_signal(signal)
+        self.assertFalse(can_execute)
+        self.assertIn("экспозиция", reason)
+
+    async def test_check_signal_total_notional_within_limit(self):
+        """Сумма в пределах лимита — сигнал проходит как обычно."""
+        self.risk.profile.max_total_notional_pct = 50.0
+        self.risk.state.max_total_notional_pct = 50.0
+        self.risk.state.add_open_position("ETH/USDT", 15.0)
+        signal = MagicMock()
+        signal.symbol = "BTC/USDT"
+        signal.position_size_pct = 8.0
+        can_execute, reason = self.risk.check_signal(signal)
+        self.assertTrue(can_execute)
 
     async def test_adjust_position_size(self):
         """Расчёт размера позиции."""
@@ -13785,6 +13848,225 @@ class TestTelegramSignalRespectsMaxOpenPositions(unittest.IsolatedAsyncioTestCas
         self.assertEqual(bot._save_telegram_signal.await_args.args[2], "executed")
 
 
+class TestTelegramSignalRespectsMaxTotalNotional(unittest.IsolatedAsyncioTestCase):
+    """
+    Дополняет TestTelegramSignalRespectsMaxOpenPositions — risk_max_total_
+    notional_pct блокирует автоисполнение, когда СУММА уже открытых позиций
+    плюс размер нового сигнала превышает лимит, даже если число позиций и
+    размер этой ОДНОЙ позиции по отдельности в пределах своих лимитов.
+    Реальный инцидент (прод, эта же сессия): 20 позиций почти на 90%
+    баланса — per-position лимиты каждую пропускали изолированно.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        self._saved_open_positions = dict(global_risk_manager.state.open_positions)
+        self._saved_count = global_risk_manager.state.open_positions_count
+        self._saved_max_total = global_risk_manager.state.max_total_notional_pct
+        global_risk_manager.state.open_positions.clear()
+        global_risk_manager.state.open_positions_count = 0
+
+    def tearDown(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        global_risk_manager.state.open_positions = self._saved_open_positions
+        global_risk_manager.state.open_positions_count = self._saved_count
+        global_risk_manager.state.max_total_notional_pct = self._saved_max_total
+
+    async def test_rejects_signal_when_total_notional_exceeded(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        global_risk_manager.state.max_total_notional_pct = 20.0
+        global_risk_manager.state.add_open_position("ALREADYOPEN/USDT", 15.0)
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 8.0, "spot"))
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        with patch.object(bot, "_execute_telegram_signal", new=AsyncMock()) as exec_mock:
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "NOTIONAL1/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 50000.0,
+                "parsed_sl": 48000.0,
+                "raw_message": "test",
+            })
+
+        exec_mock.assert_not_awaited()
+        self.assertEqual(bot._save_telegram_signal.await_args.args[2], "rejected")
+        self.assertIn("экспозиция", bot._save_telegram_signal.await_args.args[0]["reject_reason"])
+
+    async def test_executes_signal_when_total_notional_within_limit(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        global_risk_manager.state.max_total_notional_pct = 50.0
+        global_risk_manager.state.add_open_position("ALREADYOPEN/USDT", 15.0)
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 8.0, "spot"))
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        fake_order = MagicMock(id=1)
+        with patch.object(bot, "_execute_telegram_signal", new=AsyncMock(return_value=fake_order)) as exec_mock:
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "NOTIONAL2/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 50000.0,
+                "parsed_sl": 48000.0,
+                "raw_message": "test",
+            })
+
+        exec_mock.assert_awaited_once()
+        self.assertEqual(bot._save_telegram_signal.await_args.args[2], "executed")
+
+
+class TestTelegramSignalStalenessGate(unittest.IsolatedAsyncioTestCase):
+    """
+    telegram_signals_max_age_seconds (см. config.py) — реальный риск: при
+    деградации цепочки LLM-фолбэков (Anthropic → Groq → Gemini → Cerebras,
+    все три одновременно недоступны по квоте/биллингу — наблюдалось в
+    этой же сессии на проде) обработка сообщения канала может занять
+    заметно больше обычного, и цена успевает уйти от контекста сигнала.
+    signal_posted_at — реальная метка времени сообщения Telethon (см.
+    channel_monitor.py), не message_date (время завершения парсинга).
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        self._saved_max_age = settings.telegram_signals_max_age_seconds
+        # Изолируемся от других тестов, мутирующих тот же глобальный
+        # risk_manager (open_positions_count/max_open_positions) — этот
+        # класс проверяет только staleness-гейт, а не лимит числа позиций,
+        # поэтому явно ставим заведомо разрешающие значения вместо того,
+        # чтобы полагаться на состояние, оставленное порядком запуска
+        # других тестов.
+        self._saved_count = global_risk_manager.state.open_positions_count
+        self._saved_max_positions = global_risk_manager.state.max_open_positions
+        global_risk_manager.state.open_positions_count = 0
+        global_risk_manager.state.max_open_positions = 100
+
+    def tearDown(self):
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        settings.telegram_signals_max_age_seconds = self._saved_max_age
+        global_risk_manager.state.open_positions_count = self._saved_count
+        global_risk_manager.state.max_open_positions = self._saved_max_positions
+
+    async def test_rejects_stale_signal(self):
+        from src.utils.timeutils import utcnow
+        settings.telegram_signals_max_age_seconds = 300.0
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        with patch.object(bot, "_execute_telegram_signal", new=AsyncMock()) as exec_mock:
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "STALE1/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 50000.0,
+                "parsed_sl": 48000.0,
+                "raw_message": "test",
+                "signal_posted_at": utcnow() - timedelta(seconds=600),
+            })
+
+        exec_mock.assert_not_awaited()
+        # Отклонён ДО получения настроек канала — иначе бы не считался
+        # "structural" гейт наравне с blacklist-проверкой выше по коду.
+        bot._get_channel_settings.assert_not_awaited()
+        self.assertEqual(bot._save_telegram_signal.await_args.args[2], "rejected")
+        self.assertIn("устарел", bot._save_telegram_signal.await_args.args[0]["reject_reason"])
+
+    async def test_accepts_fresh_signal(self):
+        from src.utils.timeutils import utcnow
+        settings.telegram_signals_max_age_seconds = 300.0
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        fake_order = MagicMock(id=1)
+        with patch.object(bot, "_execute_telegram_signal", new=AsyncMock(return_value=fake_order)) as exec_mock:
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "FRESH1/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 50000.0,
+                "parsed_sl": 48000.0,
+                "raw_message": "test",
+                "signal_posted_at": utcnow() - timedelta(seconds=5),
+            })
+
+        exec_mock.assert_awaited_once()
+        self.assertEqual(bot._save_telegram_signal.await_args.args[2], "executed")
+
+    async def test_gate_disabled_when_zero(self):
+        from src.utils.timeutils import utcnow
+        settings.telegram_signals_max_age_seconds = 0.0
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        fake_order = MagicMock(id=1)
+        with patch.object(bot, "_execute_telegram_signal", new=AsyncMock(return_value=fake_order)) as exec_mock:
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "NOGATE1/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 50000.0,
+                "parsed_sl": 48000.0,
+                "raw_message": "test",
+                "signal_posted_at": utcnow() - timedelta(hours=5),
+            })
+
+        exec_mock.assert_awaited_once()
+
+    async def test_missing_signal_posted_at_does_not_crash(self):
+        """
+        Сигналы без signal_posted_at (например, старые тесты/payload'ы без
+        этого поля) не должны падать — гейт просто пропускается, как и
+        было до его добавления.
+        """
+        settings.telegram_signals_max_age_seconds = 300.0
+        bot = self._make_bot()
+        bot._telegram_channel_db_ids = {}
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._save_telegram_signal = AsyncMock()
+        bot.open_positions = {}
+
+        fake_order = MagicMock(id=1)
+        with patch.object(bot, "_execute_telegram_signal", new=AsyncMock(return_value=fake_order)) as exec_mock:
+            await bot._on_telegram_signal({
+                "channel_id": "@test_channel",
+                "parsed_pair": "NODATE1/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 50000.0,
+                "parsed_sl": 48000.0,
+                "raw_message": "test",
+            })
+
+        exec_mock.assert_awaited_once()
+
+
 class TestTelegramSignalMarketEntryResolution(unittest.IsolatedAsyncioTestCase):
     """
     Реальный формат сигнала без фиксированной цены входа ("Диапазон входа:
@@ -16665,6 +16947,42 @@ class TestHandlerRoutesStopHitReports(unittest.IsolatedAsyncioTestCase):
 
         parse_mock.assert_awaited_once()
         self.assertEqual(received, [])  # parsed=None -> подписчики не уведомляются вообще
+
+    async def test_signal_event_carries_real_message_post_time(self):
+        """signal_posted_at должен браться из Telethon message.date (реальное
+        время ПОСТА в канале), а не из message_date (время ЗАВЕРШЕНИЯ парсинга,
+        см. докстрайб signal_posted_at в _handler) — иначе staleness-gate
+        (telegram_signals_max_age_seconds, main.py) не ловил бы задержку самой
+        цепочки regex/LLM-фолбэков."""
+        from datetime import datetime, timezone
+        from src.utils.timeutils import utcnow
+
+        self.cm._monitored[-100779] = {
+            "channel_id": "@timedchan", "channel_title": "Timed", "parser_config": {},
+        }
+        event = MagicMock()
+        event.chat_id = -100779
+        event.message.text = "BTC/USDT LONG 50000 SL 49000 TP 52000"
+        event.message.photo = None
+        posted_at_aware = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        event.message.date = posted_at_aware
+
+        received = []
+
+        async def fake_cb(ev):
+            received.append(ev)
+        self.cm._subscribers.append(fake_cb)
+
+        before = utcnow()
+        with patch.object(self.cm, "parse_telegram_signal", new=AsyncMock(return_value={"pair": "BTC/USDT", "side": "long"})):
+            await self.cm._handler(event)
+        after = utcnow()
+
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]["signal_posted_at"], posted_at_aware.replace(tzinfo=None))
+        self.assertLessEqual(before, received[0]["message_date"])
+        self.assertLessEqual(received[0]["message_date"], after)
+        self.assertNotEqual(received[0]["signal_posted_at"], received[0]["message_date"])
 
 
 class TestOnChannelStopHitReport(unittest.IsolatedAsyncioTestCase):

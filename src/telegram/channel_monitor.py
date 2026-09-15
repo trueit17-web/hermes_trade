@@ -158,6 +158,16 @@ async def _handler(event: events.NewMessage.Event):
             "channel_title": channel.get("channel_title", ""),
             "raw_message": raw_text,
             "message_date": utcnow(),
+            # Реальная метка времени СООБЩЕНИЯ в Telegram (Telethon,
+            # tz-aware UTC — приводим к наивному, как и весь остальной код
+            # проекта, см. docstring utcnow()), в отличие от message_date
+            # выше (время ЗАВЕРШЕНИЯ парсинга — parse_telegram_signal с его
+            # цепочкой regex/LLM-фолбэков уже отработал к этому моменту).
+            # Нужна отдельно для staleness-gate (telegram_signals_max_age_
+            # seconds в _on_telegram_signal, main.py) — не переиспользуем
+            # message_date, чтобы не менять его существующую семантику
+            # (историю сигналов/бэктест уже читают его как "processed at").
+            "signal_posted_at": message.date.replace(tzinfo=None) if message.date else None,
             "parsed_pair": parsed.get("pair"),
             "parsed_side": parsed.get("side"),
             "parsed_entry": parsed.get("entry"),
