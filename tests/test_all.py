@@ -14640,6 +14640,161 @@ class TestTelegramSignalMaxSlPctOfMargin(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(applied_sl, 49800.0)
 
 
+class TestTelegramSignalMinSlPctOfMargin(unittest.IsolatedAsyncioTestCase):
+    """
+    Зеркало TestTelegramSignalMaxSlPctOfMargin: каналы нередко указывают SL
+    на пару десятых процента от входа, который при типичном для сигналов
+    плече (10-30x) пробивается обычной внутридневной волатильностью за
+    минуты, не успев подтвердиться в сторону сигнала (реальная жалоба
+    пользователя этой сессии — "много сделок падает на шуме").
+    telegram_signals_min_sl_pct_of_margin раздвигает такой SL по % от
+    МАРЖИ до минимума, только когда SL СЛИШКОМ близко; более широкий SL
+    канала не трогается, и на споте (нет плеча) раздвижки нет вообще.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved = {
+            "trading_mode": settings.trading_mode,
+            "telegram_signals_min_sl_pct_of_margin": settings.telegram_signals_min_sl_pct_of_margin,
+            "telegram_signals_max_sl_pct_of_margin": settings.telegram_signals_max_sl_pct_of_margin,
+            "telegram_signals_default_sl_pct": settings.telegram_signals_default_sl_pct,
+            "futures_leverage": settings.futures_leverage,
+            "telegram_signals_max_leverage": settings.telegram_signals_max_leverage,
+        }
+        settings.trading_mode = "real"
+        settings.telegram_signals_min_sl_pct_of_margin = 12.0
+        settings.telegram_signals_max_sl_pct_of_margin = 0  # изолируем от потолка в этих тестах
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            setattr(settings, key, value)
+
+    async def test_tight_sl_widened_on_futures_long(self):
+        # 12% маржи / 20x плечо = 0.6% от цены -> раздвинутый SL = 50000*0.994 = 49700,
+        # исходный SL канала (49900, -0.2%) теснее этого предела.
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49900.0, "parsed_tp": 55000.0,
+                "parsed_leverage": 20, "channel_market_type": "futures",
+                "channel_id": "@test_channel",
+            })
+
+        applied_sl = mock_engine.create_order.await_args.kwargs["stop_loss"]
+        self.assertAlmostEqual(applied_sl, 49700.0)
+
+    async def test_tight_sl_widened_on_futures_short(self):
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "short",
+                "parsed_entry": 50000.0, "parsed_sl": 50100.0, "parsed_tp": 45000.0,
+                "parsed_leverage": 20, "channel_market_type": "futures",
+                "channel_id": "@test_channel",
+            })
+
+        applied_sl = mock_engine.create_order.await_args.kwargs["stop_loss"]
+        self.assertAlmostEqual(applied_sl, 50300.0)
+
+    async def test_wide_enough_sl_not_touched(self):
+        # SL канала (49700, -0.6%) УЖЕ шире минимума (0.6% при плече 20x) —
+        # раздвижки быть не должно, значение не трогается.
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49700.0, "parsed_tp": 52000.0,
+                "parsed_leverage": 20, "channel_market_type": "futures",
+                "channel_id": "@test_channel",
+            })
+
+        applied_sl = mock_engine.create_order.await_args.kwargs["stop_loss"]
+        self.assertEqual(applied_sl, 49700.0)
+
+    async def test_missing_channel_leverage_falls_back_to_global_futures_leverage(self):
+        # Канал не указал плечо -> используется settings.futures_leverage
+        # (10x): 12%/10 = 1.2% -> раздвинутый SL = 50000*0.988 = 49400.
+        settings.futures_leverage = 10.0
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49900.0, "parsed_tp": 55000.0,
+                "channel_market_type": "futures",
+                "channel_id": "@test_channel",
+            })
+
+        applied_sl = mock_engine.create_order.await_args.kwargs["stop_loss"]
+        self.assertAlmostEqual(applied_sl, 49400.0)
+
+    async def test_spot_signal_never_widened(self):
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49999.0, "parsed_tp": 55000.0,
+                "parsed_leverage": 20, "channel_market_type": "spot",
+                "channel_id": "@test_channel",
+            })
+
+        applied_sl = mock_engine.create_order.await_args.kwargs["stop_loss"]
+        self.assertEqual(applied_sl, 49999.0)
+
+    async def test_zero_min_setting_disables_widening(self):
+        settings.telegram_signals_min_sl_pct_of_margin = 0.0
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49900.0, "parsed_tp": 55000.0,
+                "parsed_leverage": 20, "channel_market_type": "futures",
+                "channel_id": "@test_channel",
+            })
+
+        applied_sl = mock_engine.create_order.await_args.kwargs["stop_loss"]
+        self.assertEqual(applied_sl, 49900.0)
+
+    async def test_min_applied_before_max_when_both_enabled(self):
+        # min (12%) раздвигает тесный SL канала до 49700 (0.6% при 20x);
+        # затем max (20%) видит уже раздвинутое значение (0.6% < 1% лимита
+        # потолка) и не трогает его дальше — итоговый результат совпадает
+        # с чистым применением min.
+        settings.telegram_signals_max_sl_pct_of_margin = 20.0
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49900.0, "parsed_tp": 55000.0,
+                "parsed_leverage": 20, "channel_market_type": "futures",
+                "channel_id": "@test_channel",
+            })
+
+        applied_sl = mock_engine.create_order.await_args.kwargs["stop_loss"]
+        self.assertAlmostEqual(applied_sl, 49700.0)
+
+
 class TestTelegramSignalMaxLeverage(unittest.IsolatedAsyncioTestCase):
     """
     Каналы иногда указывают очень высокое плечо (35x, 50x) — та же % маржи

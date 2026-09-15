@@ -1251,6 +1251,35 @@ class TradingBot:
             )
             signal_changes.append(f"SL не указан каналом → применён дефолтный {settings.telegram_signals_default_sl_pct:.1f}% ({sl:.6f})")
 
+        # Раздвигаем СЛИШКОМ ТЕСНЫЙ SL канала до минимума (см. докстринг
+        # telegram_signals_min_sl_pct_of_margin в config.py) — тот же расчёт
+        # дистанции через эффективное плечо, что и у потолка ниже, только в
+        # обратную сторону: не урезаем далёкий SL, а раздвигаем слишком
+        # близкий, который иначе пробивается обычным шумом цены за минуты,
+        # не успев подтвердиться в сторону сигнала. Применяется ДО потолка
+        # ниже (min ожидается <= max, см. докстринг настройки).
+        if (
+            sl is not None
+            and market_type == "futures"
+            and settings.telegram_signals_min_sl_pct_of_margin > 0
+        ):
+            effective_leverage = leverage or settings.futures_leverage
+            if effective_leverage and effective_leverage > 0:
+                min_distance = (settings.telegram_signals_min_sl_pct_of_margin / 100) / effective_leverage
+                widened_sl = entry * (1 - min_distance) if side == "long" else entry * (1 + min_distance)
+                sl_too_close = sl > widened_sl if side == "long" else sl < widened_sl
+                if sl_too_close:
+                    logger.info(
+                        f"⚠️ Сигнал по {pair}: SL {sl:.6f} теснее "
+                        f"{settings.telegram_signals_min_sl_pct_of_margin:.0f}% маржи при плече "
+                        f"{effective_leverage:.0f}x — раздвинут до {widened_sl:.6f}"
+                    )
+                    signal_changes.append(
+                        f"SL {sl:.6f} → {widened_sl:.6f} (минимум {settings.telegram_signals_min_sl_pct_of_margin:.0f}% "
+                        f"маржи при плече {effective_leverage:.0f}x)"
+                    )
+                    sl = widened_sl
+
         # Капаем SL по % от маржи (см. докстринг telegram_signals_max_sl_pct_of_margin
         # в config.py) — только на фьючерсах, только когда СЛИШКОМ далёкий SL
         # (более консервативный SL канала/фоллбэка выше не трогаем). Плечо —
