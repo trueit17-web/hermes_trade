@@ -336,7 +336,25 @@
 
   .trade-row { cursor: pointer; }
   .trade-row:hover { background: rgba(255,255,255,.04); }
-  .trade-detail-row td { background: rgba(0,0,0,.15); padding: 14px 16px; }
+  /* Сбрасываем max-width/overflow/white-space/text-overflow с générique
+     "td" (см. выше — те рассчитаны на однострочные обрезаемые ячейки
+     обычных строк таблицы) — иначе lightweight-charts, создавая canvas
+     внутри этой ячейки (colspan на всю таблицу, никогда не однострочная),
+     считывает где-то в процессе layout временную ширину, урезанную этим
+     max-width:320px, и намертво прибивает к ней позицию ценовой шкалы
+     графика (даже когда сама ячейка уже растянулась шире) — баг
+     воспроизведён и локализован именно до этого правила: график занимал
+     на вид только часть отведённого блока, а шкала цены рисовалась
+     будто наложенной на середину свечей вместо правого края.
+  */
+  .trade-detail-row td {
+    background: rgba(0,0,0,.15);
+    padding: 14px 16px;
+    max-width: none;
+    overflow: visible;
+    white-space: normal;
+    text-overflow: clip;
+  }
   .trade-detail-block { margin-bottom: 16px; }
   .trade-detail-block:last-child { margin-bottom: 0; }
   .trade-detail-block h4 {
@@ -1635,7 +1653,6 @@ function chartBlockHtml(prefix, key) {
 // им невозможно пользоваться (реальная жалоба).
 const chartInstances = new Map();
 const chartVisibleRanges = new Map();
-const chartResizeObservers = new Map();
 
 // Рисует candlestick-график (lightweight-charts, см. <script> в <head>) по
 // свечам с биржи (GET /chart/candles — свечи нигде не хранятся в БД,
@@ -1665,11 +1682,6 @@ async function initTradeChart(containerId, opts) {
   if (oldChart) {
     try { oldChart.remove(); } catch (e) { /* уже удалён/невалиден — не страшно */ }
     chartInstances.delete(containerId);
-  }
-  const oldResizeObserver = chartResizeObservers.get(containerId);
-  if (oldResizeObserver) {
-    oldResizeObserver.disconnect();
-    chartResizeObservers.delete(containerId);
   }
 
   const HOUR_MS = 3600 * 1000;
@@ -1707,6 +1719,13 @@ async function initTradeChart(containerId, opts) {
   }
 
   container.innerHTML = "";
+  // autoSize:true вместо ручных width/height + собственного ResizeObserver
+  // — библиотека сама следит за размером контейнера через свой внутренний
+  // ResizeObserver, один источник правды вместо двух. (Ценовая шкала,
+  // рендерившаяся не у правого края контейнера, а где-то посередине
+  // графика, была вызвана НЕ гонкой resize-логики — см. .trade-detail-row
+  // td выше: реальная причина в унаследованном max-width:320px+overflow:
+  // hidden с общего правила td, воспроизведено и локализовано отдельно.)
   const chart = LightweightCharts.createChart(container, {
     layout: { background: { color: "transparent" }, textColor: "#e2e8f0" },
     grid: { vertLines: { color: "#2d3148" }, horzLines: { color: "#2d3148" } },
@@ -1714,8 +1733,7 @@ async function initTradeChart(containerId, opts) {
     rightPriceScale: { borderColor: "#2d3148" },
     handleScroll: true,
     handleScale: true,
-    width: container.clientWidth,
-    height: container.clientHeight,
+    autoSize: true,
   });
   chartInstances.set(containerId, chart);
   const series = chart.addCandlestickSeries({
@@ -1805,13 +1823,6 @@ async function initTradeChart(containerId, opts) {
     };
   }
 
-  const resizeObserver = new ResizeObserver(entries => {
-    for (const entry of entries) {
-      chart.applyOptions({ width: entry.contentRect.width, height: entry.contentRect.height });
-    }
-  });
-  resizeObserver.observe(container);
-  chartResizeObservers.set(containerId, resizeObserver);
 }
 
 // Честный ML-бейдж (см. докстринг GET /ml/forecast в api.py) — только
