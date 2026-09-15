@@ -764,12 +764,19 @@
 
   /* График цены в развороте подробностей позиции/сделки (см.
      initTradeChart) — lightweight-charts сам рисует свой canvas внутрь
-     этого контейнера, здесь только рамка/фон под общий стиль карточек. */
+     этого контейнера, здесь только рамка/фон под общий стиль карточек.
+     340px (а не 260px, как было изначально) — заметно удобнее целиться
+     мышью при масштабировании/панорамировании узкого 1h-графика. */
   .trade-chart-container {
-    height: 260px;
+    height: 340px;
     border-radius: 6px;
     overflow: hidden;
     margin-bottom: 8px;
+    position: relative;
+  }
+  .chart-reset-btn {
+    font-size: 12px;
+    padding: 4px 10px;
   }
   .ml-forecast-badge {
     display: flex;
@@ -1366,6 +1373,26 @@ function renderPositions(status) {
   const body = document.getElementById("positionsBody");
   const positions = status.paper_positions || {};
   const rows = Object.entries(positions);
+
+  // Сохраняем УЖЕ ЗАГРУЖЕННЫЕ detail-строки как настоящие DOM-узлы ДО
+  // перестройки таблицы (см. переустановку ниже) — без этого таблица
+  // перерисовывалась бы целиком каждые REFRESH_MS (5с, см. REFRESH_MS),
+  // уничтожая canvas графика внутри и заставляя initTradeChart каждый раз
+  // пересоздавать его заново — реальная жалоба пользователя: график
+  // "сбрасывается в начальное положение" и им невозможно управлять
+  // (масштаб/панорама терялись каждые 5 секунд). Перенос настоящего узла
+  // вместо перерисовки по кэшу оставляет сам объект графика (и его
+  // текущий видимый диапазон, см. chartVisibleRanges) живым между
+  // обновлениями — правильные live PnL/цена всё равно приходят в
+  // СВОДНУЮ строку, которая перестраивается как раньше.
+  const preservedDetailRows = new Map();
+  body.querySelectorAll("tr.trade-detail-row[data-position-detail]").forEach(tr => {
+    const cell = tr.querySelector("td");
+    if (cell && cell.dataset.loaded === "1") {
+      preservedDetailRows.set(tr.dataset.positionDetail, tr);
+    }
+  });
+
   if (!rows.length) {
     body.innerHTML = `<tr class="empty-row"><td colspan="10">Нет открытых позиций</td></tr>`;
     return;
@@ -1419,13 +1446,24 @@ function renderPositions(status) {
   `;
   }).join("");
 
+  // Вернуть на место живые detail-строки вместо свежесозданных пустышек —
+  // см. комментарий у preservedDetailRows выше. Позиция, которой больше
+  // нет в списке (закрылась), просто отбрасывает сохранённый узел вместе
+  // с его графиком — восстанавливать нечего.
+  preservedDetailRows.forEach((liveRow, symbol) => {
+    const freshRow = body.querySelector(`tr[data-position-detail="${CSS.escape(symbol)}"]`);
+    if (freshRow) freshRow.replaceWith(liveRow);
+  });
+
   body.querySelectorAll(".trade-row[data-position-symbol]").forEach(row => {
     row.addEventListener("click", (ev) => {
       if (ev.target.closest("[data-close-position]")) return;
       togglePositionDetail(row);
     });
     const symbol = row.dataset.positionSymbol;
-    if (expandedPositions.has(symbol)) {
+    // Живой узел уже перенесён на место (см. выше) — восстанавливать по
+    // кэшу нужно только то, что ЕЩЁ не было загружено live-узлом.
+    if (expandedPositions.has(symbol) && !preservedDetailRows.has(symbol)) {
       restoreExpandedPosition(row);
     }
   });
@@ -1560,7 +1598,10 @@ function chartBlockHtml(prefix, key) {
   const id = chartContainerId(prefix, key);
   return `
     <div class="trade-detail-block">
-      <h4>График цены</h4>
+      <div class="trade-detail-header">
+        <h4>График цены</h4>
+        <button type="button" class="btn-ghost chart-reset-btn">⤢ Сбросить масштаб</button>
+      </div>
       <div class="ml-forecast-badge" id="${id}-ml" style="display:none"></div>
       <div class="trade-chart-container" id="${id}">
         <div class="muted" style="padding:10px 16px">Загрузка графика…</div>
@@ -1568,6 +1609,18 @@ function chartBlockHtml(prefix, key) {
     </div>
   `;
 }
+
+// Живые chart-объекты и текущий видимый диапазон (from/to), по containerId
+// — оба нужны, чтобы фоновое обновление дашборда (renderPositions()/
+// renderTrades() перестраивают ВСЮ таблицу целиком раз в REFRESH_MS,
+// уничтожая старый canvas) не сбрасывало масштаб/панораму, которые
+// пользователь только что настроил руками. Раньше initTradeChart каждый
+// раз безусловно звал fitContent() — с точки зрения пользователя график
+// "прыгал" обратно к исходному виду каждые несколько секунд, что и делало
+// им невозможно пользоваться (реальная жалоба).
+const chartInstances = new Map();
+const chartVisibleRanges = new Map();
+const chartResizeObservers = new Map();
 
 // Рисует candlestick-график (lightweight-charts, см. <script> в <head>) по
 // свечам с биржи (GET /chart/candles — свечи нигде не хранятся в БД,
@@ -1582,6 +1635,26 @@ async function initTradeChart(containerId, opts) {
   if (typeof LightweightCharts === "undefined") {
     container.innerHTML = `<div class="muted" style="padding:10px 16px">Библиотека графиков не загрузилась</div>`;
     return;
+  }
+
+  // renderPositions()/renderTrades() теперь переносят уже загруженный
+  // detail-узел как живой DOM-элемент между перестройками таблицы (см. их
+  // комментарии про preservedDetailRows), поэтому initTradeChart в
+  // норме вызывается ровно один раз за сессию разворота строки. На
+  // случай, если он всё же вызовется повторно для того же containerId
+  // (например, "Пересчитать по бирже" перезагружает подробности сделки),
+  // явно удаляем старый chart-объект — без .remove() он остаётся висеть
+  // в памяти со своими подписками/RAF-циклом, даже когда его canvas уже
+  // вырезан из DOM следующей строкой (container.innerHTML = "").
+  const oldChart = chartInstances.get(containerId);
+  if (oldChart) {
+    try { oldChart.remove(); } catch (e) { /* уже удалён/невалиден — не страшно */ }
+    chartInstances.delete(containerId);
+  }
+  const oldResizeObserver = chartResizeObservers.get(containerId);
+  if (oldResizeObserver) {
+    oldResizeObserver.disconnect();
+    chartResizeObservers.delete(containerId);
   }
 
   const HOUR_MS = 3600 * 1000;
@@ -1624,9 +1697,12 @@ async function initTradeChart(containerId, opts) {
     grid: { vertLines: { color: "#2d3148" }, horzLines: { color: "#2d3148" } },
     timeScale: { timeVisible: true, secondsVisible: false, borderColor: "#2d3148" },
     rightPriceScale: { borderColor: "#2d3148" },
+    handleScroll: true,
+    handleScale: true,
     width: container.clientWidth,
     height: container.clientHeight,
   });
+  chartInstances.set(containerId, chart);
   const series = chart.addCandlestickSeries({
     upColor: "#10b981", downColor: "#ef4444",
     borderUpColor: "#10b981", borderDownColor: "#ef4444",
@@ -1680,7 +1756,26 @@ async function initTradeChart(containerId, opts) {
     series.setMarkers(markers);
   }
 
-  chart.timeScale().fitContent();
+  // Восстановить видимый диапазон, если пользователь уже настраивал
+  // масштаб/панораму этого графика раньше в этой же сессии (см.
+  // chartVisibleRanges выше) — иначе fitContent() как для первого показа.
+  const savedRange = chartVisibleRanges.get(containerId);
+  if (savedRange) {
+    try { chart.timeScale().setVisibleRange(savedRange); } catch (e) { chart.timeScale().fitContent(); }
+  } else {
+    chart.timeScale().fitContent();
+  }
+  chart.timeScale().subscribeVisibleTimeRangeChange(range => {
+    if (range) chartVisibleRanges.set(containerId, range);
+  });
+
+  const resetBtn = container.parentElement && container.parentElement.querySelector(".chart-reset-btn");
+  if (resetBtn) {
+    resetBtn.onclick = () => {
+      chartVisibleRanges.delete(containerId);
+      chart.timeScale().fitContent();
+    };
+  }
 
   const resizeObserver = new ResizeObserver(entries => {
     for (const entry of entries) {
@@ -1688,6 +1783,7 @@ async function initTradeChart(containerId, opts) {
     }
   });
   resizeObserver.observe(container);
+  chartResizeObservers.set(containerId, resizeObserver);
 }
 
 // Честный ML-бейдж (см. докстринг GET /ml/forecast в api.py) — только
@@ -2077,6 +2173,17 @@ const expandedTradeDetails = new Map();
 async function renderTrades() {
   const body = document.getElementById("tradesBody");
   const pagination = document.getElementById("tradesPagination");
+  // Тот же приём, что и в renderPositions (см. её комментарий) — сохранить
+  // уже загруженные detail-строки как живые DOM-узлы, чтобы периодическая
+  // перестройка таблицы не пересоздавала canvas графика внутри и не
+  // сбрасывала масштаб/панораму, которые пользователь только что настроил.
+  const preservedDetailRows = new Map();
+  body.querySelectorAll("tr.trade-detail-row[data-trade-detail]").forEach(tr => {
+    const cell = tr.querySelector("td");
+    if (cell && cell.dataset.loaded === "1") {
+      preservedDetailRows.set(tr.dataset.tradeDetail, tr);
+    }
+  });
   try {
     const offset = tradesPage * TRADES_PAGE_SIZE;
     const pairParam = tradesPairFilter ? `&pair=${encodeURIComponent(tradesPairFilter)}` : "";
@@ -2127,10 +2234,17 @@ async function renderTrades() {
     `;
     }).join("");
 
+    // Вернуть на место живые detail-строки — см. комментарий у
+    // preservedDetailRows выше и у аналогичного места в renderPositions.
+    preservedDetailRows.forEach((liveRow, id) => {
+      const freshRow = body.querySelector(`tr[data-trade-detail="${id}"]`);
+      if (freshRow) freshRow.replaceWith(liveRow);
+    });
+
     body.querySelectorAll(".trade-row").forEach(row => {
       row.addEventListener("click", () => toggleTradeDetail(row));
       const id = row.dataset.tradeId;
-      if (expandedTrades.has(id)) {
+      if (expandedTrades.has(id) && !preservedDetailRows.has(id)) {
         restoreExpandedTrade(row);
       }
     });
