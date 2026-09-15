@@ -6313,6 +6313,60 @@ class TestTradeDetail(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(detail["legs"]), 1)
         self.assertEqual(detail["legs"][0]["order_id_exchange_close"], "detail-close-ex-1")
 
+    async def test_detail_includes_market_type_from_opening_order(self):
+        """
+        market_type добавлен в ответ ради графика цены на дашборде (см.
+        renderTradeDetail -> initTradeChart в dashboard.html) — GET /chart/
+        candles должен запросить свечи у ПРАВИЛЬНОГО ccxt-клиента (спот/
+        фьючерсы), а рынок сделки хранится на её открывающем Order, не на
+        самом Trade. Реальный (не paper) режим — у paper-ордеров market_type
+        сейчас не персистится на Order вообще (pre-existing ограничение
+        paper-режима, вне рамок этой задачи).
+        """
+        from src.execution.executor import ExecutionEngine
+        from src.web.api import get_trade_detail
+
+        engine = ExecutionEngine()
+        saved_market_type = settings.market_type
+        settings.trading_mode = "real"
+        settings.market_type = "futures"
+        engine.is_paper = False
+        engine.exchange_id = "bybit"
+        # exchange-setter кладёт клиент в _exchanges[settings.market_type]
+        # (см. ExecutionEngine.exchange.setter) — _exchange_for(pos) резолвит
+        # клиент ПО РЫНКУ КОНКРЕТНОЙ ПОЗИЦИИ (pos["market_type"]), поэтому
+        # settings.market_type должен быть "futures" уже на момент этого
+        # присваивания, иначе мок попадёт в _exchanges["spot"] и close_real_
+        # position не найдёт клиента для futures-позиции.
+        engine.exchange = AsyncMock()
+        engine.exchange.create_market_buy_order.return_value = {
+            "id": "detailmt-open-real-1", "filled": 10.0, "price": None, "average": 100.0,
+            "fee": {"cost": 0.5, "currency": "USDT"},
+        }
+
+        symbol = "TRADEDETAILMT1/USDT"
+        try:
+            order = await engine.create_order(
+                symbol=symbol, side="buy", amount=10.0, price=100.0, order_type="market",
+                market_type="futures",
+            )
+            self.assertIsNotNone(order)
+
+            engine.exchange.create_market_sell_order.return_value = {
+                "id": "detailmt-close-real-1", "filled": 10.0, "price": None, "average": 110.0,
+                "fee": {"cost": 0.5, "currency": "USDT"},
+            }
+            result = await engine.close_real_position(
+                symbol=symbol, side="long", entry_price=100.0, amount=10.0,
+                reason="take_profit_3", entry_fee=0.5, holding_seconds=60, order_open_id=order.id,
+            )
+        finally:
+            settings.market_type = saved_market_type
+        self.assertIsNotNone(result)
+
+        detail = await get_trade_detail(result["trade_id"])
+        self.assertEqual(detail["market_type"], "futures")
+
 
 class TestRecalculateClosedTrade(unittest.IsolatedAsyncioTestCase):
     """
@@ -12283,6 +12337,35 @@ class TestManualTrading(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(detail["channel"])
         self.assertIsNone(detail["signal"])
 
+    async def test_position_detail_includes_market_type_and_opened_at(self):
+        """
+        market_type/opened_at добавлены в ответ ради графика цены на
+        дашборде (см. renderPositionDetail -> initTradeChart в dashboard.
+        html) — GET /chart/candles должен запросить свечи у правильного
+        ccxt-клиента (спот/фьючерсы), а opened_at задаёт диапазон
+        запрашиваемых свечей. Реальные позиции всегда получают opened_at
+        при открытии (см. real_positions[...]["opened_at"] в executor.py).
+        """
+        engine, bot = await self._install_engine_and_bot(exchange_id="bybit", is_paper=False)
+        saved_market_type = settings.market_type
+        settings.market_type = "futures"
+        engine.exchange = AsyncMock()
+        engine.exchange.create_market_buy_order.return_value = {
+            "id": "detailmt-open-1", "filled": 1.0, "average": 100.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+        try:
+            result = await self.api_module.create_manual_order(self.api_module.ManualOrderCreate(
+                symbol="DETAILMT1/USDT", side="buy", amount=1.0, price=100.0,
+            ))
+        finally:
+            settings.market_type = saved_market_type
+        self.assertTrue(result["success"])
+
+        detail = await self.api_module.get_position_detail("DETAILMT1/USDT")
+        self.assertEqual(detail["market_type"], "futures")
+        self.assertIsNotNone(detail["opened_at"])
+
     async def test_position_detail_includes_telegram_channel_and_signal(self):
         from datetime import datetime
 
@@ -12384,6 +12467,220 @@ class TestManualTrading(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(detail["channel"])
         self.assertIsNotNone(detail["decision_log"])
         self.assertEqual(detail["decision_log"][0]["step_type"], "risk_check")
+
+
+class TestChartCandlesEndpoint(unittest.IsolatedAsyncioTestCase):
+    """
+    GET /chart/candles — свечи для графика цены в развороте подробностей
+    позиции/сделки на дашборде (см. renderPositionDetail/renderTradeDetail
+    -> initTradeChart). Свечи нигде не хранятся в БД (таблица candles
+    заведена, но ничего в неё не пишет), поэтому эндпоинт всегда идёт
+    через bot.ingest — тот же MarketDataIngest, что и основной цикл.
+    """
+
+    def setUp(self):
+        import src.bot_registry as bot_registry
+        import src.main as main_module
+        import src.web.api as api_module
+
+        self.main_module = main_module
+        self.bot_registry = bot_registry
+        self.api_module = api_module
+        self.HTTPException = __import__("fastapi").HTTPException
+        self._saved_current_bot = bot_registry.current_bot
+
+    def tearDown(self):
+        self.bot_registry.current_bot = self._saved_current_bot
+
+    @staticmethod
+    def _make_candles_df(n=5):
+        idx = pd.date_range("2026-01-01", periods=n, freq="h")
+        return pd.DataFrame({
+            "open": [1.0] * n, "high": [1.1] * n, "low": [0.9] * n,
+            "close": [1.05] * n, "volume": [100.0] * n,
+        }, index=idx)
+
+    async def test_returns_candles_shaped_for_lightweight_charts(self):
+        bot = self.main_module.TradingBot()
+        bot.ingest = AsyncMock()
+        bot.ingest.fetch_ohlcv = AsyncMock(return_value=self._make_candles_df(3))
+        self.bot_registry.current_bot = bot
+
+        result = await self.api_module.get_chart_candles(symbol="BTC/USDT", market_type="futures", limit=100)
+
+        self.assertEqual(len(result["candles"]), 3)
+        first = result["candles"][0]
+        self.assertEqual(set(first.keys()), {"time", "open", "high", "low", "close", "volume"})
+        self.assertIsInstance(first["time"], int)
+        bot.ingest.fetch_ohlcv.assert_awaited_once_with(
+            "BTC/USDT", "1h", limit=100, since=None, market_type="futures",
+        )
+
+    async def test_returns_empty_list_when_ingest_has_no_data(self):
+        bot = self.main_module.TradingBot()
+        bot.ingest = AsyncMock()
+        bot.ingest.fetch_ohlcv = AsyncMock(return_value=None)
+        self.bot_registry.current_bot = bot
+
+        result = await self.api_module.get_chart_candles(symbol="NODATA/USDT")
+
+        self.assertEqual(result["candles"], [])
+
+    async def test_limit_is_clamped_to_500(self):
+        bot = self.main_module.TradingBot()
+        bot.ingest = AsyncMock()
+        bot.ingest.fetch_ohlcv = AsyncMock(return_value=self._make_candles_df(1))
+        self.bot_registry.current_bot = bot
+
+        await self.api_module.get_chart_candles(symbol="BTC/USDT", limit=99999)
+
+        self.assertEqual(bot.ingest.fetch_ohlcv.await_args.kwargs["limit"], 500)
+
+    async def test_503_when_bot_not_initialized(self):
+        self.bot_registry.current_bot = None
+        with self.assertRaises(self.HTTPException) as ctx:
+            await self.api_module.get_chart_candles(symbol="BTC/USDT")
+        self.assertEqual(ctx.exception.status_code, 503)
+
+
+class TestMlForecastEndpoint(unittest.IsolatedAsyncioTestCase):
+    """
+    GET /ml/forecast + TradingBot.get_ml_forecast — честный ML-бейдж на
+    дашборде (см. докстринг get_ml_forecast в main.py): вероятность роста/
+    падения цены через ~5ч и ожидаемая волатильность, а НЕ траектория
+    цены — никакая "прогнозная линия" на графике не рисуется. В отличие
+    от _process_symbol (основной цикл), где ML-инференс гейтится
+    settings.active_trading_mode == "algo", этот путь — разовый
+    информационный запрос и работает независимо от текущего режима.
+    """
+
+    def setUp(self):
+        import src.bot_registry as bot_registry
+        import src.main as main_module
+        import src.web.api as api_module
+
+        self.main_module = main_module
+        self.bot_registry = bot_registry
+        self.api_module = api_module
+        self.HTTPException = __import__("fastapi").HTTPException
+        self._saved_current_bot = bot_registry.current_bot
+        self._saved_vol_enabled = settings.volatility_adjustment_enabled
+        self._saved_trading_mode_source = settings.active_trading_mode
+
+    def tearDown(self):
+        self.bot_registry.current_bot = self._saved_current_bot
+        settings.volatility_adjustment_enabled = self._saved_vol_enabled
+        settings.active_trading_mode = self._saved_trading_mode_source
+
+    @staticmethod
+    def _make_candles_df(n=60):
+        idx = pd.date_range("2026-01-01", periods=n, freq="h")
+        return pd.DataFrame({
+            "open": [1.0] * n, "high": [1.0] * n, "low": [1.0] * n,
+            "close": [1.0] * n, "volume": [1.0] * n,
+        }, index=idx)
+
+    def _make_bot_with_mocks(self, candles_len=60):
+        bot = self.main_module.TradingBot()
+        bot.ingest = AsyncMock()
+        bot.ingest.fetch_ohlcv = AsyncMock(return_value=self._make_candles_df(candles_len))
+        # feature_engine мокается целиком (не через реальный pandas_ta) —
+        # тот же приём, что и в TestProcessSymbolBlacklist: get_ml_forecast
+        # не проверяет содержимое фичей, только передаёт их дальше в
+        # ml_inference (тоже мок ниже).
+        bot.feature_engine = MagicMock()
+        bot.ml_inference = AsyncMock()
+        return bot
+
+    async def test_get_ml_forecast_returns_none_without_ml_inference(self):
+        bot = self._make_bot_with_mocks()
+        bot.ml_inference = None
+        result = await bot.get_ml_forecast("BTC/USDT")
+        self.assertIsNone(result)
+
+    async def test_get_ml_forecast_returns_none_with_too_few_candles(self):
+        bot = self._make_bot_with_mocks(candles_len=10)
+        result = await bot.get_ml_forecast("BTC/USDT")
+        self.assertIsNone(result)
+        bot.ml_inference.predict_direction.assert_not_awaited()
+
+    async def test_get_ml_forecast_returns_none_when_model_not_loaded(self):
+        bot = self._make_bot_with_mocks()
+        bot.ml_inference.predict_direction = AsyncMock(return_value=None)
+        result = await bot.get_ml_forecast("BTC/USDT")
+        self.assertIsNone(result)
+
+    async def test_get_ml_forecast_returns_probabilities(self):
+        bot = self._make_bot_with_mocks()
+        bot.ml_inference.predict_direction = AsyncMock(
+            return_value={"proba_up": 0.62, "proba_down": 0.28, "proba_neutral": 0.10}
+        )
+        settings.volatility_adjustment_enabled = False
+
+        result = await bot.get_ml_forecast("BTC/USDT", market_type="futures")
+
+        self.assertEqual(result["proba_up"], 0.62)
+        self.assertEqual(result["proba_down"], 0.28)
+        self.assertEqual(result["proba_neutral"], 0.10)
+        self.assertIsNone(result["predicted_volatility"])
+        bot.ingest.fetch_ohlcv.assert_awaited_once_with("BTC/USDT", "1h", limit=100, market_type="futures")
+
+    async def test_get_ml_forecast_includes_volatility_when_enabled(self):
+        bot = self._make_bot_with_mocks()
+        bot.ml_inference.predict_direction = AsyncMock(
+            return_value={"proba_up": 0.5, "proba_down": 0.5, "proba_neutral": 0.0}
+        )
+        bot.ml_inference.predict_volatility = AsyncMock(return_value=0.018)
+        settings.volatility_adjustment_enabled = True
+
+        result = await bot.get_ml_forecast("BTC/USDT")
+
+        self.assertAlmostEqual(result["predicted_volatility"], 0.018)
+
+    async def test_get_ml_forecast_ignores_active_trading_mode(self):
+        """
+        _process_symbol (основной цикл) гейтит ML-инференс режимом "алго"
+        — этот путь честного бейджа по запросу НЕ должен зависеть от
+        settings.active_trading_mode вообще (иначе бейдж молчал бы в
+        режиме "signals", хотя сейчас именно он активен на проде).
+        """
+        settings.active_trading_mode = "signals"
+        bot = self._make_bot_with_mocks()
+        bot.ml_inference.predict_direction = AsyncMock(
+            return_value={"proba_up": 0.5, "proba_down": 0.5, "proba_neutral": 0.0}
+        )
+
+        result = await bot.get_ml_forecast("BTC/USDT")
+
+        self.assertIsNotNone(result)
+
+    async def test_endpoint_returns_available_false_when_forecast_none(self):
+        bot = self._make_bot_with_mocks()
+        bot.ml_inference = None
+        self.bot_registry.current_bot = bot
+
+        result = await self.api_module.get_ml_forecast_endpoint(symbol="BTC/USDT")
+
+        self.assertEqual(result, {"available": False})
+
+    async def test_endpoint_returns_available_true_with_data(self):
+        bot = self._make_bot_with_mocks()
+        bot.ml_inference.predict_direction = AsyncMock(
+            return_value={"proba_up": 0.7, "proba_down": 0.2, "proba_neutral": 0.1}
+        )
+        settings.volatility_adjustment_enabled = False
+        self.bot_registry.current_bot = bot
+
+        result = await self.api_module.get_ml_forecast_endpoint(symbol="BTC/USDT")
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["proba_up"], 0.7)
+
+    async def test_endpoint_503_when_bot_not_initialized(self):
+        self.bot_registry.current_bot = None
+        with self.assertRaises(self.HTTPException) as ctx:
+            await self.api_module.get_ml_forecast_endpoint(symbol="BTC/USDT")
+        self.assertEqual(ctx.exception.status_code, 503)
 
 
 class TestSyncOpenPositionsRestoresTakeProfitsAfterRestart(unittest.IsolatedAsyncioTestCase):

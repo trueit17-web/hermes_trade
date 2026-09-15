@@ -814,6 +814,7 @@ async def get_position_detail(symbol: str):
                 for s in pending
             ]
 
+    opened_at = pos.get("opened_at")
     return {
         "symbol": symbol,
         "side": pos.get("side"),
@@ -828,7 +829,73 @@ async def get_position_detail(symbol: str):
         "signal": signal,
         "signal_changes": signal_changes,
         "decision_log": decision_log,
+        # Для графика цены в развороте (см. renderPositionDetail →
+        # initTradeChart в dashboard.html) — market_type определяет, каким
+        # ccxt-клиентом (спот/фьючерсы) грузить свечи (GET /chart/candles).
+        "market_type": pos.get("market_type", "spot"),
+        "opened_at": opened_at.isoformat() + "Z" if opened_at else None,
     }
+
+
+@app.get("/chart/candles")
+async def get_chart_candles(
+    symbol: str, market_type: str = "spot", limit: int = 200, since_ms: int | None = None,
+):
+    """
+    OHLCV-свечи (1h) для графика цены в развороте подробностей позиции/
+    сделки на дашборде (см. renderPositionDetail/renderTradeDetail →
+    initTradeChart). Данные нигде не персистятся (таблица candles в БД
+    заведена, но ничего в неё не пишет — см. db/models.py), поэтому каждый
+    запрос идёт напрямую к бирже через тот же MarketDataIngest, что и
+    основной цикл бота (bot.ingest), а не к БД.
+
+    since_ms — начало диапазона в мс (unix timestamp), опционально: для
+    открытой позиции фронт запрашивает последние `limit` свечей от "сейчас"
+    (since_ms не передаётся), для закрытой сделки — от времени открытия
+    минус запас, чтобы захватить контекст ДО входа.
+    """
+    bot = bot_registry.current_bot
+    if bot is None or bot.ingest is None:
+        raise HTTPException(status_code=503, detail="Бот ещё не инициализирован")
+    limit = max(1, min(limit, 500))
+    df = await bot.ingest.fetch_ohlcv(symbol, "1h", limit=limit, since=since_ms, market_type=market_type)
+    if df is None or df.empty:
+        return {"candles": []}
+    return {
+        "candles": [
+            {
+                "time": int(ts.timestamp()),
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+                "volume": float(row["volume"]),
+            }
+            for ts, row in df.iterrows()
+        ]
+    }
+
+
+@app.get("/ml/forecast")
+async def get_ml_forecast_endpoint(symbol: str, market_type: str = "spot"):
+    """
+    Честная ML-оценка по запросу для бейджа в развороте подробностей
+    ОТКРЫТОЙ позиции на дашборде — см. докстринг TradingBot.get_ml_forecast
+    (main.py): вероятность роста/падения цены через ~5 часов (горизонт
+    обучения моделей) и ожидаемая волатильность за это же окно, а не
+    траектория цены — модель на прогноз графика не рассчитана, поэтому на
+    самом графике никакая "прогнозная линия" не рисуется. available=false —
+    модель не обучена/не загружена или данных недостаточно (не ошибка,
+    штатный случай, особенно если оба классификатора ни разу не обучались
+    на этом инстансе).
+    """
+    bot = bot_registry.current_bot
+    if bot is None:
+        raise HTTPException(status_code=503, detail="Бот ещё не инициализирован")
+    result = await bot.get_ml_forecast(symbol, market_type=market_type)
+    if result is None:
+        return {"available": False}
+    return {"available": True, **result}
 
 
 @app.get("/risk/state")
@@ -1169,6 +1236,11 @@ async def get_trade_detail(trade_id: int):
         return {
             "trade_id": trade_id,
             "symbol": trade.symbol.symbol if trade.symbol else None,
+            # Для графика цены в развороте (см. renderTradeDetail →
+            # initTradeChart в dashboard.html) — тот же market_type, что и
+            # у GET /positions/detail, только источник другой: у закрытой
+            # сделки это открывающий Order, а не execution_engine.
+            "market_type": trade.order_open.market_type if trade.order_open else "spot",
             "direction": trade.direction,
             "source": _position_source_label(trade.strategy.name if trade.strategy else None, channel_title),
             "entry_price": entry_price,

@@ -1728,6 +1728,98 @@ class TradingBot:
                 self.candles_buffer[symbol] = df
         return df
 
+    def _build_strategy_data(self, symbol: str, close: float, latest_features) -> dict:
+        """
+        Собрать словарь фичей для стратегий/ML-инференса из последней строки
+        FeatureEngine.compute_all_indicators — вынесено из _process_symbol
+        отдельным методом, чтобы тот же набор фичей мог собрать и
+        get_ml_forecast (разовый инференс по запросу для бейджа на
+        дашборде, см. её докстринг), не дублируя список полей.
+        """
+        return {
+            "symbol": symbol,
+            "timeframe": "1h",
+            "close": close,
+            "rsi_14": latest_features.get("rsi_14"),
+            "rsi_7": latest_features.get("rsi_7"),
+            "rsi_21": latest_features.get("rsi_21"),
+            "macd": latest_features.get("macd"),
+            "macd_signal": latest_features.get("macd_signal"),
+            "macd_hist": latest_features.get("macd_hist"),
+            "bb_upper": latest_features.get("bb_upper"),
+            "bb_lower": latest_features.get("bb_lower"),
+            "bb_mid": latest_features.get("bb_mid"),
+            "bb_pct": latest_features.get("bb_pct"),
+            "bb_width": latest_features.get("bb_width"),
+            "ema_20": latest_features.get("ema_20"),
+            "ema_50": latest_features.get("ema_50"),
+            "ema_20_slope": latest_features.get("ema_20_slope"),
+            "ema_50_slope": latest_features.get("ema_50_slope"),
+            "price_above_ema20": latest_features.get("price_above_ema20"),
+            "price_above_ema50": latest_features.get("price_above_ema50"),
+            "atr_14": latest_features.get("atr_14"),
+            "natr_14": latest_features.get("natr_14"),
+            "realized_vol_20": latest_features.get("realized_vol_20"),
+            "volume_ratio": latest_features.get("volume_ratio"),
+            "obv": latest_features.get("obv"),
+            "return_1": latest_features.get("return_1"),
+            "return_3": latest_features.get("return_3"),
+            "return_5": latest_features.get("return_5"),
+            "log_return": latest_features.get("log_return"),
+            "momentum_10": latest_features.get("momentum_10"),
+            "dist_from_ema20": latest_features.get("dist_from_ema20"),
+            "dist_from_ema50": latest_features.get("dist_from_ema50"),
+            "high_low_range": latest_features.get("high_low_range"),
+            "stoch_k": latest_features.get("stoch_k"),
+            "stoch_d": latest_features.get("stoch_d"),
+            "wr_14": latest_features.get("wr_14"),
+            "mfi_14": latest_features.get("mfi_14"),
+            "hour": latest_features.get("hour", 0),
+            "day_of_week": latest_features.get("day_of_week", 0),
+        }
+
+    async def get_ml_forecast(self, symbol: str, market_type: str = "spot") -> dict | None:
+        """
+        Разовая ML-оценка по запросу — для честного бейджа в развороте
+        подробностей ОТКРЫТОЙ позиции на дашборде (GET /ml/forecast, см.
+        api.py): вероятность роста/падения цены ЧЕРЕЗ HORIZON=5 часов (5
+        1h-свечей — см. horizon в FeatureEngine.extract_features_for_ml,
+        именно на этом горизонте размечен target_direction/target_volatility
+        при обучении) и ожидаемая волатильность за это же окно — модели
+        direction_classifier/volatility_predictor не предсказывают
+        траекторию цены, только это (см. MLInference в src/ml/__init__.py),
+        поэтому на графике намеренно не рисуется никакая "прогнозная линия".
+
+        В основном цикле (_process_symbol) тот же инференс гейтится
+        settings.active_trading_mode == "algo" (влияет на реальные решения
+        по алго-стратегиям) — здесь гейта нет: это чисто информационный
+        запрос по требованию пользователя, не должен зависеть от текущего
+        режима исполнения и никак не воздействует на торговлю (не пишет
+        обучающий сэмпл, не трогает decision_logger).
+        """
+        if not self.ml_inference:
+            return None
+        df = await self.ingest.fetch_ohlcv(symbol, "1h", limit=100, market_type=market_type)
+        if df is None or df.empty or len(df) < 50:
+            return None
+        close = float(df.iloc[-1]["close"])
+        features = self.feature_engine.compute_all_indicators(df)
+        latest_features = features.iloc[-1]
+        strategy_data = self._build_strategy_data(symbol, close, latest_features)
+
+        ml_result = await self.ml_inference.predict_direction(strategy_data)
+        if ml_result is None:
+            return None
+        predicted_volatility = None
+        if settings.volatility_adjustment_enabled:
+            predicted_volatility = await self.ml_inference.predict_volatility(strategy_data)
+        return {
+            "proba_up": ml_result.get("proba_up"),
+            "proba_down": ml_result.get("proba_down"),
+            "proba_neutral": ml_result.get("proba_neutral"),
+            "predicted_volatility": predicted_volatility,
+        }
+
     async def _process_symbol(self, symbol: str):
         """Обработка одной пары."""
         df = await self._refresh_symbol_candles(symbol)
@@ -1772,47 +1864,7 @@ class TradingBot:
         await self._record_ml_training_sample(symbol, df)
 
         # Сбор данных для стратегий
-        strategy_data = {
-            "symbol": symbol,
-            "timeframe": "1h",
-            "close": close,
-            "rsi_14": latest_features.get("rsi_14"),
-            "rsi_7": latest_features.get("rsi_7"),
-            "rsi_21": latest_features.get("rsi_21"),
-            "macd": latest_features.get("macd"),
-            "macd_signal": latest_features.get("macd_signal"),
-            "macd_hist": latest_features.get("macd_hist"),
-            "bb_upper": latest_features.get("bb_upper"),
-            "bb_lower": latest_features.get("bb_lower"),
-            "bb_mid": latest_features.get("bb_mid"),
-            "bb_pct": latest_features.get("bb_pct"),
-            "bb_width": latest_features.get("bb_width"),
-            "ema_20": latest_features.get("ema_20"),
-            "ema_50": latest_features.get("ema_50"),
-            "ema_20_slope": latest_features.get("ema_20_slope"),
-            "ema_50_slope": latest_features.get("ema_50_slope"),
-            "price_above_ema20": latest_features.get("price_above_ema20"),
-            "price_above_ema50": latest_features.get("price_above_ema50"),
-            "atr_14": latest_features.get("atr_14"),
-            "natr_14": latest_features.get("natr_14"),
-            "realized_vol_20": latest_features.get("realized_vol_20"),
-            "volume_ratio": latest_features.get("volume_ratio"),
-            "obv": latest_features.get("obv"),
-            "return_1": latest_features.get("return_1"),
-            "return_3": latest_features.get("return_3"),
-            "return_5": latest_features.get("return_5"),
-            "log_return": latest_features.get("log_return"),
-            "momentum_10": latest_features.get("momentum_10"),
-            "dist_from_ema20": latest_features.get("dist_from_ema20"),
-            "dist_from_ema50": latest_features.get("dist_from_ema50"),
-            "high_low_range": latest_features.get("high_low_range"),
-            "stoch_k": latest_features.get("stoch_k"),
-            "stoch_d": latest_features.get("stoch_d"),
-            "wr_14": latest_features.get("wr_14"),
-            "mfi_14": latest_features.get("mfi_14"),
-            "hour": latest_features.get("hour", 0),
-            "day_of_week": latest_features.get("day_of_week", 0),
-        }
+        strategy_data = self._build_strategy_data(symbol, close, latest_features)
 
         # Режим "сигналы"/"алго" (active_trading_mode, переключается кнопкой
         # в шапке дашборда — POST /trading-source-mode): в режиме "signals"

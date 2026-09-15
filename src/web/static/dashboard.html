@@ -761,7 +761,29 @@
     .controls { gap: 8px; margin-bottom: 16px; }
     section { margin-bottom: 14px; }
   }
+
+  /* График цены в развороте подробностей позиции/сделки (см.
+     initTradeChart) — lightweight-charts сам рисует свой canvas внутрь
+     этого контейнера, здесь только рамка/фон под общий стиль карточек. */
+  .trade-chart-container {
+    height: 260px;
+    border-radius: 6px;
+    overflow: hidden;
+    margin-bottom: 8px;
+  }
+  .ml-forecast-badge {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    align-items: center;
+    background: rgba(99,102,241,.08);
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 13px;
+    margin-bottom: 12px;
+  }
 </style>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
 
@@ -1332,6 +1354,13 @@ function renderStats(status, trades) {
 // (плановое обновление раз в несколько секунд) — та же логика, что и
 // expandedTrades для закрытых сделок (см. комментарий там).
 const expandedPositions = new Map();
+// Сырые данные детализации (не HTML) — нужны отдельно от expandedPositions
+// выше, чтобы после restoreExpandedPosition() можно было заново
+// инициализировать ЖИВОЙ график (initPositionChart): кэшированный HTML
+// содержит только статичную заглушку "Загрузка графика…", а не сам canvas
+// lightweight-charts — тот существует лишь как JS-объект, привязанный к
+// DOM-узлу, который перестройка таблицы каждый раз уничтожает заново.
+const expandedPositionDetails = new Map();
 
 function renderPositions(status) {
   const body = document.getElementById("positionsBody");
@@ -1451,6 +1480,8 @@ async function loadPositionDetailInto(cell, symbol) {
     cell.innerHTML = html;
     cell.dataset.loaded = "1";
     if (expandedPositions.has(symbol)) expandedPositions.set(symbol, html);
+    expandedPositionDetails.set(symbol, detail);
+    initPositionChart(detail);
   } catch (err) {
     cell.innerHTML = `<div class="muted" style="padding:10px 16px">Ошибка загрузки: ${err.message}</div>`;
   }
@@ -1471,6 +1502,11 @@ function restoreExpandedPosition(row) {
     const cell = detailsRow.querySelector("td");
     cell.innerHTML = cachedHtml;
     cell.dataset.loaded = "1";
+    // cachedHtml несёт только статичную заглушку графика (см. комментарий
+    // у expandedPositionDetails) — перерисовываем сам canvas заново поверх
+    // восстановленной разметки.
+    const detail = expandedPositionDetails.get(symbol);
+    if (detail) initPositionChart(detail);
   }
 }
 
@@ -1509,6 +1545,180 @@ function tpLevelsHtml(levels) {
       </div>
     </div>
   `;
+}
+
+// ID контейнера графика/ML-бейджа — привязан к идентичности позиции/сделки
+// (не случайный счётчик), т.к. renderPositionDetail/renderTradeDetail
+// вызываются один раз за сессию разворота строки (см. cell.dataset.loaded
+// в loadPositionDetailInto/loadTradeDetailInto — при повторном схлопывании/
+// разворачивании DOM-узел переиспользуется, без повторной загрузки).
+function chartContainerId(prefix, key) {
+  return `${prefix}-${String(key).replace(/[^a-zA-Z0-9]/g, "_")}`;
+}
+
+function chartBlockHtml(prefix, key) {
+  const id = chartContainerId(prefix, key);
+  return `
+    <div class="trade-detail-block">
+      <h4>График цены</h4>
+      <div class="ml-forecast-badge" id="${id}-ml" style="display:none"></div>
+      <div class="trade-chart-container" id="${id}">
+        <div class="muted" style="padding:10px 16px">Загрузка графика…</div>
+      </div>
+    </div>
+  `;
+}
+
+// Рисует candlestick-график (lightweight-charts, см. <script> в <head>) по
+// свечам с биржи (GET /chart/candles — свечи нигде не хранятся в БД,
+// запрашиваются заново каждый раз) с линиями входа/SL/TP и маркерами
+// точек входа/выхода. opts.exits — точки ЗАКРЫТИЯ (частичные TP или
+// финальное закрытие), КАЖДАЯ явно помечена и выделена цветом по PnL —
+// то, что просил пользователь для истории сделок, а не только графика цены
+// как такового.
+async function initTradeChart(containerId, opts) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  if (typeof LightweightCharts === "undefined") {
+    container.innerHTML = `<div class="muted" style="padding:10px 16px">Библиотека графиков не загрузилась</div>`;
+    return;
+  }
+
+  const HOUR_MS = 3600 * 1000;
+  const openedMs = opts.openedAt ? new Date(opts.openedAt).getTime() : null;
+  const closedMs = opts.closedAt ? new Date(opts.closedAt).getTime() : null;
+
+  let sinceMs = null;
+  let limit = 200;
+  if (openedMs) {
+    if (closedMs) {
+      const spanHours = Math.max(1, Math.ceil((closedMs - openedMs) / HOUR_MS));
+      sinceMs = openedMs - 20 * HOUR_MS;
+      limit = Math.min(500, spanHours + 40);
+    } else {
+      const spanHours = Math.max(1, Math.ceil((Date.now() - openedMs) / HOUR_MS));
+      limit = Math.min(500, spanHours + 30);
+    }
+  }
+
+  let candles;
+  try {
+    const params = new URLSearchParams({
+      symbol: opts.symbol, market_type: opts.marketType || "spot", limit: String(limit),
+    });
+    if (sinceMs !== null) params.set("since_ms", String(Math.floor(sinceMs)));
+    const data = await api(`/chart/candles?${params.toString()}`);
+    candles = data.candles || [];
+  } catch (err) {
+    container.innerHTML = `<div class="muted" style="padding:10px 16px">Не удалось загрузить график: ${escapeHtml(err.message)}</div>`;
+    return;
+  }
+  if (!candles.length) {
+    container.innerHTML = `<div class="muted" style="padding:10px 16px">Нет данных для графика</div>`;
+    return;
+  }
+
+  container.innerHTML = "";
+  const chart = LightweightCharts.createChart(container, {
+    layout: { background: { color: "transparent" }, textColor: "#e2e8f0" },
+    grid: { vertLines: { color: "#2d3148" }, horzLines: { color: "#2d3148" } },
+    timeScale: { timeVisible: true, secondsVisible: false, borderColor: "#2d3148" },
+    rightPriceScale: { borderColor: "#2d3148" },
+    width: container.clientWidth,
+    height: container.clientHeight,
+  });
+  const series = chart.addCandlestickSeries({
+    upColor: "#10b981", downColor: "#ef4444",
+    borderUpColor: "#10b981", borderDownColor: "#ef4444",
+    wickUpColor: "#10b981", wickDownColor: "#ef4444",
+  });
+  series.setData(candles);
+
+  if (opts.entryPrice) {
+    series.createPriceLine({
+      price: opts.entryPrice, color: "#6366f1", lineWidth: 1,
+      lineStyle: LightweightCharts.LineStyle.Dashed, title: "Вход",
+    });
+  }
+  if (opts.stopLoss) {
+    series.createPriceLine({
+      price: opts.stopLoss, color: "#ef4444", lineWidth: 1,
+      lineStyle: LightweightCharts.LineStyle.Dashed, title: "SL",
+    });
+  }
+  (opts.takeProfits || []).forEach((tp, i) => {
+    series.createPriceLine({
+      price: tp.price, color: "#10b981", lineWidth: 1,
+      lineStyle: LightweightCharts.LineStyle.Dashed, title: `TP${i + 1}`,
+    });
+  });
+
+  const markers = [];
+  if (openedMs) {
+    markers.push({
+      time: Math.floor(openedMs / 1000), position: "belowBar",
+      color: "#6366f1", shape: "arrowUp", text: "Вход",
+    });
+  }
+  // Точки закрытия — крупнее (size:2) и подписаны, чтобы явно выделяться
+  // на фоне обычных свечей, как просил пользователь ("точку закрытия
+  // позиции пометь и выдели"); зелёный/красный — по знаку PnL этой ноги.
+  (opts.exits || []).forEach(exit => {
+    if (!exit.time) return;
+    const win = exit.pnl >= 0;
+    markers.push({
+      time: Math.floor(exit.time / 1000),
+      position: win ? "aboveBar" : "belowBar",
+      color: win ? "#10b981" : "#ef4444",
+      shape: "circle",
+      size: 2,
+      text: exit.label || "Закрыто",
+    });
+  });
+  if (markers.length) {
+    markers.sort((a, b) => a.time - b.time);
+    series.setMarkers(markers);
+  }
+
+  chart.timeScale().fitContent();
+
+  const resizeObserver = new ResizeObserver(entries => {
+    for (const entry of entries) {
+      chart.applyOptions({ width: entry.contentRect.width, height: entry.contentRect.height });
+    }
+  });
+  resizeObserver.observe(container);
+}
+
+// Честный ML-бейдж (см. докстринг GET /ml/forecast в api.py) — только
+// вероятность роста/падения через ~5ч и ожидаемая волатильность, БЕЗ
+// какой-либо нарисованной "прогнозной линии" на графике: модель бота
+// такое не предсказывает, рисовать это было бы вводящей в заблуждение
+// визуализацией. Бейдж просто скрывается, если модели не обучены —
+// это штатный случай, а не ошибка.
+async function loadMlForecastInto(badgeId, symbol, marketType) {
+  const el = document.getElementById(badgeId);
+  if (!el) return;
+  try {
+    const params = new URLSearchParams({ symbol, market_type: marketType || "spot" });
+    const data = await api(`/ml/forecast?${params.toString()}`);
+    if (!data.available) return;
+    const up = data.proba_up !== null && data.proba_up !== undefined ? Math.round(data.proba_up * 100) : null;
+    const down = data.proba_down !== null && data.proba_down !== undefined ? Math.round(data.proba_down * 100) : null;
+    const vol = data.predicted_volatility !== null && data.predicted_volatility !== undefined
+      ? fmt(data.predicted_volatility * 100, 2) : null;
+    if (up === null && down === null && vol === null) return;
+    el.innerHTML = `
+      🤖 <strong>ML-оценка (~5ч вперёд):</strong>
+      ${up !== null ? `<span style="color:var(--green)">▲ ${up}%</span>` : ""}
+      ${down !== null ? `<span style="color:var(--red)">▼ ${down}%</span>` : ""}
+      ${vol !== null ? `<span class="muted">ожид. волатильность ±${vol}%</span>` : ""}
+    `;
+    el.style.display = "";
+  } catch (err) {
+    // Бейдж просто остаётся скрытым — это необязательное информационное
+    // дополнение, не стоит показывать ошибку ради него.
+  }
 }
 
 function renderPositionDetail(d) {
@@ -1572,12 +1782,32 @@ function renderPositionDetail(d) {
   return `
     <div class="trade-detail">
       ${changesBlock}
+      ${chartBlockHtml("pos-chart", d.symbol)}
       ${tpBlock}
       ${channelBlock}
       ${signalBlock}
       ${logHtml}
     </div>
   `;
+}
+
+// Инициализация графика+ML-бейджа для развёрнутой ОТКРЫТОЙ позиции —
+// вызывается после того, как renderPositionDetail(d) уже вставлен в DOM
+// (см. loadPositionDetailInto), т.к. lightweight-charts рисует canvas в
+// уже существующий контейнер по его id.
+function initPositionChart(d) {
+  const id = chartContainerId("pos-chart", d.symbol);
+  initTradeChart(id, {
+    symbol: d.symbol,
+    marketType: d.market_type,
+    openedAt: d.opened_at,
+    closedAt: null,
+    entryPrice: d.entry_price,
+    stopLoss: d.stop_loss,
+    takeProfits: d.take_profits,
+    exits: [],
+  });
+  loadMlForecastInto(`${id}-ml`, d.symbol, d.market_type);
 }
 
 // Открытые вручную позиции — то же status.paper_positions, что и обычная
@@ -1840,6 +2070,9 @@ let tradesPairFilter = "";
 // стиралось бы при каждой такой перестройке, и подробности закрывались
 // бы сами собой, будто по таймеру.
 const expandedTrades = new Map();
+// Сырые данные детализации — см. комментарий у expandedPositionDetails
+// (тот же приём: перерисовать живой график после restoreExpandedTrade).
+const expandedTradeDetails = new Map();
 
 async function renderTrades() {
   const body = document.getElementById("tradesBody");
@@ -1952,6 +2185,8 @@ async function loadTradeDetailInto(cell, id) {
     cell.innerHTML = html;
     cell.dataset.loaded = "1";
     if (expandedTrades.has(id)) expandedTrades.set(id, html);
+    expandedTradeDetails.set(id, detail);
+    initTradeDetailChart(detail);
     wireTradeDetailButtons(cell, id);
   } catch (err) {
     cell.innerHTML = `<div class="muted" style="padding:10px 16px">Ошибка загрузки: ${err.message}</div>`;
@@ -1999,6 +2234,10 @@ function restoreExpandedTrade(row) {
     cell.innerHTML = cachedHtml;
     cell.dataset.loaded = "1";
     wireTradeDetailButtons(cell, id);
+    // cachedHtml несёт только статичную заглушку графика — см. комментарий
+    // у expandedPositionDetails, тот же приём для закрытых сделок.
+    const detail = expandedTradeDetails.get(id);
+    if (detail) initTradeDetailChart(detail);
   }
 }
 
@@ -2176,11 +2415,42 @@ function renderTradeDetail(d) {
           <div><span class="muted">ID открывающего ордера</span><br>${d.order_id_exchange_open ? escapeHtml(fmtOrderId(d.order_id_exchange_open)) : "—"}</div>
         </div>
       </div>
+      ${chartBlockHtml("trade-chart", d.trade_id)}
       ${ordersHtml}
       ${legsHtml}
       ${logHtml}
     </div>
   `;
+}
+
+// Инициализация графика для развёрнутой ЗАКРЫТОЙ сделки — в отличие от
+// initPositionChart, без ML-бейджа (прогноз имеет смысл только для ещё не
+// решённого будущего движения открытой позиции) и с маркером(ами) точки
+// ЗАКРЫТИЯ на каждую "ногу" (частичные TP1/TP2/TP3 закрываются отдельными
+// Trade — см. d.legs), как явно просил пользователь — выделены цветом по
+// знаку PnL этой ноги и подписаны, а не просто последняя свеча графика.
+function initTradeDetailChart(d) {
+  const id = chartContainerId("trade-chart", d.trade_id);
+  const legs = d.legs || [];
+  const exits = legs
+    .filter(leg => leg.closed_at)
+    .map((leg, i) => ({
+      time: new Date(leg.closed_at).getTime(),
+      pnl: leg.pnl,
+      label: legs.length > 1 ? `Закрыт #${i + 1}` : "Закрыт",
+    }));
+  const takeProfits = d.opening_order && d.opening_order.take_profit !== null && d.opening_order.take_profit !== undefined
+    ? [{ price: d.opening_order.take_profit }] : [];
+  initTradeChart(id, {
+    symbol: d.symbol,
+    marketType: d.market_type,
+    openedAt: d.created_at,
+    closedAt: d.closed_at,
+    entryPrice: d.entry_price,
+    stopLoss: d.opening_order ? d.opening_order.stop_loss : null,
+    takeProfits,
+    exits,
+  });
 }
 
 function fmtModelMetrics(m) {
