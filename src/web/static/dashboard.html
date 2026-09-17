@@ -914,7 +914,7 @@
   <section>
     <h2>Последние сделки</h2>
     <div class="log-filters" style="padding:0 0 12px">
-      <input type="text" id="tradesPairFilter" placeholder="Фильтр по паре (напр. BTC)" style="flex:0 0 200px">
+      <input type="text" id="tradesPairFilter" placeholder="Фильтр по паре (напр. BTC)" style="flex:0 0 200px" autocomplete="off" name="trades-pair-filter" data-lpignore="true" data-1p-ignore>
     </div>
     <div class="table-wrap">
       <table>
@@ -3105,7 +3105,7 @@ function renderChannelSignalsShell(id) {
   const f = getChannelSignalFilters(id);
   return `
     <div class="log-filters" style="padding:10px 16px 0">
-      <input type="text" class="channel-signal-pair-filter" placeholder="Пара (напр. BTC)" value="${escapeHtml(f.pair)}" style="flex:0 0 140px">
+      <input type="text" class="channel-signal-pair-filter" placeholder="Пара (напр. BTC)" value="${escapeHtml(f.pair)}" style="flex:0 0 140px" autocomplete="off" name="channel-signal-pair-filter" data-lpignore="true" data-1p-ignore>
       <input type="date" class="channel-signal-date-filter" value="${f.date}" style="flex:0 0 150px" title="Дата сигнала">
       <select class="channel-signal-decision-filter" style="flex:0 0 160px">
         <option value="all" ${f.decision === "all" ? "selected" : ""}>Все решения</option>
