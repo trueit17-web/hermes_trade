@@ -17,8 +17,15 @@ from sqlalchemy.orm import selectinload
 
 from src.config import settings
 from src.db.models import (
+    BotEvent,
+    Candle,
     Exchange,
+    LogEntry,
     Order,
+    PerformanceSnapshot,
+    RiskCloseEvent,
+    RiskLock,
+    Signal,
     Strategy,
     Symbol,
     TelegramSignal,
@@ -1077,6 +1084,86 @@ class ExecutionEngine:
         logger.warning(
             f"🔄 Paper-аккаунт сброшен: удалено ордеров={len(order_ids)}, сделок={len(trade_ids)}, "
             f"баланс возвращён к {self.paper_balance:.2f}"
+        )
+        return {"orders_deleted": len(order_ids), "trades_deleted": len(trade_ids)}
+
+    async def clear_test_and_demo_data(self) -> dict:
+        """
+        Очистить ВСЮ накопленную торговую историю (paper И real/demo —
+        в отличие от reset_paper_account, который трогает только
+        Exchange.is_paper=True) перед переходом на боевую торговлю. В
+        режиме real+sandbox (демо-счёт биржи, например api-demo.bybit.com)
+        ордера/сделки пишутся под ТЕМ ЖЕ Exchange-рядом is_paper=False, что
+        и настоящие боевые сделки (см. _resolve_symbol_id) — reset_paper_
+        account их не видит вообще, поэтому нужен отдельный, более широкий
+        сброс именно перед выключением use_exchange_sandbox.
+
+        НЕ трогает данные, на которых обучаются ML-модели:
+        - ml_features (см. FeatureEngine.extract_features_for_ml) —
+          признаки/метки для direction/volatility моделей, не привязаны к
+          конкретным Order/Trade;
+        - historical_signals (см. history_backfill.py/signal_quality_
+          training.py) — размеченные примеры для quality-scorer сигналов,
+          отдельная таблица от live TelegramSignal специально для этого;
+        - ml_models — реестр уже обученных версий моделей и их метрик.
+        Также не трогает конфигурацию (telegram_channels, bot_config,
+        symbols, exchanges, strategies) — это не тестовые ДАННЫЕ, а
+        настройки, которые нужны и после перехода на реальную торговлю.
+
+        Вызывающий код (API-эндпоинт) обязан убедиться, что нет открытых
+        позиций (paper и real) ДО вызова — очистка истории при открытой
+        позиции оставила бы её "повисшей" без какой-либо истории входа.
+        """
+        async with get_session() as session:
+            order_ids = (await session.execute(select(Order.id))).scalars().all()
+            trade_ids = (await session.execute(select(Trade.id))).scalars().all()
+
+            # Тот же паттерн, что и в reset_paper_account: отвязываем
+            # TelegramSignal, а не удаляем — сырое сообщение канала и
+            # решение бота (executed/rejected/pending) остаются в истории,
+            # просто теряют ссылку на удалённые ордер/сделку.
+            if order_ids:
+                await session.execute(update(TelegramSignal).values(executed_order_id=None))
+            if trade_ids:
+                await session.execute(update(TelegramSignal).values(executed_trade_id=None))
+                await session.execute(delete(TradeDecisionLog))
+                await session.execute(delete(Trade))
+            if order_ids:
+                await session.execute(delete(Order))
+
+            await session.execute(delete(RiskCloseEvent))
+            await session.execute(delete(RiskLock))
+            await session.execute(delete(PerformanceSnapshot))
+            await session.execute(delete(LogEntry))
+            await session.execute(delete(BotEvent))
+            await session.execute(delete(Candle))
+            await session.execute(delete(Signal))
+
+            await session.commit()
+
+        self.paper_positions = {}
+        self.paper_balance = settings.startup_capital_usdt
+        self.real_positions = {}
+
+        if self.is_paper:
+            risk_manager.reset_for_new_paper_account()
+        else:
+            # Реальный баланс биржи (демо или боевой) — та же логика, что
+            # и после sweep_balances_to_usdt: без пересчёта базы просадка
+            # считалась бы от устаревшего/нулевого старта.
+            try:
+                exchange = self.exchange
+                if exchange is not None:
+                    balance = await exchange.fetch_balance()
+                    total_usdt = self._extract_currency_balance(balance, "USDT", "total")
+                    risk_manager.reset_for_real_account(total_usdt)
+            except Exception as e:
+                logger.warning(f"Не удалось пересчитать базу просадки после очистки демо-данных: {e}")
+
+        logger.warning(
+            f"🧹 Тестовые/демо-данные очищены перед переходом на боевую торговлю: "
+            f"ордеров={len(order_ids)}, сделок={len(trade_ids)} "
+            f"(ml_features/historical_signals/ml_models не затронуты)"
         )
         return {"orders_deleted": len(order_ids), "trades_deleted": len(trade_ids)}
 

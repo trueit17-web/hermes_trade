@@ -874,6 +874,7 @@
     <button id="btnKillSwitch" class="btn-danger">🔴 Kill Switch</button>
     <button id="btnClearKill" class="btn-ghost">Сбросить Kill Switch</button>
     <button id="btnResetPaper" class="btn-danger" title="Удалить всю paper-историю и начать с чистого баланса">🗑 Сбросить paper-аккаунт</button>
+    <button id="btnClearTestData" class="btn-danger" title="Удалить всю тестовую/демо-историю (paper и real+sandbox) перед переходом на боевую торговлю — не трогает данные ML-моделей">🧹 Очистить тестовые/демо-данные</button>
     <button id="btnRefresh" class="btn-primary">↻ Обновить</button>
   </div>
 
@@ -4143,6 +4144,39 @@ document.getElementById("btnResetPaper").addEventListener("click", async () => {
   try {
     const result = await api("/paper/reset", { method: "POST" });
     showToast(`Paper-аккаунт сброшен: удалено ордеров ${result.orders_deleted}, сделок ${result.trades_deleted}`);
+    await refreshAll();
+  } catch (err) {
+    showToast(`Ошибка: ${err.message}`, true);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// В отличие от btnResetPaper (только paper), эта кнопка чистит ВСЮ
+// торговую историю, включая real+sandbox (демо-счёт биржи) — по масштабу
+// необратимости просим не просто OK/Cancel, а набрать слово подтверждения
+// (тот же паттерн, что и сервер ожидает в /admin/clear-test-data).
+document.getElementById("btnClearTestData").addEventListener("click", async () => {
+  const phrase = "УДАЛИТЬ";
+  const typed = prompt(
+    "Очистить ВСЮ тестовую/демо-историю (paper и real+sandbox) перед переходом " +
+    "на боевую торговлю?\n\nЭто НЕОБРАТИМО удалит все ордера, сделки, decision log, " +
+    "графики производительности, логи и блокировки Protections.\n\n" +
+    "Данные ML-моделей (обучающие признаки, история сигналов каналов для " +
+    "quality-scorer, реестр обученных моделей) НЕ затрагиваются.\n\n" +
+    `Наберите «${phrase}», чтобы подтвердить:`
+  );
+  if (typed !== phrase) {
+    if (typed !== null) showToast("Отменено — фраза подтверждения не совпала", true);
+    return;
+  }
+  const btn = document.getElementById("btnClearTestData");
+  btn.disabled = true;
+  try {
+    const result = await api("/admin/clear-test-data", {
+      method: "POST", body: JSON.stringify({ confirm: phrase }),
+    });
+    showToast(`Тестовые/демо-данные очищены: удалено ордеров ${result.orders_deleted}, сделок ${result.trades_deleted}`);
     await refreshAll();
   } catch (err) {
     showToast(`Ошибка: ${err.message}`, true);

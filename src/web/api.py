@@ -238,6 +238,11 @@ class BacktestRequest(BaseModel):
     paper_balance: float = 10000.0
 
 
+class ClearTestDataRequest(BaseModel):
+    """Запрос на очистку тестовых/демо-данных перед боевой торговлей."""
+    confirm: str
+
+
 class PositionCloseRequest(BaseModel):
     """Запрос на ручное закрытие открытой paper-позиции."""
     symbol: str
@@ -520,6 +525,53 @@ async def reset_paper_account():
     risk_manager.reset_for_new_paper_account()
 
     logger.warning(f"🔄 Paper-аккаунт сброшен через веб-панель: {result}")
+    return {"success": True, **result}
+
+
+_CLEAR_TEST_DATA_CONFIRM_PHRASE = "УДАЛИТЬ"
+
+
+@app.post("/admin/clear-test-data")
+async def clear_test_data(payload: ClearTestDataRequest):
+    """
+    Очистить ВСЮ накопленную торговую историю (paper И real/demo — в
+    отличие от /paper/reset, который трогает только paper) перед переходом
+    на боевую торговлю (выключением use_exchange_sandbox). ML-обучающие
+    таблицы (ml_features, historical_signals, ml_models) и конфигурация
+    (telegram_channels, bot_config, symbols, exchanges, strategies) не
+    затрагиваются — см. docstring execution_engine.clear_test_and_demo_data.
+
+    Намеренно недоступно после реального перехода на боевую торговлю
+    (is_paper=False и use_exchange_sandbox=False) — иначе эта же кнопка
+    могла бы случайно стереть уже настоящую торговую историю.
+    """
+    if not settings.is_paper and not settings.use_exchange_sandbox:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Недоступно в боевом режиме (real, без sandbox) — очищать уже нечего, "
+                "это не тестовые/демо-данные."
+            ),
+        )
+    if payload.confirm.strip() != _CLEAR_TEST_DATA_CONFIRM_PHRASE:
+        raise HTTPException(status_code=400, detail="Неверная фраза подтверждения")
+
+    open_positions_count = len(execution_engine.paper_positions) + len(execution_engine.real_positions)
+    if open_positions_count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Сначала закройте все открытые позиции (сейчас открыто: {open_positions_count})",
+        )
+
+    result = await execution_engine.clear_test_and_demo_data()
+
+    bot = bot_registry.current_bot
+    if bot is not None:
+        bot.closed_trades = []
+        bot.daily_pnl = 0.0
+        bot.open_positions = {}
+
+    logger.warning(f"🧹 Тестовые/демо-данные очищены через веб-панель: {result}")
     return {"success": True, **result}
 
 

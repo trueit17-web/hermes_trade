@@ -5624,6 +5624,305 @@ class TestPaperAccountReset(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(sig.executed_trade_id)
 
 
+class TestClearTestAndDemoData(unittest.IsolatedAsyncioTestCase):
+    """
+    Кнопка "Очистить тестовые/демо-данные" перед переходом на боевую
+    торговлю — в отличие от reset_paper_account (только Exchange.is_paper=
+    True), должна очистить историю ОБОИХ режимов: paper и real+sandbox
+    (демо-счёт биржи пишет ордера под тем же Exchange-рядом is_paper=False,
+    что и настоящая боевая торговля — см. _resolve_symbol_id), но НЕ
+    трогать данные, на которых обучаются ML-модели, и не трогать
+    конфигурацию (Telegram-каналы, настройки).
+    """
+
+    async def test_clears_all_trading_history_but_preserves_ml_and_config_data(self):
+        from sqlalchemy import select
+        from src.db.models import (
+            BotConfig, BotEvent, Candle, Exchange, HistoricalSignal, LogEntry,
+            MLFeature, MLModel, Order, PerformanceSnapshot, RiskCloseEvent,
+            RiskLock, Signal, Strategy, Symbol, TelegramChannel, TelegramSignal,
+            Trade, TradeDecisionLog,
+        )
+        from src.db.session import get_session
+        from src.execution.executor import ExecutionEngine
+        from src.risk.risk_manager import RiskManager
+        from src.utils.timeutils import utcnow
+
+        async with get_session() as session:
+            paper_ex = Exchange(name="cleartest_paper", is_paper=True)
+            real_ex = Exchange(name="cleartest_real", is_paper=False)
+            strategy = Strategy(name="cleartest-strategy", strategy_type="rule")
+            session.add_all([paper_ex, real_ex, strategy])
+            await session.flush()
+
+            paper_sym = Symbol(exchange_id=paper_ex.id, symbol="CLEARCOIN/USDT", base_asset="CLEARCOIN", quote_asset="USDT")
+            real_sym = Symbol(exchange_id=real_ex.id, symbol="CLEARCOIN/USDT", base_asset="CLEARCOIN", quote_asset="USDT")
+            session.add_all([paper_sym, real_sym])
+            await session.flush()
+
+            paper_order = Order(exchange_id=paper_ex.id, symbol_id=paper_sym.id, side="buy", order_type="market",
+                                 amount=1.0, price=100.0, status="filled", filled_amount=1.0, filled_price=100.0, fee=1.0)
+            # real+sandbox (демо) пишет под is_paper=False — именно этот
+            # случай reset_paper_account не видит, а этот метод обязан чистить.
+            real_order = Order(exchange_id=real_ex.id, symbol_id=real_sym.id, side="buy", order_type="market",
+                                amount=1.0, price=100.0, status="filled", filled_amount=1.0, filled_price=100.0, fee=1.0)
+            session.add_all([paper_order, real_order])
+            await session.flush()
+
+            paper_trade = Trade(symbol_id=paper_sym.id, direction="long", entry_price=100, exit_price=90,
+                                 amount=1.0, pnl=-10.0, pnl_pct=-10.0, outcome="loss", is_open=False,
+                                 order_open_id=paper_order.id, closed_at=utcnow())
+            real_trade = Trade(symbol_id=real_sym.id, direction="long", entry_price=100, exit_price=110,
+                                amount=1.0, pnl=10.0, pnl_pct=10.0, outcome="win", is_open=False,
+                                order_open_id=real_order.id, closed_at=utcnow())
+            session.add_all([paper_trade, real_trade])
+            await session.flush()
+
+            session.add(TradeDecisionLog(trade_id=paper_trade.id, step_order=1, step_type="execution", description="x", details={}))
+            session.add(TradeDecisionLog(trade_id=real_trade.id, step_order=1, step_type="execution", description="y", details={}))
+
+            channel = TelegramChannel(channel_id="@cleartest_channel", channel_title="X", active=True)
+            session.add(channel)
+            await session.flush()
+            signal = TelegramSignal(
+                channel_id=channel.id, raw_message="m", message_date=utcnow(),
+                parsed_pair="CLEARCOIN/USDT", parsed_side="long", parsed_entry=100.0,
+                decision="executed", executed_order_id=real_order.id, executed_trade_id=real_trade.id,
+            )
+            session.add(signal)
+
+            # Данные ML-моделей — НЕ должны быть затронуты.
+            ml_feature = MLFeature(
+                symbol="CLEARCOIN/USDT", timeframe="1h", timestamp=utcnow(),
+                features={"rsi_14": 55.0}, label_direction=1, source="live",
+            )
+            historical_signal = HistoricalSignal(
+                channel_id=channel.id, telegram_message_id=12345, raw_message="hist",
+                message_date=utcnow(), parse_status="parsed", parsed_pair="CLEARCOIN/USDT",
+            )
+            ml_model = MLModel(model_type="direction_classifier", version=1, params={}, metrics={}, is_active=True)
+            bot_config = BotConfig(config_key="cleartest_setting", config_value={"value": 1}, source="settings_ui")
+            session.add_all([ml_feature, historical_signal, ml_model, bot_config])
+
+            # "Мусорные"/легаси таблицы, которые тоже должны быть очищены.
+            session.add(RiskCloseEvent(scope_key="telegram:@cleartest_channel", symbol="CLEARCOIN/USDT", reason="stop_loss"))
+            session.add(RiskLock(scope_key="global", reason="test", until=utcnow()))
+            session.add(PerformanceSnapshot(total_balance=1000.0))
+            session.add(LogEntry(level="INFO", logger="test", message="demo log"))
+            session.add(BotEvent(level="INFO", source="test", message="demo event"))
+            session.add(Candle(exchange_id=real_ex.id, symbol_id=real_sym.id, timeframe="1h",
+                                open_time=utcnow(), open=1, high=1, low=1, close=1, volume=1))
+            session.add(Signal(strategy_id=strategy.id, symbol_id=real_sym.id, side="long",
+                                confidence=0.9, position_size_pct=5.0, timeframe="1h", rationale="x"))
+
+            await session.commit()
+            ids = {
+                "paper_order": paper_order.id, "real_order": real_order.id,
+                "paper_trade": paper_trade.id, "real_trade": real_trade.id,
+                "signal": signal.id, "ml_feature": ml_feature.id,
+                "historical_signal": historical_signal.id, "ml_model": ml_model.id,
+                "bot_config": bot_config.id, "channel": channel.id,
+            }
+
+        engine = ExecutionEngine()
+        engine.is_paper = True
+        engine.paper_balance = 100.0
+        engine.paper_positions = {"CLEARCOIN/USDT": {"amount": 1.0, "entry_price": 100.0, "side": "long"}}
+        rm = RiskManager()
+        rm.state.total_drawdown_pct = 90.0
+        rm.state.paused = True
+
+        with patch("src.execution.executor.risk_manager", rm):
+            result = await engine.clear_test_and_demo_data()
+
+        # >=2, а не ==2: метод чистит ВСЮ таблицу целиком (это его смысл —
+        # "начать с чистого листа" перед боевой торговлей), поэтому в общей
+        # тестовой БД могут остаться строки от других тестов, запущенных
+        # раньше в этом же прогоне — важен сам факт удаления НАШИХ строк
+        # (проверяется ниже по id), а не точное глобальное число.
+        self.assertGreaterEqual(result["orders_deleted"], 2)
+        self.assertGreaterEqual(result["trades_deleted"], 2)
+        self.assertEqual(engine.paper_positions, {})
+        self.assertEqual(engine.paper_balance, settings.startup_capital_usdt)
+        self.assertEqual(engine.real_positions, {})
+        # Paper-режим -> тот же сброс базы просадки, что и у /paper/reset.
+        self.assertEqual(rm.state.total_drawdown_pct, 0.0)
+        self.assertFalse(rm.state.paused)
+
+        async with get_session() as session:
+            for model, id_key in (
+                (Order, "paper_order"), (Order, "real_order"),
+                (Trade, "paper_trade"), (Trade, "real_trade"),
+            ):
+                self.assertIsNone(
+                    (await session.execute(select(model).where(model.id == ids[id_key]))).scalar_one_or_none(),
+                    f"{model.__name__} {id_key} должен быть удалён (в т.ч. real+sandbox, не только paper)",
+                )
+
+            remaining_logs = (await session.execute(select(TradeDecisionLog))).scalars().all()
+            self.assertEqual(remaining_logs, [])
+
+            self.assertEqual((await session.execute(select(RiskCloseEvent))).scalars().all(), [])
+            self.assertEqual((await session.execute(select(RiskLock))).scalars().all(), [])
+            self.assertEqual((await session.execute(select(PerformanceSnapshot))).scalars().all(), [])
+            self.assertEqual((await session.execute(select(LogEntry))).scalars().all(), [])
+            self.assertEqual((await session.execute(select(BotEvent))).scalars().all(), [])
+            self.assertEqual((await session.execute(select(Candle))).scalars().all(), [])
+            self.assertEqual((await session.execute(select(Signal))).scalars().all(), [])
+
+            # Сигнал канала остаётся (сырое сообщение — часть истории канала),
+            # но ссылки на удалённые ордер/сделку отвязаны, не каскадом удалены.
+            sig = (await session.execute(select(TelegramSignal).where(TelegramSignal.id == ids["signal"]))).scalar_one()
+            self.assertIsNone(sig.executed_order_id)
+            self.assertIsNone(sig.executed_trade_id)
+
+            # Данные ML-моделей и конфигурация не затронуты.
+            self.assertIsNotNone(
+                (await session.execute(select(MLFeature).where(MLFeature.id == ids["ml_feature"]))).scalar_one_or_none()
+            )
+            self.assertIsNotNone(
+                (await session.execute(
+                    select(HistoricalSignal).where(HistoricalSignal.id == ids["historical_signal"])
+                )).scalar_one_or_none()
+            )
+            self.assertIsNotNone(
+                (await session.execute(select(MLModel).where(MLModel.id == ids["ml_model"]))).scalar_one_or_none()
+            )
+            self.assertIsNotNone(
+                (await session.execute(select(BotConfig).where(BotConfig.id == ids["bot_config"]))).scalar_one_or_none()
+            )
+            self.assertIsNotNone(
+                (await session.execute(
+                    select(TelegramChannel).where(TelegramChannel.id == ids["channel"])
+                )).scalar_one_or_none()
+            )
+
+    async def test_real_mode_recalculates_drawdown_base_from_exchange_balance(self):
+        """
+        В real+sandbox (не paper) нет startup_capital_usdt для сброса базы —
+        нужно перечитать РЕАЛЬНЫЙ баланс биржи (демо-счёт), тот же паттерн,
+        что и после sweep_balances_to_usdt (см. reset_for_real_account)."""
+        from src.execution.executor import ExecutionEngine
+        from src.risk.risk_manager import RiskManager
+
+        engine = ExecutionEngine()
+        engine.is_paper = False
+        engine.real_positions = {}
+        engine.paper_positions = {}
+        mock_exchange = AsyncMock()
+        mock_exchange.fetch_balance = AsyncMock(return_value={"total": {"USDT": 555.0}})
+        engine.exchange = mock_exchange
+
+        rm = RiskManager()
+        original_trading_mode = settings.trading_mode
+        settings.trading_mode = "real"
+        try:
+            with patch("src.execution.executor.risk_manager", rm):
+                await engine.clear_test_and_demo_data()
+        finally:
+            settings.trading_mode = original_trading_mode
+
+        self.assertEqual(rm.state.start_balance, 555.0)
+        self.assertEqual(rm.state.current_balance, 555.0)
+        self.assertEqual(rm.state.total_drawdown_pct, 0.0)
+
+
+class TestClearTestDataEndpoint(unittest.IsolatedAsyncioTestCase):
+    """
+    POST /admin/clear-test-data — тонкий слой валидации поверх
+    execution_engine.clear_test_and_demo_data: неверная фраза
+    подтверждения, открытые позиции или уже боевой режим (не paper и не
+    sandbox) должны отклонять запрос, ничего не удаляя и не трогая.
+    """
+
+    def setUp(self):
+        import src.bot_registry as bot_registry
+        import src.main as main_module
+        import src.web.api as api_module
+        from src.execution.executor import execution_engine
+
+        self.main_module = main_module
+        self.bot_registry = bot_registry
+        self.api_module = api_module
+        self.execution_engine = execution_engine
+        self.HTTPException = __import__("fastapi").HTTPException
+        self._saved_current_bot = bot_registry.current_bot
+        self._saved_paper_positions = execution_engine.paper_positions
+        self._saved_real_positions = execution_engine.real_positions
+        self._saved_clear_method = execution_engine.clear_test_and_demo_data
+        self._saved_trading_mode = settings.trading_mode
+        self._saved_sandbox = settings.use_exchange_sandbox
+        execution_engine.paper_positions = {}
+        execution_engine.real_positions = {}
+        execution_engine.clear_test_and_demo_data = AsyncMock(
+            return_value={"orders_deleted": 3, "trades_deleted": 2}
+        )
+        settings.trading_mode = "paper"
+
+    def tearDown(self):
+        self.bot_registry.current_bot = self._saved_current_bot
+        self.execution_engine.paper_positions = self._saved_paper_positions
+        self.execution_engine.real_positions = self._saved_real_positions
+        self.execution_engine.clear_test_and_demo_data = self._saved_clear_method
+        settings.trading_mode = self._saved_trading_mode
+        settings.use_exchange_sandbox = self._saved_sandbox
+
+    def _payload(self, confirm="УДАЛИТЬ"):
+        return self.api_module.ClearTestDataRequest(confirm=confirm)
+
+    async def test_rejects_wrong_confirmation_phrase(self):
+        with self.assertRaises(self.HTTPException) as ctx:
+            await self.api_module.clear_test_data(self._payload(confirm="да, удали"))
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.execution_engine.clear_test_and_demo_data.assert_not_awaited()
+
+    async def test_rejects_when_paper_positions_open(self):
+        self.execution_engine.paper_positions = {"BTC/USDT": {"amount": 1.0}}
+        with self.assertRaises(self.HTTPException) as ctx:
+            await self.api_module.clear_test_data(self._payload())
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.execution_engine.clear_test_and_demo_data.assert_not_awaited()
+
+    async def test_rejects_when_real_positions_open(self):
+        self.execution_engine.real_positions = {"BTC/USDT": {"amount": 1.0}}
+        with self.assertRaises(self.HTTPException) as ctx:
+            await self.api_module.clear_test_data(self._payload())
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.execution_engine.clear_test_and_demo_data.assert_not_awaited()
+
+    async def test_rejects_when_fully_live_not_paper_not_sandbox(self):
+        settings.trading_mode = "real"
+        settings.use_exchange_sandbox = False
+        with self.assertRaises(self.HTTPException) as ctx:
+            await self.api_module.clear_test_data(self._payload())
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.execution_engine.clear_test_and_demo_data.assert_not_awaited()
+
+    async def test_allows_real_mode_with_sandbox_enabled(self):
+        settings.trading_mode = "real"
+        settings.use_exchange_sandbox = True
+
+        result = await self.api_module.clear_test_data(self._payload())
+
+        self.assertTrue(result["success"])
+        self.execution_engine.clear_test_and_demo_data.assert_awaited_once()
+
+    async def test_success_clears_data_and_resets_bot_in_memory_state(self):
+        bot = self.main_module.TradingBot()
+        bot.closed_trades = [{"symbol": "OLD/USDT"}]
+        bot.daily_pnl = 123.45
+        bot.open_positions = {"OLD/USDT": {}}
+        self.bot_registry.current_bot = bot
+
+        result = await self.api_module.clear_test_data(self._payload())
+
+        self.assertEqual(result, {"success": True, "orders_deleted": 3, "trades_deleted": 2})
+        self.execution_engine.clear_test_and_demo_data.assert_awaited_once()
+        self.assertEqual(bot.closed_trades, [])
+        self.assertEqual(bot.daily_pnl, 0.0)
+        self.assertEqual(bot.open_positions, {})
+
+
 class TestCreateOrderWithoutSlTp(unittest.IsolatedAsyncioTestCase):
     """
     create_order()'s own log line did f"{stop_loss:.2f}" unconditionally —
