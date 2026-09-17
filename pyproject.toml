@@ -1,12 +1,10 @@
 [tool.ruff]
-# ВАЖНО: прод-сервер (/opt/cryptobot) реально работает на Python 3.10, а не
-# на версии из requirements.txt/README. target-version="py312" здесь раньше
-# заставлял UP017 рекомендовать datetime.UTC (алиас появился только в 3.11)
-# — реальный инцидент: код с этим алиасом падал ImportError'ом на проде при
-# каждой попытке импорта (alembic env.py -> src.db.models -> timeutils.py).
-# Держите это в синхроне с реальной версией на сервере (проверить: python3
-# --version внутри /opt/cryptobot/venv), а не с тем, что удобнее для кода.
-target-version = "py310"
+# Прод реально работает в Docker (см. Dockerfile: FROM python:3.12-slim) —
+# это ЕДИНСТВЕННЫЙ источник истины про версию Python в проде, а не что-либо
+# на хосте сервера (там может стоять венв/интерпретатор другой версии для
+# ручных операций — он НЕ то, что исполняет src/, см. CLAUDE.md). Держите
+# target-version в синхроне с базовым образом в Dockerfile.
+target-version = "py312"
 line-length = 120
 
 [tool.ruff.lint]

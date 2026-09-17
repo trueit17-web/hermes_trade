@@ -6,13 +6,8 @@ datetime в UTC, вычисленный через datetime.now(timezone.utc) б
 предупреждения. Значение бит-в-бит совпадает со старым datetime.utcnow(),
 поэтому её можно безопасно использовать и как default= для колонок
 DateTime (без timezone=True) в src/db/models.py — тип колонок не меняется.
-
-Импортируем timezone.utc, а не алиас datetime.UTC (тот появился только в
-Python 3.11) — прод-сервер работает на Python 3.10.
 """
-from datetime import datetime, timezone
-
-UTC = timezone.utc
+from datetime import UTC, datetime
 
 
 def utcnow() -> datetime:

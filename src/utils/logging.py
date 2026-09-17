@@ -3,7 +3,7 @@ import json
 import logging
 import queue
 from collections import deque
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from rich.console import Console
@@ -39,7 +39,7 @@ class RingBufferHandler(logging.Handler):
     def emit(self, record: logging.LogRecord):
         try:
             entry = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
                 "level": record.levelname,
                 "logger": record.name,
                 "message": record.getMessage(),
@@ -154,7 +154,7 @@ class StructuredFormatter(logging.Formatter):
 
     def _format_structured(self, record: logging.LogRecord) -> str:
         log_obj: dict[str, Any] = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),

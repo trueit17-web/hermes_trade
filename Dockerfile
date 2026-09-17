@@ -2,9 +2,13 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Системные зависимости (libgomp1 нужен lightgbm — OpenMP рантайм)
+# Системные зависимости: libgomp1 нужен lightgbm (OpenMP рантайм), curl —
+# для healthcheck в docker-compose.yml (curl -f http://localhost:8000/health).
+# python:3.12-slim не содержит curl по умолчанию — без него healthcheck
+# всегда падал бы с "command not found" независимо от реального состояния
+# приложения (сам бот при этом отвечал нормально снаружи через nginx).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 \
+    && apt-get install -y --no-install-recommends libgomp1 curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Установка зависимостей

@@ -2,7 +2,7 @@
 import asyncio
 import logging
 import uuid
-from datetime import timezone
+from datetime import UTC
 
 # ccxt.pro (не отдельный платный пакет, а часть того же ccxt, что уже
 # стоит в requirements.txt) — прямой подкласс ccxt.async_support для
@@ -3960,8 +3960,8 @@ class ExecutionEngine:
             # opened_at — наивный datetime в UTC (см. utcnow); .timestamp()
             # на наивном datetime трактует его как ЛОКАЛЬНОЕ время, а не
             # UTC, и даёт неверный epoch вне контейнеров с TZ=UTC — сначала
-            # явно проставляем tzinfo=timezone.utc, как и utcnow_timestamp.
-            opened_at_ts = opened_at.replace(tzinfo=timezone.utc).timestamp() * 1000
+            # явно проставляем tzinfo=UTC, как и utcnow_timestamp.
+            opened_at_ts = opened_at.replace(tzinfo=UTC).timestamp() * 1000
             closing_side = "sell" if pos.get("side", "long") == "long" else "buy"
             closing_trades = [
                 t for t in recent

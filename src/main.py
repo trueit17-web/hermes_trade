@@ -4,7 +4,7 @@ import math
 import signal
 import statistics
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
 
 import pandas as pd
@@ -2728,7 +2728,7 @@ async def _flush_pending_log_records() -> int:
                     # исключением на каждой записи. Раньше эта ошибка
                     # молчала на debug — /logs (теперь читает только из
                     # LogEntry) оставался пустым без единой подсказки почему.
-                    timestamp=datetime.fromisoformat(r["timestamp"]).astimezone(timezone.utc).replace(tzinfo=None),
+                    timestamp=datetime.fromisoformat(r["timestamp"]).astimezone(UTC).replace(tzinfo=None),
                     level=r["level"],
                     logger=r["logger"],
                     message=r["message"],
