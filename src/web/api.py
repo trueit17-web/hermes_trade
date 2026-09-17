@@ -212,6 +212,7 @@ class TelegramChannelCreate(BaseModel):
     auto_execute: bool = False
     position_size_pct: float = 5.0
     market: str = "spot"
+    exact_execution: bool = False
 
 
 class TelegramChannelUpdate(BaseModel):
@@ -221,6 +222,7 @@ class TelegramChannelUpdate(BaseModel):
     auto_execute: bool | None = None
     position_size_pct: float | None = None
     market: str | None = None
+    exact_execution: bool | None = None
 
 
 class TelegramSignalDecision(BaseModel):
@@ -1901,6 +1903,7 @@ async def list_telegram_channels():
                     "quality_threshold": c.quality_threshold,
                     "position_size_pct": c.position_size_pct,
                     "market": c.market,
+                    "exact_execution": c.exact_execution,
                     "signals_count": len(c.signals),
                     "created_at": c.created_at.isoformat() + "Z" if c.created_at else None,
                 }
@@ -1940,6 +1943,7 @@ async def create_telegram_channel(channel: TelegramChannelCreate):
             auto_execute=channel.auto_execute,
             position_size_pct=channel.position_size_pct,
             market=channel.market,
+            exact_execution=channel.exact_execution,
             active=True,
         )
         session.add(new_channel)
@@ -1967,6 +1971,7 @@ async def create_telegram_channel(channel: TelegramChannelCreate):
             "channel_title": new_channel.channel_title,
             "parser_type": new_channel.parser_type,
             "auto_execute": new_channel.auto_execute,
+            "exact_execution": new_channel.exact_execution,
         }}
 
 
@@ -2422,6 +2427,7 @@ async def decide_telegram_signal(signal_id: int, decision: TelegramSignalDecisio
             "parsed_leverage": float(signal.parsed_leverage) if signal.parsed_leverage else None,
             "channel_position_size_pct": signal.channel.position_size_pct if signal.channel else 5.0,
             "channel_market_type": signal.channel.market if signal.channel else settings.market_type,
+            "channel_exact_execution": signal.channel.exact_execution if signal.channel else False,
         }
         pair = signal.parsed_pair
 

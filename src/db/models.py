@@ -259,6 +259,19 @@ class TelegramChannel(Base):
     # (тумблер в шапке дашборда), хотя разные каналы обычно рассчитаны на
     # разный тип торговли (см. _execute_telegram_signal в main.py).
     market: Mapped[str] = mapped_column(String(10), default="spot", server_default="spot")
+    # Исключить канал из ОБЩИХ ДЛЯ ВСЕХ КАНАЛОВ автоправок сигнала (см.
+    # _execute_telegram_signal в main.py: settings.telegram_signals_
+    # max_leverage/default_sl_pct/min_sl_pct_of_margin/max_sl_pct_of_margin
+    # и множитель expectancy_sizing по истории канала) — при включении
+    # цена входа/SL/TP/плечо исполняются РОВНО такими, какими их прислал
+    # канал, без каких-либо автоматических виджет/капов/дефолтов, а размер
+    # позиции не масштабируется по матожиданию канала. Портфельные
+    # ограничения (лимит числа/суммарной экспозиции позиций, kill switch,
+    # пауза, дневной лимит убытка) НЕ отключаются — это отдельная защита
+    # всего счёта, а не автоправка конкретного сигнала. Осознанный выбор
+    # доверия конкретному каналу — если он не укажет SL, позиция откроется
+    # вообще без биржевой защиты.
+    exact_execution: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(

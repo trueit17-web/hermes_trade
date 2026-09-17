@@ -943,13 +943,17 @@
         <input type="checkbox" id="channelAutoExecuteInput">
         Автоисполнение
       </label>
+      <label class="checkbox-label" title="Сигнал исполняется ровно с теми ценой входа/SL/TP/плечом, что прислал канал, без общих для каналов автоправок и капов">
+        <input type="checkbox" id="channelExactExecutionInput">
+        Точно как в сигнале
+      </label>
       <button type="submit" class="btn-primary" title="Добавить канал">+</button>
       <button type="button" id="btnRestartBot" class="btn-warn" title="Перезапустить бота">🔄</button>
     </form>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Канал</th><th>ID</th><th>Порог</th><th>Размер (%)</th><th>Рынок</th><th>Авто</th><th>Сигналов</th><th>Исполнено</th><th title="Сколько из исполненных сигналов канала сейчас реально открыто">Открытых</th><th>Win rate</th><th>PnL</th><th>Sizing</th><th>Активен</th><th></th></tr></thead>
-        <tbody id="telegramBody"><tr class="empty-row"><td colspan="14">Загрузка…</td></tr></tbody>
+        <thead><tr><th>Канал</th><th>ID</th><th>Порог</th><th>Размер (%)</th><th>Рынок</th><th>Авто</th><th title="Исполнять сигнал ровно как прислан (без общих автоправок/капов/expectancy sizing); портфельные лимиты и kill switch по-прежнему действуют">Точно</th><th>Сигналов</th><th>Исполнено</th><th title="Сколько из исполненных сигналов канала сейчас реально открыто">Открытых</th><th>Win rate</th><th>PnL</th><th>Sizing</th><th>Активен</th><th></th></tr></thead>
+        <tbody id="telegramBody"><tr class="empty-row"><td colspan="15">Загрузка…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -2872,7 +2876,7 @@ async function renderTelegram() {
     const statsById = Object.fromEntries((statsData.channels || []).map(s => [s.channel_id, s]));
 
     if (!channels.length) {
-      body.innerHTML = `<tr class="empty-row"><td colspan="14">Каналы не настроены</td></tr>`;
+      body.innerHTML = `<tr class="empty-row"><td colspan="15">Каналы не настроены</td></tr>`;
       return;
     }
     body.innerHTML = channels.map(c => {
@@ -2910,6 +2914,12 @@ async function renderTelegram() {
              <span class="slider"></span>
            </label>`
         : (c.auto_execute ? "✅" : "—");
+      const exactCell = editing
+        ? `<label class="toggle">
+             <input type="checkbox" class="channel-exact-input" data-channel-id="${c.id}" ${c.exact_execution ? "checked" : ""}>
+             <span class="slider"></span>
+           </label>`
+        : (c.exact_execution ? "✅" : "—");
       return `
       <tr class="channel-row" data-channel-id="${c.id}" title="Показать историю сигналов">
         <td><span class="expand-arrow">▸</span>${titleCell}</td>
@@ -2918,6 +2928,7 @@ async function renderTelegram() {
         <td>${sizepctCell}</td>
         <td>${marketCell}</td>
         <td>${autoexecCell}</td>
+        <td>${exactCell}</td>
         <td>${s.total_signals ?? c.signals_count}</td>
         <td>${s.executed ?? 0}</td>
         <td>${s.open_now ?? 0}</td>
@@ -2930,7 +2941,7 @@ async function renderTelegram() {
           <button class="btn-icon-danger" data-delete-channel="${c.id}" title="Удалить">✕</button>
         </td>
       </tr>
-      <tr class="channel-signals-row" data-channel-signals="${c.id}" style="display:none"><td colspan="14"></td></tr>
+      <tr class="channel-signals-row" data-channel-signals="${c.id}" style="display:none"><td colspan="15"></td></tr>
     `;
     }).join("");
 
@@ -3072,8 +3083,26 @@ async function renderTelegram() {
         }
       });
     });
+
+    body.querySelectorAll(".channel-exact-input").forEach(input => {
+      input.closest("td").classList.add("channel-editable");
+      input.addEventListener("click", (e) => e.stopPropagation());
+      input.addEventListener("change", async () => {
+        const id = input.dataset.channelId;
+        const checked = input.checked;
+        try {
+          await api(`/telegram/channels/${id}`, {
+            method: "PATCH", body: JSON.stringify({ exact_execution: checked }),
+          });
+          showToast(checked ? "Точное исполнение включено" : "Точное исполнение выключено");
+        } catch (err) {
+          input.checked = !checked;
+          showToast(`Ошибка: ${err.message}`, true);
+        }
+      });
+    });
   } catch (err) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="14">Ошибка загрузки: ${err.message}</td></tr>`;
+    body.innerHTML = `<tr class="empty-row"><td colspan="15">Ошибка загрузки: ${err.message}</td></tr>`;
   }
 }
 
@@ -3364,6 +3393,7 @@ document.getElementById("addChannelForm").addEventListener("submit", async (e) =
   const positionSizePct = parseFloat(document.getElementById("channelPositionSizeInput").value) || 5.0;
   const market = document.getElementById("channelMarketInput").value;
   const autoExecute = document.getElementById("channelAutoExecuteInput").checked;
+  const exactExecution = document.getElementById("channelExactExecutionInput").checked;
 
   if (!channelId) return;
 
@@ -3377,6 +3407,7 @@ document.getElementById("addChannelForm").addEventListener("submit", async (e) =
         position_size_pct: positionSizePct,
         market: market,
         auto_execute: autoExecute,
+        exact_execution: exactExecution,
       }),
     });
     showToast(

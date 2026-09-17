@@ -727,10 +727,10 @@ class TradingBot:
         remove_channel_from_monitoring(channel_id)
         self._telegram_channel_db_ids.pop(channel_id, None)
 
-    async def _get_channel_settings(self, channel_id: str) -> tuple[float, bool, float, str]:
+    async def _get_channel_settings(self, channel_id: str) -> tuple[float, bool, float, str, bool]:
         """
-        Порог качества, автоисполнение, базовый размер позиции (%) и рынок
-        (spot/futures) конкретного Telegram-канала.
+        Порог качества, автоисполнение, базовый размер позиции (%), рынок
+        (spot/futures) и exact_execution конкретного Telegram-канала.
 
         Раньше main.py вообще не читал TelegramChannel.quality_threshold/
         auto_execute — оба параметра брались из общих
@@ -761,12 +761,13 @@ class TradingBot:
                         return (
                             channel.quality_threshold, channel.auto_execute,
                             channel.position_size_pct, channel.market,
+                            channel.exact_execution,
                         )
             except Exception as e:
                 logger.warning(f"Не удалось прочитать настройки канала {channel_id}: {e}")
         return (
             settings.telegram_signals_quality_threshold, settings.telegram_signals_auto_execute,
-            5.0, settings.market_type,
+            5.0, settings.market_type, False,
         )
 
     async def _on_telegram_signal(self, signal_event: dict):
@@ -824,9 +825,12 @@ class TradingBot:
                     await self._save_telegram_signal(signal_event, None, "rejected", None)
                     return
 
-        quality_threshold, auto_execute, position_size_pct, market_type = await self._get_channel_settings(channel_id)
+        quality_threshold, auto_execute, position_size_pct, market_type, exact_execution = (
+            await self._get_channel_settings(channel_id)
+        )
         signal_event["channel_position_size_pct"] = position_size_pct
         signal_event["channel_market_type"] = market_type
+        signal_event["channel_exact_execution"] = exact_execution
 
         if entry is None:
             # Сигнал "по рынку" ("Диапазон входа: по рынку" — см.
@@ -1204,6 +1208,15 @@ class TradingBot:
         # там же (не здесь), чтобы поведение оставалось единообразным с
         # тем, как рынок сигнала (market_type) резолвится ниже.
         leverage = signal_event.get("parsed_leverage")
+        # Канал явно настроен на "точное" исполнение (TelegramChannel.
+        # exact_execution, см. докстринг там) — ниже пропускаются ВСЕ
+        # общие для каналов автоправки цены/SL/плеча (капы/дефолты) и
+        # масштабирование размера по expectancy_sizing (см. использование
+        # exact_execution дальше по функции). Портфельные ограничения
+        # (лимит числа/суммарной экспозиции позиций, kill switch, пауза,
+        # дневной лимит убытка) exact_execution НЕ отключает — это защита
+        # всего счёта, а не автоправка конкретного сигнала.
+        exact_execution = signal_event.get("channel_exact_execution", False)
 
         symbol = pair
         order_side = "buy" if side == "long" else "sell"
@@ -1223,7 +1236,8 @@ class TradingBot:
         signal_changes: list[str] = []
 
         if (
-            leverage
+            not exact_execution
+            and leverage
             and market_type == "futures"
             and settings.telegram_signals_max_leverage > 0
             and leverage > settings.telegram_signals_max_leverage
@@ -1243,7 +1257,7 @@ class TradingBot:
             )
             leverage = settings.telegram_signals_max_leverage
 
-        if sl is None and settings.telegram_signals_default_sl_pct > 0:
+        if not exact_execution and sl is None and settings.telegram_signals_default_sl_pct > 0:
             # Канал не указал SL — без него позиция открылась бы вообще без
             # биржевого защитного ордера (sync_stop_loss_order пропускает
             # выставление SL на бирже, если stop_loss falsy) и защищалась бы
@@ -1269,7 +1283,8 @@ class TradingBot:
         # не успев подтвердиться в сторону сигнала. Применяется ДО потолка
         # ниже (min ожидается <= max, см. докстринг настройки).
         if (
-            sl is not None
+            not exact_execution
+            and sl is not None
             and market_type == "futures"
             and settings.telegram_signals_min_sl_pct_of_margin > 0
         ):
@@ -1297,7 +1312,8 @@ class TradingBot:
         # executor._execute_real_order): указанное каналом (уже урезанное
         # выше, если превышало лимит), иначе глобальный дефолт.
         if (
-            sl is not None
+            not exact_execution
+            and sl is not None
             and market_type == "futures"
             and settings.telegram_signals_max_sl_pct_of_margin > 0
         ):
@@ -1339,11 +1355,18 @@ class TradingBot:
             # на бирже.
             balance = await execution_engine.get_real_balance() or 0.0
         channel_id = signal_event.get("channel_id", "")
-        mult = await expectancy_sizing.size_multiplier(channel_key(channel_id))
-        if mult <= 0:
-            logger.info(f"🚫 Сигнал по {pair} отклонён: канал в минусе по мат. ожиданию (expectancy sizing)")
-            signal_event["reject_reason"] = "канал в минусе по матожиданию (expectancy sizing отключил канал)"
-            return None
+        if exact_execution:
+            # expectancy_sizing — тот же общий для всех каналов механизм
+            # (масштабирует/отключает по СКОЛЬЗЯЩЕЙ статистике канала), что
+            # exact_execution обязан обходить: точное исполнение не должно
+            # ни урезаться, ни блокироваться историей канала.
+            mult = 1.0
+        else:
+            mult = await expectancy_sizing.size_multiplier(channel_key(channel_id))
+            if mult <= 0:
+                logger.info(f"🚫 Сигнал по {pair} отклонён: канал в минусе по мат. ожиданию (expectancy sizing)")
+                signal_event["reject_reason"] = "канал в минусе по матожиданию (expectancy sizing отключил канал)"
+                return None
         base_size_pct = signal_event.get("channel_position_size_pct", 5.0)
         size_pct = base_size_pct * mult
         position_value = balance * (size_pct / 100)

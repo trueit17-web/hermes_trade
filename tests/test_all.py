@@ -7759,7 +7759,7 @@ class TestTelegramSignalBlacklistRejected(unittest.IsolatedAsyncioTestCase):
         settings.symbol_blacklist = ["AAOI/USDT"]
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot", False))
         bot._save_telegram_signal = AsyncMock()
 
         with patch.object(bot, "_execute_telegram_signal", new=AsyncMock()) as exec_mock:
@@ -7781,7 +7781,7 @@ class TestTelegramSignalBlacklistRejected(unittest.IsolatedAsyncioTestCase):
         settings.symbol_blacklist = ["AAOI/USDT"]
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot", False))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -8104,13 +8104,40 @@ class TestChannelQualitySettings(unittest.IsolatedAsyncioTestCase):
         bot = main_module.TradingBot()
         bot._telegram_channel_db_ids = {"@channelsettings_unittest": db_id}
 
-        threshold, auto_execute, position_size_pct, market_type = await bot._get_channel_settings(
+        threshold, auto_execute, position_size_pct, market_type, exact_execution = await bot._get_channel_settings(
             "@channelsettings_unittest"
         )
         self.assertAlmostEqual(threshold, 0.85)
         self.assertTrue(auto_execute)
         self.assertAlmostEqual(position_size_pct, 7.5)
         self.assertEqual(market_type, "futures")
+        self.assertFalse(exact_execution)
+
+    async def test_reads_per_channel_exact_execution(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+
+        from src.db.session import get_session
+        from src.db.models import TelegramChannel
+
+        async with get_session() as session:
+            channel = TelegramChannel(
+                channel_id="@channelsettings_exact_unittest", channel_title="X",
+                exact_execution=True, active=True,
+            )
+            session.add(channel)
+            await session.commit()
+            db_id = channel.id
+
+        bot = main_module.TradingBot()
+        bot._telegram_channel_db_ids = {"@channelsettings_exact_unittest": db_id}
+
+        _, _, _, _, exact_execution = await bot._get_channel_settings(
+            "@channelsettings_exact_unittest"
+        )
+        self.assertTrue(exact_execution)
 
     async def test_falls_back_to_global_settings_for_unknown_channel(self):
         try:
@@ -8121,13 +8148,14 @@ class TestChannelQualitySettings(unittest.IsolatedAsyncioTestCase):
         bot = main_module.TradingBot()
         bot._telegram_channel_db_ids = {}
 
-        threshold, auto_execute, position_size_pct, market_type = await bot._get_channel_settings(
+        threshold, auto_execute, position_size_pct, market_type, exact_execution = await bot._get_channel_settings(
             "@unknown_channel_unittest"
         )
         self.assertEqual(threshold, settings.telegram_signals_quality_threshold)
         self.assertEqual(auto_execute, settings.telegram_signals_auto_execute)
         self.assertEqual(position_size_pct, 5.0)
         self.assertEqual(market_type, settings.market_type)
+        self.assertFalse(exact_execution)
 
 
 class TestTelegramAutoExecuteIgnoresProtections(unittest.IsolatedAsyncioTestCase):
@@ -8262,6 +8290,111 @@ class TestUpdateTelegramChannel(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as ctx:
             await update_telegram_channel(999999999, TelegramChannelUpdate(market="margin"))
         self.assertEqual(ctx.exception.status_code, 400)
+
+    async def test_update_exact_execution_field(self):
+        from src.db.models import TelegramChannel
+        from src.db.session import get_session
+        from src.web.api import TelegramChannelUpdate, update_telegram_channel
+
+        async with get_session() as session:
+            channel = TelegramChannel(
+                channel_id="@exactpatch_unittest", channel_title="X", active=True,
+            )
+            session.add(channel)
+            await session.commit()
+            db_id = channel.id
+
+        result = await update_telegram_channel(db_id, TelegramChannelUpdate(exact_execution=True))
+        self.assertTrue(result["success"])
+        self.assertEqual(result["updated"], ["exact_execution"])
+
+        async with get_session() as session:
+            refreshed = await session.get(TelegramChannel, db_id)
+            self.assertTrue(refreshed.exact_execution)
+
+
+class TestCreateTelegramChannelExactExecution(unittest.IsolatedAsyncioTestCase):
+    """POST /telegram/channels — exact_execution должен приниматься при
+    создании канала и сохраняться в БД (по умолчанию False, как и раньше)."""
+
+    async def test_create_with_exact_execution_true(self):
+        from sqlalchemy import select
+        from src.db.models import TelegramChannel
+        from src.db.session import get_session
+        from src.web.api import TelegramChannelCreate, create_telegram_channel
+
+        result = await create_telegram_channel(TelegramChannelCreate(
+            channel_id="@createexact_unittest", exact_execution=True,
+        ))
+        self.assertTrue(result["success"])
+        self.assertTrue(result["channel"]["exact_execution"])
+
+        async with get_session() as session:
+            saved = (
+                await session.execute(
+                    select(TelegramChannel).where(TelegramChannel.channel_id == "@createexact_unittest")
+                )
+            ).scalar_one()
+            self.assertTrue(saved.exact_execution)
+
+    async def test_create_defaults_exact_execution_to_false(self):
+        from src.web.api import TelegramChannelCreate, create_telegram_channel
+
+        result = await create_telegram_channel(TelegramChannelCreate(channel_id="@createexactdefault_unittest"))
+        self.assertFalse(result["channel"]["exact_execution"])
+
+
+class TestDecideTelegramSignalThreadsExactExecution(unittest.IsolatedAsyncioTestCase):
+    """
+    POST /telegram/signals/{id}/decide (ручное исполнение pending-сигнала)
+    строит signal_event вручную, в обход _get_channel_settings/
+    _on_telegram_signal — без явного threading'а channel_exact_execution
+    сюда ручное подтверждение сигнала канала с exact_execution=True всё
+    равно применяло бы общие автоправки/капы, хотя автоисполнение того же
+    канала их бы уже не применяло.
+    """
+
+    async def test_decide_execute_passes_channel_exact_execution_flag(self):
+        from src.db.models import TelegramChannel, TelegramSignal
+        from src.db.session import get_session
+        from src.web.api import TelegramSignalDecision, decide_telegram_signal
+        import src.web.api as api_module
+
+        async with get_session() as session:
+            channel = TelegramChannel(
+                channel_id="@decideexact_unittest", channel_title="X",
+                exact_execution=True, active=True,
+            )
+            session.add(channel)
+            await session.flush()
+            signal = TelegramSignal(
+                channel_id=channel.id, raw_message="x", message_date=datetime.now(),
+                parsed_pair="DECIDEEXACT1/USDT", parsed_side="long",
+                parsed_entry=100.0, parsed_sl=95.0, parsed_tp=110.0,
+                decision="pending",
+            )
+            session.add(signal)
+            await session.commit()
+            signal_id = signal.id
+
+        fake_bot = MagicMock()
+        fake_bot.open_positions = {}
+        captured_event = {}
+
+        async def fake_execute(signal_event):
+            captured_event.update(signal_event)
+            return None
+
+        fake_bot._execute_telegram_signal = AsyncMock(side_effect=fake_execute)
+
+        with patch.object(api_module.bot_registry, "current_bot", fake_bot):
+            with self.assertRaises(Exception):
+                # create_order мока нет — fake_execute возвращает None,
+                # эндпоинт поднимает 502 (не удалось исполнить); нас
+                # интересует только signal_event, переданный до этого.
+                await decide_telegram_signal(signal_id, TelegramSignalDecision(action="execute"))
+
+        self.assertTrue(captured_event.get("channel_exact_execution"))
 
 
 class TestProtectionsLockTimestampFormat(unittest.IsolatedAsyncioTestCase):
@@ -14162,6 +14295,202 @@ class TestTelegramSignalShortRejectedInRealMode(unittest.IsolatedAsyncioTestCase
         self.assertEqual(mock_engine.create_order.await_args.kwargs["side"], "buy")
 
 
+class TestChannelExactExecutionBypassesSharedAdjustments(unittest.IsolatedAsyncioTestCase):
+    """
+    TelegramChannel.exact_execution (см. докстринг в src/db/models.py и
+    комментарий в начале _execute_telegram_signal) — при включении сигнал
+    должен исполняться ровно с ценой входа/SL/TP/плечом, присланными
+    каналом, без общих для ВСЕХ каналов автоправок (капы/дефолты SL, лимит
+    плеча) и без масштабирования/блокировки размера по expectancy_sizing.
+    Портфельные ограничения (kill switch, пауза и т.п.) отдельно не
+    отключаются exact_execution — они проверяются глубже, внутри
+    execution_engine.create_order(), который здесь замокан целиком.
+    """
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot()
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "real"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    async def test_leverage_cap_bypassed_when_exact_execution(self):
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "EXACTLEV1/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 100.0,
+                "parsed_sl": 95.0,
+                "parsed_tp": 110.0,
+                "parsed_leverage": 50.0,
+                "channel_id": "@exact_channel",
+                "channel_market_type": "futures",
+                "channel_exact_execution": True,
+            })
+
+        self.assertEqual(mock_engine.create_order.await_args.kwargs["leverage"], 50.0)
+
+    async def test_leverage_still_capped_when_not_exact_execution(self):
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "EXACTLEV2/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 100.0,
+                "parsed_sl": 95.0,
+                "parsed_tp": 110.0,
+                "parsed_leverage": 50.0,
+                "channel_id": "@regular_channel",
+                "channel_market_type": "futures",
+            })
+
+        self.assertEqual(
+            mock_engine.create_order.await_args.kwargs["leverage"],
+            settings.telegram_signals_max_leverage,
+        )
+
+    async def test_missing_sl_not_defaulted_when_exact_execution(self):
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "EXACTNOSL1/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 100.0,
+                "parsed_sl": None,
+                "parsed_tp": 110.0,
+                "channel_id": "@exact_channel",
+                "channel_market_type": "spot",
+                "channel_exact_execution": True,
+            })
+
+        self.assertIsNone(mock_engine.create_order.await_args.kwargs["stop_loss"])
+
+    async def test_missing_sl_still_defaulted_when_not_exact_execution(self):
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "EXACTNOSL2/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 100.0,
+                "parsed_sl": None,
+                "parsed_tp": 110.0,
+                "channel_id": "@regular_channel",
+                "channel_market_type": "spot",
+            })
+
+        self.assertIsNotNone(mock_engine.create_order.await_args.kwargs["stop_loss"])
+
+    async def test_too_tight_sl_not_widened_when_exact_execution(self):
+        bot = self._make_bot()
+        # SL всего 0.5% от цены — при плече 10x это 5% маржи, теснее
+        # дефолтного минимума telegram_signals_min_sl_pct_of_margin (12%),
+        # т.е. без exact_execution был бы раздвинут.
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "EXACTTIGHT1/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 100.0,
+                "parsed_sl": 99.5,
+                "parsed_tp": 110.0,
+                "parsed_leverage": 10.0,
+                "channel_id": "@exact_channel",
+                "channel_market_type": "futures",
+                "channel_exact_execution": True,
+            })
+
+        self.assertAlmostEqual(mock_engine.create_order.await_args.kwargs["stop_loss"], 99.5)
+
+    async def test_too_wide_sl_not_capped_when_exact_execution(self):
+        bot = self._make_bot()
+        # SL 40% от цены при плече 10x — 400% маржи, намного шире дефолтного
+        # потолка telegram_signals_max_sl_pct_of_margin (20%), т.е. без
+        # exact_execution был бы урезан.
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "EXACTWIDE1/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 100.0,
+                "parsed_sl": 60.0,
+                "parsed_tp": 110.0,
+                "parsed_leverage": 10.0,
+                "channel_id": "@exact_channel",
+                "channel_market_type": "futures",
+                "channel_exact_execution": True,
+            })
+
+        self.assertAlmostEqual(mock_engine.create_order.await_args.kwargs["stop_loss"], 60.0)
+
+    async def test_expectancy_sizing_bypassed_when_exact_execution(self):
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine, \
+                patch("src.main.expectancy_sizing") as mock_sizing:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            # Канал в глубоком минусе по мат. ожиданию — обычно это
+            # заблокировало бы сигнал целиком (mult<=0).
+            mock_sizing.size_multiplier = AsyncMock(return_value=0.0)
+
+            order_result = await bot._execute_telegram_signal({
+                "parsed_pair": "EXACTSIZING1/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 100.0,
+                "parsed_sl": 95.0,
+                "parsed_tp": 110.0,
+                "channel_id": "@exact_channel",
+                "channel_market_type": "spot",
+                "channel_position_size_pct": 5.0,
+                "channel_exact_execution": True,
+            })
+
+        mock_sizing.size_multiplier.assert_not_awaited()
+        mock_engine.create_order.assert_awaited_once()
+        # mult принудительно 1.0 → amount = (10000 * 5%) / 100 = 5.0
+        self.assertAlmostEqual(mock_engine.create_order.await_args.kwargs["amount"], 5.0)
+        self.assertIsNone(order_result)  # create_order сам вернул None (мок) — это не отклонение sizing'ом
+
+    async def test_expectancy_sizing_still_blocks_when_not_exact_execution(self):
+        bot = self._make_bot()
+        with patch("src.main.execution_engine") as mock_engine, \
+                patch("src.main.expectancy_sizing") as mock_sizing:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            mock_sizing.size_multiplier = AsyncMock(return_value=0.0)
+
+            order_result = await bot._execute_telegram_signal({
+                "parsed_pair": "EXACTSIZING2/USDT",
+                "parsed_side": "long",
+                "parsed_entry": 100.0,
+                "parsed_sl": 95.0,
+                "parsed_tp": 110.0,
+                "channel_id": "@regular_channel",
+                "channel_position_size_pct": 5.0,
+            })
+
+        mock_sizing.size_multiplier.assert_awaited_once()
+        mock_engine.create_order.assert_not_awaited()
+        self.assertIsNone(order_result)
+
+
 class TestShortSignalAllowedOnFutures(unittest.IsolatedAsyncioTestCase):
     """
     ЭТАП 2 перехода на фьючерсы: short-сигналы больше не отклоняются
@@ -14628,7 +14957,7 @@ class TestTradingSourceModeGatesTelegramSignals(unittest.IsolatedAsyncioTestCase
         settings.active_trading_mode = "algo"
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot", False))
         bot._save_telegram_signal = AsyncMock()
 
         with patch.object(bot, "_execute_telegram_signal", new=AsyncMock()) as exec_mock:
@@ -14650,7 +14979,7 @@ class TestTradingSourceModeGatesTelegramSignals(unittest.IsolatedAsyncioTestCase
         settings.active_trading_mode = "signals"
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot", False))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -14703,7 +15032,7 @@ class TestTelegramSignalRespectsMaxOpenPositions(unittest.IsolatedAsyncioTestCas
         global_risk_manager.state.open_positions_count = 2
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot", False))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -14727,7 +15056,7 @@ class TestTelegramSignalRespectsMaxOpenPositions(unittest.IsolatedAsyncioTestCas
         global_risk_manager.state.open_positions_count = 2
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot", False))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -14783,7 +15112,7 @@ class TestTelegramSignalRespectsMaxTotalNotional(unittest.IsolatedAsyncioTestCas
         global_risk_manager.state.add_open_position("ALREADYOPEN/USDT", 15.0)
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 8.0, "spot"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 8.0, "spot", False))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -14807,7 +15136,7 @@ class TestTelegramSignalRespectsMaxTotalNotional(unittest.IsolatedAsyncioTestCas
         global_risk_manager.state.add_open_position("ALREADYOPEN/USDT", 15.0)
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 8.0, "spot"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 8.0, "spot", False))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -14869,7 +15198,7 @@ class TestTelegramSignalStalenessGate(unittest.IsolatedAsyncioTestCase):
         settings.telegram_signals_max_age_seconds = 300.0
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot", False))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -14896,7 +15225,7 @@ class TestTelegramSignalStalenessGate(unittest.IsolatedAsyncioTestCase):
         settings.telegram_signals_max_age_seconds = 300.0
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot", False))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -14920,7 +15249,7 @@ class TestTelegramSignalStalenessGate(unittest.IsolatedAsyncioTestCase):
         settings.telegram_signals_max_age_seconds = 0.0
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot", False))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -14947,7 +15276,7 @@ class TestTelegramSignalStalenessGate(unittest.IsolatedAsyncioTestCase):
         settings.telegram_signals_max_age_seconds = 300.0
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot", False))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -14999,7 +15328,7 @@ class TestTelegramSignalMarketEntryResolution(unittest.IsolatedAsyncioTestCase):
     async def test_market_entry_resolved_via_reference_price(self):
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures", False))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -15031,7 +15360,7 @@ class TestTelegramSignalMarketEntryResolution(unittest.IsolatedAsyncioTestCase):
         """
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures", False))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -15058,7 +15387,7 @@ class TestTelegramSignalMarketEntryResolution(unittest.IsolatedAsyncioTestCase):
         execution_engine.get_reference_price вообще (уже есть число)."""
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "spot", False))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -15120,7 +15449,7 @@ class TestTelegramSignalRejectsMessagesWithNoPriceData(unittest.IsolatedAsyncioT
         # Порог качества 0.0 — канал принимает любой скор (как @signalyp в
         # реальном инциденте), проверяем, что новый гейт срабатывает даже
         # тогда, когда качество само по себе сигнал бы не остановило.
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures", False))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -15149,7 +15478,7 @@ class TestTelegramSignalRejectsMessagesWithNoPriceData(unittest.IsolatedAsyncioT
         хотя бы один из двух уровней (здесь — только SL, без TP)."""
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures", False))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -15172,7 +15501,7 @@ class TestTelegramSignalRejectsMessagesWithNoPriceData(unittest.IsolatedAsyncioT
         достаточен, даже если однозначного parsed_tp почему-то нет."""
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures", False))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -15220,7 +15549,7 @@ class TestTelegramSignalQualityScoringUsesCorrectShape(unittest.IsolatedAsyncioT
 
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(1.1, False, 5.0, "spot"))  # порог недостижим — просто проверяем вызов
+        bot._get_channel_settings = AsyncMock(return_value=(1.1, False, 5.0, "spot", False))  # порог недостижим — просто проверяем вызов
         bot._save_telegram_signal = AsyncMock()
 
         with patch.object(signal_quality_scorer, "score_signal", return_value=0.9) as score_mock:
@@ -15258,7 +15587,7 @@ class TestTelegramSignalQualityScoringUsesCorrectShape(unittest.IsolatedAsyncioT
 
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(1.1, False, 5.0, "spot"))
+        bot._get_channel_settings = AsyncMock(return_value=(1.1, False, 5.0, "spot", False))
         bot._save_telegram_signal = AsyncMock()
         signal_quality_scorer.channel_stats.pop("@quality_shape_test", None)
 
@@ -16916,7 +17245,7 @@ class TestTelegramSignalRejectReasonReflectsExchangeFailure(unittest.IsolatedAsy
     async def test_reject_reason_uses_execution_engine_specific_reason(self):
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures", False))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
@@ -16950,7 +17279,7 @@ class TestTelegramSignalRejectReasonReflectsExchangeFailure(unittest.IsolatedAsy
         вместо старого бесполезного текста."""
         bot = self._make_bot()
         bot._telegram_channel_db_ids = {}
-        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures"))
+        bot._get_channel_settings = AsyncMock(return_value=(0.0, True, 5.0, "futures", False))
         bot._save_telegram_signal = AsyncMock()
         bot.open_positions = {}
 
