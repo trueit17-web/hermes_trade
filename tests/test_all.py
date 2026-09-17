@@ -13961,6 +13961,153 @@ class TestShortSignalRejectedBeforeExecutionInRealMode(unittest.IsolatedAsyncioT
         self.assertEqual(mock_engine.create_order.await_args.kwargs["side"], "buy")
 
 
+class TestCountAlgoOpenPositions(unittest.IsolatedAsyncioTestCase):
+    """
+    TradingBot._count_algo_open_positions() — считает только позиции с
+    реальным strategy_id встроенной стратегии, исключая Telegram-сигналы
+    (strategy_id=="telegram_signal") и ручные позиции (strategy_id==
+    "manual") — см. risk_max_algo_open_positions в config.py.
+    """
+
+    def _make_bot(self):
+        import src.main as main_module
+        return main_module.TradingBot()
+
+    def test_counts_only_real_strategy_ids_in_paper_mode(self):
+        bot = self._make_bot()
+        original = settings.trading_mode
+        settings.trading_mode = "paper"
+        try:
+            with patch("src.main.execution_engine") as mock_engine:
+                mock_engine.paper_positions = {
+                    "A/USDT": {"strategy_id": "ensemble_voter"},
+                    "B/USDT": {"strategy_id": "rsi_reversal"},
+                    "C/USDT": {"strategy_id": "telegram_signal"},
+                    "D/USDT": {"strategy_id": "manual"},
+                    "E/USDT": {"strategy_id": None},
+                }
+                self.assertEqual(bot._count_algo_open_positions(), 2)
+        finally:
+            settings.trading_mode = original
+
+    def test_counts_from_real_positions_in_real_mode(self):
+        bot = self._make_bot()
+        original = settings.trading_mode
+        settings.trading_mode = "real"
+        try:
+            with patch("src.main.execution_engine") as mock_engine:
+                mock_engine.real_positions = {"A/USDT": {"strategy_id": "ensemble_voter"}}
+                mock_engine.paper_positions = {"B/USDT": {"strategy_id": "rsi_reversal"}}
+                # real-режим -> должен читать real_positions, не paper_positions
+                self.assertEqual(bot._count_algo_open_positions(), 1)
+        finally:
+            settings.trading_mode = original
+
+
+class TestAlgoOpenPositionsLimit(unittest.IsolatedAsyncioTestCase):
+    """
+    risk_max_algo_open_positions — отдельный от общего risk_max_open_
+    positions лимит именно на позиции встроенных алго-стратегий (см.
+    докстринг в config.py): позволяет ограничить алго независимо от
+    Telegram-каналов/ручных позиций, не трогая общий лимит.
+    """
+
+    def _make_bot(self):
+        import src.main as main_module
+        return main_module.TradingBot()
+
+    @staticmethod
+    def _make_candles_df():
+        return pd.DataFrame({
+            "open": [1.0] * 60, "high": [1.0] * 60, "low": [1.0] * 60,
+            "close": [1.0] * 60, "volume": [1.0] * 60,
+        })
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        self._saved_active_trading_mode = settings.active_trading_mode
+        self._saved_max_algo = settings.risk_max_algo_open_positions
+        settings.trading_mode = "paper"
+        settings.active_trading_mode = "algo"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+        settings.active_trading_mode = self._saved_active_trading_mode
+        settings.risk_max_algo_open_positions = self._saved_max_algo
+
+    def _fake_signal(self, symbol="NEW/USDT", side="long"):
+        from src.strategy import StrategySignal
+        return StrategySignal(
+            strategy_id="ensemble_voter", symbol=symbol, side=side, confidence=0.9,
+            entry_price=100.0,
+        )
+
+    async def _run(self, existing_positions, limit, symbol="NEW/USDT"):
+        settings.risk_max_algo_open_positions = limit
+        bot = self._make_bot()
+        bot.feature_engine = MagicMock()
+        bot.ml_inference = None
+        bot._refresh_symbol_candles = AsyncMock(return_value=self._make_candles_df())
+
+        fake_strategy = MagicMock()
+        fake_strategy.strategy_id = "ensemble_voter"
+        fake_strategy.name = "Ensemble"
+        fake_strategy.weight = 1.0
+        fake_strategy.generate_signal.return_value = self._fake_signal(symbol=symbol)
+
+        with patch("src.main.strategy_registry.get_active", return_value=[fake_strategy]), \
+                patch("src.main.strategy_registry.get", return_value=None), \
+                patch("src.main.execution_engine") as mock_engine, \
+                patch("src.main.risk_manager") as mock_risk, \
+                patch("src.main.protection_manager") as mock_protections, \
+                patch("src.main.expectancy_sizing") as mock_sizing:
+            mock_engine.paper_positions = existing_positions
+            mock_engine.real_positions = {}
+            mock_engine.last_prices = {}
+            mock_engine.get_paper_balance = MagicMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            mock_risk.check_signal.return_value = (True, "")
+            mock_protections.locked_reason = AsyncMock(return_value=None)
+            mock_sizing.size_multiplier = AsyncMock(return_value=1.0)
+
+            await bot._process_symbol(symbol)
+
+        return mock_engine
+
+    async def test_rejects_when_algo_limit_reached(self):
+        mock_engine = await self._run(
+            existing_positions={"OLD/USDT": {"strategy_id": "ensemble_voter"}}, limit=1,
+        )
+        mock_engine.create_order.assert_not_awaited()
+
+    async def test_allows_when_below_algo_limit(self):
+        mock_engine = await self._run(existing_positions={}, limit=1)
+        mock_engine.create_order.assert_awaited_once()
+
+    async def test_telegram_and_manual_positions_do_not_count_toward_algo_limit(self):
+        mock_engine = await self._run(
+            existing_positions={
+                "T1/USDT": {"strategy_id": "telegram_signal"},
+                "T2/USDT": {"strategy_id": "telegram_signal"},
+                "M1/USDT": {"strategy_id": "manual"},
+            },
+            limit=1,
+        )
+        # 0 алго-позиций из трёх существующих (все telegram/manual) -> лимит 1 не достигнут
+        mock_engine.create_order.assert_awaited_once()
+
+    async def test_disabled_by_default_ignores_algo_position_count(self):
+        mock_engine = await self._run(
+            existing_positions={
+                "A/USDT": {"strategy_id": "ensemble_voter"},
+                "B/USDT": {"strategy_id": "ensemble_voter"},
+                "C/USDT": {"strategy_id": "ensemble_voter"},
+            },
+            limit=0,
+        )
+        mock_engine.create_order.assert_awaited_once()
+
+
 class TestTelegramSignalShortRejectedInRealMode(unittest.IsolatedAsyncioTestCase):
     """Тот же класс бага, что и TestShortSignalRejectedBeforeExecutionInRealMode,
     но для пути исполнения Telegram-сигналов (_execute_telegram_signal)."""

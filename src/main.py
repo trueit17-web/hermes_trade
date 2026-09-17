@@ -1584,6 +1584,23 @@ class TradingBot:
                 equity += (pos["entry_price"] - price) * amount
         return equity
 
+    def _count_algo_open_positions(self) -> int:
+        """
+        Число открытых позиций, источник которых — встроенная алго-
+        стратегия (см. risk_max_algo_open_positions в config.py) — НЕ
+        Telegram-сигнал (strategy_id=="telegram_signal") и не ручная
+        позиция с дашборда (strategy_id=="manual", см. register_manual_
+        position). Считаем из execution_engine.paper_positions/
+        real_positions (актуальный source of truth по позициям), а не из
+        risk_manager.state.open_positions — там хранится только size_pct
+        по символу, без привязки к источнику.
+        """
+        tracked = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
+        return sum(
+            1 for pos in tracked.values()
+            if pos.get("strategy_id") not in (None, "telegram_signal", "manual")
+        )
+
     async def _trading_iteration(self):
         """Одна итерация торговли."""
         if risk_manager.state.kill_switch_active:
@@ -1956,6 +1973,20 @@ class TradingBot:
         # Риск + исполнение
         for signal in signals:
             can_execute, reason = risk_manager.check_signal(signal)
+            if can_execute and settings.risk_max_algo_open_positions > 0:
+                # Отдельный лимит именно на алго-позиции (см. докстринг
+                # risk_max_algo_open_positions в config.py) — risk_manager.
+                # check_signal() выше проверяет только ОБЩИЙ лимит на все
+                # источники разом, здесь дополнительно считаем именно
+                # открытые алго-позиции, чтобы можно было ограничить их
+                # независимо от Telegram-каналов/ручных позиций.
+                algo_open_count = self._count_algo_open_positions()
+                if algo_open_count >= settings.risk_max_algo_open_positions:
+                    can_execute = False
+                    reason = (
+                        f"Достигнут отдельный лимит открытых алго-позиций "
+                        f"({algo_open_count}/{settings.risk_max_algo_open_positions})"
+                    )
             decision_logger.log_risk_check(
                 decision="allowed" if can_execute else "rejected",
                 reason=reason,
