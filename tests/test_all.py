@@ -9211,6 +9211,60 @@ class TestConnectionsStatusPerExchange(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(llm_keys, {"llm_anthropic", "llm_groq", "llm_gemini", "llm_cerebras"})
 
 
+class TestSystemMetrics(unittest.TestCase):
+    """
+    GET /system/metrics (src/web/system_metrics.py) — панель "Системные
+    показатели" на вкладке "Логи" дашборда, добавлена по запросу
+    пользователя. Раньше на этой странице были видны только статусы
+    подключений и сами логи — базовые метрики сервера (CPU/память/диск/
+    аптайм процесса) нигде не отображались.
+    """
+
+    def test_returns_expected_shape(self):
+        from src.web.system_metrics import get_system_metrics
+        m = get_system_metrics()
+
+        self.assertIn("cpu_percent", m)
+        self.assertIsInstance(m["cpu_count"], int)
+        self.assertGreaterEqual(m["cpu_count"], 1)
+
+        for key in ("used", "total", "percent"):
+            self.assertIn(key, m["memory"])
+            self.assertIn(key, m["disk"])
+        self.assertGreater(m["memory"]["total"], 0)
+        self.assertGreater(m["disk"]["total"], 0)
+
+        for key in ("1m", "5m", "15m"):
+            self.assertIn(key, m["load_avg"])
+
+        self.assertIn("rss", m["process"])
+        self.assertIn("cpu_percent", m["process"])
+        self.assertIn("uptime_seconds", m["process"])
+        self.assertGreater(m["process"]["rss"], 0)
+        self.assertGreaterEqual(m["process"]["uptime_seconds"], 0)
+
+    def test_disk_usage_reported_for_data_dir(self):
+        from src.config import settings
+        from src.web.system_metrics import get_system_metrics
+        import shutil
+
+        m = get_system_metrics()
+        expected = shutil.disk_usage(str(settings.data_dir))
+        self.assertEqual(m["disk"]["total"], expected.total)
+
+
+class TestSystemMetricsEndpoint(unittest.IsolatedAsyncioTestCase):
+    """GET /system/metrics — тот же снимок, отданный через FastAPI-эндпоинт."""
+
+    async def test_endpoint_returns_metrics_dict(self):
+        from src.web.api import system_metrics
+        result = await system_metrics()
+        self.assertIn("cpu_percent", result)
+        self.assertIn("memory", result)
+        self.assertIn("disk", result)
+        self.assertIn("process", result)
+
+
 class TestExtractUsdtBalance(unittest.TestCase):
     """
     ccxt fetch_balance() кладёт баланс валюты во ВЛОЖЕННЫЙ словарь

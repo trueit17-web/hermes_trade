@@ -50,6 +50,7 @@ from src.utils.timeutils import utcnow
 from src.web import auth
 from src.web.connections_status import get_connections_status
 from src.web.settings_store import apply_settings_update, get_settings_snapshot
+from src.web.system_metrics import get_system_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -1797,6 +1798,13 @@ async def get_log_loggers():
 async def connections_status():
     """Статусы внешних подключений (БД, биржа, Telegram, CoinGlass)."""
     return {"connections": await get_connections_status()}
+
+
+@app.get("/system/metrics")
+async def system_metrics():
+    """Системные показатели сервера/контейнера (CPU, память, диск, аптайм
+    процесса бота) — для панели логов дашборда, см. get_system_metrics."""
+    return get_system_metrics()
 
 
 @app.post("/system/restart")

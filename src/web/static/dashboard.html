@@ -641,6 +641,34 @@
   }
   .conn-exchange-card .conn-name-row { display: flex; align-items: center; gap: 6px; }
 
+  /* Системные показатели (CPU/память/диск/аптайм) — та же сетка карточек,
+     что и у бирж выше, но со значением показателя вместо статус-точки. */
+  .metric-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+    gap: 1px;
+    background: var(--panel-border);
+    border-top: 1px solid var(--panel-border);
+  }
+  .metric-card {
+    background: var(--panel);
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .metric-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .03em;
+    color: var(--text-dim);
+  }
+  .metric-value { font-size: 16px; font-weight: 600; }
+  .metric-value.metric-ok { color: var(--green); }
+  .metric-value.metric-warn { color: var(--yellow); }
+  .metric-value.metric-crit { color: var(--red); }
+  .metric-sub { font-size: 11px; color: var(--text-dim); }
+
   .log-filters {
     display: flex;
     align-items: center;
@@ -1044,6 +1072,13 @@
     </div>
     <div id="connectionsBody"><div class="conn-row muted">Загрузка…</div></div>
     <div id="redeployStatus" class="muted" style="display:none; padding: 0 16px 12px; font-size:12px;"></div>
+  </div>
+
+  <div class="side-panel">
+    <h2>Системные показатели</h2>
+    <div class="metric-grid" id="systemMetricsBody">
+      <div class="muted" style="padding:12px 16px">Загрузка…</div>
+    </div>
   </div>
 
   <div class="side-panel">
@@ -3446,6 +3481,7 @@ function switchTab(tab) {
   }
   if (tab === "logs") {
     loadConnections();
+    loadSystemMetrics();
     loadModuleList().then(loadLogs);
   }
   if (tab === "manual") {
@@ -3734,6 +3770,83 @@ async function loadConnections() {
   }
 }
 
+function formatBytes(n) {
+  if (n === null || n === undefined) return "—";
+  const units = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${fmt(v, i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function formatUptime(seconds) {
+  if (seconds === null || seconds === undefined) return "—";
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (d > 0) return `${d}д ${h}ч`;
+  if (h > 0) return `${h}ч ${m}м`;
+  return `${m}м`;
+}
+
+// >=90% — критично (красный), >=70% — предупреждение (жёлтый), иначе
+// зелёный — тот же порог, что интуитивно используется для дискового
+// места/памяти в большинстве мониторингов.
+function metricClass(pct) {
+  if (pct === null || pct === undefined) return "";
+  if (pct >= 90) return "metric-crit";
+  if (pct >= 70) return "metric-warn";
+  return "metric-ok";
+}
+
+async function loadSystemMetrics() {
+  const body = document.getElementById("systemMetricsBody");
+  try {
+    const m = await api("/system/metrics");
+    const cards = [
+      {
+        label: "CPU",
+        value: `${fmt(m.cpu_percent, 0)}%`,
+        cls: metricClass(m.cpu_percent),
+        sub: `${m.cpu_count} ядер`,
+      },
+      {
+        label: "Память",
+        value: `${fmt(m.memory.percent, 0)}%`,
+        cls: metricClass(m.memory.percent),
+        sub: `${formatBytes(m.memory.used)} / ${formatBytes(m.memory.total)}`,
+      },
+      {
+        label: "Диск (data)",
+        value: `${fmt(m.disk.percent, 0)}%`,
+        cls: metricClass(m.disk.percent),
+        sub: `${formatBytes(m.disk.used)} / ${formatBytes(m.disk.total)}`,
+      },
+      {
+        label: "Load average",
+        value: m.load_avg["1m"] !== null ? fmt(m.load_avg["1m"], 2) : "—",
+        cls: "",
+        sub: m.load_avg["5m"] !== null ? `5м: ${fmt(m.load_avg["5m"], 2)} · 15м: ${fmt(m.load_avg["15m"], 2)}` : "недоступно",
+      },
+      {
+        label: "Процесс бота",
+        value: formatUptime(m.process.uptime_seconds),
+        cls: "",
+        sub: `${formatBytes(m.process.rss)} · CPU ${fmt(m.process.cpu_percent, 0)}%`,
+      },
+    ];
+    body.innerHTML = cards.map(c => `
+      <div class="metric-card">
+        <span class="metric-label">${c.label}</span>
+        <span class="metric-value ${c.cls}">${c.value}</span>
+        <span class="metric-sub">${c.sub}</span>
+      </div>
+    `).join("");
+  } catch (err) {
+    body.innerHTML = `<div class="muted" style="padding:12px 16px">Ошибка загрузки: ${err.message}</div>`;
+  }
+}
+
 // === Логи ===
 
 let logsFilterTimer = null;
@@ -3949,6 +4062,7 @@ document.getElementById("btnResumeLogs").addEventListener("click", reloadLogsLiv
 setInterval(() => {
   if (currentTab === "logs") {
     loadConnections();
+    loadSystemMetrics();
     loadModuleList();
     loadLogs();
   }
