@@ -66,8 +66,16 @@ def _get_client():
         if not settings.gemini_api_key:
             raise RuntimeError("GEMINI_API_KEY не настроен")
         from google import genai
+        from google.genai import types
 
-        _client = genai.Client(api_key=settings.gemini_api_key)
+        # Явный timeout (мс) — см. комментарий у AsyncAnthropic в
+        # llm_parser.py: без него зависший запрос стопорит разбор всех
+        # последующих сигналов. google-genai принимает timeout только через
+        # http_options, не как отдельный kwarg клиента.
+        _client = genai.Client(
+            api_key=settings.gemini_api_key,
+            http_options=types.HttpOptions(timeout=20_000),
+        )
     return _client
 
 

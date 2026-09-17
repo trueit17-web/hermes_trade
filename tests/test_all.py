@@ -4996,6 +4996,64 @@ class TestParserSchemasAllowNullTakeProfits(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result["sl"])
 
 
+class TestLlmParserClientTimeouts(unittest.TestCase):
+    """
+    Все 4 LLM-парсера сигналов (Anthropic/Gemini/Cerebras/Groq) раньше
+    создавали клиент без явного timeout — зависший (не оборвавшийся
+    ошибкой) запрос к любому из них стопорил бы разбор каждого следующего
+    сигнала канала, сводя на нет смысл фолбэк-цепочки Anthropic→Gemini→
+    Cerebras→Groq→regex: та помогает только если провайдер падает быстро.
+    Эти тесты создают РЕАЛЬНЫЙ клиент SDK (пакет уже установлен, сетевых
+    запросов при конструировании клиента ни один из SDK не делает) и
+    проверяют, что таймаут реально долетел до него, а не только до
+    сигнатуры вызова.
+    """
+
+    def setUp(self):
+        self._saved = {
+            "anthropic_api_key": settings.anthropic_api_key,
+            "gemini_api_key": settings.gemini_api_key,
+            "cerebras_api_key": settings.cerebras_api_key,
+            "groq_api_key": settings.groq_api_key,
+        }
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            setattr(settings, key, value)
+        import src.telegram.cerebras_parser as cerebras_parser_module
+        import src.telegram.gemini_parser as gemini_parser_module
+        import src.telegram.groq_parser as groq_parser_module
+        import src.telegram.llm_parser as llm_parser_module
+        llm_parser_module._client = None
+        gemini_parser_module._client = None
+        cerebras_parser_module._client = None
+        groq_parser_module._client = None
+
+    def test_anthropic_client_has_explicit_timeout(self):
+        import src.telegram.llm_parser as llm_parser_module
+        settings.anthropic_api_key = "test-key"
+        client = llm_parser_module._get_client()
+        self.assertEqual(client.timeout, 20.0)
+
+    def test_gemini_client_has_explicit_timeout(self):
+        import src.telegram.gemini_parser as gemini_parser_module
+        settings.gemini_api_key = "test-key"
+        client = gemini_parser_module._get_client()
+        self.assertEqual(client._api_client._http_options.timeout, 20_000)
+
+    def test_cerebras_client_has_explicit_timeout(self):
+        import src.telegram.cerebras_parser as cerebras_parser_module
+        settings.cerebras_api_key = "test-key"
+        client = cerebras_parser_module._get_client()
+        self.assertEqual(client.timeout, 20.0)
+
+    def test_groq_client_has_explicit_timeout(self):
+        import src.telegram.groq_parser as groq_parser_module
+        settings.groq_api_key = "test-key"
+        client = groq_parser_module._get_client()
+        self.assertEqual(client.timeout, 20.0)
+
+
 class TestQualificationScorer(unittest.TestCase):
     """Тесты для scorer качества сигналов."""
 
@@ -12541,6 +12599,103 @@ class TestChartCandlesEndpoint(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(self.HTTPException) as ctx:
             await self.api_module.get_chart_candles(symbol="BTC/USDT")
         self.assertEqual(ctx.exception.status_code, 503)
+
+
+class TestHealthEndpoint(unittest.IsolatedAsyncioTestCase):
+    """
+    GET /health — раньше "bot_running": True было захардкожено безусловно
+    (см. историю), из-за чего зависший основной цикл (TradingBot.run(),
+    застрявший внутри await без таймаута — сеть биржи/LLM-парсера) выглядел
+    бы для внешнего healthcheck/аптайм-монитора полностью здоровым. Теперь
+    ответ строится по TradingBot.last_iteration_at, обновляемому раз за
+    проход основного цикла.
+    """
+
+    def setUp(self):
+        import json
+
+        import src.bot_registry as bot_registry
+        import src.main as main_module
+        import src.web.api as api_module
+
+        self.json = json
+        self.main_module = main_module
+        self.bot_registry = bot_registry
+        self.api_module = api_module
+        self._saved_current_bot = bot_registry.current_bot
+
+    def tearDown(self):
+        self.bot_registry.current_bot = self._saved_current_bot
+
+    def _body(self, response):
+        return self.json.loads(response.body)
+
+    async def test_503_when_bot_not_initialized(self):
+        self.bot_registry.current_bot = None
+
+        response = await self.api_module.health()
+
+        self.assertEqual(response.status_code, 503)
+        body = self._body(response)
+        self.assertEqual(body["status"], "not_initialized")
+        self.assertFalse(body["bot_running"])
+
+    async def test_starting_when_no_iteration_completed_yet(self):
+        bot = self.main_module.TradingBot()
+        bot.running = True
+        bot.last_iteration_at = None
+        self.bot_registry.current_bot = bot
+
+        response = await self.api_module.health()
+
+        self.assertEqual(response.status_code, 200)
+        body = self._body(response)
+        self.assertEqual(body["status"], "starting")
+        self.assertIsNone(body["last_iteration_at"])
+
+    async def test_ok_when_loop_recently_alive(self):
+        from src.utils.timeutils import utcnow
+
+        bot = self.main_module.TradingBot()
+        bot.running = True
+        bot.last_iteration_at = utcnow() - timedelta(seconds=30)
+        self.bot_registry.current_bot = bot
+
+        response = await self.api_module.health()
+
+        self.assertEqual(response.status_code, 200)
+        body = self._body(response)
+        self.assertEqual(body["status"], "ok")
+        self.assertTrue(body["bot_running"])
+        self.assertLess(body["seconds_since_last_iteration"], 60)
+
+    async def test_stale_when_loop_has_not_updated_in_time(self):
+        from src.utils.timeutils import utcnow
+
+        bot = self.main_module.TradingBot()
+        bot.running = True
+        bot.last_iteration_at = utcnow() - timedelta(seconds=600)
+        self.bot_registry.current_bot = bot
+
+        response = await self.api_module.health()
+
+        self.assertEqual(response.status_code, 503)
+        body = self._body(response)
+        self.assertEqual(body["status"], "stale")
+
+    async def test_unhealthy_when_running_flag_is_false(self):
+        from src.utils.timeutils import utcnow
+
+        bot = self.main_module.TradingBot()
+        bot.running = False
+        bot.last_iteration_at = utcnow()
+        self.bot_registry.current_bot = bot
+
+        response = await self.api_module.health()
+
+        self.assertEqual(response.status_code, 503)
+        body = self._body(response)
+        self.assertFalse(body["bot_running"])
 
 
 class TestMlForecastEndpoint(unittest.IsolatedAsyncioTestCase):

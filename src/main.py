@@ -91,6 +91,16 @@ class TradingBot:
         # полного пересчёта торговой вселенной (_refresh_symbol_universe),
         # который только тогда убрал бы символ из active_symbols.
         self._symbol_market_type: dict[str, str] = {}
+        # Отметка времени последнего ЗАВЕРШЁННОГО прохода основного цикла
+        # (см. run()) — единственный способ GET /health отличить реально
+        # зависший цикл (застрял внутри await без таймаута — сетевой вызов
+        # биржи/LLM-парсера и т.п.) от штатной работы: раньше /health всегда
+        # возвращал "bot_running": True захардкоженно, независимо от того,
+        # жив ли цикл — контейнерный healthcheck/аптайм-монитор никогда не
+        # увидел бы зависание. Обновляется и на успешной, и на пойманной
+        # исключением итерации — важен сам факт, что цикл провернулся, а не
+        # содержательный результат итерации (тот уже логируется отдельно).
+        self.last_iteration_at: datetime | None = None
 
     async def initialize(self):
         """Инициализация всех компонентов."""
@@ -1522,12 +1532,14 @@ class TradingBot:
         while self.running:
             try:
                 await self._trading_iteration()
+                self.last_iteration_at = utcnow()
                 await asyncio.sleep(60)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Основной цикл: {e}")
                 await send_notification(f"🔴 Ошибка основного цикла: {e}")
+                self.last_iteration_at = utcnow()
                 await asyncio.sleep(60)
 
         await self._cleanup()

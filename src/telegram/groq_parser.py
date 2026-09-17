@@ -91,7 +91,9 @@ def _get_client():
             raise RuntimeError("GROQ_API_KEY не настроен")
         from groq import AsyncGroq
 
-        _client = AsyncGroq(api_key=settings.groq_api_key)
+        # Явный timeout — см. комментарий у AsyncAnthropic в llm_parser.py:
+        # без него зависший запрос стопорит разбор всех последующих сигналов.
+        _client = AsyncGroq(api_key=settings.groq_api_key, timeout=20.0)
     return _client
 
 

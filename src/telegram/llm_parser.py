@@ -74,7 +74,11 @@ def _get_client():
             raise RuntimeError("ANTHROPIC_API_KEY не настроен")
         import anthropic
 
-        _client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        # Явный timeout — без него зависший (не оборвавшийся ошибкой) запрос
+        # к провайдеру стопорил бы разбор КАЖДОГО следующего сигнала канала,
+        # сводя на нет смысл фолбэк-цепочки Anthropic→Gemini→Cerebras→Groq→
+        # regex: та помогает только если провайдер падает быстро.
+        _client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key, timeout=20.0)
     return _client
 
 

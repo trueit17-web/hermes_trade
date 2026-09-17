@@ -80,7 +80,9 @@ def _get_client():
             raise RuntimeError("CEREBRAS_API_KEY не настроен")
         from cerebras.cloud.sdk import AsyncCerebras
 
-        _client = AsyncCerebras(api_key=settings.cerebras_api_key)
+        # Явный timeout — см. комментарий у AsyncAnthropic в llm_parser.py:
+        # без него зависший запрос стопорит разбор всех последующих сигналов.
+        _client = AsyncCerebras(api_key=settings.cerebras_api_key, timeout=20.0)
     return _client
 
 

@@ -344,15 +344,55 @@ async def logout(request: Request):
     return response
 
 
+# Основной цикл (TradingBot.run() в main.py) проходит одну итерацию и
+# засыпает на 60с — 300с (5 нормальных интервалов) даёт запас на то, что
+# одна конкретная итерация отработала дольше обычного (сетевые ретраи
+# биржи/LLM-парсера), но всё ещё достаточно мало, чтобы поймать реальное
+# зависание (застрял внутри await без таймаута) заметно раньше следующей
+# внешней проверки мониторинга.
+_HEALTH_STALE_THRESHOLD_SECONDS = 300
+
+
 @app.get("/health")
 async def health():
-    """Проверка здоровья."""
-    return {
-        "status": "ok",
+    """
+    Проверка здоровья — раньше "bot_running": True было захардкожено
+    безусловно, поэтому даже полностью зависший основной цикл (см.
+    TradingBot.last_iteration_at) выглядел бы для внешнего healthcheck/
+    аптайм-монитора полностью здоровым. Теперь статус реально зависит от
+    того, обновлял ли цикл свою отметку времени в ожидаемое окно.
+    """
+    now = utcnow()
+    bot = bot_registry.current_bot
+    if bot is None:
+        return JSONResponse(status_code=503, content={
+            "status": "not_initialized",
+            "trading_mode": settings.trading_mode,
+            "bot_running": False,
+            "timestamp": now.isoformat() + "Z",
+        })
+
+    last_iteration_at = bot.last_iteration_at
+    if last_iteration_at is None:
+        # Ещё не прошла ни одна итерация (бот только что стартовал) —
+        # не считаем это ошибкой, но и не подтверждаем работоспособность.
+        status_str = "starting"
+        seconds_since = None
+        healthy = True
+    else:
+        seconds_since = (now - last_iteration_at).total_seconds()
+        healthy = seconds_since <= _HEALTH_STALE_THRESHOLD_SECONDS
+        status_str = "ok" if healthy else "stale"
+
+    body = {
+        "status": status_str,
         "trading_mode": settings.trading_mode,
-        "bot_running": True,
-        "timestamp": utcnow().isoformat() + "Z",
+        "bot_running": bool(bot.running),
+        "last_iteration_at": last_iteration_at.isoformat() + "Z" if last_iteration_at else None,
+        "seconds_since_last_iteration": seconds_since,
+        "timestamp": now.isoformat() + "Z",
     }
+    return JSONResponse(status_code=200 if (healthy and bot.running) else 503, content=body)
 
 
 @app.get("/status")
