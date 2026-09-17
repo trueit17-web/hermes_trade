@@ -1,6 +1,6 @@
 """CoinGlass API клиент — получение аналитических данных для ML и стратегий."""
 import logging
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -56,7 +56,7 @@ class CoinGlassClient:
         cached = self._cache.get(cache_key)
         if cached:
             cached_time = cached.get("_cached_at", 0)
-            if datetime.now(UTC).timestamp() - cached_time < self._cache_ttl:
+            if datetime.now(timezone.utc).timestamp() - cached_time < self._cache_ttl:
                 return cached.get("data")
 
         try:
@@ -69,7 +69,7 @@ class CoinGlassClient:
             data = response.json()
             self._cache[cache_key] = {
                 "data": data,
-                "_cached_at": datetime.now(UTC).timestamp(),
+                "_cached_at": datetime.now(timezone.utc).timestamp(),
             }
             return data
         except httpx.HTTPStatusError as e:

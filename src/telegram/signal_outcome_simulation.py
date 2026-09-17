@@ -18,7 +18,7 @@ break-even для будущей ML-модели качества сигнала
 тянуть в этот модуль весь TradingBot и его зависимости.
 """
 import logging
-from datetime import UTC
+from datetime import timezone
 
 import ccxt.async_support as ccxt
 from sqlalchemy import select
@@ -199,7 +199,7 @@ async def simulate_channel_signal_outcomes(
         for row in rows:
             ccxt_symbol = _ccxt_symbol_for_market(row.parsed_pair, market_type)
             try:
-                since_ms = int(row.message_date.replace(tzinfo=UTC).timestamp() * 1000)
+                since_ms = int(row.message_date.replace(tzinfo=timezone.utc).timestamp() * 1000)
                 ohlcv = await exchange.fetch_ohlcv(ccxt_symbol, timeframe="1h", since=since_ms, limit=1000)
             except Exception as e:
                 logger.debug(f"Не удалось получить свечи {ccxt_symbol} для симуляции сигнала {row.id}: {e}")

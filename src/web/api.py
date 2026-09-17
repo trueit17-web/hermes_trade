@@ -3,7 +3,7 @@ import asyncio
 import logging
 import os
 import signal
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1776,7 +1776,7 @@ async def get_logs(
         "logs": [
             {
                 "id": r.id,
-                "timestamp": r.timestamp.replace(tzinfo=UTC).isoformat(),
+                "timestamp": r.timestamp.replace(tzinfo=timezone.utc).isoformat(),
                 "level": r.level,
                 "logger": r.logger,
                 "message": r.message,
