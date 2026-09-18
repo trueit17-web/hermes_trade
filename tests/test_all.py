@@ -2021,16 +2021,14 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         restored = positions["RESTORECOIN/USDT"]
         self.assertAlmostEqual(restored["amount"], 4.0)
         self.assertEqual(restored["tp_hit_count"], 1)
-        # После TP1 остаток должен восстановиться с SL в безубытке — с
-        # реальной положительной комиссией входа это НЕ ровно entry_price
-        # (см. breakeven_stop_price/ONDO-инцидент), а entry_price + буфер
-        # на комиссии полного круга, отсюда > вместо ==.
-        self.assertGreater(restored["stop_loss"], restored["entry_price"])
-        from src.utils.trading_math import breakeven_stop_price
-        expected_fee_rate = restored["entry_fee"] / (restored["entry_price"] * restored["amount"])
+        # После TP1 остаток должен восстановиться с SL на полпути от
+        # ИСХОДНОГО SL ордера (45.0, см. Order.stop_loss выше) к входу
+        # (halfway_to_entry_stop_price) — не в безубыток (по явному запросу
+        # пользователя, см. main.py._check_position_exit).
+        from src.utils.trading_math import halfway_to_entry_stop_price
         self.assertAlmostEqual(
             restored["stop_loss"],
-            breakeven_stop_price(restored["entry_price"], "long", expected_fee_rate),
+            halfway_to_entry_stop_price(45.0, restored["entry_price"]),
         )
 
     async def test_restore_steps_trailing_sl_to_previous_tp_level_after_multiple_hits(self):
@@ -7621,6 +7619,27 @@ class TestBreakevenStopPrice(unittest.TestCase):
     def test_non_positive_entry_price_returned_unchanged(self):
         from src.utils.trading_math import breakeven_stop_price
         self.assertEqual(breakeven_stop_price(0.0, "long", 0.001), 0.0)
+
+
+class TestHalfwayToEntryStopPrice(unittest.TestCase):
+    """
+    halfway_to_entry_stop_price (src/utils/trading_math.py) — по явному
+    запросу пользователя заменяет breakeven_stop_price для переноса SL
+    после первого частичного TP (TP1): не в безубыток, а на полпути между
+    ПРЕЖНИМ значением SL и ценой входа.
+    """
+
+    def test_long_moves_sl_up_halfway_to_entry(self):
+        from src.utils.trading_math import halfway_to_entry_stop_price
+        self.assertAlmostEqual(halfway_to_entry_stop_price(90.0, 100.0), 95.0)
+
+    def test_short_moves_sl_down_halfway_to_entry(self):
+        from src.utils.trading_math import halfway_to_entry_stop_price
+        self.assertAlmostEqual(halfway_to_entry_stop_price(110.0, 100.0), 105.0)
+
+    def test_sl_already_at_entry_stays_at_entry(self):
+        from src.utils.trading_math import halfway_to_entry_stop_price
+        self.assertAlmostEqual(halfway_to_entry_stop_price(100.0, 100.0), 100.0)
 
 
 class TestTpLevelsUsesRealChannelTargets(unittest.TestCase):
@@ -17565,7 +17584,9 @@ class TestCheckPositionExitRatchetsStopLossToPriorTpLevel(unittest.IsolatedAsync
     TP3 и т.д. никак его не двигали. Откат до входа после серии успешных
     целей отдавал бы рынку уже подтверждённую движением прибыль. Теперь
     каждый следующий частичный TP подтягивает SL к цене ПРЕДЫДУЩЕГО уровня
-    (TP1 -> безубыток, TP2 -> уровень TP1, TP3 -> уровень TP2, и т.д.).
+    (TP1 -> полпути от исходного SL к входу, см. halfway_to_entry_stop_price
+    — по отдельному запросу пользователя вместо полного безубытка,
+    TP2 -> уровень TP1, TP3 -> уровень TP2, и т.д.).
     """
 
     def _make_bot(self):
@@ -17603,7 +17624,7 @@ class TestCheckPositionExitRatchetsStopLossToPriorTpLevel(unittest.IsolatedAsync
 
         with patch.object(engine, "close_paper_position", side_effect=fake_close):
             await bot._check_position_exit(symbol, 110.0)  # TP1
-            self.assertAlmostEqual(bot.open_positions[symbol]["sl"], 100.0)  # безубыток
+            self.assertAlmostEqual(bot.open_positions[symbol]["sl"], 95.0)  # полпути 90->100
 
             await bot._check_position_exit(symbol, 120.0)  # TP2
             self.assertAlmostEqual(bot.open_positions[symbol]["sl"], 110.0)  # уровень TP1
@@ -17632,7 +17653,7 @@ class TestCheckPositionExitRatchetsStopLossToPriorTpLevel(unittest.IsolatedAsync
 
         with patch.object(engine, "close_paper_position", side_effect=fake_close):
             await bot._check_position_exit(symbol, 90.0)  # TP1
-            self.assertAlmostEqual(bot.open_positions[symbol]["sl"], 100.0)
+            self.assertAlmostEqual(bot.open_positions[symbol]["sl"], 105.0)  # полпути 110->100
 
             await bot._check_position_exit(symbol, 80.0)  # TP2
             self.assertAlmostEqual(bot.open_positions[symbol]["sl"], 90.0)
@@ -17665,17 +17686,18 @@ class TestCheckPositionExitRatchetsStopLossToPriorTpLevel(unittest.IsolatedAsync
 
         self.assertAlmostEqual(bot.open_positions[symbol]["sl"], 120.0)  # уровень TP2
 
-    async def test_breakeven_after_tp1_includes_fee_buffer_not_bare_entry_price(self):
+    async def test_tp1_sl_is_halfway_point_regardless_of_fee(self):
         """
-        Реальный инцидент (прод, ONDO/USDT): TP1 сработал через 26с после
-        входа, SL остатка переставился РОВНО на entry_price, откат цены к
-        той же отметке (без какого-либо фактического движения против
-        позиции) закрыл сделку в минус на -16.49 USDT чисто на комиссиях
-        входа+выхода. "Безубыток" ровно на entry_price не является
-        безубытком, если есть ненулевая комиссия — нужен буфер сверху (см.
-        breakeven_stop_price).
+        По явному запросу пользователя SL после TP1 переносится не в
+        безубыток, а на полпути между ИСХОДНЫМ SL и входом
+        (halfway_to_entry_stop_price) — независимо от комиссии входа: в
+        отличие от прежнего поведения (breakeven_stop_price, где ненулевая
+        комиссия сдвигала SL дальше entry_price буфером — см. ONDO-инцидент
+        в halfway_to_entry_stop_price/breakeven_stop_price), эта формула
+        комиссию вообще не учитывает.
         """
         from src.utils.timeutils import utcnow
+        from src.utils.trading_math import halfway_to_entry_stop_price
 
         bot, engine = self._make_bot()
         symbol = "RATCHETFEE1/USDT"
@@ -17698,30 +17720,30 @@ class TestCheckPositionExitRatchetsStopLossToPriorTpLevel(unittest.IsolatedAsync
             await bot._check_position_exit(symbol, 110.0)  # TP1
 
         new_sl = bot.open_positions[symbol]["sl"]
-        self.assertGreater(new_sl, entry_price)
-        # Оставшаяся (после списания доли TP1) комиссия входа для остатка
-        # объёма — 3/4 от исходной (TP1 закрыл 1/4 объёма на 4 уровнях).
-        remaining_amount = bot.open_positions[symbol]["amount"]
-        remaining_fee = bot.open_positions[symbol]["entry_fee"]
-        expected_fee_rate = remaining_fee / (entry_price * remaining_amount)
-        from src.utils.trading_math import breakeven_stop_price
-        expected_sl = breakeven_stop_price(entry_price, "long", expected_fee_rate)
-        self.assertAlmostEqual(new_sl, expected_sl)
+        self.assertAlmostEqual(new_sl, halfway_to_entry_stop_price(90.0, entry_price))  # 95.0
 
-    async def test_breakeven_after_tp1_stays_at_entry_price_when_fee_is_zero(self):
-        """Регресс: при entry_fee=0 (например, paper-режим без комиссий)
-        буфер не должен появляться из ниоткуда — прежнее поведение (SL
-        ровно на entry_price) сохраняется."""
+    async def test_tp1_falls_back_to_fee_aware_breakeven_when_no_original_sl(self):
+        """
+        Позиция без исходного SL (например, ручная сделка, открытая без
+        указания стопа) — "полпути от текущего SL" неприменимо (SL нет),
+        поэтому сохраняется прежнее поведение: перенос в безубыток с
+        буфером на комиссию полного круга (см. breakeven_stop_price/
+        ONDO-инцидент).
+        """
         from src.utils.timeutils import utcnow
+        from src.utils.trading_math import breakeven_stop_price
 
         bot, engine = self._make_bot()
-        symbol = "RATCHETFEE2/USDT"
-        engine.paper_positions[symbol] = {"side": "short", "entry_price": 100.0, "amount": 4.0}
+        symbol = "RATCHETNOSL1/USDT"
+        entry_price = 100.0
+        amount = 8.0
+        entry_fee = 4.0
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": entry_price, "amount": amount}
         bot.open_positions[symbol] = {
-            "side": "short", "entry_price": 100.0, "amount": 4.0,
-            "original_amount": 4.0, "strategy_id": "telegram_signal",
-            "sl": 110.0, "tp": 70.0, "take_profits": [90.0, 80.0, 70.0],
-            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+            "side": "long", "entry_price": entry_price, "amount": amount,
+            "original_amount": amount, "strategy_id": "telegram_signal",
+            "sl": None, "tp": 140.0, "take_profits": [110.0, 120.0, 130.0, 140.0],
+            "tp_hit_count": 0, "entry_fee": entry_fee, "order_id": None, "opened_at": utcnow(),
         }
 
         async def fake_close(**kwargs):
@@ -17729,9 +17751,15 @@ class TestCheckPositionExitRatchetsStopLossToPriorTpLevel(unittest.IsolatedAsync
             return {"pnl": 1.0, "pnl_pct": 1.0, "outcome": "win", "trade_id": 1}
 
         with patch.object(engine, "close_paper_position", side_effect=fake_close):
-            await bot._check_position_exit(symbol, 90.0)  # TP1
+            await bot._check_position_exit(symbol, 110.0)  # TP1
 
-        self.assertAlmostEqual(bot.open_positions[symbol]["sl"], 100.0)
+        new_sl = bot.open_positions[symbol]["sl"]
+        self.assertGreater(new_sl, entry_price)
+        remaining_amount = bot.open_positions[symbol]["amount"]
+        remaining_fee = bot.open_positions[symbol]["entry_fee"]
+        expected_fee_rate = remaining_fee / (entry_price * remaining_amount)
+        expected_sl = breakeven_stop_price(entry_price, "long", expected_fee_rate)
+        self.assertAlmostEqual(new_sl, expected_sl)
 
     async def test_real_mode_resyncs_exchange_stop_loss_order(self):
         """На реальном рынке новый SL должен переставляться на бирже, а не
@@ -17761,7 +17789,7 @@ class TestCheckPositionExitRatchetsStopLossToPriorTpLevel(unittest.IsolatedAsync
             await bot._check_position_exit(symbol, 110.0)  # TP1
             await bot._check_position_exit(symbol, 120.0)  # TP2
 
-        self.assertEqual(mock_sync.await_args_list[0].args, (symbol, 6.0, 100.0))
+        self.assertEqual(mock_sync.await_args_list[0].args, (symbol, 6.0, 95.0))  # полпути 90->100
         self.assertEqual(mock_sync.await_args_list[1].args, (symbol, 4.0, 110.0))
 
 
@@ -19195,9 +19223,10 @@ class TestSimulateSignalAgainstCandles(unittest.TestCase):
     simulate_signal_against_candles (src/telegram/signal_outcome_simulation.py)
     — второй этап плана: реальная метка win/loss/break-even для исторических
     сигналов по свечам биржи, прогоняя ТУ ЖЕ логику частичных TP (1/N
-    исходного объёма на уровень) и ступенчатого SL (TP1 -> безубыток, TPn
-    (n>=2) -> уровень TP(n-1)), что и живой _check_position_exit (main.py).
-    Сравнивает только close свечи — как и сам живой бот.
+    исходного объёма на уровень) и ступенчатого SL (TP1 -> полпути от
+    исходного SL к входу, TPn (n>=2) -> уровень TP(n-1)), что и живой
+    _check_position_exit (main.py). Сравнивает только close свечи — как и
+    сам живой бот.
     """
 
     def _sim(self, side, entry, sl, tp, take_profits, closes):
@@ -19234,10 +19263,13 @@ class TestSimulateSignalAgainstCandles(unittest.TestCase):
         self.assertAlmostEqual(result["pnl_pct"], 20.0, places=4)
 
     def test_ratchets_sl_to_prior_tp_level_after_each_partial_hit(self):
-        """TP1 -> безубыток, TP2 -> уровень TP1 — после третьей свечи цена
-        откатывается ровно на TP1 (100->110->120->110) и должна закрыться
-        стопом на уровне TP1, а не в убыток, как раньше (до ступенчатого
-        SL — только безубыток после TP1, TP2 бы его никак не подвинул)."""
+        """TP2 -> уровень TP1 — после третьей свечи цена откатывается ровно
+        на TP1 (100->110->120->110) и должна закрыться стопом на уровне TP1,
+        а не в убыток, как раньше (до ступенчатого SL — TP2 бы его никак не
+        подвинул). Промежуточный SL после самого TP1 (полпути к входу, см.
+        halfway_to_entry_stop_price) здесь не проверяется отдельно — он
+        перезаписывается уровнем TP1 ещё до того, как цена успевает к нему
+        вернуться."""
         result = self._sim(
             "long", 100.0, 90.0, None, [110.0, 120.0, 130.0], [110.0, 120.0, 110.0],
         )
@@ -19254,10 +19286,30 @@ class TestSimulateSignalAgainstCandles(unittest.TestCase):
         self.assertEqual(result["tp_hit_count"], 0)
         self.assertAlmostEqual(result["pnl_pct"], 0.0, places=6)
 
-    def test_short_side_mirrors_long_logic(self):
+    def test_short_side_ratchets_to_halfway_point_after_tp1(self):
+        """
+        После TP1 SL остатка переносится не в безубыток (100), а на
+        полпути между исходным SL (110) и входом (100) — halfway_to_entry_
+        stop_price(110, 100) = 105 (см. src/utils/trading_math.py). Откат
+        цены за 105 (а не только до входа 100, как раньше) добивает сделку
+        до итогового убытка — раньше (перенос в безубыток) итог после TP1
+        был гарантированно неотрицательным, теперь уже нет.
+        """
+        result = self._sim("short", 100.0, 110.0, None, [90.0, 80.0, 70.0], [90.0, 106.0])
+        self.assertEqual(result["outcome"], "loss")
+        self.assertEqual(result["exit_reason"], "stop_loss")
+        self.assertEqual(result["tp_hit_count"], 1)
+        # (10/3) закрыто по TP1 + (2/3 остатка * -6% отката за новый SL 105) = -0.6667
+        self.assertAlmostEqual(result["pnl_pct"], -0.666667, places=4)
+
+    def test_short_side_does_not_stop_out_at_old_breakeven_price(self):
+        """Регресс: цена возвращается ровно к старому безубытку (100) —
+        новый SL (105) этого ещё не видит, позиция остаётся открытой
+        (unresolved), а не закрывается стопом, как было бы при старом
+        поведении "TP1 -> безубыток"."""
         result = self._sim("short", 100.0, 110.0, None, [90.0, 80.0, 70.0], [90.0, 100.0])
         self.assertEqual(result["outcome"], "win")
-        self.assertEqual(result["exit_reason"], "stop_loss")
+        self.assertEqual(result["exit_reason"], "unresolved_after_partial_tp")
         self.assertEqual(result["tp_hit_count"], 1)
         self.assertAlmostEqual(result["pnl_pct"], 3.333333, places=4)
 
@@ -19273,8 +19325,9 @@ class TestSimulateSignalAgainstCandles(unittest.TestCase):
 
     def test_unresolved_after_partial_tp_still_counts_as_win(self):
         """Свечи закончились после одного частичного TP, финальная цель не
-        достигнута — ступенчатый SL держит остаток минимум в безубытке,
-        поэтому итог уже не может быть отрицательным."""
+        достигнута — realized_pnl_pct считает только уже закрытую (по TP)
+        долю объёма, которая по построению всегда положительна, независимо
+        от того, где сейчас стоит SL ещё не закрытого остатка."""
         result = self._sim("long", 100.0, 90.0, None, [110.0, 120.0, 130.0], [110.0])
         self.assertEqual(result["outcome"], "win")
         self.assertEqual(result["exit_reason"], "unresolved_after_partial_tp")

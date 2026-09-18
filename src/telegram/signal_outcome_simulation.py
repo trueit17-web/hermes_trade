@@ -11,11 +11,11 @@ break-even для будущей ML-модели качества сигнала
 сравнивается ровно одна цена (close), а не диапазон.
 
 Использует ту же логику частичных TP (1/N исходного объёма на каждом
-уровне, кроме последнего закрывающего остаток) и ступенчатого SL (TP1ой ->
-безубыток, TPn (n>=2) -> уровень TP(n-1)), что и _check_position_exit —
-продублирована здесь как чистая, тестируемая без сети функция
-(simulate_signal_against_candles), а не импортирована из main.py, чтобы не
-тянуть в этот модуль весь TradingBot и его зависимости.
+уровне, кроме последнего закрывающего остаток) и ступенчатого SL (TP1 ->
+полпути от исходного SL к входу, TPn (n>=2) -> уровень TP(n-1)), что и
+_check_position_exit — продублирована здесь как чистая, тестируемая без
+сети функция (simulate_signal_against_candles), а не импортирована из
+main.py, чтобы не тянуть в этот модуль весь TradingBot и его зависимости.
 """
 import logging
 from datetime import UTC
@@ -27,6 +27,7 @@ from src.config import settings
 from src.db.models import HistoricalSignal
 from src.db.session import get_session
 from src.utils.timeutils import utcnow
+from src.utils.trading_math import halfway_to_entry_stop_price
 
 logger = logging.getLogger(__name__)
 
@@ -66,11 +67,18 @@ def simulate_signal_against_candles(
     остаток — на финальном закрытии (последний TP или SL).
 
     Если свечи закончились, а позиция ещё не закрыта полностью, но хотя бы
-    один TP уже сработал — итог помечается "win": ступенчатый SL держит
-    остаток минимум в безубытке, поэтому общий результат уже не может стать
-    отрицательным, даже если финальная цель ещё не достигнута в пределах
-    загруженных свечей. Если ни один уровень не сработал вообще —
-    "unresolved" (недостаточно данных, чтобы судить).
+    один TP уже сработал — итог помечается "win": realized_pnl_pct на этой
+    ветке считает только УЖЕ ЗАКРЫТЫЕ (сработавшие TP) доли объёма, которые
+    по построению всегда прибыльны (цена дошла до цели), а ещё не закрытый
+    остаток в это число не входит вовсе — независимо от того, где именно
+    стоит его SL. Если ни один уровень не сработал вообще — "unresolved"
+    (недостаточно данных, чтобы судить).
+
+    Если же SL остатка СРАБАТЫВАЕТ (ветка ниже, до исчерпания свечей) —
+    итог уже НЕ гарантированно неотрицателен после первого TP: SL остатка
+    после TP1 переносится на полпути к входу (halfway_to_entry_stop_price),
+    а не в безубыток, поэтому банковский прибыток по TP1 может быть
+    перекрыт убытком остатка, если цена откатится до этого SL.
     """
     tp_levels = _tp_levels(entry, tp, take_profits)
     n_levels = len(tp_levels)
@@ -119,7 +127,7 @@ def simulate_signal_against_candles(
                 "exit_reason": f"take_profit_{level_hit + 1}", "tp_hit_count": tp_hit_count + 1,
             }
         tp_hit_count += 1
-        current_sl = entry if level_hit == 0 else tp_levels[level_hit - 1]
+        current_sl = halfway_to_entry_stop_price(current_sl, entry) if level_hit == 0 else tp_levels[level_hit - 1]
 
     if tp_hit_count > 0:
         return {

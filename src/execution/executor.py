@@ -40,7 +40,7 @@ from src.event_bus import (
 from src.risk.risk_manager import risk_manager
 from src.utils.ccxt_helpers import ccxt_symbol as _shared_ccxt_symbol
 from src.utils.timeutils import utcnow, utcnow_timestamp
-from src.utils.trading_math import breakeven_stop_price
+from src.utils.trading_math import breakeven_stop_price, halfway_to_entry_stop_price
 
 logger = logging.getLogger(__name__)
 
@@ -845,19 +845,22 @@ class ExecutionEngine:
 
         # Если хотя бы один уровень TP уже сработал, SL остатка позиции был
         # передвинут ступенчатым трейлингом (см. _check_position_exit в
-        # main.py: TP1 -> безубыток, TPn (n>=2) -> уровень TP(n-1)) — это
-        # решение никогда не пишется в Order.stop_loss в БД, поэтому
-        # пересчитываем его здесь по тому же правилу, а не восстанавливаем
-        # исходный SL. Раньше здесь безусловно писалось entry_price для
-        # ЛЮБОГО tp_hit_count >= 1 — верно только для tp_hit_count == 1
-        # (TP1 -> безубыток), но для tp_hit_count >= 2 откатывало уже
-        # подтверждённый рынком трейлинг обратно к безубытку вместо
-        # уровня TP(tp_hit_count-1) (реальный инцидент: прод-позиция
-        # INJ/USDT с tp_hit_count=3 после рестарта показывала SL=entry
-        # вместо цены TP2). Нужны реальные уровни канала (take_profits) —
-        # тот же запрос к TelegramSignal.parsed_take_profits по
-        # executed_order_id, что и в TradingBot._sync_open_positions_from_
-        # execution_engine (main.py) и GET /positions/detail (api.py).
+        # main.py: TP1 -> полпути от прежнего SL к входу, TPn (n>=2) ->
+        # уровень TP(n-1)) — это решение никогда не пишется в Order.stop_loss
+        # в БД (там всегда остаётся ИСХОДНЫЙ SL, см. присвоение pos["stop_
+        # loss"] из o.stop_loss выше), поэтому пересчитываем его здесь по
+        # тому же правилу, используя этот исходный SL как отправную точку
+        # для halfway_to_entry_stop_price, а не восстанавливая его как есть.
+        # Раньше здесь безусловно писалось entry_price для ЛЮБОГО
+        # tp_hit_count >= 1 — верно только для tp_hit_count == 1 (TP1), но
+        # для tp_hit_count >= 2 откатывало уже подтверждённый рынком
+        # трейлинг обратно к безубытку вместо уровня TP(tp_hit_count-1)
+        # (реальный инцидент: прод-позиция INJ/USDT с tp_hit_count=3 после
+        # рестарта показывала SL=entry вместо цены TP2). Нужны реальные
+        # уровни канала (take_profits) — тот же запрос к TelegramSignal.
+        # parsed_take_profits по executed_order_id, что и в TradingBot.
+        # _sync_open_positions_from_execution_engine (main.py) и
+        # GET /positions/detail (api.py).
         multi_tp_order_ids = [
             pos["order_id"] for pos in positions.values()
             if pos["tp_hit_count"] >= 1
@@ -889,9 +892,13 @@ class ExecutionEngine:
             )
             level_hit = pos["tp_hit_count"] - 1
             if level_hit == 0 or level_hit - 1 >= len(tp_levels):
-                notional = pos["entry_price"] * pos["amount"] if pos["amount"] else 0.0
-                entry_fee_rate = (pos["entry_fee"] / notional) if notional else 0.0
-                pos["stop_loss"] = breakeven_stop_price(pos["entry_price"], pos["side"], entry_fee_rate)
+                original_sl = pos["stop_loss"]
+                if original_sl is not None:
+                    pos["stop_loss"] = halfway_to_entry_stop_price(original_sl, pos["entry_price"])
+                else:
+                    notional = pos["entry_price"] * pos["amount"] if pos["amount"] else 0.0
+                    entry_fee_rate = (pos["entry_fee"] / notional) if notional else 0.0
+                    pos["stop_loss"] = breakeven_stop_price(pos["entry_price"], pos["side"], entry_fee_rate)
             else:
                 pos["stop_loss"] = tp_levels[level_hit - 1]
 

@@ -27,3 +27,23 @@ def breakeven_stop_price(entry_price: float, side: str, entry_fee_rate: float) -
         return entry_price
     buffer = entry_price * entry_fee_rate * 2
     return entry_price + buffer if side == "long" else entry_price - buffer
+
+
+def halfway_to_entry_stop_price(current_sl: float, entry_price: float) -> float:
+    """
+    Цена SL на полпути от ТЕКУЩЕГО значения к цене входа — по явному
+    запросу пользователя используется вместо переноса В безубыток после
+    первого частичного TP (TP1): полный перенос в безубыток сразу после
+    самого первого (обычно ближайшего и наименее значимого) уровня цели
+    отдавал сделке слишком мало места для обычного шума цены.
+
+    ВАЖНО: в отличие от breakeven_stop_price выше, эта цена НЕ гарантирует
+    неотрицательный итог сделки после TP1 — SL остатка всё ещё на
+    "убыточной" стороне от входа, просто ближе к нему, чем был до
+    срабатывания TP1. Это осознанный выбор пользователя (больше свободы
+    движению цены), а не баг.
+
+    Работает одинаково для обеих сторон сделки: результат — линейная
+    интерполяция между current_sl и entry_price, знак направления не важен.
+    """
+    return current_sl + (entry_price - current_sl) / 2

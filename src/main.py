@@ -54,7 +54,7 @@ from src.telegram.channel_monitor import (
 from src.telegram.notifier import edit_notification, send_notification
 from src.utils.logging import drain_pending_log_records, logger, setup_logging
 from src.utils.timeutils import utcnow
-from src.utils.trading_math import breakeven_stop_price
+from src.utils.trading_math import breakeven_stop_price, halfway_to_entry_stop_price
 from src.web.api import app as web_app
 from src.web.settings_store import load_settings_overrides
 from src.web.websocket import setup_websocket_broadcast
@@ -2412,7 +2412,8 @@ class TradingBot:
         уровень, кроме последнего, закрывает 1/N ИСХОДНОГО объёма позиции
         (N — общее число уровней у этой позиции); последний уровень (или
         SL) закрывает весь остаток. После первого частичного срабатывания
-        SL переносится в безубыток.
+        (TP1) SL переносится на полпути от прежнего значения к цене входа
+        (см. halfway_to_entry_stop_price) — НЕ в безубыток.
 
         Раньше уровней всегда было ровно 3 (TP1=50% остатка, TP2=ещё 50%
         остатка = 25% исходного, TP3=остаток) — столько же ставилось
@@ -2565,20 +2566,28 @@ class TradingBot:
             position["amount"] -= close_amount
             position["entry_fee"] = entry_fee_total - entry_fee_portion
             position["tp_hit_count"] = tp_hit_count + 1
-            # Ступенчатый трейлинг: TP1 -> безубыток (как и раньше), каждый
-            # СЛЕДУЮЩИЙ частичный TP подтягивает стоп к цене уровня,
-            # предшествующего только что сработавшему, а не оставляет его
-            # замёрзшим в безубытке навсегда после самого первого TP. Без
-            # этого откат до входа после серии успешных TP (TP2, TP3, ...)
-            # отдавал бы рынку уже подтверждённую движением прибыль вместо
-            # того, чтобы зафиксировать её нарастающим SL. level_hit — индекс
-            # ИМЕННО этого сработавшего уровня (0 = TP1), а не счётчик — верно
-            # и в случае гэпа, перепрыгнувшего сразу через несколько уровней
+            # Ступенчатый трейлинг: TP1 -> половина расстояния от текущего SL
+            # до входа (по явному запросу пользователя — раньше здесь был
+            # полный перенос в безубыток, см. halfway_to_entry_stop_price про
+            # разницу), каждый СЛЕДУЮЩИЙ частичный TP подтягивает стоп к цене
+            # уровня, предшествующего только что сработавшему, а не оставляет
+            # его замёрзшим навсегда после самого первого TP. Без этого откат
+            # до входа после серии успешных TP (TP2, TP3, ...) отдавал бы
+            # рынку уже подтверждённую движением прибыль вместо того, чтобы
+            # зафиксировать её нарастающим SL. level_hit — индекс ИМЕННО
+            # этого сработавшего уровня (0 = TP1), а не счётчик — верно и в
+            # случае гэпа, перепрыгнувшего сразу через несколько уровней
             # (см. цикл поиска reason/level_hit выше).
             if level_hit == 0:
-                notional = position["entry_price"] * position["amount"] if position["amount"] else 0.0
-                entry_fee_rate = (position["entry_fee"] / notional) if notional else 0.0
-                position["sl"] = breakeven_stop_price(position["entry_price"], side, entry_fee_rate)
+                if sl is not None:
+                    position["sl"] = halfway_to_entry_stop_price(sl, position["entry_price"])
+                else:
+                    # Позиция без исходного SL (например, ручная сделка без
+                    # указанного стопа) — "половина пути от текущего SL"
+                    # неприменима, откатываемся на прежнее поведение.
+                    notional = position["entry_price"] * position["amount"] if position["amount"] else 0.0
+                    entry_fee_rate = (position["entry_fee"] / notional) if notional else 0.0
+                    position["sl"] = breakeven_stop_price(position["entry_price"], side, entry_fee_rate)
             else:
                 position["sl"] = tp_levels[level_hit - 1]
             if not settings.is_paper:
