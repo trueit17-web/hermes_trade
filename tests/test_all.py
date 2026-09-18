@@ -4635,6 +4635,27 @@ class TestClosedTradeReportNotParsedAsSignal(unittest.IsolatedAsyncioTestCase):
         text = "Ожидаемая прибыль по сделке: около 20% при достижении цели 1"
         self.assertFalse(is_closed_trade_report(text))
 
+    def test_detects_tsel_dostignuta_variant(self):
+        """
+        Реальный инцидент (прод, @Treyding_Signaly_Kripto): формат "Цель
+        достигнута N ✅" (с лишним словом "достигнута" между ключевым
+        словом и номером) не матчился исходным _HIT_TARGET_PATTERN — такие
+        отчёты уходили в парсеры и логировались как "не распознано ни
+        одним парсером", хотя это не сигнал вообще, а безобидный отчёт.
+        """
+        from src.telegram.channel_monitor import is_closed_trade_report
+
+        text = "#YFI/USDT \n\nЦель достигнута 1 ✅\n\nПрибыль: 22.7924% 📈\nВ: 3 Час 5 Минута ⏰"
+        self.assertTrue(is_closed_trade_report(text))
+
+    def test_detects_all_targets_achieved_variant(self):
+        """Реальный инцидент: итоговая сводка "All targets achieved 😎" —
+        без номера конкретной цели и с другим эмодзи вместо ✅."""
+        from src.telegram.channel_monitor import is_closed_trade_report
+
+        text = "#LDO/USDT All targets achieved 😎\n\nПрибыль: 278.1912% 📈\nВ: 1 День 6 Час ⏰"
+        self.assertTrue(is_closed_trade_report(text))
+
     async def test_parse_telegram_signal_returns_none_for_closed_report(self):
         from src.telegram.channel_monitor import parse_telegram_signal
 
@@ -18823,6 +18844,27 @@ class TestExtractStopHitPair(unittest.TestCase):
         from src.telegram.channel_monitor import extract_stop_hit_pair
 
         self.assertIsNone(extract_stop_hit_pair("Stop Target Hit ❌ на одной из сделок"))
+
+    def test_detects_russian_pozitsiya_ostanovlena_variant(self):
+        """
+        Реальный инцидент (прод, @Treyding_Signaly_Kripto): тот же тип
+        отчёта (сработал СВОЙ стоп канала), но по-русски — "Позиция была
+        остановлена ⛔" вместо английского "Stop Target Hit". Без этого
+        такие отчёты не закрывали нашу позицию немедленно (только на
+        следующей плановой сверке) и попадали в лог как "не распознано ни
+        одним парсером" (это не сигнал вообще, а отчёт о своём же стопе).
+        """
+        from src.telegram.channel_monitor import extract_stop_hit_pair
+
+        text = "#ONT/USDT \n\nПозиция была остановлена ⛔\n\nУбыток: 85.4119% 📉"
+        self.assertEqual(extract_stop_hit_pair(text), "ONT/USDT")
+
+    def test_russian_variant_without_byla_still_matches(self):
+        """"была" в "Позиция была остановлена" необязательно — канал мог
+        написать и без него ("Позиция остановлена")."""
+        from src.telegram.channel_monitor import extract_stop_hit_pair
+
+        self.assertEqual(extract_stop_hit_pair("#SOL/USDT Позиция остановлена ⛔"), "SOL/USDT")
 
 
 class TestHandlerRoutesStopHitReports(unittest.IsolatedAsyncioTestCase):

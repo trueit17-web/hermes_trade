@@ -373,7 +373,16 @@ def normalize_pair(pair: str) -> str:
 
 
 _HIT_TARGET_PATTERN = re.compile(
-    r"(?:цель|target|tp)\s*\d*\s*[:\-–—]?\s*[\d.]+\s*✅", re.IGNORECASE,
+    r"(?:цель|target|tp)\s*\d*\s*[:\-–—]?\s*[\d.]+\s*✅"
+    # "Цель достигнута 1 ✅" — реальный инцидент (прод,
+    # @Treyding_Signaly_Kripto): между ключевым словом и номером цели
+    # стоит слово "достигнута", которое первая альтернатива не пропускает
+    # (там номер идёт сразу за словом/разделителем).
+    r"|(?:цель|target)\s+достигнут\w*\s*\d+\s*✅"
+    # "All targets achieved 😎" — итоговая сводка без номера конкретной
+    # цели и с другим эмодзи вместо ✅ (тот же канал, реальный инцидент).
+    r"|all\s+targets?\s+achieved",
+    re.IGNORECASE,
 )
 _PROFIT_REPORT_PATTERN = re.compile(r"прибыль|profit|pnl", re.IGNORECASE)
 _PERCENT_PATTERN = re.compile(r"\d+(?:[.,]\d+)?\s*%")
@@ -562,7 +571,18 @@ def _extract_pair(text: str) -> str | None:
     return normalize_pair(pair)
 
 
-_STOP_HIT_PATTERN = re.compile(r"stop[\s-]*target[\s-]*hit", re.IGNORECASE)
+_STOP_HIT_PATTERN = re.compile(
+    r"stop[\s-]*target[\s-]*hit"
+    # "Позиция была остановлена ⛔" — реальный инцидент (прод,
+    # @Treyding_Signaly_Kripto): тот же тип отчёта (сработал СВОЙ стоп
+    # канала), но по-русски — не матчился английской фразой выше, поэтому
+    # ни is_closed_trade_report (там нужна связка "цель ✅"+"%прибыли", а
+    # тут "Убыток", не "Прибыль"), ни этот паттерн не срабатывали, и
+    # позиция не закрывалась немедленно по отчёту канала (только на
+    # следующей плановой сверке цены/биржевого SL).
+    r"|позици\w*\s+(?:была\s+)?остановлен\w*",
+    re.IGNORECASE,
+)
 
 
 def extract_stop_hit_pair(text: str) -> str | None:
