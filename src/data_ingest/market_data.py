@@ -128,7 +128,14 @@ class MarketDataIngest:
             df.set_index("timestamp", inplace=True)
             df.sort_index(inplace=True)
 
-            logger.info(f"[{self.exchange_id}] Загружено {len(df)} свечей для {symbol} {timeframe}")
+            # DEBUG, а не INFO — этот метод дёргается на каждый символ на
+            # каждой итерации основного цикла (см. TradingBot._refresh_symbol_
+            # candles в main.py), одна строка на пару за раз при десятках
+            # активных пар превращала лог INFO+ на дашборде в почти
+            # исключительно "Загружено N свечей для X" без реального сигнала.
+            # Ошибки загрузки (ниже) остаются на своих уровнях — они и есть
+            # то, что операционно важно видеть.
+            logger.debug(f"[{self.exchange_id}] Загружено {len(df)} свечей для {symbol} {timeframe}")
             return df
 
         except Exception as e:

@@ -631,7 +631,7 @@ class TradingBot:
             await self.cg_client.get_fear_greed_history(limit=10)
             logger.debug("CoinGlass данные обновлены")
         except Exception as e:
-            logger.debug(f"CoinGlass: {e}")
+            logger.debug(f"Ошибка CoinGlass: {e}")
 
     async def _retrain_ml(self):
         """Переобучение ML моделей."""
@@ -666,7 +666,7 @@ class TradingBot:
                 if self.ml_inference:
                     self.ml_inference.load_model("volatility_predictor", vol_result["model_path"])
         except Exception as e:
-            logger.error(f"ML retraining: {e}")
+            logger.error(f"Ошибка переобучения ML-моделей: {e}")
 
     async def _start_telegram_monitoring(self):
         """Загрузить активные каналы из БД и запустить их мониторинг.

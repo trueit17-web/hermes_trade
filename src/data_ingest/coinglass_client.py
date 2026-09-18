@@ -73,10 +73,10 @@ class CoinGlassClient:
             }
             return data
         except httpx.HTTPStatusError as e:
-            logger.warning(f"CoinGlass API error [{endpoint}]: {e.response.status_code} {e.response.text}")
+            logger.warning(f"Ошибка CoinGlass API [{endpoint}]: {e.response.status_code} {e.response.text}")
             return None
         except Exception as e:
-            logger.error(f"CoinGlass request failed [{endpoint}]: {e}")
+            logger.error(f"Запрос к CoinGlass не удался [{endpoint}]: {e}")
             return None
 
     # === Futures Market ===

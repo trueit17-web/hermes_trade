@@ -1905,6 +1905,17 @@ function renderPositionDetail(d) {
     </div>
   ` : "";
 
+  // Маржа — раньше видна была только по наведению на бейдж плеча ⚡Nx в
+  // главной таблице (title-тултип), отдельной строкой в подробностях не
+  // показывалась вовсе — легко было не заметить и приходилось наводить
+  // курсор каждый раз. Только для фьючерсов (на споте плеча/маржи нет).
+  const marginBlock = (d.market_type === "futures" && d.leverage) ? `
+    <div class="muted" style="margin-bottom:12px; font-size:13px">
+      💰 <strong>Маржа:</strong> ${d.margin_usdt !== null && d.margin_usdt !== undefined ? "$" + fmt(d.margin_usdt, 2) : "—"}
+      <span style="margin-left:4px">(плечо ${d.leverage}x)</span>
+    </div>
+  ` : "";
+
   const tpBlock = `
     <div class="trade-detail-block">
       <h4>Take Profit (${d.tp_hit_count || 0} из ${d.take_profits.length} достигнуто)</h4>
@@ -1970,6 +1981,7 @@ function renderPositionDetail(d) {
   return `
     <div class="trade-detail">
       ${changesBlock}
+      ${marginBlock}
       ${chartRow}
       ${tpBlock}
       ${logHtml}

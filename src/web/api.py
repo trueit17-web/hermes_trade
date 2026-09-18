@@ -910,10 +910,22 @@ async def get_position_detail(symbol: str):
             ]
 
     opened_at = pos.get("opened_at")
+    entry_price = float(pos["entry_price"]) if pos.get("entry_price") is not None else None
+    leverage = pos.get("leverage")
+    # margin_usdt — реальное значение с биржи, если уже сверялось (см.
+    # _reconcile_futures_position в executor.py, raw.get("initialMargin")).
+    # Если его ещё нет (например, реконсиляция не проходила с момента
+    # открытия) — оцениваем сами по номиналу/плечу, тем же способом, что и
+    # tooltip плеча в главной таблице позиций (leverageBadge в
+    # dashboard.html), просто теперь отдельной видимой строкой в
+    # подробностях, а не только по наведению на бейдж плеча.
+    margin_usdt = pos.get("margin_usdt")
+    if margin_usdt is None and leverage and entry_price and pos.get("amount"):
+        margin_usdt = float(pos["amount"]) * entry_price / float(leverage)
     return {
         "symbol": symbol,
         "side": pos.get("side"),
-        "entry_price": float(pos["entry_price"]) if pos.get("entry_price") is not None else None,
+        "entry_price": entry_price,
         "current_price": pos.get("current_price"),
         "amount": pos.get("amount"),
         "stop_loss": float(pos["stop_loss"]) if pos.get("stop_loss") is not None else None,
@@ -924,6 +936,8 @@ async def get_position_detail(symbol: str):
         "signal": signal,
         "signal_changes": signal_changes,
         "decision_log": decision_log,
+        "leverage": leverage,
+        "margin_usdt": margin_usdt,
         # Для графика цены в развороте (см. renderPositionDetail →
         # initTradeChart в dashboard.html) — market_type определяет, каким
         # ccxt-клиентом (спот/фьючерсы) грузить свечи (GET /chart/candles).

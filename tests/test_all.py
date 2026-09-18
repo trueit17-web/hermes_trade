@@ -12910,6 +12910,50 @@ class TestManualTrading(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail["market_type"], "futures")
         self.assertIsNotNone(detail["opened_at"])
 
+    async def test_position_detail_computes_margin_when_not_reconciled_from_exchange(self):
+        """
+        margin_usdt по умолчанию берётся с биржи (initialMargin, см.
+        _reconcile_futures_position в executor.py) — но пока сверка ни разу
+        не проходила (например, сразу после открытия), его в позиции ещё
+        нет. Раньше маржу вообще было видно только по наведению на бейдж
+        плеча ⚡Nx в таблице позиций; теперь /positions/detail должен сам
+        оценить её по номиналу/плечу для отдельной строки в подробностях.
+        """
+        engine, bot = await self._install_engine_and_bot(is_paper=False)
+        engine.real_positions["DETAILMARGIN1/USDT"] = {
+            "amount": 2.0, "entry_price": 100.0, "side": "long",
+            "leverage": 10.0, "market_type": "futures", "strategy_id": "manual",
+        }
+
+        detail = await self.api_module.get_position_detail("DETAILMARGIN1/USDT")
+
+        self.assertEqual(detail["leverage"], 10.0)
+        self.assertAlmostEqual(detail["margin_usdt"], 20.0)  # (2.0 * 100.0) / 10
+
+    async def test_position_detail_prefers_exchange_reconciled_margin(self):
+        engine, bot = await self._install_engine_and_bot(is_paper=False)
+        engine.real_positions["DETAILMARGIN2/USDT"] = {
+            "amount": 2.0, "entry_price": 100.0, "side": "long",
+            "leverage": 10.0, "market_type": "futures", "strategy_id": "manual",
+            "margin_usdt": 25.5,
+        }
+
+        detail = await self.api_module.get_position_detail("DETAILMARGIN2/USDT")
+
+        self.assertAlmostEqual(detail["margin_usdt"], 25.5)  # не пересчитан заново
+
+    async def test_position_detail_no_margin_on_spot(self):
+        engine, bot = await self._install_engine_and_bot(is_paper=True)
+        engine.paper_positions["DETAILMARGIN3/USDT"] = {
+            "amount": 2.0, "entry_price": 100.0, "side": "long",
+            "strategy_id": "manual", "market_type": "spot",
+        }
+
+        detail = await self.api_module.get_position_detail("DETAILMARGIN3/USDT")
+
+        self.assertIsNone(detail["leverage"])
+        self.assertIsNone(detail["margin_usdt"])
+
     async def test_position_detail_includes_telegram_channel_and_signal(self):
         from datetime import datetime
 
@@ -18419,6 +18463,77 @@ class TestHandlerRoutesStopHitReports(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(before, received[0]["message_date"])
         self.assertLessEqual(received[0]["message_date"], after)
         self.assertNotEqual(received[0]["signal_posted_at"], received[0]["message_date"])
+
+
+class TestHandlerWarnsOnUnparsedMessage(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент: сигналы канала @Treyding_Signaly_Kripto перестали
+    появляться в истории на несколько дней — причина оказалась в том, что
+    _handler() полностью МОЛЧА отбрасывал сообщение, если ни regex, ни один
+    из LLM-фолбэков (см. parse_telegram_signal) не смогли его разобрать —
+    ни строки в БД (TelegramSignal создаётся только при parsed), ни
+    видимого в дашборде лога (был только logger.debug, не попадающий в
+    ring-буфер при settings.log_level=INFO). Теперь такой случай должен
+    хотя бы попадать в лог WARNING'ом, чтобы это было видно на дашборде.
+    """
+
+    def setUp(self):
+        import src.telegram.channel_monitor as cm
+        self.cm = cm
+        self._saved_monitored = dict(cm._monitored)
+        self._saved_subscribers = list(cm._subscribers)
+        cm._monitored.clear()
+        cm._subscribers.clear()
+
+    def tearDown(self):
+        self.cm._monitored.clear()
+        self.cm._monitored.update(self._saved_monitored)
+        self.cm._subscribers.clear()
+        self.cm._subscribers.extend(self._saved_subscribers)
+
+    async def test_warns_when_all_parsers_fail_on_nonempty_text(self):
+        self.cm._monitored[-100780] = {
+            "channel_id": "@Treyding_Signaly_Kripto", "channel_title": "AI", "parser_config": {},
+        }
+        event = MagicMock()
+        event.chat_id = -100780
+        event.message.text = "Какое-то нестандартное сообщение канала"
+        event.message.photo = None
+
+        with patch.object(self.cm, "parse_telegram_signal", new=AsyncMock(return_value=None)):
+            with self.assertLogs("src.telegram.channel_monitor", level="WARNING") as logs:
+                await self.cm._handler(event)
+
+        self.assertTrue(any("не распознано" in msg for msg in logs.output))
+        self.assertTrue(any("@Treyding_Signaly_Kripto" in msg for msg in logs.output))
+
+    async def test_no_warning_when_parser_succeeds(self):
+        self.cm._monitored[-100781] = {
+            "channel_id": "@okchan", "channel_title": "OK", "parser_config": {},
+        }
+        event = MagicMock()
+        event.chat_id = -100781
+        event.message.text = "BTC/USDT LONG 50000 SL 49000 TP 52000"
+        event.message.photo = None
+
+        with patch.object(
+            self.cm, "parse_telegram_signal", new=AsyncMock(return_value={"pair": "BTC/USDT", "side": "long"}),
+        ):
+            with self.assertNoLogs("src.telegram.channel_monitor", level="WARNING"):
+                await self.cm._handler(event)
+
+    async def test_no_warning_on_empty_message(self):
+        self.cm._monitored[-100782] = {
+            "channel_id": "@emptychan", "channel_title": "Empty", "parser_config": {},
+        }
+        event = MagicMock()
+        event.chat_id = -100782
+        event.message.text = None
+        event.message.photo = None
+
+        with patch.object(self.cm, "parse_telegram_signal", new=AsyncMock(return_value=None)):
+            with self.assertNoLogs("src.telegram.channel_monitor", level="WARNING"):
+                await self.cm._handler(event)
 
 
 class TestOnChannelStopHitReport(unittest.IsolatedAsyncioTestCase):

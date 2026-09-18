@@ -46,7 +46,7 @@ async def init_telegram():
     api_hash = settings.telegram_api_hash
 
     if not api_id or not api_hash:
-        logger.warning("Telegram API credentials not configured — monitoring disabled")
+        logger.warning("TELEGRAM_API_ID/HASH не заданы — мониторинг каналов отключён")
         return None
 
     _telegram_client = TelegramClient(SESSION_PATH, api_id, api_hash)
@@ -150,6 +150,25 @@ async def _handler(event: events.NewMessage.Event):
             return
 
     parsed = await parse_telegram_signal(raw_text, channel, image_bytes=image_bytes)
+
+    if not parsed and (raw_text.strip() or image_bytes):
+        # Ни регулярки, ни один из LLM-фолбэков (см. цепочку в
+        # parse_telegram_signal) не смогли разобрать сообщение — раньше это
+        # проходило ПОЛНОСТЬЮ БЕССЛЕДНО: ни строки в БД (TelegramSignal
+        # создаётся только при parsed), ни видимого в дашборде лога (только
+        # logger.debug выше, который не попадает даже в ring-буфер при
+        # обычном settings.log_level=INFO). Реальный инцидент: сигналы
+        # канала @Treyding_Signaly_Kripto перестали появляться в истории —
+        # причиной оказалось одновременное исчерпание квот/кредитов у ВСЕХ
+        # LLM-провайдеров подряд (Anthropic/Groq/Gemini/Cerebras) в течение
+        # нескольких дней, и заметить это по логам было невозможно.
+        # Может сработать и на не-сигнальное сообщение канала (обычная
+        # реплика/анонс) — это ожидаемо для каналов, целиком посвящённых
+        # сигналам: лучше видимый лишний WARNING, чем немой пропущенный сигнал.
+        logger.warning(
+            f"⚠️ Сообщение канала {channel['channel_id']} не распознано ни одним парсером "
+            f"(regex+LLM-фолбэки): {raw_text[:200]}"
+        )
 
     if parsed:
         signal_event = {
