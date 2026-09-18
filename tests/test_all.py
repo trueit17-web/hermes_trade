@@ -3884,6 +3884,64 @@ class TestTelegramSignalParser(unittest.TestCase):
         self.assertEqual(result["take_profits"], [0.4720, 0.4650, 0.4448])
 
 
+class TestPositionManagementRuleExtraction(unittest.TestCase):
+    """
+    Реальный инцидент: канал @kripto_signalyX/@kripto_signaly3 в каждом
+    сигнале явно пишет свои доли частичного закрытия (не поровну 1/N) и
+    своё правило переноса SL после TP1 (в безубыток, а не на полпути, как
+    по умолчанию у бота) — см. extract_tp_weights/extract_post_tp1_sl_rule
+    в channel_monitor.py.
+    """
+
+    def setUp(self):
+        from src.telegram.channel_monitor import (
+            extract_post_tp1_sl_rule,
+            extract_tp_weights,
+        )
+        self.extract_tp_weights = extract_tp_weights
+        self.extract_post_tp1_sl_rule = extract_post_tp1_sl_rule
+
+    def test_real_channel_template_weights_and_breakeven_rule(self):
+        text = (
+            "Фиксируем 50% на первой цели, 25% на второй цели и 25% на "
+            "оставшейся и после первой цели ставим стоп в без убыток"
+        )
+        self.assertEqual(self.extract_tp_weights(text), [0.5, 0.25, 0.25])
+        self.assertEqual(self.extract_post_tp1_sl_rule(text), "breakeven")
+
+    def test_no_explicit_rules_returns_none(self):
+        text = "Тейк: 70000, 71000, 72000 Стоп: 68000"
+        self.assertIsNone(self.extract_tp_weights(text))
+        self.assertIsNone(self.extract_post_tp1_sl_rule(text))
+
+    def test_missing_middle_level_returns_none(self):
+        """"первой" и "третьей" без "второй" — нельзя надёжно восстановить
+        порядок, лучше откатиться на дефолт бота, чем угадывать."""
+        text = "Фиксируем 50% на первой цели и 30% на третьей цели"
+        self.assertIsNone(self.extract_tp_weights(text))
+
+    def test_sum_far_from_100_percent_returns_none(self):
+        """Сумма процентов сильно не сходится к 100% — вероятно, относится
+        не к долям объёма этой сделки."""
+        text = "Фиксируем 10% на первой цели, 10% на второй цели"
+        self.assertIsNone(self.extract_tp_weights(text))
+
+    def test_rounding_normalizes_to_exact_one(self):
+        """33/33/34 (типичное округление канала) должно нормализоваться к
+        точной сумме 1.0, а не оставаться 0.999999...·"""
+        text = (
+            "Фиксируем 33% на первой цели, 33% на второй цели и 34% на "
+            "оставшейся"
+        )
+        weights = self.extract_tp_weights(text)
+        self.assertAlmostEqual(sum(weights), 1.0)
+
+    def test_breakeven_phrase_variant_without_space(self):
+        self.assertEqual(
+            self.extract_post_tp1_sl_rule("после TP1 стоп в безубыток"), "breakeven",
+        )
+
+
 class TestMarketEntryDetection(unittest.TestCase):
     def setUp(self):
         from src.telegram.channel_monitor import is_market_entry
@@ -17522,6 +17580,48 @@ class TestExecuteTelegramSignalStoresRealTakeProfits(unittest.IsolatedAsyncioTes
 
         self.assertEqual(bot.open_positions["BTC/USDT"]["take_profits"], [])
 
+    async def test_open_positions_gets_tp_weights_and_post_tp1_sl_rule_from_signal_event(self):
+        """
+        Реальный инцидент: канал @kripto_signalyX/@kripto_signaly3 явно
+        указывает доли частичного закрытия и SL-правило после TP1 в
+        тексте сигнала (см. extract_tp_weights/extract_post_tp1_sl_rule) —
+        должны дойти до open_positions, иначе _check_position_exit не
+        сможет их применить и откатится на дефолт бота.
+        """
+        bot = self._make_bot()
+        bot._refresh_symbol_candles = AsyncMock()
+        fake_order = MagicMock(id=1, fee=0.0)
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=fake_order)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 53000.0,
+                "parsed_take_profits": [51000.0, 52000.0, 53000.0],
+                "parsed_tp_weights": [0.5, 0.25, 0.25],
+                "parsed_post_tp1_sl_rule": "breakeven",
+                "channel_id": "@test_channel",
+            })
+
+        self.assertEqual(bot.open_positions["BTC/USDT"]["tp_weights"], [0.5, 0.25, 0.25])
+        self.assertEqual(bot.open_positions["BTC/USDT"]["post_tp1_sl_rule"], "breakeven")
+
+    async def test_missing_tp_weights_and_post_tp1_sl_rule_default_to_none(self):
+        bot = self._make_bot()
+        bot._refresh_symbol_candles = AsyncMock()
+        fake_order = MagicMock(id=1, fee=0.0)
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=fake_order)
+            await bot._execute_telegram_signal({
+                "parsed_pair": "BTC/USDT", "parsed_side": "long",
+                "parsed_entry": 50000.0, "parsed_sl": 49000.0, "parsed_tp": 52000.0,
+                "channel_id": "@test_channel",
+            })
+
+        self.assertIsNone(bot.open_positions["BTC/USDT"]["tp_weights"])
+        self.assertIsNone(bot.open_positions["BTC/USDT"]["post_tp1_sl_rule"])
+
 
 class TestTelegramSignalRejectReasonReflectsExchangeFailure(unittest.IsolatedAsyncioTestCase):
     """
@@ -17886,6 +17986,114 @@ class TestCheckPositionExitRatchetsStopLossToPriorTpLevel(unittest.IsolatedAsync
 
         new_sl = bot.open_positions[symbol]["sl"]
         self.assertGreater(new_sl, entry_price)
+        remaining_amount = bot.open_positions[symbol]["amount"]
+        remaining_fee = bot.open_positions[symbol]["entry_fee"]
+        expected_fee_rate = remaining_fee / (entry_price * remaining_amount)
+        expected_sl = breakeven_stop_price(entry_price, "long", expected_fee_rate)
+        self.assertAlmostEqual(new_sl, expected_sl)
+
+    async def test_custom_tp_weights_close_unequal_shares(self):
+        """
+        Реальный инцидент: канал @kripto_signalyX/@kripto_signaly3 явно
+        рассчитывает на 50%/25%/25%, а не поровну между тремя целями (см.
+        extract_tp_weights в channel_monitor.py) — position["tp_weights"]
+        должен управлять фактической долей ИСХОДНОГО объёма, закрываемой
+        на каждом уровне, вместо дефолтного равного 1/N.
+        """
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        symbol = "TPWEIGHT1/USDT"
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": 100.0, "amount": 8.0}
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 100.0, "amount": 8.0,
+            "original_amount": 8.0, "strategy_id": "telegram_signal",
+            "sl": 90.0, "tp": 130.0, "take_profits": [110.0, 120.0, 130.0],
+            "tp_weights": [0.5, 0.25, 0.25],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+        }
+
+        closed_amounts = []
+
+        async def fake_close(**kwargs):
+            closed_amounts.append(kwargs["amount"])
+            engine.paper_positions[symbol]["amount"] -= kwargs["amount"]
+            if engine.paper_positions[symbol]["amount"] <= 1e-9:
+                engine.paper_positions.pop(symbol, None)
+            return {"pnl": 1.0, "pnl_pct": 1.0, "outcome": "win", "trade_id": 1}
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close):
+            await bot._check_position_exit(symbol, 110.0)  # TP1 -> 50%
+            await bot._check_position_exit(symbol, 120.0)  # TP2 -> 25%
+            await bot._check_position_exit(symbol, 130.0)  # TP3 (финальный) -> остаток
+
+        self.assertAlmostEqual(closed_amounts[0], 4.0)
+        self.assertAlmostEqual(closed_amounts[1], 2.0)
+        self.assertAlmostEqual(closed_amounts[2], 2.0)
+
+    async def test_mismatched_tp_weights_length_falls_back_to_equal_split(self):
+        """Регресс: если tp_weights собран под другое число уровней (не
+        совпадает с фактическим числом целей), нельзя брать долю не с той
+        позиции списка — откатываемся на равное распределение бота."""
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        symbol = "TPWEIGHTMISMATCH1/USDT"
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": 100.0, "amount": 6.0}
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 100.0, "amount": 6.0,
+            "original_amount": 6.0, "strategy_id": "telegram_signal",
+            "sl": 90.0, "tp": 130.0, "take_profits": [110.0, 120.0, 130.0],
+            "tp_weights": [0.5, 0.5],  # длина 2, а уровней 3 — несовпадение
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+        }
+
+        closed_amounts = []
+
+        async def fake_close(**kwargs):
+            closed_amounts.append(kwargs["amount"])
+            engine.paper_positions[symbol]["amount"] -= kwargs["amount"]
+            return {"pnl": 1.0, "pnl_pct": 1.0, "outcome": "win", "trade_id": 1}
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close):
+            await bot._check_position_exit(symbol, 110.0)  # TP1
+
+        self.assertAlmostEqual(closed_amounts[0], 2.0)  # 6.0 / 3 уровня, поровну
+
+    async def test_post_tp1_sl_rule_breakeven_overrides_halfway_default(self):
+        """
+        Реальный инцидент: тот же канал @kripto_signalyX/@kripto_signaly3
+        явно пишет "после первой цели ставим стоп в без убыток" (см.
+        extract_post_tp1_sl_rule) — position["post_tp1_sl_rule"] ==
+        "breakeven" должен переносить SL в безубыток, а не на полпути
+        (дефолт бота для всех остальных каналов).
+        """
+        from src.utils.timeutils import utcnow
+        from src.utils.trading_math import breakeven_stop_price
+
+        bot, engine = self._make_bot()
+        symbol = "TPBREAKEVEN1/USDT"
+        entry_price = 100.0
+        amount = 8.0
+        entry_fee = 4.0
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": entry_price, "amount": amount}
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": entry_price, "amount": amount,
+            "original_amount": amount, "strategy_id": "telegram_signal",
+            "sl": 90.0, "tp": 140.0, "take_profits": [110.0, 120.0, 130.0, 140.0],
+            "post_tp1_sl_rule": "breakeven",
+            "tp_hit_count": 0, "entry_fee": entry_fee, "order_id": None, "opened_at": utcnow(),
+        }
+
+        async def fake_close(**kwargs):
+            engine.paper_positions[symbol]["amount"] -= kwargs["amount"]
+            return {"pnl": 1.0, "pnl_pct": 1.0, "outcome": "win", "trade_id": 1}
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close):
+            await bot._check_position_exit(symbol, 110.0)  # TP1
+
+        new_sl = bot.open_positions[symbol]["sl"]
+        self.assertGreater(new_sl, entry_price)  # НЕ на полпути (95.0) от 90 к 100
         remaining_amount = bot.open_positions[symbol]["amount"]
         remaining_fee = bot.open_positions[symbol]["entry_fee"]
         expected_fee_rate = remaining_fee / (entry_price * remaining_amount)
@@ -19418,9 +19626,11 @@ class TestSimulateSignalAgainstCandles(unittest.TestCase):
     сам живой бот.
     """
 
-    def _sim(self, side, entry, sl, tp, take_profits, closes):
+    def _sim(self, side, entry, sl, tp, take_profits, closes, tp_weights=None, post_tp1_sl_rule=None):
         from src.telegram.signal_outcome_simulation import simulate_signal_against_candles
-        return simulate_signal_against_candles(side, entry, sl, tp, take_profits, closes)
+        return simulate_signal_against_candles(
+            side, entry, sl, tp, take_profits, closes, tp_weights, post_tp1_sl_rule,
+        )
 
     def test_no_sl_is_unresolved_regardless_of_candles(self):
         result = self._sim("long", 100.0, None, 130.0, None, [110.0, 120.0, 130.0])
@@ -19499,6 +19709,53 @@ class TestSimulateSignalAgainstCandles(unittest.TestCase):
         result = self._sim("short", 100.0, 110.0, None, [90.0, 80.0, 70.0], [90.0, 100.0])
         self.assertEqual(result["outcome"], "win")
         self.assertEqual(result["exit_reason"], "unresolved_after_partial_tp")
+        self.assertEqual(result["tp_hit_count"], 1)
+        self.assertAlmostEqual(result["pnl_pct"], 3.333333, places=4)
+
+    def test_custom_tp_weights_override_equal_split(self):
+        """
+        Реальный инцидент: канал @kripto_signalyX/@kripto_signaly3 явно
+        рассчитывает на 50%/25%/25%, а не поровну (см. extract_tp_weights)
+        — tp_weights должен управлять взвешенным pnl_pct симуляции точно
+        так же, как долями закрытия в живом _check_position_exit, иначе
+        ML-метка исхода не соответствовала бы тому, как сделка реально
+        велась бы ботом.
+        """
+        result = self._sim(
+            "long", 100.0, 90.0, None, [110.0, 120.0, 130.0], [110.0, 120.0, 130.0],
+            tp_weights=[0.5, 0.25, 0.25],
+        )
+        self.assertEqual(result["outcome"], "win")
+        self.assertEqual(result["tp_hit_count"], 3)
+        # 0.5*10 + 0.25*20 + 0.25*30 = 17.5 (равное распределение дало бы 20.0)
+        self.assertAlmostEqual(result["pnl_pct"], 17.5, places=4)
+
+    def test_mismatched_tp_weights_length_falls_back_to_equal_split(self):
+        """Несовпадение длины tp_weights с фактическим числом уровней —
+        откат на равное распределение, как и в живом _check_position_exit."""
+        result = self._sim(
+            "long", 100.0, 90.0, None, [110.0, 120.0, 130.0], [110.0, 120.0, 130.0],
+            tp_weights=[0.5, 0.5],  # длина 2, уровней 3
+        )
+        self.assertAlmostEqual(result["pnl_pct"], 20.0, places=4)
+
+    def test_post_tp1_sl_rule_breakeven_overrides_halfway_default(self):
+        """
+        Реальный инцидент: тот же канал явно пишет "после первой цели
+        ставим стоп в без убыток" — post_tp1_sl_rule="breakeven" переносит
+        SL остатка ровно на entry (без буфера на комиссии — симуляция их
+        не моделирует), а не на полпути (105 в этом примере, дефолт бота),
+        так что цена, вернувшаяся ровно к входу, должна закрыть остаток
+        стопом здесь — в отличие от дефолтного halfway-поведения
+        (test_short_side_does_not_stop_out_at_old_breakeven_price), где та
+        же цена оставляет позицию unresolved.
+        """
+        result = self._sim(
+            "short", 100.0, 110.0, None, [90.0, 80.0, 70.0], [90.0, 100.0],
+            post_tp1_sl_rule="breakeven",
+        )
+        self.assertEqual(result["outcome"], "win")
+        self.assertEqual(result["exit_reason"], "stop_loss")
         self.assertEqual(result["tp_hit_count"], 1)
         self.assertAlmostEqual(result["pnl_pct"], 3.333333, places=4)
 

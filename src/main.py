@@ -376,6 +376,12 @@ class TradingBot:
         (channel_key/expectancy_sizing/protection_manager ключуются по
         этой строке) — иначе после рестарта позиция начинала бы
         считаться сигналом от "другого" канала для этих подсистем.
+
+        tp_weights/post_tp1_sl_rule — та же логика: явные правила канала
+        (см. extract_tp_weights/extract_post_tp1_sl_rule в
+        channel_monitor.py) персистятся только в TelegramSignal, без этого
+        восстановления канал с 50/25/25-долями откатывался бы на равные
+        доли бота после каждого рестарта.
         """
         self.open_positions = {}
         # Раньше здесь безусловно читался execution_engine.paper_positions —
@@ -420,6 +426,8 @@ class TradingBot:
                 "sl": pos.get("stop_loss"),
                 "tp": pos.get("take_profit"),
                 "take_profits": signal.parsed_take_profits if signal else None,
+                "tp_weights": signal.parsed_tp_weights if signal else None,
+                "post_tp1_sl_rule": signal.parsed_post_tp1_sl_rule if signal else None,
                 "original_amount": filled_amount_by_order_id.get(order_id, pos.get("amount")),
                 "channel_id": signal.channel.channel_id if signal and signal.channel else None,
                 "tp_hit_count": pos.get("tp_hit_count", 0),
@@ -1122,6 +1130,8 @@ class TradingBot:
                     parsed_tp=signal_event.get("parsed_tp"),
                     parsed_take_profits=signal_event.get("parsed_take_profits") or None,
                     parsed_leverage=signal_event.get("parsed_leverage"),
+                    parsed_tp_weights=signal_event.get("parsed_tp_weights"),
+                    parsed_post_tp1_sl_rule=signal_event.get("parsed_post_tp1_sl_rule"),
                     quality_score=quality,
                     decision=decision,
                     reject_reason=signal_event.get("reject_reason") if decision == "rejected" else None,
@@ -1201,6 +1211,12 @@ class TradingBot:
         sl = signal_event.get("parsed_sl")
         tp = signal_event.get("parsed_tp")
         take_profits = signal_event.get("parsed_take_profits") or []
+        # Явные правила управления позицией после TP1 (доли объёма/SL-
+        # правило), если канал их указал — см. extract_tp_weights/
+        # extract_post_tp1_sl_rule (channel_monitor.py) и докстринг
+        # _check_position_exit про то, какие дефолты бота они переопределяют.
+        tp_weights = signal_event.get("parsed_tp_weights")
+        post_tp1_sl_rule = signal_event.get("parsed_post_tp1_sl_rule")
         # Кредитное плечо, явно указанное каналом в тексте сигнала
         # ("Кредитное плечо: х35") — актуально только на фьючерсах,
         # применяется вместо глобальной settings.futures_leverage (см.
@@ -1234,6 +1250,16 @@ class TradingBot:
         # видно, что именно и почему бот изменил относительно того, что
         # реально написал канал.
         signal_changes: list[str] = []
+
+        # Не автоправка бота, а собственное явное указание канала — но
+        # показываем той же строкой в подробностях сделки, чтобы было видно,
+        # что бот распознал и применил именно ЭТИ доли/правило SL, а не
+        # свой обычный дефолт (равные доли, halfway-SL после TP1).
+        if tp_weights:
+            pct_list = ", ".join(f"{w * 100:.3g}%" for w in tp_weights)
+            signal_changes.append(f"канал указал доли частичного закрытия: {pct_list}")
+        if post_tp1_sl_rule == "breakeven":
+            signal_changes.append("канал указал перенос SL в безубыток после TP1 (не на полпути)")
 
         if (
             not exact_execution
@@ -1413,6 +1439,11 @@ class TradingBot:
                 # использует их напрямую вместо интерполяции между entry и
                 # одним числом tp (см. комментарий в _tp_levels).
                 "take_profits": take_profits,
+                # Явные правила канала (доли объёма/SL-правило после TP1) —
+                # None, если канал их не указал: _check_position_exit
+                # использует свой дефолт (равные доли, halfway-SL).
+                "tp_weights": tp_weights,
+                "post_tp1_sl_rule": post_tp1_sl_rule,
                 # Объём НА МОМЕНТ ОТКРЫТИЯ — неизменная база для расчёта доли
                 # каждого TP-уровня (1/N от исходного объёма, см.
                 # _check_position_exit); "amount" выше мутирует после каждого
@@ -1502,6 +1533,8 @@ class TradingBot:
                 [float(x) for x in signal.parsed_take_profits] if signal.parsed_take_profits else []
             )
             leverage = float(signal.parsed_leverage) if signal.parsed_leverage else None
+            tp_weights = signal.parsed_tp_weights
+            post_tp1_sl_rule = signal.parsed_post_tp1_sl_rule
             channel_string_id = signal.channel.channel_id if signal.channel else None
 
         if symbol in self.open_positions:
@@ -1520,6 +1553,8 @@ class TradingBot:
             "amount": amount, "strategy_id": "telegram_signal",
             "rationale": "Telegram сигнал (подхвачен вручную)", "sl": sl, "tp": tp,
             "take_profits": take_profits,
+            "tp_weights": tp_weights,
+            "post_tp1_sl_rule": post_tp1_sl_rule,
             "original_amount": amount,
             "tp_hit_count": 0,
             "opened_at": utcnow(),
@@ -2209,19 +2244,24 @@ class TradingBot:
         return [tp1, tp2, tp]
 
     @staticmethod
-    def _reason_ru(reason: str, is_partial: bool, n_levels: int) -> str:
+    def _reason_ru(reason: str, is_partial: bool, n_levels: int, weight: float | None = None) -> str:
         """
         Человекочитаемая причина закрытия для логов/уведомлений. Раньше это
         был статический словарь ровно на 3 ключа (take_profit_1/2/3) с
         зашитыми в текст процентами 50%/25% — не масштабировался на
         произвольное число уровней (см. _tp_levels/_check_position_exit).
+
+        weight — фактическая доля ИСХОДНОГО объёма, закрытая на этом
+        уровне (см. position["tp_weights"]/extract_tp_weights) — если
+        канал не указал свои доли явно, вызывающий код передаёт равную
+        долю 1/n_levels, тот же процент, что показывался всегда.
         """
         if reason == "stop_loss":
             return "Stop Loss"
         if reason.startswith("take_profit_"):
             level = reason.rsplit("_", 1)[-1]
             if is_partial:
-                pct = 100 / n_levels if n_levels else 100
+                pct = (weight if weight is not None else (1 / n_levels if n_levels else 1.0)) * 100
                 return f"Take Profit {level} ({pct:.3g}%)"
             return f"Take Profit {level} (остаток)"
         return reason
@@ -2415,12 +2455,20 @@ class TradingBot:
         (TP1) SL переносится на полпути от прежнего значения к цене входа
         (см. halfway_to_entry_stop_price) — НЕ в безубыток.
 
+        Оба этих дефолта — равные доли 1/N и перенос SL на полпути после
+        TP1 — канал может ПЕРЕОПРЕДЕЛИТЬ явным указанием в тексте сигнала
+        ("Фиксируем 50% на первой цели, 25% на второй цели и 25% на
+        оставшейся и после первой цели ставим стоп в без убыток" —
+        реальный инцидент, @kripto_signalyX/@kripto_signaly3): см.
+        position["tp_weights"]/position["post_tp1_sl_rule"], заполняемые
+        из extract_tp_weights/extract_post_tp1_sl_rule в channel_monitor.py.
+
         Раньше уровней всегда было ровно 3 (TP1=50% остатка, TP2=ещё 50%
         остатка = 25% исходного, TP3=остаток) — столько же ставилось
         всегда, сколько бы целей канал ни прислал: реальный сигнал с 8
         целями закрывался целиком уже на 3-й, ближайшей (см. _tp_levels).
         Теперь число уровней = длине списка реальных целей канала, а доля
-        каждого — 1/N от исходного объёма.
+        каждого — 1/N от исходного объёма (если канал не указал свои).
 
         Возвращает True, если позиция была закрыта (полностью) в этом вызове.
         """
@@ -2493,13 +2541,24 @@ class TradingBot:
 
         # Все уровни, кроме последнего, закрывают 1/N ИСХОДНОГО объёма
         # позиции (original_amount — не мутирует при частичных закрытиях,
-        # в отличие от position["amount"]). Последний уровень и SL — весь
-        # остаток. Если после частичного закрытия остаётся управляющая
-        # погрешность (пыль), закрываем полностью, а не оставляем висеть.
+        # в отличие от position["amount"]) — если канал НЕ указал свои доли
+        # явно. Если указал (position["tp_weights"], см. extract_tp_weights
+        # в channel_monitor.py — реальный инцидент: канал явно рассчитывает
+        # на 50%/25%/25%, а не поровну), используется его доля для этого
+        # конкретного уровня; при несовпадении длины с фактическим числом
+        # уровней (например, tp_weights собран под другое число целей)
+        # безопасно откатываемся на равное распределение, а не берём долю
+        # не с той позиции списка. Последний уровень и SL — весь остаток.
+        # Если после частичного закрытия остаётся управляющая погрешность
+        # (пыль), закрываем полностью, а не оставляем висеть.
         is_partial = reason != "stop_loss" and level_hit is not None and level_hit < n_levels - 1
+        weight = 1 / n_levels if n_levels else 1.0
         if is_partial:
             original_amount = position.get("original_amount") or position["amount"]
-            close_amount = min(original_amount / n_levels, position["amount"])
+            tp_weights = position.get("tp_weights")
+            if tp_weights and len(tp_weights) == n_levels:
+                weight = tp_weights[level_hit]
+            close_amount = min(original_amount * weight, position["amount"])
         else:
             close_amount = position["amount"]
         if position["amount"] - close_amount <= 1e-9:
@@ -2579,15 +2638,17 @@ class TradingBot:
             # случае гэпа, перепрыгнувшего сразу через несколько уровней
             # (см. цикл поиска reason/level_hit выше).
             if level_hit == 0:
-                if sl is not None:
-                    position["sl"] = halfway_to_entry_stop_price(sl, position["entry_price"])
-                else:
-                    # Позиция без исходного SL (например, ручная сделка без
-                    # указанного стопа) — "половина пути от текущего SL"
-                    # неприменима, откатываемся на прежнее поведение.
+                # Канал мог явно указать перенос SL в безубыток после TP1
+                # ("...после первой цели ставим стоп в без убыток" —
+                # реальный инцидент, @kripto_signalyX/@kripto_signaly3, см.
+                # extract_post_tp1_sl_rule) — это ПЕРЕОПРЕДЕЛЯЕТ дефолт бота
+                # (halfway_to_entry_stop_price) именно для этой сделки.
+                if position.get("post_tp1_sl_rule") == "breakeven" or sl is None:
                     notional = position["entry_price"] * position["amount"] if position["amount"] else 0.0
                     entry_fee_rate = (position["entry_fee"] / notional) if notional else 0.0
                     position["sl"] = breakeven_stop_price(position["entry_price"], side, entry_fee_rate)
+                else:
+                    position["sl"] = halfway_to_entry_stop_price(sl, position["entry_price"])
             else:
                 position["sl"] = tp_levels[level_hit - 1]
             if not settings.is_paper:
@@ -2612,7 +2673,7 @@ class TradingBot:
                 )
 
         emoji = "✅" if result["pnl"] > 0 else "❌"
-        reason_ru = self._reason_ru(reason, is_partial, n_levels)
+        reason_ru = self._reason_ru(reason, is_partial, n_levels, weight)
         logger.info(
             f"{emoji} {'Частично закрыта' if is_partial else 'Позиция закрыта'}: {symbol} {side.upper()} | "
             f"{reason_ru} @ {current_price:.4f} | объём {close_amount:.6f} | "

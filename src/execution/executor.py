@@ -868,17 +868,30 @@ class ExecutionEngine:
             and pos.get("order_id")
         ]
         take_profits_by_order_id: dict[int, list[float]] = {}
+        # Правило переноса SL после TP1, если канал указало его явно в
+        # тексте сигнала (см. extract_post_tp1_sl_rule в channel_monitor.py
+        # и halfway_to_entry_stop_price про дефолт бота, который оно
+        # переопределяет) — та же связь по executed_order_id, что и для
+        # take_profits_by_order_id.
+        post_tp1_sl_rule_by_order_id: dict[int, str] = {}
         if multi_tp_order_ids:
             try:
                 async with get_session() as session:
                     signals = (
                         await session.execute(
-                            select(TelegramSignal.executed_order_id, TelegramSignal.parsed_take_profits)
+                            select(
+                                TelegramSignal.executed_order_id,
+                                TelegramSignal.parsed_take_profits,
+                                TelegramSignal.parsed_post_tp1_sl_rule,
+                            )
                             .where(TelegramSignal.executed_order_id.in_(multi_tp_order_ids))
                         )
                     ).all()
                 take_profits_by_order_id = {
-                    order_id: parsed for order_id, parsed in signals if parsed
+                    order_id: parsed for order_id, parsed, _rule in signals if parsed
+                }
+                post_tp1_sl_rule_by_order_id = {
+                    order_id: rule for order_id, _parsed, rule in signals if rule
                 }
             except Exception as e:
                 logger.warning(f"Не удалось загрузить исходные уровни TP для восстановления трейлинг-SL: {e}")
@@ -891,9 +904,10 @@ class ExecutionEngine:
                 take_profits_by_order_id.get(pos.get("order_id")),
             )
             level_hit = pos["tp_hit_count"] - 1
+            is_breakeven_rule = post_tp1_sl_rule_by_order_id.get(pos.get("order_id")) == "breakeven"
             if level_hit == 0 or level_hit - 1 >= len(tp_levels):
                 original_sl = pos["stop_loss"]
-                if original_sl is not None:
+                if original_sl is not None and not is_breakeven_rule:
                     pos["stop_loss"] = halfway_to_entry_stop_price(original_sl, pos["entry_price"])
                 else:
                     notional = pos["entry_price"] * pos["amount"] if pos["amount"] else 0.0

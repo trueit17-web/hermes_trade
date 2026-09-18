@@ -26,6 +26,7 @@ from sqlalchemy import select
 from src.config import settings
 from src.db.models import HistoricalSignal
 from src.db.session import get_session
+from src.telegram.channel_monitor import extract_post_tp1_sl_rule, extract_tp_weights
 from src.utils.timeutils import utcnow
 from src.utils.trading_math import halfway_to_entry_stop_price
 
@@ -53,18 +54,27 @@ def _tp_levels(entry_price: float, tp: float | None, take_profits: list[float] |
 def simulate_signal_against_candles(
     side: str, entry: float, sl: float | None, tp: float | None,
     take_profits: list[float] | None, closes: list[float],
+    tp_weights: list[float] | None = None, post_tp1_sl_rule: str | None = None,
 ) -> dict:
     """
     closes — цены закрытия часовых свечей ПОСЛЕ времени сигнала, в
     хронологическом порядке (см. докстринг модуля про "почему только close").
+
+    tp_weights/post_tp1_sl_rule — явные правила канала (см.
+    extract_tp_weights/extract_post_tp1_sl_rule в channel_monitor.py),
+    разобранные из raw_message ТОГО ЖЕ сигнала — переопределяют дефолты
+    бота (равные доли 1/N, halfway-SL после TP1) точно так же, как в живом
+    _check_position_exit, иначе ML-метка исхода для таких сигналов не
+    соответствовала бы тому, как сделка реально велась бы бота.
 
     Возвращает {"outcome": "win"/"loss"/"break-even"/"unresolved",
     "pnl_pct": float | None, "exit_reason": str | None, "tp_hit_count": int}.
 
     pnl_pct — взвешенная по объёму каждого уровня доходность в процентах
     (без комиссий — исторических данных по ним нет), тот же принцип, что у
-    _check_position_exit: 1/N исходного объёма на каждый частичный уровень,
-    остаток — на финальном закрытии (последний TP или SL).
+    _check_position_exit: 1/N исходного объёма на каждый частичный уровень
+    (или явная доля канала, см. tp_weights выше), остаток — на финальном
+    закрытии (последний TP или SL).
 
     Если свечи закончились, а позиция ещё не закрыта полностью, но хотя бы
     один TP уже сработал — итог помечается "win": realized_pnl_pct на этой
@@ -85,6 +95,12 @@ def simulate_signal_against_candles(
     if not sl or n_levels == 0 or not closes:
         return {"outcome": "unresolved", "pnl_pct": None, "exit_reason": None, "tp_hit_count": 0}
 
+    # Несовпадение длины (например, tp_weights собран под другое число
+    # целей) — откатываемся на дефолтное равное распределение, а не берём
+    # долю не с той позиции списка (см. тот же приём в _check_position_exit).
+    if tp_weights and len(tp_weights) != n_levels:
+        tp_weights = None
+
     def price_return_pct(price: float) -> float:
         return (price - entry) / entry * 100 if side == "long" else (entry - price) / entry * 100
 
@@ -93,12 +109,13 @@ def simulate_signal_against_candles(
 
     current_sl = sl
     tp_hit_count = 0
+    consumed_weight = 0.0
     realized_pnl_pct = 0.0
 
     for close in closes:
         sl_triggered = close <= current_sl if side == "long" else close >= current_sl
         if sl_triggered:
-            remaining_weight = 1 - tp_hit_count / n_levels
+            remaining_weight = 1 - consumed_weight
             realized_pnl_pct += remaining_weight * price_return_pct(close)
             return {
                 "outcome": outcome_from_pnl(realized_pnl_pct), "pnl_pct": realized_pnl_pct,
@@ -119,15 +136,25 @@ def simulate_signal_against_candles(
             continue
 
         is_final = level_hit == n_levels - 1
-        weight = (1 - tp_hit_count / n_levels) if is_final else (1 / n_levels)
+        weight = (1 - consumed_weight) if is_final else (tp_weights[level_hit] if tp_weights else 1 / n_levels)
         realized_pnl_pct += weight * price_return_pct(close)
         if is_final:
             return {
                 "outcome": outcome_from_pnl(realized_pnl_pct), "pnl_pct": realized_pnl_pct,
                 "exit_reason": f"take_profit_{level_hit + 1}", "tp_hit_count": tp_hit_count + 1,
             }
+        consumed_weight += weight
         tp_hit_count += 1
-        current_sl = halfway_to_entry_stop_price(current_sl, entry) if level_hit == 0 else tp_levels[level_hit - 1]
+        if level_hit == 0:
+            # Канал мог явно указать перенос SL в безубыток после TP1 (см.
+            # extract_post_tp1_sl_rule) — переопределяет дефолт бота
+            # (halfway_to_entry_stop_price). "В безубыток" здесь — ровно
+            # entry, без буфера на комиссии (в отличие от breakeven_stop_
+            # price в живом коде): эта симуляция в принципе не моделирует
+            # комиссии (см. докстринг модуля/функции выше).
+            current_sl = entry if post_tp1_sl_rule == "breakeven" else halfway_to_entry_stop_price(current_sl, entry)
+        else:
+            current_sl = tp_levels[level_hit - 1]
 
     if tp_hit_count > 0:
         return {
@@ -217,6 +244,12 @@ async def simulate_channel_signal_outcomes(
                 continue
 
             closes = [float(c[4]) for c in ohlcv]
+            # HistoricalSignal не хранит tp_weights/post_tp1_sl_rule
+            # отдельными колонками (в отличие от TelegramSignal) — разбираем
+            # их из уже сохранённого raw_message тут же, а не заводим ещё
+            # одну миграцию: тот же текст, тот же результат, что дал бы
+            # live-парсер в момент получения сигнала (см.
+            # extract_tp_weights/extract_post_tp1_sl_rule).
             result = simulate_signal_against_candles(
                 row.parsed_side,
                 float(row.parsed_entry),
@@ -224,6 +257,8 @@ async def simulate_channel_signal_outcomes(
                 float(row.parsed_tp) if row.parsed_tp else None,
                 [float(x) for x in row.parsed_take_profits] if row.parsed_take_profits else None,
                 closes,
+                extract_tp_weights(row.raw_message),
+                extract_post_tp1_sl_rule(row.raw_message),
             )
 
             async with get_session() as session:

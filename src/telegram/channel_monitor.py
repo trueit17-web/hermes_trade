@@ -199,6 +199,13 @@ async def _handler(event: events.NewMessage.Event):
             # уровня линейной интерполяцией вместо использования того,
             # что канал реально указал.
             "parsed_take_profits": parsed.get("take_profits", []),
+            # Явные правила управления позицией после TP1, если канал их
+            # указал свободным текстом сообщения (см. extract_tp_weights/
+            # extract_post_tp1_sl_rule/_enrich_with_position_rules выше) —
+            # None, если не указал: вызывающий код (_execute_telegram_signal
+            # в main.py) использует дефолт бота.
+            "parsed_tp_weights": parsed.get("tp_weights"),
+            "parsed_post_tp1_sl_rule": parsed.get("post_tp1_sl_rule"),
             # Кредитное плечо, явно указанное каналом ("Кредитное плечо:
             # х35") — актуально только для фьючерсных сигналов, см.
             # _execute_telegram_signal (main.py) и _execute_real_order
@@ -437,17 +444,17 @@ async def parse_telegram_signal(
         from src.telegram.llm_parser import parse_with_llm
         parsed = await parse_with_llm(text, channel_config, image_bytes=image_bytes)
         if parsed:
-            return parsed
+            return _enrich_with_position_rules(parsed, text)
         from src.telegram.gemini_parser import parse_with_gemini
         parsed = await parse_with_gemini(text, channel_config, image_bytes=image_bytes)
         if parsed:
-            return parsed
+            return _enrich_with_position_rules(parsed, text)
         return None
 
     # Попытка 1: регулярки для стандартных форматов
     parsed = parse_with_regex(text)
     if parsed:
-        return parsed
+        return _enrich_with_position_rules(parsed, text)
 
     # Попытка 2: LLM-фолбэк через Anthropic (выключен по умолчанию —
     # telegram_llm_fallback_enabled) — для сообщений, которые регулярки не
@@ -456,7 +463,7 @@ async def parse_telegram_signal(
     from src.telegram.llm_parser import parse_with_llm
     parsed = await parse_with_llm(text, channel_config)
     if parsed:
-        return parsed
+        return _enrich_with_position_rules(parsed, text)
 
     # Попытка 3: LLM-фолбэк через Groq — второй уровень, пробуется если
     # Anthropic не настроен (нет ключа) или тоже не смог разобрать. Groq
@@ -466,7 +473,7 @@ async def parse_telegram_signal(
     from src.telegram.groq_parser import parse_with_groq
     parsed = await parse_with_groq(text, channel_config)
     if parsed:
-        return parsed
+        return _enrich_with_position_rules(parsed, text)
 
     # Попытка 4: LLM-фолбэк через Gemini — пробуется если ни Anthropic, ни
     # Groq не настроены/не смогли. Gemini выбран как ещё один бесплатный по
@@ -475,7 +482,7 @@ async def parse_telegram_signal(
     from src.telegram.gemini_parser import parse_with_gemini
     parsed = await parse_with_gemini(text, channel_config)
     if parsed:
-        return parsed
+        return _enrich_with_position_rules(parsed, text)
 
     # Попытка 5: LLM-фолбэк через Cerebras — последний уровень, пробуется
     # если ни один из предыдущих трёх не настроен/не смог. Независимый
@@ -486,7 +493,7 @@ async def parse_telegram_signal(
     from src.telegram.cerebras_parser import parse_with_cerebras
     parsed = await parse_with_cerebras(text, channel_config)
     if parsed:
-        return parsed
+        return _enrich_with_position_rules(parsed, text)
 
     return None
 
@@ -830,6 +837,102 @@ def extract_all_prices(text: str, *keywords) -> list[float]:
         if values:
             return values
     return []
+
+
+_ORDINAL_WORDS_RU = [
+    "первой", "второй", "третьей", "четвёртой", "пятой",
+    "шестой", "седьмой", "восьмой", "девятой", "десятой",
+]
+
+
+def extract_tp_weights(text: str) -> list[float] | None:
+    """
+    Извлечь ЯВНО указанные каналом доли объёма для частичного закрытия по
+    каждому уровню TP ("Фиксируем 50% на первой цели, 25% на второй цели
+    и 25% на оставшейся"). Реальный инцидент (прод, @kripto_signalyX/
+    @kripto_signaly3): канал регулярно указывает НЕравное распределение
+    (50/25/25), а не поровну между уровнями — дефолт бота (_tp_levels/
+    _check_position_exit в main.py, 1/N исходного объёма на каждый
+    уровень) закрывал бы позицию не так, как рассчитывал канал.
+
+    Возвращает список долей (сумма нормализована к 1.0), самый первый
+    (ближайший к входу) уровень — первый элемент списка, в том же
+    порядке, что и take_profits/parsed_take_profits. None, если явных
+    долей в тексте нет ИЛИ они выглядят ненадёжно (пропущен уровень
+    посередине — "первой"+"третьей" без "второй", или сумма процентов
+    сильно не сходится к 100%) — в этом случае вызывающий код использует
+    дефолтное равное распределение бота, а не угадывает по неполным данным.
+    """
+    ordinal_matches = re.findall(
+        rf"(\d+(?:[.,]\d+)?)\s*%\s*на\s+({'|'.join(_ORDINAL_WORDS_RU)})\s+цел",
+        text, re.IGNORECASE,
+    )
+    if not ordinal_matches:
+        return None
+
+    weights_by_index: dict[int, float] = {}
+    for pct_str, word in ordinal_matches:
+        idx = _ORDINAL_WORDS_RU.index(word.lower())
+        weights_by_index[idx] = float(pct_str.replace(",", ".")) / 100
+
+    max_idx = max(weights_by_index)
+    weights: list[float | None] = [weights_by_index.get(i) for i in range(max_idx + 1)]
+    if any(w is None for w in weights):
+        return None
+
+    # "25% на оставшейся" — доля последнего уровня, обычно не привязана к
+    # слову "цели" ("...25% на оставшейся И после первой цели ставим
+    # стоп..." — дальше идёт новое предложение о SL, а не "цели").
+    remainder_match = re.search(
+        r"(\d+(?:[.,]\d+)?)\s*%\s*на\s+(?:оставшейс\w*|остат\w*|остальн\w*)",
+        text, re.IGNORECASE,
+    )
+    if remainder_match:
+        weights.append(float(remainder_match.group(1).replace(",", ".")) / 100)
+
+    total = sum(weights)
+    if not (0.9 <= total <= 1.1):
+        # Сумма заметно не сходится к 100% — вероятно, проценты в тексте
+        # относятся не к долям объёма ЭТОЙ сделки, а к чему-то другому.
+        # Безопаснее откатиться на дефолт бота, чем закрыть позицию по
+        # неверным долям объёма.
+        return None
+    return [w / total for w in weights]
+
+
+def extract_post_tp1_sl_rule(text: str) -> str | None:
+    """
+    Явное указание канала, куда переносить SL остатка позиции ПОСЛЕ
+    первого частичного TP. Возвращает "breakeven", если канал прямо
+    пишет перенос в безубыток ("...после первой цели ставим стоп в без
+    убыток") — реальный инцидент (прод, @kripto_signalyX/
+    @kripto_signaly3): в отличие от дефолта бота
+    (halfway_to_entry_stop_price — на полпути к входу, см. её докстринг
+    про причину этого дефолта), этот канал рассчитывает именно на
+    безубыток. None, если канал ничего явно не указал — вызывающий код
+    использует дефолт бота.
+    """
+    if re.search(r"стоп\w*\s+в\s+без\s?убыт", text, re.IGNORECASE):
+        return "breakeven"
+    return None
+
+
+def _enrich_with_position_rules(parsed: dict, text: str) -> dict:
+    """
+    Добавляет к результату ЛЮБОГО парсера (regex или LLM-фолбэки) явные
+    правила управления позицией после TP1, если канал указал их свободным
+    текстом сообщения, отдельно от полей самого сигнала (entry/SL/TP) —
+    см. extract_tp_weights/extract_post_tp1_sl_rule.
+    """
+    if not text:
+        return parsed
+    tp_weights = extract_tp_weights(text)
+    if tp_weights:
+        parsed["tp_weights"] = tp_weights
+    post_tp1_sl_rule = extract_post_tp1_sl_rule(text)
+    if post_tp1_sl_rule:
+        parsed["post_tp1_sl_rule"] = post_tp1_sl_rule
+    return parsed
 
 
 # "Диапазон входа: по рынку", "Entry: market", "at market price" — канал

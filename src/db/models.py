@@ -316,6 +316,16 @@ class TelegramSignal(Base):
     # указано, применяется через set_leverage ИМЕННО для этого ордера
     # вместо глобального значения.
     parsed_leverage: Mapped[float | None] = mapped_column(DECIMAL)
+    # Явные доли объёма на каждый уровень TP ("Фиксируем 50% на первой
+    # цели, 25% на второй цели и 25% на оставшейся") — см. docstring
+    # extract_tp_weights в channel_monitor.py. NULL — канал не указал,
+    # используется дефолтное равное распределение бота (1/N).
+    parsed_tp_weights: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Явное указание канала, куда переносить SL остатка после TP1 —
+    # сейчас единственное поддержанное значение "breakeven" (в безубыток),
+    # см. docstring extract_post_tp1_sl_rule. NULL — канал не указал,
+    # используется дефолт бота (halfway_to_entry_stop_price).
+    parsed_post_tp1_sl_rule: Mapped[str | None] = mapped_column(String(20))
     quality_score: Mapped[float | None] = mapped_column(Float)
     decision: Mapped[str] = mapped_column(
         String(30), default="pending"
