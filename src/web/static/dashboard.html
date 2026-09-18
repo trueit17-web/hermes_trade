@@ -3817,6 +3817,12 @@ async function loadSystemMetrics() {
     const m = await api("/system/metrics");
     const cards = [
       {
+        label: "Версия",
+        value: m.version || "—",
+        cls: "",
+        sub: "см. CHANGELOG.md",
+      },
+      {
         label: "CPU",
         value: `${fmt(m.cpu_percent, 0)}%`,
         cls: metricClass(m.cpu_percent),

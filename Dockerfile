@@ -19,6 +19,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ ./src/
 COPY alembic.ini .
 COPY alembic/ ./alembic/
+# Номер версии (см. CHANGELOG.md) — читается GET /system/metrics
+# (src/web/system_metrics.py), чтобы по дашборду можно было однозначно
+# отличить "новый код уже развернулся" от "докер собрал из кеша старый
+# слой" (реальный инцидент при отладке редеплоя — см. CHANGELOG.md).
+COPY VERSION .
 
 # Создание директорий (data/ гитигнорится и монтируется как volume в docker-compose.yml)
 RUN mkdir -p /app/data/logs /app/data/models

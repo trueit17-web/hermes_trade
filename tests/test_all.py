@@ -9498,6 +9498,7 @@ class TestSystemMetrics(unittest.TestCase):
         from src.web.system_metrics import get_system_metrics
         m = get_system_metrics()
 
+        self.assertIn("version", m)
         self.assertIn("cpu_percent", m)
         self.assertIsInstance(m["cpu_count"], int)
         self.assertGreaterEqual(m["cpu_count"], 1)
@@ -9525,6 +9526,35 @@ class TestSystemMetrics(unittest.TestCase):
         m = get_system_metrics()
         expected = shutil.disk_usage(str(settings.data_dir))
         self.assertEqual(m["disk"]["total"], expected.total)
+
+    def test_version_matches_version_file_at_repo_root(self):
+        """
+        Реальный мотив (см. CHANGELOG.md): без явного номера версии в
+        ответе редеплоя невозможно быстро отличить "код уже обновился" от
+        "docker собрал из кеша старый слой" — версия должна отражать
+        именно файл VERSION в корне репозитория, который Dockerfile
+        копирует в образ отдельной командой.
+        """
+        from pathlib import Path
+
+        from src.web.system_metrics import get_system_metrics
+
+        version_path = Path(__file__).parent.parent / "VERSION"
+        expected = version_path.read_text().strip()
+        self.assertEqual(get_system_metrics()["version"], expected)
+
+    def test_version_falls_back_to_unknown_when_file_missing(self):
+        """Отсутствие VERSION в образе (старый билд до этой фичи, или
+        забытый COPY в Dockerfile) не должно ронять /system/metrics
+        целиком — деградация до "unknown", а не 500."""
+        import src.web.system_metrics as sm
+
+        original = sm._VERSION
+        try:
+            sm._VERSION = "unknown"
+            self.assertEqual(sm.get_system_metrics()["version"], "unknown")
+        finally:
+            sm._VERSION = original
 
 
 class TestSystemMetricsEndpoint(unittest.IsolatedAsyncioTestCase):
