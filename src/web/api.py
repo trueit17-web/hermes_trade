@@ -2107,6 +2107,38 @@ async def simulate_telegram_channel_outcomes(channel_id: int, limit: int = 50):
     return result
 
 
+@app.get("/telegram/channels/{channel_id}/unparsed-samples")
+async def telegram_channel_unparsed_samples(channel_id: int, limit: int = 5):
+    """
+    Диагностика: полный сырой текст последних сообщений канала, которые
+    бэкафилл (POST /telegram/channels/{id}/backfill) сохранил со статусом
+    "unparsed" — ни regex, ни LLM-фолбэки не смогли их разобрать.
+
+    Нужен отдельно от живого WARNING-лога (_handler в channel_monitor.py,
+    "не распознано ни одним парсером") — тот обрезает превью до 200
+    символов, этого не хватает, чтобы обновить правила парсера под
+    реальный (часто изменившийся) формат канала. Здесь — текст целиком.
+    """
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                select(HistoricalSignal.raw_message, HistoricalSignal.message_date)
+                .where(
+                    HistoricalSignal.channel_id == channel_id,
+                    HistoricalSignal.parse_status == "unparsed",
+                )
+                .order_by(HistoricalSignal.message_date.desc())
+                .limit(min(limit, 50))
+            )
+        ).all()
+    return {
+        "samples": [
+            {"message_date": d.isoformat() + "Z" if d else None, "raw_message": m}
+            for m, d in rows
+        ]
+    }
+
+
 @app.get("/telegram/channels/{channel_id}/backfill-summary")
 async def telegram_channel_backfill_summary(channel_id: int):
     """Сводка по уже загруженной бэкафиллом истории канала и уже

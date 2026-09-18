@@ -19217,6 +19217,64 @@ class TestBackfillApiEndpoints(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["total"], 0)
         self.assertIsNone(result["oldest_message_date"])
 
+    async def test_unparsed_samples_returns_only_unparsed_full_text_newest_first(self):
+        """
+        GET .../unparsed-samples — диагностика реального формата канала,
+        когда живой WARNING-лог (_handler в channel_monitor.py) обрезает
+        превью до 200 символов и этого не хватает для обновления правил
+        парсера (реальный случай: @topslivs сменил формат сигналов).
+        """
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal, TelegramChannel
+        from src.utils.timeutils import utcnow
+        from src.web.api import telegram_channel_unparsed_samples
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@api_unparsed_samples_1")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+            older = utcnow() - timedelta(days=1)
+            newer = utcnow()
+            long_text = "x" * 300  # длиннее, чем 200-символьное превью в WARNING-логе
+            session.add_all([
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=1,
+                                  raw_message="parsed one", message_date=newer, parse_status="parsed"),
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=2,
+                                  raw_message="older unparsed", message_date=older, parse_status="unparsed"),
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=3,
+                                  raw_message=long_text, message_date=newer, parse_status="unparsed"),
+            ])
+            await session.commit()
+
+        result = await telegram_channel_unparsed_samples(db_channel_id)
+
+        self.assertEqual(len(result["samples"]), 2)  # только unparsed, не "parsed"
+        self.assertEqual(result["samples"][0]["raw_message"], long_text)  # новее — первым
+        self.assertEqual(len(result["samples"][0]["raw_message"]), 300)  # текст целиком, без обрезки
+        self.assertEqual(result["samples"][1]["raw_message"], "older unparsed")
+
+    async def test_unparsed_samples_respects_limit(self):
+        from src.db.session import get_session
+        from src.db.models import HistoricalSignal, TelegramChannel
+        from src.utils.timeutils import utcnow
+        from src.web.api import telegram_channel_unparsed_samples
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@api_unparsed_samples_2")
+            session.add(channel)
+            await session.commit()
+            db_channel_id = channel.id
+            session.add_all([
+                HistoricalSignal(channel_id=db_channel_id, telegram_message_id=i,
+                                  raw_message=f"msg {i}", message_date=utcnow(), parse_status="unparsed")
+                for i in range(5)
+            ])
+            await session.commit()
+
+        result = await telegram_channel_unparsed_samples(db_channel_id, limit=2)
+        self.assertEqual(len(result["samples"]), 2)
+
 
 class TestSimulateSignalAgainstCandles(unittest.TestCase):
     """
