@@ -3795,6 +3795,94 @@ class TestTelegramSignalParser(unittest.TestCase):
         )
         self.assertEqual(result_space["take_profits"], [0.1962, 0.1933, 0.1853])
 
+    def test_lowercase_side_word_after_bare_ticker(self):
+        """
+        Реальный инцидент: каналы @kripto_signalyX/@kripto_signaly3 пишут
+        "ARKM long 25x" — тикер БЕЗ хэштега и БЕЗ quote-валюты, слово
+        стороны сделки строчными буквами. Финальный fallback-паттерн
+        _extract_pair() матчил только заглавные LONG/SHORT/BUY/SELL,
+        поэтому такие (полностью корректные, с рыночным входом,
+        несколькими целями и стопом) сигналы отбрасывались целиком.
+        Текст — дословный реальный сигнал канала.
+        """
+        text = (
+            "🚀**Заходим ARKM long 25x\n\n"
+            "Вход: по рынку \n"
+            "Тейк: 0.1133, 0.1144, 0.1183\n"
+            "Стоп: 0.1083**\n\n"
+            "**Фиксируем 50% на первой цели, 25% на второй цели и 25% на "
+            "оставшейся и после первой цели ставим стоп в без убыток**"
+        )
+        result = self.parse(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "ARKM/USDT")
+        self.assertEqual(result["side"], "long")
+        self.assertEqual(result["sl"], 0.1083)
+        self.assertEqual(result["take_profits"], [0.1133, 0.1144, 0.1183])
+
+    def test_uppercase_side_word_after_bare_ticker_still_matches(self):
+        """Регресс: расширение фолбэк-паттерна строчными вариантами
+        стороны сделки не должно ломать уже поддержанный заглавный формат
+        ("ARB SHORT x25")."""
+        result = self.parse("ARB SHORT x25 Вход: по рынку Тейк: 1.5, 1.6 Стоп: 1.8")
+        self.assertEqual(result["pair"], "ARB/USDT")
+        self.assertEqual(result["side"], "short")
+
+    def test_casual_lowercase_word_before_side_still_not_matched_as_ticker(self):
+        """
+        Регресс: тикер [A-Z]{2,10} в фолбэк-паттерне ОСТАЁТСЯ
+        регистрозависимым даже после добавления строчных вариантов слова
+        стороны — обычная строчная фраза ("watch short on this one") не
+        должна быть принята за тикер.
+        """
+        result = self.parse("just watch short on this one, could bounce")
+        self.assertIsNone(result)
+
+    def test_hashtag_ticker_split_by_markdown_asterisks(self):
+        """
+        Реальный инцидент: канал @signalyp форматирует хэштег через
+        Markdown-жирный, разрывая его звёздочками между "#" и буквами
+        тикера ("#**APT**"), из-за чего "#" не оказывался НЕПОСРЕДСТВЕННО
+        перед буквой тикера, и хэштег-паттерн не матчился вовсе. Текст —
+        дословный реальный сигнал канала (без рекламной ссылки в конце).
+        """
+        text = (
+            "**🚀**** ****#**APT **LONG\n\n"
+            "Плечо: 25-30x**🔵\n\n"
+            "⏺**Диапазон входа: **по рынку\n"
+            "⏺**Тейки: 0.6678 0.6780 0.7066\n"
+            "****⏺****Cтоп: 0.6242**"
+        )
+        result = self.parse(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "APT/USDT")
+        self.assertEqual(result["side"], "long")
+        self.assertEqual(result["sl"], 0.6242)
+        self.assertEqual(result["take_profits"], [0.6678, 0.678, 0.7066])
+        self.assertEqual(result["leverage"], 25.0)
+
+    def test_latin_c_lookalike_stop_keyword(self):
+        """
+        Реальный инцидент: тот же канал @signalyp набирает слово "Стоп" с
+        ЛАТИНСКОЙ "C" вместо кириллической "С" ("Cтоп: 0.5030") в каждом
+        сигнале своего шаблона — визуально неотличимо, но это разные
+        символы Unicode, и re.IGNORECASE не помогает (не регистр одного
+        алфавита, а два разных алфавита), так что SL не находился вовсе.
+        """
+        text = (
+            "**🚀**** ****#**WLD** SHORT\n\n"
+            "Плечо: 25-30x**🔵\n\n"
+            "⏺**Диапазон входа: **по рынку\n"
+            "⏺**Тейки: 0.4720 0.4650 0.4448\n"
+            "****⏺****Cтоп: 0.5030**"
+        )
+        result = self.parse(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "WLD/USDT")
+        self.assertEqual(result["side"], "short")
+        self.assertEqual(result["sl"], 0.5030)
+        self.assertEqual(result["take_profits"], [0.4720, 0.4650, 0.4448])
+
 
 class TestMarketEntryDetection(unittest.TestCase):
     def setUp(self):
