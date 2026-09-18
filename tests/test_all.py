@@ -3752,6 +3752,49 @@ class TestTelegramSignalParser(unittest.TestCase):
         result = self.parse("шортим эфир около 3500, стоп 3600, цели 3300 и 3200")
         self.assertIsNone(result)
 
+    def test_bare_vhod_keyword_and_dash_separated_targets(self):
+        """
+        Реальный инцидент: канал @topslivs сменил формат — сигналы стали
+        пропадать бесследно. Две отдельные причины: (1) "ВХОД:" без слова
+        "точка"/"цена" перед ним не матчился ни одним entry-ключевым
+        словом; (2) список целей через " - " ("ЦЕЛИ: 0.1725 - 0.1800 -
+        0.1900 - ...") захватывал только САМОЕ ПЕРВОЕ число — дефис не
+        входил в класс разделителей между числами списка. Текст —
+        дословный (без markdown-ссылки в начале) реальный сигнал канала.
+        """
+        text = (
+            "МОНЕТА: $FET/USDT (2-5x)\n"
+            "НАПРАВЛЕНИЕ: ЛОНГ📈\n"
+            "➖➖➖➖➖➖➖\n"
+            "ВХОД: 0.1640 - 0.1650 **(СТАВИМ ЛИМИТНЫЙ ОРДЕР)**\n\n"
+            "ЦЕЛИ: 0.1725 - 0.1800 - 0.1900 - 0.2000 - 0.2150 - 0.2300 - 0.2500 - 0.2750\n\n"
+            "СТОП-ЛОСС: 0.1500\n\n"
+            "На графике 6H видно, что FVG в зоне входа подкреплён восходящим трендом."
+        )
+        result = self.parse(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "FET/USDT")
+        self.assertEqual(result["side"], "long")
+        self.assertEqual(result["entry"], 0.1640)
+        self.assertEqual(result["sl"], 0.1500)
+        self.assertEqual(
+            result["take_profits"],
+            [0.1725, 0.1800, 0.1900, 0.2000, 0.2150, 0.2300, 0.2500, 0.2750],
+        )
+
+    def test_dash_separated_targets_do_not_regress_comma_or_space_separated(self):
+        """Регресс: расширение класса разделителей между числами списка
+        (запятая/пробел -> + дефис) не должно ломать уже поддержанные
+        форматы без дефиса вообще."""
+        result_comma = self.parse("BTC/USDT Long по рынку Тейк: 70000, 71000, 72000 Стоп: 68000")
+        self.assertEqual(result_comma["take_profits"], [70000.0, 71000.0, 72000.0])
+
+        result_space = self.parse(
+            "#WIF SHORT / Плечо: 25-30х / Диапазон входа: по рынку / "
+            "Тейки: 0.1962 0.1933 0.1853 / Стоп: 0.2091"
+        )
+        self.assertEqual(result_space["take_profits"], [0.1962, 0.1933, 0.1853])
+
 
 class TestMarketEntryDetection(unittest.TestCase):
     def setUp(self):
