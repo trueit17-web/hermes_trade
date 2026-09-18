@@ -382,6 +382,16 @@ class TradingBot:
         channel_monitor.py) персистятся только в TelegramSignal, без этого
         восстановления канал с 50/25/25-долями откатывался бы на равные
         доли бота после каждого рестарта.
+
+        _notif_header/_notif_sl_value/_notif_tp_values — реальная жалоба
+        пользователя: после каждого рестарта процесса бот переставал
+        РЕДАКТИРОВАТЬ исходное сообщение об открытии при частичных
+        закрытиях уже открытых на тот момент Telegram-позиций и начинал
+        отвечать новыми сообщениями — эти три поля нигде не персистились
+        (см. докстринг _build_notif_header_lines). Восстанавливаются здесь
+        же из тех же источников (TelegramSignal/Order), что и остальные
+        поля выше, только для позиций, у которых уведомление вообще было
+        отправлено (notification_message_id известен).
         """
         self.open_positions = {}
         # Раньше здесь безусловно читался execution_engine.paper_positions —
@@ -413,10 +423,24 @@ class TradingBot:
                 filled_amount_by_order_id = {
                     o.id: float(o.filled_amount) for o in orders if o.filled_amount
                 }
+                # ИСХОДНЫЙ (не ступенчато-перенесённый трейлингом) SL — тот
+                # же принцип, что и у take_profits/tp_weights выше: Order.
+                # stop_loss в БД никогда не перезаписывается трейлингом
+                # (см. комментарий в executor.py._load_open_positions_from_db
+                # про "там всегда остаётся ИСХОДНЫЙ SL"), а pos["stop_loss"]
+                # из execution_engine ниже уже МОГ быть подменён восстановленным
+                # трейлинг-значением — для "_notif_sl_value" (см. ниже) нужен
+                # именно исходный, иначе отредактированное после рестарта
+                # уведомление показывало бы неверную "исходную" цену SL.
+                original_sl_by_order_id = {
+                    o.id: float(o.stop_loss) for o in orders if o.stop_loss
+                }
 
         for symbol, pos in source.items():
             order_id = pos.get("order_id")
             signal = signal_by_order_id.get(order_id) if order_id else None
+            take_profits = signal.parsed_take_profits if signal else None
+            tp = pos.get("take_profit")
             self.open_positions[symbol] = {
                 "side": pos.get("side", "long"),
                 "entry_price": pos.get("entry_price"),
@@ -424,8 +448,8 @@ class TradingBot:
                 "strategy_id": pos.get("strategy_id"),
                 "rationale": "Восстановлено при старте бота",
                 "sl": pos.get("stop_loss"),
-                "tp": pos.get("take_profit"),
-                "take_profits": signal.parsed_take_profits if signal else None,
+                "tp": tp,
+                "take_profits": take_profits,
                 "tp_weights": signal.parsed_tp_weights if signal else None,
                 "post_tp1_sl_rule": signal.parsed_post_tp1_sl_rule if signal else None,
                 "original_amount": filled_amount_by_order_id.get(order_id, pos.get("amount")),
@@ -439,6 +463,21 @@ class TradingBot:
             position_value = (pos.get("amount") or 0) * (pos.get("entry_price") or 0)
             size_pct = (position_value / balance * 100) if balance else 0.0
             risk_manager.on_position_added(symbol, size_pct)
+
+            # Восстановить возможность РЕДАКТИРОВАТЬ исходное уведомление об
+            # открытии вместо отправки новых при частичных закрытиях после
+            # рестарта (см. докстринг _build_notif_header_lines) — только
+            # если уведомление вообще было отправлено (notification_message_id
+            # известен); без этого _render_signal_message всё равно вернул бы
+            # None и _check_position_exit сам откатился бы на reply.
+            new_pos = self.open_positions[symbol]
+            if new_pos["strategy_id"] == "telegram_signal" and new_pos["notification_message_id"]:
+                new_pos["_notif_header"] = "\n".join(await self._build_notif_header_lines(
+                    symbol, new_pos["side"], new_pos["entry_price"], new_pos["channel_id"],
+                    pending_save=False,
+                ))
+                new_pos["_notif_sl_value"] = original_sl_by_order_id.get(order_id, new_pos["sl"])
+                new_pos["_notif_tp_values"] = list(take_profits) if take_profits else ([tp] if tp else [])
 
         if self.open_positions:
             logger.info(f"🔗 Синхронизировано {len(self.open_positions)} открытых позиций с риск-менеджером")
@@ -1141,6 +1180,48 @@ class TradingBot:
         except Exception as e:
             logger.warning(f"Не удалось сохранить Telegram-сигнал в БД: {e}")
 
+    async def _build_notif_header_lines(
+        self, symbol: str, side: str, entry_price: float, channel_id: str | None,
+        *, pending_save: bool,
+    ) -> list[str]:
+        """
+        Общая "шапка" уведомления об открытии Telegram-сигнала (сторона/
+        канал/вход) — вынесена из _notify_signal_opened, чтобы её же можно
+        было пересобрать при восстановлении позиции после рестарта
+        процесса (см. _sync_open_positions_from_execution_engine) для
+        продолжения РЕДАКТИРОВАНИЯ исходного сообщения об открытии вместо
+        отправки новых при каждом частичном закрытии. Реальный инцидент:
+        _notif_header/_notif_sl_value/_notif_tp_values нигде не персистились
+        — КАЖДЫЙ рестарт процесса (а редеплоев стало заметно больше с
+        появлением версионирования) необратимо ломал редактирование для
+        всех уже открытых на тот момент Telegram-позиций до конца их жизни.
+
+        pending_save=True — сигнал ЕЩЁ НЕ сохранён в БД на момент подсчёта
+        статистики канала (обычное открытие, _save_telegram_signal
+        вызывается позже, см. _on_telegram_signal) — считаем его как уже
+        применённый и открытый (+1 к applied/open_count). pending_save=
+        False — восстановление после рестарта: сигнал УЖЕ есть в БД и уже
+        учтён статистикой, +1 добавлять не нужно (иначе задвоили бы себя
+        же). Из-за этого статистика в восстановленной шапке отражает
+        ТЕКУЩЕЕ состояние канала на момент рестарта, а не снимок на момент
+        реального открытия сделки — сознательное упрощение ради того,
+        чтобы редактирование продолжало работать вообще.
+        """
+        side_label = "LONG 📈" if side == "long" else "SHORT 📉"
+        header_lines = [f"📲 Сигнал: {side_label} {symbol}"]
+
+        if channel_id:
+            channel_stats = await self._channel_notification_stats(channel_id)
+            if channel_stats:
+                title, applied, wins, open_count = channel_stats
+                offset = 1 if pending_save else 0
+                header_lines.append(f"Канал: {title} (из {applied + offset}/ {wins} в+/{open_count + offset} откр.)")
+            else:
+                header_lines.append(f"Канал: {channel_id}")
+
+        header_lines.append(f"Вход: {entry_price:.6f}")
+        return header_lines
+
     async def _notify_signal_opened(
         self, symbol: str, signal_event: dict, order, side: str,
         entry: float, sl: float | None, tp: float | None, take_profits: list[float],
@@ -1160,23 +1241,8 @@ class TradingBot:
         (частичное/полное закрытие, ручное закрытие через дашборд), в т.ч.
         после рестарта процесса (см. _load_open_positions_from_db).
         """
-        side_label = "LONG 📈" if side == "long" else "SHORT 📉"
-        header_lines = [f"📲 Сигнал: {side_label} {symbol}"]
-
         channel_id = signal_event.get("channel_id")
-        if channel_id:
-            channel_stats = await self._channel_notification_stats(channel_id)
-            if channel_stats:
-                title, applied, wins, open_count = channel_stats
-                # +1 к applied и open_count — эта сделка ещё не сохранена в
-                # БД на момент подсчёта (_save_telegram_signal вызывается
-                # ПОСЛЕ _execute_telegram_signal, см. _on_telegram_signal),
-                # но она уже применена и уже открыта.
-                header_lines.append(f"Канал: {title} (из {applied + 1}/ {wins} в+/{open_count + 1} откр.)")
-            else:
-                header_lines.append(f"Канал: {channel_id}")
-
-        header_lines.append(f"Вход: {entry:.6f}")
+        header_lines = await self._build_notif_header_lines(symbol, side, entry, channel_id, pending_save=True)
 
         lines = [*header_lines, self._sl_notification_line(symbol, sl), self._tp_notification_lines(take_profits, tp)]
 

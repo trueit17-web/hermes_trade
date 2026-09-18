@@ -4695,6 +4695,54 @@ class TestClosedTradeReportNotParsedAsSignal(unittest.IsolatedAsyncioTestCase):
             llm_parser_module._client = None
 
 
+class TestLockedVipTeaserNotParsedAsSignal(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент (прод, @Treyding_Signaly_Kripto): канал шлёт тизер
+    без единого реального числа — все поля скрыты за иконкой замка,
+    полноценный сигнал доступен только VIP-подписчикам. Такие сообщения
+    структурно не могут содержать пару/цену и закономерно возвращали None
+    из regex/LLM — is_locked_teaser распознаёт их ДО любого парсера, чтобы
+    не тратить LLM-запрос и не логировать это как сбой парсера.
+    """
+
+    def test_detects_the_real_incident_message(self):
+        from src.telegram.channel_monitor import is_locked_teaser
+
+        text = (
+            "#RUNE/USDT\nНаправление позиции: 🔐\nТочка входа: 🔐\nСтоп-лосс: 🔐\n\n"
+            "Цель: 🔐\nКредитное плечо: x🔐\n\nДетали сигнала в VIP"
+        )
+        self.assertTrue(is_locked_teaser(text))
+
+    def test_does_not_flag_ordinary_signal(self):
+        from src.telegram.channel_monitor import is_locked_teaser
+
+        self.assertFalse(is_locked_teaser("BTC/USDT LONG 69000 SL 68000 TP 72000"))
+
+    async def test_parse_telegram_signal_returns_none_without_calling_llm(self):
+        from src.telegram.channel_monitor import parse_telegram_signal
+        import src.telegram.llm_parser as llm_parser_module
+
+        self._saved_enabled = settings.telegram_llm_fallback_enabled
+        self._saved_key = settings.anthropic_api_key
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = "test-key"
+        mock_client = AsyncMock()
+        llm_parser_module._client = mock_client
+        try:
+            text = (
+                "#RUNE/USDT\nНаправление позиции: 🔐\nТочка входа: 🔐\nСтоп-лосс: 🔐\n\n"
+                "Цель: 🔐\nКредитное плечо: x🔐\n\nДетали сигнала в VIP"
+            )
+            result = await parse_telegram_signal(text)
+            self.assertIsNone(result)
+            mock_client.messages.create.assert_not_called()
+        finally:
+            settings.telegram_llm_fallback_enabled = self._saved_enabled
+            settings.anthropic_api_key = self._saved_key
+            llm_parser_module._client = None
+
+
 class TestGroqSignalParser(unittest.IsolatedAsyncioTestCase):
     """
     Groq LLM-фолбэк парсинга — второй уровень, между Anthropic и Gemini
@@ -13800,6 +13848,107 @@ class TestSyncOpenPositionsRestoresTakeProfitsAfterRestart(unittest.IsolatedAsyn
         self.assertIsNone(pos["channel_id"])
         self.assertEqual(pos["original_amount"], 5.0, "без Order — падаем на текущий amount")
 
+    async def test_restores_editable_notification_fields_when_message_was_sent(self):
+        """
+        Реальная жалоба пользователя: после каждого рестарта процесса бот
+        переставал РЕДАКТИРОВАТЬ исходное сообщение об открытии при
+        частичных закрытиях и начинал отвечать новыми сообщениями —
+        _notif_header/_notif_sl_value/_notif_tp_values нигде не
+        персистились. Восстанавливаются из TelegramSignal/Order, только
+        если уведомление вообще было отправлено (notification_message_id
+        известен) — без этого _render_signal_message вернул бы None.
+        """
+        from datetime import datetime
+
+        from src.db.models import Order, TelegramChannel, TelegramSignal
+        from src.db.session import get_session
+        from src.execution.executor import execution_engine
+        from src.risk.risk_manager import risk_manager
+
+        async with get_session() as session:
+            exchange_id, symbol_id = await execution_engine._resolve_symbol_id(session, "SYNCNOTIF1/USDT")
+            order = Order(
+                exchange_id=exchange_id, symbol_id=symbol_id,
+                side="buy", order_type="market", amount=100.0, price=1.0,
+                status="filled", filled_amount=100.0, filled_price=1.0, fee=0.1,
+                stop_loss=0.9, client_order_id="syncnotif1-open",
+            )
+            session.add(order)
+            await session.flush()
+            channel = TelegramChannel(channel_id="@syncnotif_test_channel", channel_title="SyncNotif Test")
+            session.add(channel)
+            await session.flush()
+            signal = TelegramSignal(
+                channel_id=channel.id, raw_message="x", message_date=datetime.now(),
+                parsed_pair="SYNCNOTIF1/USDT", parsed_side="long", parsed_entry=1.0,
+                parsed_sl=0.9, parsed_tp=1.5, parsed_take_profits=[1.1, 1.3, 1.5],
+                decision="executed", executed_order_id=order.id,
+            )
+            session.add(signal)
+            await session.commit()
+            order_id = order.id
+
+        saved_positions = dict(execution_engine.paper_positions)
+        saved_is_paper = execution_engine.is_paper
+        saved_balance = execution_engine.paper_balance
+        execution_engine.is_paper = True
+        execution_engine.paper_balance = 10000.0
+        # stop_loss=0.95 — как будто SL уже подтянулся трейлингом после
+        # TP1 (халфвей от исходных 0.9 к входу 1.0); _notif_sl_value
+        # должен показать ИСХОДНЫЙ 0.9 (из Order.stop_loss), а не этот.
+        execution_engine.paper_positions["SYNCNOTIF1/USDT"] = {
+            "amount": 66.7, "entry_price": 1.0, "side": "long",
+            "stop_loss": 0.95, "take_profit": 1.5, "strategy_id": "telegram_signal",
+            "order_id": order_id, "tp_hit_count": 1, "notification_message_id": 4242,
+        }
+        bot = self._make_bot()
+        try:
+            await bot._sync_open_positions_from_execution_engine()
+        finally:
+            execution_engine.paper_positions.clear()
+            execution_engine.paper_positions.update(saved_positions)
+            execution_engine.is_paper = saved_is_paper
+            execution_engine.paper_balance = saved_balance
+            risk_manager.on_position_closed("SYNCNOTIF1/USDT")
+
+        pos = bot.open_positions["SYNCNOTIF1/USDT"]
+        self.assertIn("📲 Сигнал: LONG 📈 SYNCNOTIF1/USDT", pos["_notif_header"])
+        self.assertIn("@syncnotif_test_channel", pos["_notif_header"])
+        self.assertEqual(pos["_notif_sl_value"], 0.9)
+        self.assertEqual(pos["_notif_tp_values"], [1.1, 1.3, 1.5])
+        self.assertIsNotNone(bot._render_signal_message("SYNCNOTIF1/USDT", pos))
+
+    async def test_no_editable_notification_fields_without_notification_message_id(self):
+        """Регресс: если уведомление вообще не отправлялось (message_id
+        неизвестен), не заводим _notif_header — _render_signal_message
+        должен по-прежнему явно откатываться на reply, а не пытаться
+        редактировать несуществующее сообщение."""
+        from src.execution.executor import execution_engine
+        from src.risk.risk_manager import risk_manager
+
+        saved_positions = dict(execution_engine.paper_positions)
+        saved_is_paper = execution_engine.is_paper
+        saved_balance = execution_engine.paper_balance
+        execution_engine.is_paper = True
+        execution_engine.paper_balance = 10000.0
+        execution_engine.paper_positions["SYNCNOTIF2/USDT"] = {
+            "amount": 5.0, "entry_price": 100.0, "side": "long",
+            "stop_loss": 90.0, "take_profit": 120.0, "strategy_id": "telegram_signal",
+        }
+        bot = self._make_bot()
+        try:
+            await bot._sync_open_positions_from_execution_engine()
+        finally:
+            execution_engine.paper_positions.clear()
+            execution_engine.paper_positions.update(saved_positions)
+            execution_engine.is_paper = saved_is_paper
+            execution_engine.paper_balance = saved_balance
+            risk_manager.on_position_closed("SYNCNOTIF2/USDT")
+
+        pos = bot.open_positions["SYNCNOTIF2/USDT"]
+        self.assertNotIn("_notif_header", pos)
+        self.assertIsNone(bot._render_signal_message("SYNCNOTIF2/USDT", pos))
+
     async def test_telegram_position_without_matching_signal_does_not_crash(self):
         from src.execution.executor import execution_engine
         from src.risk.risk_manager import risk_manager
@@ -19024,6 +19173,48 @@ class TestHandlerWarnsOnUnparsedMessage(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             self.cm, "parse_telegram_signal", new=AsyncMock(return_value={"pair": "BTC/USDT", "side": "long"}),
         ):
+            with self.assertNoLogs("src.telegram.channel_monitor", level="WARNING"):
+                await self.cm._handler(event)
+
+    async def test_no_warning_when_message_is_a_known_closed_trade_report(self):
+        """
+        Реальный инцидент (прод, @Treyding_Signaly_Kripto): расширение
+        is_closed_trade_report на новые форматы отчётов ("Цель достигнута
+        N ✅" и т.п.) не остановило спам WARNING'ом — сам _handler()
+        логировал его на КАЖДОМ сообщении, где parse_telegram_signal()
+        вернул None, не различая "не сигнал по определению" (закрытый
+        отчёт) и "не удалось разобрать" (настоящий сбой). parse_telegram_
+        signal замокан на None (как и было бы в реальности для такого
+        текста), но is_closed_trade_report вызывается по-настоящему.
+        """
+        self.cm._monitored[-100783] = {
+            "channel_id": "@Treyding_Signaly_Kripto", "channel_title": "AI", "parser_config": {},
+        }
+        event = MagicMock()
+        event.chat_id = -100783
+        event.message.text = "#APE/USDT \n\nЦель достигнута 2 ✅\n\nПрибыль: 22.69% 📈\nВ: 54 Минута ⏰"
+        event.message.photo = None
+
+        with patch.object(self.cm, "parse_telegram_signal", new=AsyncMock(return_value=None)):
+            with self.assertNoLogs("src.telegram.channel_monitor", level="WARNING"):
+                await self.cm._handler(event)
+
+    async def test_no_warning_when_message_is_a_locked_vip_teaser(self):
+        """Реальный инцидент (тот же канал): тизер без единого реального
+        числа ("Направление позиции: 🔐 ... Детали сигнала в VIP") тоже не
+        должен спамить WARNING — это заведомо не сигнал, а не сбой парсера."""
+        self.cm._monitored[-100784] = {
+            "channel_id": "@Treyding_Signaly_Kripto", "channel_title": "AI", "parser_config": {},
+        }
+        event = MagicMock()
+        event.chat_id = -100784
+        event.message.text = (
+            "#RUNE/USDT\nНаправление позиции: 🔐\nТочка входа: 🔐\nСтоп-лосс: 🔐\n\n"
+            "Цель: 🔐\nКредитное плечо: x🔐\n\nДетали сигнала в VIP"
+        )
+        event.message.photo = None
+
+        with patch.object(self.cm, "parse_telegram_signal", new=AsyncMock(return_value=None)):
             with self.assertNoLogs("src.telegram.channel_monitor", level="WARNING"):
                 await self.cm._handler(event)
 

@@ -151,7 +151,21 @@ async def _handler(event: events.NewMessage.Event):
 
     parsed = await parse_telegram_signal(raw_text, channel, image_bytes=image_bytes)
 
-    if not parsed and (raw_text.strip() or image_bytes):
+    # parse_telegram_signal() возвращает falsy НЕ ТОЛЬКО при настоящем сбое
+    # разбора, но и ДЕТЕРМИНИРОВАННО — когда is_closed_trade_report()
+    # опознал отчёт об уже открытой/закрытой сделке (см. её докстринг) как
+    # заведомо не сигнал: это два принципиально разных исхода с одним и тем
+    # же falsy-результатом. Реальный инцидент (прод, @Treyding_Signaly_
+    # Kripto): расширение is_closed_trade_report на новые форматы отчётов
+    # ("Цель достигнута N ✅", "All targets achieved 😎") исправило то, что
+    # эти сообщения могли бы отправиться на LLM/ошибочно исполниться, но
+    # WARNING ниже всё равно продолжал спамить на КАЖДОМ из них — сам
+    # WARNING проверяет только "не удалось разобрать", а не "почему".
+    is_known_non_signal = bool(raw_text) and (
+        is_closed_trade_report(raw_text) or is_locked_teaser(raw_text)
+    )
+
+    if not parsed and (raw_text.strip() or image_bytes) and not is_known_non_signal:
         # Ни регулярки, ни один из LLM-фолбэков (см. цепочку в
         # parse_telegram_signal) не смогли разобрать сообщение — раньше это
         # проходило ПОЛНОСТЬЮ БЕССЛЕДНО: ни строки в БД (TelegramSignal
@@ -420,6 +434,23 @@ def is_closed_trade_report(text: str) -> bool:
     return bool(_HIT_TARGET_PATTERN.search(text))
 
 
+_LOCKED_TEASER_PATTERN = re.compile(r"детали\s+сигнала\s+в\s+vip", re.IGNORECASE)
+
+
+def is_locked_teaser(text: str) -> bool:
+    """
+    Тизер БЕЗ единого реального числа — канал прячет все поля сигнала за
+    иконкой замка ("Направление позиции: 🔐\\nТочка входа: 🔐\\nСтоп-лосс:
+    🔐\\n\\nЦель: 🔐\\nКредитное плечо: x🔐\\n\\nДетали сигнала в VIP"),
+    полноценный сигнал доступен только VIP-подписчикам. Реальный инцидент
+    (прод, @Treyding_Signaly_Kripto): такие тизеры структурно не могут
+    содержать ни пары с ценой, ни entry/SL/TP — regex и LLM-фолбэки
+    закономерно возвращают None на каждом, и это заведомо известный исход,
+    а не сбой парсера, который стоило бы логировать как WARNING.
+    """
+    return bool(_LOCKED_TEASER_PATTERN.search(text))
+
+
 async def parse_telegram_signal(
     text: str, channel_config: dict | None = None, image_bytes: bytes | None = None,
 ) -> dict | None:
@@ -438,6 +469,12 @@ async def parse_telegram_signal(
         # докстринг is_closed_trade_report: полагаться на то, что LLM ни
         # разу не нарушит собственную инструкцию "update о уже открытой
         # сделке -> не сигнал", недостаточно (реальный инцидент, прод).
+        return None
+
+    if text and is_locked_teaser(text):
+        # Та же причина, что и у is_closed_trade_report выше — см. её
+        # докстринг: тизер без единого реального числа не может дать
+        # парсерам ничего, кроме None, тратить на него LLM-запрос бессмысленно.
         return None
 
     if image_bytes:
