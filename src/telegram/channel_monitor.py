@@ -593,33 +593,50 @@ def parse_with_regex(text: str) -> dict | None:
 
     # Ищем направление
     side = None
+    # Русские каналы часто пишут направление словом, а не английским LONG/
+    # SHORT — "Короткая🔴"/"Длинная🟢" (реальный инцидент: канал
+    # @Treyding_Signaly_Kripto пишет ИСКЛЮЧИТЕЛЬНО так, ни разу не
+    # используя английские ключевые слова — без этих паттернов regex
+    # возвращал None на КАЖДОМ его сигнале, и разбор целиком зависел от
+    # LLM-фолбэка; когда квоты/кредиты кончились у всех LLM-провайдеров
+    # сразу, все сигналы канала терялись бесследно — см. докстринг
+    # _handler() про WARNING на нераспознанное сообщение). "лонг"/"шорт" —
+    # частые транслитерации, встречаются у других каналов.
     side_patterns = [
         r"\b(LONG|LONG|long|buy|BUY)\b",
         r"\b(SHORT|short|sell|SELL)\b",
         r"\b(-)\s*(Short|short|SELL|sell)\b",
+        r"\b(Длинная|длинная|Лонг|лонг)\b",
+        r"\b(Короткая|короткая|Шорт|шорт)\b",
     ]
 
     for pattern in side_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            if "long" in match.group(0).lower() or "buy" in match.group(0).lower():
+            matched = match.group(0).lower()
+            if "long" in matched or "buy" in matched or "длин" in matched or "лонг" in matched:
                 side = "long"
-            elif "short" in match.group(0).lower() or "sell" in match.group(0).lower():
+            elif "short" in matched or "sell" in matched or "коротк" in matched or "шорт" in matched:
                 side = "short"
             break
 
     if not side:
         # Если нет явного направления, пробуем по контексту
-        if "buy" in text.lower() or "long" in text.lower():
+        lower = text.lower()
+        if "buy" in lower or "long" in lower or "длин" in lower or "лонг" in lower:
             side = "long"
-        elif "sell" in text.lower() or "short" in text.lower():
+        elif "sell" in lower or "short" in lower or "коротк" in lower or "шорт" in lower:
             side = "short"
 
     if not side:
         return None
 
     # Ищем entry, SL, TP
-    entry = extract_price(text, side, "entry", "price", "entry_price")
+    # "точка входа"/"цена входа" — кириллица, та же причина, что и у
+    # "стоп"/"стоп-лосс" ниже: не матчится с латинским "entry" ни при каком
+    # регистре (реальный инцидент: канал @Treyding_Signaly_Kripto пишет
+    # ИСКЛЮЧИТЕЛЬНО "Точка входа: ...", без единого английского сигнала).
+    entry = extract_price(text, side, "entry", "price", "entry_price", "точка входа", "цена входа")
     # "стоп"/"стоп-лосс" — кириллица, НЕ матчится с латинским "stop" даже
     # при IGNORECASE (это разные символы Unicode, а не регистр одного и
     # того же алфавита) — без этого "Стоп: 0.2091" терялся полностью.
@@ -715,12 +732,17 @@ def extract_price(
     бы на "SL" + число="680" + остаток "00" вместо 68000).
     """
     for keyword in keywords:
-        # Ищем ключевое слово, за которым следует число
+        # Ищем ключевое слово, за которым следует число. "`?" перед числом —
+        # каналы часто оборачивают цену в Markdown-бэктики для моноширинного
+        # шрифта ("Стоп-лосс: `222.51872`") — без этого бэктик между
+        # разделителем и цифрами ломал совпадение целиком (реальный
+        # инцидент: канал @Treyding_Signaly_Kripto пишет так каждое число
+        # в каждом сигнале — ни entry, ни SL, ни TP не находились вообще).
         patterns = [
             # "SL: 68000", "SL 68000", "TP1: 51000", "Target 1:0.92718"
-            rf"{keyword}\d*(?:\s+\d{{1,3}}(?=\s*[:\-–—]))?\s*[:\-–—]?\s*([\d.]+)",
-            rf"{keyword}\d*\s+([\d.]+)",  # "SL 68000"
-            rf"[\(]+\s*{keyword}\d*\s*[:\-–—]?\s*([\d.]+)",  # "(SL: 68000)"
+            rf"{keyword}\d*(?:\s+\d{{1,3}}(?=\s*[:\-–—]))?\s*[:\-–—]?\s*`?([\d.]+)",
+            rf"{keyword}\d*\s+`?([\d.]+)",  # "SL 68000"
+            rf"[\(]+\s*{keyword}\d*\s*[:\-–—]?\s*`?([\d.]+)",  # "(SL: 68000)"
         ]
 
         for pattern in patterns:
@@ -756,7 +778,9 @@ def extract_all_prices(text: str, *keywords) -> list[float]:
     (номера самих целей) вместо реальных цен.
     """
     for keyword in keywords:
-        pattern = rf"{keyword}\d*(?:\s+\d{{1,3}}(?=\s*[:\-–—]))?\s*[:\-–—]?\s*([\d.]+)"
+        # "`?" перед числом — см. тот же комментарий в extract_price() про
+        # Markdown-бэктики вокруг цены.
+        pattern = rf"{keyword}\d*(?:\s+\d{{1,3}}(?=\s*[:\-–—]))?\s*[:\-–—]?\s*`?([\d.]+)"
         matches = re.findall(pattern, text, re.IGNORECASE)
         # "Тейки: 0.1962 0.1933 0.1853" — ОДНО вхождение ключевого слова
         # (без номеров TP1/TP2/TP3), за которым через пробел идёт весь
@@ -768,7 +792,7 @@ def extract_all_prices(text: str, *keywords) -> list[float]:
             # список целей и запятой ("Тейк: 0.04078, 0.0418, 0.0435"), и
             # просто пробелом ("Тейки: 0.1962 0.1933 0.1853").
             line_match = re.search(
-                rf"{keyword}\s*[:\-–—]?\s*((?:[\d.]+[,\s]*)+)", text, re.IGNORECASE,
+                rf"{keyword}\s*[:\-–—]?\s*`?((?:[\d.]+[,\s]*)+)", text, re.IGNORECASE,
             )
             if line_match:
                 line_numbers = re.findall(r"[\d.]+", line_match.group(1))

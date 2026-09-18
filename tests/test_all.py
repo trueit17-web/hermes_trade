@@ -3688,6 +3688,72 @@ class TestTelegramSignalParser(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["take_profits"], [70000.0, 71000.0, 72000.0])
 
+    def test_russian_side_words_and_backtick_wrapped_prices(self):
+        """
+        Реальный инцидент: канал @Treyding_Signaly_Kripto писал сигналы
+        ИСКЛЮЧИТЕЛЬНО в этом формате — "Короткая🔴"/"Длинная🟢" вместо
+        LONG/SHORT, "Точка входа" вместо "Entry", и каждое число в
+        Markdown-бэктиках ("Точка входа: `221.33`"). Ни один из этих трёх
+        элементов раньше не распознавался regex'ом (side оставался None,
+        entry/sl/tp regex не находил из-за бэктика перед цифрами) — сигнал
+        ПОЛНОСТЬЮ зависел от LLM-фолбэка. Когда квоты/кредиты кончились у
+        всех LLM-провайдеров одновременно (реальный инцидент, прод),
+        сигналы канала стали пропадать бесследно на несколько дней.
+        Это дословный текст исторического сигнала (id=330 в БД), который
+        был успешно исполнен именно в этом формате.
+        """
+        text = (
+            "#BCH/USDT - Короткая🔴\n\n"
+            "Точка входа: `221.33`\n"
+            "Стоп-лосс: `222.51872`\n\n"
+            "Цель 1: `220.15127`\n"
+            "Цель 2: `219.93835`\n"
+            "Цель 3: `219.32944`\n"
+            "Цель 4: `217.78262`\n"
+            "Цель 5: `216.47581`\n\n"
+            "Кредитное плечо: x60"
+        )
+        result = self.parse(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "BCH/USDT")
+        self.assertEqual(result["side"], "short")
+        self.assertEqual(result["entry"], 221.33)
+        self.assertEqual(result["sl"], 222.51872)
+        self.assertEqual(
+            result["take_profits"],
+            [220.15127, 219.93835, 219.32944, 217.78262, 216.47581],
+        )
+        self.assertEqual(result["tp"], 216.47581)
+        self.assertEqual(result["leverage"], 60.0)
+
+    def test_russian_long_side_word_backtick_prices(self):
+        text = (
+            "#ETHFI/USDT - Длинная🟢\n\n"
+            "Точка входа: `0.6495`\n"
+            "Стоп-лосс: `0.59755`\n\n"
+            "Цель 1: `0.69793`\n"
+            "Цель 2: `0.74786`\n\n"
+            "Кредитное плечо: x37"
+        )
+        result = self.parse(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "ETHFI/USDT")
+        self.assertEqual(result["side"], "long")
+        self.assertEqual(result["entry"], 0.6495)
+        self.assertEqual(result["sl"], 0.59755)
+        self.assertEqual(result["take_profits"], [0.69793, 0.74786])
+
+    def test_informal_shortim_still_not_matched_by_side_word_regex(self):
+        """
+        "шортим" (разговорное "открываем шорт") НЕ должно матчиться новым
+        \\b(...шорт...)\\b паттерном — граница слова после "шорт" отсутствует
+        (дальше идёт "им"), иначе это сломало бы существующие тесты, где
+        такие сообщения намеренно уходят в LLM-фолбэк (parse_with_llm и
+        аналоги), а не разбираются одной regex'ой на "шорт".
+        """
+        result = self.parse("шортим эфир около 3500, стоп 3600, цели 3300 и 3200")
+        self.assertIsNone(result)
+
 
 class TestMarketEntryDetection(unittest.TestCase):
     def setUp(self):
