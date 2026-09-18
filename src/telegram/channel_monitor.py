@@ -162,7 +162,9 @@ async def _handler(event: events.NewMessage.Event):
     # WARNING ниже всё равно продолжал спамить на КАЖДОМ из них — сам
     # WARNING проверяет только "не удалось разобрать", а не "почему".
     is_known_non_signal = bool(raw_text) and (
-        is_closed_trade_report(raw_text) or is_locked_teaser(raw_text)
+        is_closed_trade_report(raw_text)
+        or is_locked_teaser(raw_text)
+        or is_position_update_report(raw_text)
     )
 
     if not parsed and (raw_text.strip() or image_bytes) and not is_known_non_signal:
@@ -451,6 +453,26 @@ def is_locked_teaser(text: str) -> bool:
     return bool(_LOCKED_TEASER_PATTERN.search(text))
 
 
+_PARTIAL_UPDATE_PATTERN = re.compile(r"забрал\w*\s+\S+\s+тейк", re.IGNORECASE)
+_DEPOSIT_PATTERN = re.compile(r"депозит", re.IGNORECASE)
+
+
+def is_position_update_report(text: str) -> bool:
+    """
+    Текстовое обновление статуса уже открытой позиции ("▪️ **PUMP**,
+    забрали второй тейк, зафиксировал 50% и стоп ставлю в бу.\\n\\n
+    прибыль: 9.63$\\nактуальный депозит: 321.51$") — реальный инцидент
+    (прод, @kripto_signaly3/@kripto_signalyX): тот же смысл, что и
+    is_closed_trade_report (отчёт об уже открытой сделке, не новый
+    сигнал), но прибыль указана в ДОЛЛАРАХ, а не в процентах, и без
+    отметки "цель N ✅" — ни один из двух маркеров is_closed_trade_report
+    не матчится. Сочетание "забрали ... тейк" + упоминание депозита
+    достаточно специфично, чтобы не путать с настоящим сигналом (там
+    "тейк" встречается только со списком целевых цен, без слова "забрали").
+    """
+    return bool(_PARTIAL_UPDATE_PATTERN.search(text) and _DEPOSIT_PATTERN.search(text))
+
+
 async def parse_telegram_signal(
     text: str, channel_config: dict | None = None, image_bytes: bytes | None = None,
 ) -> dict | None:
@@ -475,6 +497,13 @@ async def parse_telegram_signal(
         # Та же причина, что и у is_closed_trade_report выше — см. её
         # докстринг: тизер без единого реального числа не может дать
         # парсерам ничего, кроме None, тратить на него LLM-запрос бессмысленно.
+        return None
+
+    if text and is_position_update_report(text):
+        # Та же причина, что и у is_closed_trade_report выше — см. её
+        # докстринг: текстовое обновление статуса уже открытой позиции
+        # (прибыль в $, не в %) — не сигнал, а в тексте нет ни entry, ни
+        # SL/TP, которые LLM-фолбэку иначе пришлось бы придумывать.
         return None
 
     if image_bytes:

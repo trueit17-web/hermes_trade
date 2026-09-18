@@ -4743,6 +4743,58 @@ class TestLockedVipTeaserNotParsedAsSignal(unittest.IsolatedAsyncioTestCase):
             llm_parser_module._client = None
 
 
+class TestPositionUpdateReportNotParsedAsSignal(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент (прод, @kripto_signaly3/@kripto_signalyX): канал
+    шлёт текстовое обновление статуса УЖЕ открытой позиции ("забрали
+    второй тейк, зафиксировал 50% и стоп ставлю в бу... прибыль: 9.63$...
+    актуальный депозит: 321.51$") — та же суть, что и is_closed_trade_
+    report, но прибыль в долларах, а не в процентах, и без отметки
+    "цель N ✅", поэтому её маркеры не срабатывают.
+    """
+
+    def test_detects_the_real_incident_message(self):
+        from src.telegram.channel_monitor import is_position_update_report
+
+        text = (
+            "▪️ **PUMP**, забрали второй тейк, зафиксировал 50% и стоп ставлю в бу. \n\n"
+            "прибыль: 9.63$\nактуальный депозит: 321.51$"
+        )
+        self.assertTrue(is_position_update_report(text))
+
+    def test_does_not_flag_ordinary_signal_with_take_profit_list(self):
+        """Регресс: настоящий сигнал того же канала тоже упоминает "тейк",
+        но без слова "забрали" перед ним и без депозита — не должен
+        матчиться."""
+        from src.telegram.channel_monitor import is_position_update_report
+
+        text = "🚀**Заходим ARKM long 25x\n\nВход: по рынку \nТейк: 0.1133, 0.1144, 0.1183\nСтоп: 0.1083**"
+        self.assertFalse(is_position_update_report(text))
+
+    async def test_parse_telegram_signal_returns_none_without_calling_llm(self):
+        from src.telegram.channel_monitor import parse_telegram_signal
+        import src.telegram.llm_parser as llm_parser_module
+
+        self._saved_enabled = settings.telegram_llm_fallback_enabled
+        self._saved_key = settings.anthropic_api_key
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = "test-key"
+        mock_client = AsyncMock()
+        llm_parser_module._client = mock_client
+        try:
+            text = (
+                "▪️ **PUMP**, забрали второй тейк, зафиксировал 50% и стоп ставлю в бу. \n\n"
+                "прибыль: 9.63$\nактуальный депозит: 321.51$"
+            )
+            result = await parse_telegram_signal(text)
+            self.assertIsNone(result)
+            mock_client.messages.create.assert_not_called()
+        finally:
+            settings.telegram_llm_fallback_enabled = self._saved_enabled
+            settings.anthropic_api_key = self._saved_key
+            llm_parser_module._client = None
+
+
 class TestGroqSignalParser(unittest.IsolatedAsyncioTestCase):
     """
     Groq LLM-фолбэк парсинга — второй уровень, между Anthropic и Gemini
@@ -19211,6 +19263,27 @@ class TestHandlerWarnsOnUnparsedMessage(unittest.IsolatedAsyncioTestCase):
         event.message.text = (
             "#RUNE/USDT\nНаправление позиции: 🔐\nТочка входа: 🔐\nСтоп-лосс: 🔐\n\n"
             "Цель: 🔐\nКредитное плечо: x🔐\n\nДетали сигнала в VIP"
+        )
+        event.message.photo = None
+
+        with patch.object(self.cm, "parse_telegram_signal", new=AsyncMock(return_value=None)):
+            with self.assertNoLogs("src.telegram.channel_monitor", level="WARNING"):
+                await self.cm._handler(event)
+
+    async def test_no_warning_when_message_is_a_position_update_report(self):
+        """Реальный инцидент (прод, @kripto_signaly3/@kripto_signalyX):
+        текстовое обновление статуса ("забрали второй тейк... прибыль:
+        9.63$... депозит: 321.51$") — прибыль в долларах, не в процентах,
+        поэтому is_closed_trade_report её не ловит; is_position_update_
+        report должен."""
+        self.cm._monitored[-100785] = {
+            "channel_id": "@kripto_signaly3", "channel_title": "Crypto", "parser_config": {},
+        }
+        event = MagicMock()
+        event.chat_id = -100785
+        event.message.text = (
+            "▪️ **PUMP**, забрали второй тейк, зафиксировал 50% и стоп ставлю в бу. \n\n"
+            "прибыль: 9.63$\nактуальный депозит: 321.51$"
         )
         event.message.photo = None
 
