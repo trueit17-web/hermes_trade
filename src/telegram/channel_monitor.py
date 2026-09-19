@@ -165,6 +165,7 @@ async def _handler(event: events.NewMessage.Event):
         is_closed_trade_report(raw_text)
         or is_locked_teaser(raw_text)
         or is_position_update_report(raw_text)
+        or is_daily_summary_report(raw_text)
     )
 
     if not parsed and (raw_text.strip() or image_bytes) and not is_known_non_signal:
@@ -473,6 +474,24 @@ def is_position_update_report(text: str) -> bool:
     return bool(_PARTIAL_UPDATE_PATTERN.search(text) and _DEPOSIT_PATTERN.search(text))
 
 
+_DAILY_SUMMARY_PATTERN = re.compile(r"прибыль\s+\S*канала\s+за\s+последние\s+\d+\s*час", re.IGNORECASE)
+
+
+def is_daily_summary_report(text: str) -> bool:
+    """
+    Ежедневная сводка прибыли канала по МНОЖЕСТВУ пар сразу ("📈 Прибыль
+    VIP-канала за последние 24 часа\\n\\n```\\nLTCUSDT : +41.01% 🟢\\n
+    ORDIUSDT : +266.90% 🟢\\n...") — реальный инцидент (прод,
+    @Treyding_Signaly_Kripto): не сигнал и не отчёт по ОДНОЙ сделке (как
+    is_closed_trade_report/is_position_update_report), а агрегированная
+    статистика за сутки сразу по десятку пар — структурно не может дать
+    парсерам одну пару/цену, закономерно возвращает None. Заголовок
+    "Прибыль ...канала за последние N часов" достаточно специфичен, чтобы
+    не путать с настоящим сигналом.
+    """
+    return bool(_DAILY_SUMMARY_PATTERN.search(text))
+
+
 async def parse_telegram_signal(
     text: str, channel_config: dict | None = None, image_bytes: bytes | None = None,
 ) -> dict | None:
@@ -504,6 +523,12 @@ async def parse_telegram_signal(
         # докстринг: текстовое обновление статуса уже открытой позиции
         # (прибыль в $, не в %) — не сигнал, а в тексте нет ни entry, ни
         # SL/TP, которые LLM-фолбэку иначе пришлось бы придумывать.
+        return None
+
+    if text and is_daily_summary_report(text):
+        # Та же причина, что и у is_closed_trade_report выше — см. её
+        # докстринг: агрегированная сводка по десятку пар сразу — не
+        # сигнал и структурно не может дать парсерам одну пару/цену.
         return None
 
     if image_bytes:

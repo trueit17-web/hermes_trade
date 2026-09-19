@@ -4795,6 +4795,54 @@ class TestPositionUpdateReportNotParsedAsSignal(unittest.IsolatedAsyncioTestCase
             llm_parser_module._client = None
 
 
+class TestDailySummaryReportNotParsedAsSignal(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент (прод, @Treyding_Signaly_Kripto): канал шлёт
+    ежедневную сводку прибыли сразу по десятку пар ("📈 Прибыль VIP-канала
+    за последние 24 часа\n\n```\nLTCUSDT : +41.01% 🟢\n..."). Это не
+    сигнал и не отчёт по одной сделке — агрегированная статистика, которая
+    структурно не может дать парсерам одну пару/цену.
+    """
+
+    def test_detects_the_real_incident_message(self):
+        from src.telegram.channel_monitor import is_daily_summary_report
+
+        text = (
+            "📈 Прибыль VIP-канала за последние 24 часа\n\n```\n\n"
+            "LTCUSDT    : +41.01% 🟢\nORDIUSDT   : +266.90% 🟢\nSTGUSDT    : -556.22% 🚫\n"
+            "XTZUSDT    : +95.02% 🟢\nADAUSDT    : +94.60% 🟢\nMORPHOUSDT : +24.94% 🟢\nAPEUSDT    :"
+        )
+        self.assertTrue(is_daily_summary_report(text))
+
+    def test_does_not_flag_ordinary_signal(self):
+        from src.telegram.channel_monitor import is_daily_summary_report
+
+        self.assertFalse(is_daily_summary_report("BTC/USDT LONG 69000 SL 68000 TP 72000"))
+
+    async def test_parse_telegram_signal_returns_none_without_calling_llm(self):
+        from src.telegram.channel_monitor import parse_telegram_signal
+        import src.telegram.llm_parser as llm_parser_module
+
+        self._saved_enabled = settings.telegram_llm_fallback_enabled
+        self._saved_key = settings.anthropic_api_key
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = "test-key"
+        mock_client = AsyncMock()
+        llm_parser_module._client = mock_client
+        try:
+            text = (
+                "📈 Прибыль VIP-канала за последние 24 часа\n\n```\n\n"
+                "LTCUSDT    : +41.01% 🟢\nORDIUSDT   : +266.90% 🟢"
+            )
+            result = await parse_telegram_signal(text)
+            self.assertIsNone(result)
+            mock_client.messages.create.assert_not_called()
+        finally:
+            settings.telegram_llm_fallback_enabled = self._saved_enabled
+            settings.anthropic_api_key = self._saved_key
+            llm_parser_module._client = None
+
+
 class TestGroqSignalParser(unittest.IsolatedAsyncioTestCase):
     """
     Groq LLM-фолбэк парсинга — второй уровень, между Anthropic и Gemini
@@ -19284,6 +19332,26 @@ class TestHandlerWarnsOnUnparsedMessage(unittest.IsolatedAsyncioTestCase):
         event.message.text = (
             "▪️ **PUMP**, забрали второй тейк, зафиксировал 50% и стоп ставлю в бу. \n\n"
             "прибыль: 9.63$\nактуальный депозит: 321.51$"
+        )
+        event.message.photo = None
+
+        with patch.object(self.cm, "parse_telegram_signal", new=AsyncMock(return_value=None)):
+            with self.assertNoLogs("src.telegram.channel_monitor", level="WARNING"):
+                await self.cm._handler(event)
+
+    async def test_no_warning_when_message_is_a_daily_summary_report(self):
+        """Реальный инцидент (прод, @Treyding_Signaly_Kripto): ежедневная
+        сводка прибыли по десятку пар сразу ("Прибыль VIP-канала за
+        последние 24 часа") — не сигнал и структурно не может дать
+        парсерам одну пару/цену."""
+        self.cm._monitored[-100786] = {
+            "channel_id": "@Treyding_Signaly_Kripto", "channel_title": "AI", "parser_config": {},
+        }
+        event = MagicMock()
+        event.chat_id = -100786
+        event.message.text = (
+            "📈 Прибыль VIP-канала за последние 24 часа\n\n```\n\n"
+            "LTCUSDT    : +41.01% 🟢\nORDIUSDT   : +266.90% 🟢\nSTGUSDT    : -556.22% 🚫"
         )
         event.message.photo = None
 
