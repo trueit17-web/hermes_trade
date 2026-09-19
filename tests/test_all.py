@@ -4771,6 +4771,30 @@ class TestPositionUpdateReportNotParsedAsSignal(unittest.IsolatedAsyncioTestCase
         text = "🚀**Заходим ARKM long 25x\n\nВход: по рынку \nТейк: 0.1133, 0.1144, 0.1183\nСтоп: 0.1083**"
         self.assertFalse(is_position_update_report(text))
 
+    def test_detects_zabrali_tsel_marathon_variant(self):
+        """
+        Реальный инцидент (прод, @signaly_treyding/@kripto_signaly7): тот
+        же тип отчёта, но словом "цель", а не "тейк" — "✅Забрали 3ю цель
+        по вчерашнему сигналу OP, закрыл 100% позиции!\n\nДепозит
+        марафона: 20611.6$".
+        """
+        from src.telegram.channel_monitor import is_position_update_report
+
+        text = (
+            "**✅****Забрали 3ю цель по вчерашнему сигналу OP**, **закрыл 100% позиции! **\n**\n"
+            "Депозит марафона: 20611.6$**🔥"
+        )
+        self.assertTrue(is_position_update_report(text))
+
+    def test_does_not_flag_ordinary_signal_with_target_list(self):
+        """Регресс: настоящий сигнал упоминает "цель" в списке целей, но
+        без слова "забрали" перед ним и без депозита — не должен
+        матчиться."""
+        from src.telegram.channel_monitor import is_position_update_report
+
+        text = "#BCH/USDT - Короткая🔴\n\nТочка входа: 221.33\n\nЦель 1: 220.15\nЦель 2: 219.93"
+        self.assertFalse(is_position_update_report(text))
+
     async def test_parse_telegram_signal_returns_none_without_calling_llm(self):
         from src.telegram.channel_monitor import parse_telegram_signal
         import src.telegram.llm_parser as llm_parser_module
