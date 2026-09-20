@@ -1682,6 +1682,55 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trade.direction, "short")
         self.assertAlmostEqual(float(trade.pnl), 100.0, places=4)
 
+    async def test_record_external_close_accepts_long_comma_joined_trade_ids(self):
+        """
+        Реальный инцидент (прод, 2026-09-20): позиция закрылась биржей
+        ТРЕМЯ отдельными частичными сделками — order_id_exchange получает
+        их ID через запятую (3 UUID по 36 символов + 2 запятые = 110
+        символов), что превышало прежний VARCHAR(100) и роняло всю запись
+        Order/Trade с StringDataRightTruncationError, при этом позиция уже
+        была удалена из памяти бота ДО этой записи — закрытие терялось из
+        истории без следа. Колонка расширена до TEXT (миграция 019).
+        """
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Trade, Symbol, Order
+
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        symbol = "EXTLONGIDS1/USDT"
+        self.engine.real_positions[symbol] = {
+            "amount": 10.0, "entry_price": 100.0, "side": "long",
+            "strategy_id": None, "entry_fee": 0.0, "order_id": None,
+            "opened_at": datetime.now(), "sl_order_id": None, "market_type": "spot",
+        }
+        trade_ids = [
+            "146907a0-ec86-41f4-bc11-8739b9faa735",
+            "5aa6f657-4fe8-463d-8969-9390e046d843",
+            "7dd184c8-5fb1-49e4-bbdf-7e1268df7e39",
+        ]
+        long_order_id_exchange = ",".join(trade_ids)
+        self.assertGreater(len(long_order_id_exchange), 100)
+
+        await self.engine._record_external_close(
+            symbol, self.engine.real_positions[symbol], exit_price=110.0, amount=10.0, exit_fee=0.0,
+            order_id_exchange=long_order_id_exchange, log_note="test",
+        )
+
+        async with get_session() as session:
+            symbol_row = (
+                await session.execute(select(Symbol).where(Symbol.symbol == symbol))
+            ).scalar_one()
+            trade = (
+                await session.execute(select(Trade).where(Trade.symbol_id == symbol_row.id))
+            ).scalar_one()
+            close_order = (
+                await session.execute(select(Order).where(Order.id == trade.order_close_id))
+            ).scalar_one()
+        self.assertEqual(close_order.order_id_exchange, long_order_id_exchange)
+
     async def test_reconcile_real_positions_finds_close_via_trade_history_without_sl_order(self):
         """
         Позиция без выставленного биржевого SL-ордера (например, SL не был

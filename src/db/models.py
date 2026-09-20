@@ -138,7 +138,17 @@ class Order(Base):
     # тумблера settings.market_type в шапке дашборда — без этого поля
     # позиция ошибочно "переезжала" на другой рынок при каждом переключении.
     market_type: Mapped[str] = mapped_column(String(10), default="spot", server_default="spot")
-    order_id_exchange: Mapped[str | None] = mapped_column(String(100))
+    # Обычно один ID ордера биржи, но при закрытии позиции, обнаруженном
+    # ВНЕ цикла бота (см. _record_external_close/_finalize_via_recent_
+    # trade_history в executor.py), сюда пишется список ID отдельных
+    # СДЕЛОК (не ордеров), через запятую — реальный инцидент (прод):
+    # позиция закрылась биржей тремя отдельными частичными сделками,
+    # 3 UUID по 36 символов через запятую = 110 символов, что превышало
+    # прежний VARCHAR(100) и роняло запись ордера/сделки в БД целиком
+    # (StringDataRightTruncationError) — при этом сама позиция уже была
+    # удалена из памяти бота (self.real_positions.pop) ДО этой записи,
+    # то есть закрытие терялось из истории и не попадало в risk_manager.
+    order_id_exchange: Mapped[str | None] = mapped_column(Text)
     client_order_id: Mapped[str | None] = mapped_column(String(100))
     # id сообщения в Telegram-чате с уведомлением об открытии этой позиции
     # (см. src/telegram/notifier.py) — последующие уведомления по этой же
