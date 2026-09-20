@@ -180,6 +180,37 @@ class TestRiskState(unittest.TestCase):
         state.update_daily_pnl(-500.0)
         self.assertTrue(state.daily_loss_limit_reached)
 
+    def test_daily_loss_limit_resets_after_scheduled_midnight(self):
+        """
+        check_daily_loss_limit_reset() должен сбрасывать лимит только
+        ПОСЛЕ наступления запланированной полуночи, а не сразу при первом
+        же вызове.
+        """
+        from src.utils.timeutils import utcnow
+
+        state = RiskState()
+        state.daily_loss_limit_usd = 500.0
+        state.update_daily_pnl(-500.0)
+        self.assertTrue(state.daily_loss_limit_reached)
+
+        state.check_daily_loss_limit_reset()
+        self.assertTrue(state.daily_loss_limit_reached, "полночь ещё не наступила — сброса быть не должно")
+        self.assertIsNotNone(state.daily_loss_reset_time)
+
+        state.daily_loss_reset_time = utcnow() - timedelta(seconds=1)
+        state.check_daily_loss_limit_reset()
+        self.assertFalse(state.daily_loss_limit_reached)
+        self.assertEqual(state.daily_pnl, 0.0)
+
+    def test_daily_loss_limit_reset_is_idempotent_when_not_reached(self):
+        """Вызов без активного лимита не должен ничего ломать (безопасно
+        вызывать на каждой итерации основного цикла, а не только реактивно
+        при закрытии сделки)."""
+        state = RiskState()
+        state.check_daily_loss_limit_reset()
+        self.assertFalse(state.daily_loss_limit_reached)
+        self.assertIsNone(state.daily_loss_reset_time)
+
     def test_add_open_position(self):
         """Добавление открытой позиции."""
         state = RiskState()
@@ -7684,6 +7715,45 @@ class TestTradingIterationPausedStillUpdatesPrices(unittest.IsolatedAsyncioTestC
             settings.trading_mode = original_trading_mode
 
         self.assertEqual(processed, ["A/USDT", "B/USDT"])
+
+    async def test_checks_daily_loss_limit_reset_every_iteration(self):
+        """
+        Реальный инцидент (прод): risk_manager.state.check_daily_loss_
+        limit_reset() раньше вызывался ТОЛЬКО реактивно, из on_trade_
+        closed() при закрытии сделки — если после срабатывания дневного
+        лимита убытков ни одна позиция не закрывалась (например, все
+        открытые уже были плоскими), сброс не происходил вообще, даже
+        после наступления новой календарной полуночи: can_trade()
+        продолжал видеть daily_loss_limit_reached=True и молча блокировал
+        любой новый вход потенциально бессрочно, а не на один день, как
+        задумано. Теперь вызывается на каждой итерации основного цикла,
+        независимо от закрытия сделок.
+        """
+        from unittest.mock import AsyncMock
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+
+        bot = main_module.TradingBot()
+        bot.active_symbols = []
+        bot.daily_pnl_reset_date = main_module.utcnow().date()
+
+        original_risk_manager = main_module.risk_manager
+        original_get_paper_balance = main_module.execution_engine.get_paper_balance
+        mock_risk_manager = AsyncMock()
+        mock_risk_manager.state.kill_switch_active = False
+        mock_risk_manager.state.paused = False
+        try:
+            main_module.risk_manager = mock_risk_manager
+            main_module.execution_engine.get_paper_balance = lambda: 10000.0
+
+            await bot._trading_iteration()
+        finally:
+            main_module.risk_manager = original_risk_manager
+            main_module.execution_engine.get_paper_balance = original_get_paper_balance
+
+        mock_risk_manager.state.check_daily_loss_limit_reset.assert_called_once()
 
 
 class TestProtections(unittest.IsolatedAsyncioTestCase):
