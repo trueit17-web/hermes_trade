@@ -98,6 +98,12 @@
   .badge-running { background: rgba(16,185,129,.15); color: var(--green); }
   .badge-paused { background: rgba(245,158,11,.15); color: var(--yellow); }
   .badge-killed { background: rgba(239,68,68,.2); color: var(--red); }
+  /* Вердикты анализа исходов сделок после закрытия — см. GET
+     /analytics/trade-outcomes (src/execution/trade_outcome_tracker.py). */
+  .badge-verdict-optimal { background: rgba(16,185,129,.15); color: var(--green); }
+  .badge-verdict-sl_too_tight { background: rgba(239,68,68,.15); color: var(--red); }
+  .badge-verdict-tp_too_conservative { background: rgba(245,158,11,.15); color: var(--yellow); }
+  .badge-verdict-premature_exit { background: rgba(148,163,184,.15); color: var(--text-dim); }
   .logout-btn {
     background: transparent;
     border: 1px solid var(--panel-border);
@@ -954,6 +960,19 @@
       </table>
     </div>
     <div class="pagination" id="tradesPagination"></div>
+  </section>
+
+  <section>
+    <h2>Анализ исходов сделок <span class="muted" style="font-weight:400; font-size:12px">— движение цены после закрытия, см. CHANGELOG 1.1.0</span></h2>
+    <div class="metric-grid" id="tradeOutcomesSummary">
+      <div class="muted" style="padding:12px 16px">Загрузка…</div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Символ</th><th>Вердикт</th><th>Цена закрытия</th><th>Лучшая цена</th><th>PnL факт.</th><th>PnL оптимально</th><th>Упущено</th><th>Закрыта</th></tr></thead>
+        <tbody id="tradeOutcomesBody"><tr class="empty-row"><td colspan="8">Загрузка…</td></tr></tbody>
+      </table>
+    </div>
   </section>
 
   <section>
@@ -2368,6 +2387,69 @@ async function renderTrades() {
   } catch (err) {
     body.innerHTML = `<tr class="empty-row"><td colspan="9">Ошибка загрузки: ${err.message}</td></tr>`;
     return [];
+  }
+}
+
+const VERDICT_LABELS = {
+  optimal: "Оптимально",
+  sl_too_tight: "SL слишком тесный",
+  tp_too_conservative: "TP слишком консервативный",
+  premature_exit: "Ранний выход",
+};
+
+function verdictBadge(verdict) {
+  if (!verdict) return "—";
+  const label = VERDICT_LABELS[verdict] || verdict;
+  return `<span class="badge badge-verdict-${verdict}">${label}</span>`;
+}
+
+// GET /analytics/trade-outcomes — сводка по отслеживанию цены ПОСЛЕ
+// закрытия сделки (см. src/execution/trade_outcome_tracker.py, CHANGELOG
+// 1.1.0): понять постфактум, как нужно было бы выставить вход/SL/TP для
+// максимальной прибыли. tracking_count — сделки ещё в процессе (best_
+// price/вердикт не окончательны), finished_count — уже классифицированные.
+async function renderTradeOutcomes() {
+  const summaryEl = document.getElementById("tradeOutcomesSummary");
+  const bodyEl = document.getElementById("tradeOutcomesBody");
+  try {
+    const data = await api("/analytics/trade-outcomes?limit=15");
+    const counts = data.verdict_counts || {};
+    const cards = [
+      { label: "В процессе", value: data.tracking_count, sub: "ждём локальный экстремум цены" },
+      { label: "Завершено", value: data.finished_count, sub: "вердикт окончательный" },
+      { label: "Оптимально", value: counts.optimal || 0, sub: "выход был близок к лучшему" },
+      { label: "SL слишком тесный", value: counts.sl_too_tight || 0, sub: "закрылись в минус, цена ушла в плюс" },
+      { label: "TP слишком консервативный", value: counts.tp_too_conservative || 0, sub: "цена ушла заметно дальше TP" },
+      { label: "Ранний выход", value: counts.premature_exit || 0, sub: "упущенная прибыль значима" },
+    ];
+    summaryEl.innerHTML = cards.map(c => `
+      <div class="metric-card">
+        <span class="metric-label">${c.label}</span>
+        <span class="metric-value">${c.value}</span>
+        <span class="metric-sub">${c.sub}</span>
+      </div>
+    `).join("");
+
+    const misses = data.biggest_misses || [];
+    if (!misses.length) {
+      bodyEl.innerHTML = `<tr class="empty-row"><td colspan="8">Пока нет завершённых наблюдений с упущенной прибылью</td></tr>`;
+      return;
+    }
+    bodyEl.innerHTML = misses.map(r => `
+      <tr>
+        <td class="side-${r.direction === 'long' ? 'long' : 'short'}">${r.symbol || "—"}</td>
+        <td>${verdictBadge(r.verdict)}</td>
+        <td>${fmtPrice(r.close_price)}</td>
+        <td>${r.best_price !== null ? fmtPrice(r.best_price) : "—"}</td>
+        <td class="${r.baseline_pnl_pct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${r.baseline_pnl_pct >= 0 ? "+" : ""}${fmt(r.baseline_pnl_pct, 2)}%</td>
+        <td class="pnl-pos">${r.optimal_pnl_pct >= 0 ? "+" : ""}${fmt(r.optimal_pnl_pct, 2)}%</td>
+        <td class="pnl-neg">+${fmt(r.missed_pnl_pct, 2)}%</td>
+        <td class="muted">${r.close_time ? new Date(r.close_time).toLocaleString("ru-RU") : "—"}</td>
+      </tr>
+    `).join("");
+  } catch (err) {
+    summaryEl.innerHTML = `<div class="muted" style="padding:12px 16px">Ошибка загрузки: ${err.message}</div>`;
+    bodyEl.innerHTML = `<tr class="empty-row"><td colspan="8">Ошибка загрузки: ${err.message}</td></tr>`;
   }
 }
 
@@ -4210,6 +4292,7 @@ async function refreshAll() {
     renderManualPositions(status);
     const trades = await renderTrades();
     renderStats(status, trades || []);
+    await renderTradeOutcomes();
     await renderStrategies();
     await renderTelegram();
     await renderProtections();
