@@ -1320,6 +1320,26 @@ class ExecutionEngine:
             self.last_order_rejection_reason = "аварийный стоп торговли (kill switch) активен"
             return None
 
+        if risk_manager.state.daily_loss_limit_reached:
+            # Реальный инцидент (прод): Telegram-сигнал с auto_execute открыл
+            # НОВУЮ позицию (ONT/USDT) через ~2 часа ПОСЛЕ того, как дневной
+            # лимит убытков был достигнут — can_execute() ниже проверял
+            # только kill_switch/paused, а daily_loss_limit_reached в него
+            # не входил. Алго-путь (risk_manager.check_signal → can_trade())
+            # этот флаг уже проверял, Telegram-путь сознательно обходит
+            # check_signal (см. комментарий в _on_telegram_signal про доливку/
+            # already-open), полагаясь на "can_execute() всё равно
+            # останавливает" — это было верно только для kill switch/паузы,
+            # не для дневного лимита. Проверка здесь, в общей точке входа
+            # ВСЕХ ордеров (ручных/алго/Telegram), закрывает разрыв для всех
+            # путей разом, а не только для Telegram.
+            logger.warning(f"❌ Исполнение отклонено (дневной лимит убытков достигнут): {symbol}")
+            self.last_order_rejection_reason = (
+                f"дневной лимит убытков достигнут ({risk_manager.state.daily_pnl:.2f} / "
+                f"{risk_manager.profile.daily_loss_limit_usd:.2f})"
+            )
+            return None
+
         if not self.can_execute():
             logger.warning(f"❌ Исполнение отклонено: {symbol} {side}")
             self.last_order_rejection_reason = "торговля приостановлена (ручная пауза)"
@@ -3292,7 +3312,11 @@ class ExecutionEngine:
 
     def can_execute(self) -> bool:
         """Можно ли исполнить ордер?"""
-        return not risk_manager.state.kill_switch_active and not risk_manager.state.paused
+        return (
+            not risk_manager.state.kill_switch_active
+            and not risk_manager.state.paused
+            and not risk_manager.state.daily_loss_limit_reached
+        )
 
     def get_paper_balance(self) -> float:
         """Текущий paper баланс."""

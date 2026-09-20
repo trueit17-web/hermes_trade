@@ -1959,6 +1959,51 @@ class TestExecutionEngine(unittest.IsolatedAsyncioTestCase):
         """Можно исполнять в начальном состоянии."""
         self.assertTrue(self.engine.can_execute())
 
+    async def test_can_execute_false_when_daily_loss_limit_reached(self):
+        """
+        Реальный инцидент (прод): Telegram-сигнал с auto_execute открыл
+        НОВУЮ позицию (ONT/USDT) через ~2 часа ПОСЛЕ того, как дневной
+        лимит убытков был достигнут — can_execute() проверял только
+        kill_switch/paused, не daily_loss_limit_reached (тот проверялся
+        только на алго-пути через risk_manager.check_signal/can_trade()
+        — Telegram-путь сознательно обходит check_signal и полагался на
+        то, что can_execute() "и так" останавливает любую торговлю).
+        """
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+
+        original = global_risk_manager.state.daily_loss_limit_reached
+        try:
+            global_risk_manager.state.daily_loss_limit_reached = True
+            self.assertFalse(self.engine.can_execute())
+        finally:
+            global_risk_manager.state.daily_loss_limit_reached = original
+
+    async def test_create_order_rejected_when_daily_loss_limit_reached(self):
+        """См. test_can_execute_false_when_daily_loss_limit_reached — здесь
+        сквозная проверка через create_order (общая точка входа ВСЕХ
+        ордеров: ручных/алго/Telegram), с понятной причиной отказа."""
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+
+        settings.trading_mode = "paper"
+        settings.startup_capital_usdt = 10000.0
+        await self.engine.initialize("binance")
+
+        original_reached = global_risk_manager.state.daily_loss_limit_reached
+        original_pnl = global_risk_manager.state.daily_pnl
+        try:
+            global_risk_manager.state.daily_loss_limit_reached = True
+            global_risk_manager.state.daily_pnl = -51.07
+            order = await self.engine.create_order(
+                symbol="BTC/USDT", side="buy", amount=0.01, price=50000.0,
+                order_type="market", stop_loss=49000.0, take_profit=51000.0,
+            )
+        finally:
+            global_risk_manager.state.daily_loss_limit_reached = original_reached
+            global_risk_manager.state.daily_pnl = original_pnl
+
+        self.assertIsNone(order)
+        self.assertIn("дневной лимит убытков", self.engine.last_order_rejection_reason)
+
     async def test_paper_create_order(self):
         """Создание paper ордера."""
         settings.trading_mode = "paper"
@@ -8765,11 +8810,14 @@ class TestTelegramAutoExecuteIgnoresProtections(unittest.IsolatedAsyncioTestCase
     Автоисполнение сигнала включённого канала — явное доверие каналу по
     запросу пользователя, поэтому Protections-блокировки (кулдаун канала
     после закрытия сделки, StoplossGuard, LosingStreak) не должны его
-    останавливать, в отличие от стратегийного пути. Kill switch/пауза
-    (execution_engine.can_execute(), общий аварийный стоп) по-прежнему
-    применяются — это не тестируется здесь напрямую (сигнал просто
-    доходит до _execute_telegram_signal, тот сам упирается в can_execute()
-    внутри create_order при необходимости).
+    останавливать, в отличие от стратегийного пути. Kill switch/пауза/
+    дневной лимит убытков (execution_engine.can_execute(), общий
+    аварийный стоп) по-прежнему применяются — это не тестируется здесь
+    напрямую (сигнал просто доходит до _execute_telegram_signal, тот сам
+    упирается в can_execute() внутри create_order при необходимости), см.
+    TestExecutionEngine.test_can_execute_false_when_daily_loss_limit_
+    reached/test_create_order_rejected_when_daily_loss_limit_reached для
+    прямой проверки самого can_execute()/create_order().
     """
 
     async def test_auto_execute_runs_despite_active_protections_lock(self):
