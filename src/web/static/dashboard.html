@@ -656,6 +656,15 @@
     background: var(--panel-border);
     border-top: 1px solid var(--panel-border);
   }
+  /* auto-fill (выше) оставляет видимые пустые колонки, когда карточек
+     меньше, чем помещается по ширине КОНТЕЙНЕРА — незаметно в узкой
+     боковой панели ("Системные показатели", 6 карточек не помещаются в 2
+     колонки полностью пустыми), но заметно в широкой секции основного
+     контента ("Анализ исходов сделок") — auto-fit схлопывает лишние
+     колонки, давая карточкам растянуться на всю ширину без пробелов. */
+  .metric-grid.metric-grid-wide {
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  }
   .metric-card {
     background: var(--panel);
     padding: 10px 12px;
@@ -964,7 +973,7 @@
 
   <section>
     <h2>Анализ исходов сделок <span class="muted" style="font-weight:400; font-size:12px">— движение цены после закрытия, см. CHANGELOG 1.1.0</span></h2>
-    <div class="metric-grid" id="tradeOutcomesSummary">
+    <div class="metric-grid metric-grid-wide" id="tradeOutcomesSummary">
       <div class="muted" style="padding:12px 16px">Загрузка…</div>
     </div>
     <div class="table-wrap">
