@@ -101,13 +101,20 @@ async def parse_with_gemini(
     else:
         contents = text[:4000]
 
+    system_prompt = _SYSTEM
+    if channel_config:
+        from src.telegram.channel_outcome_context import get_channel_outcome_context
+        context = await get_channel_outcome_context(channel_config.get("channel_id"))
+        if context:
+            system_prompt = f"{_SYSTEM}\n\n{context}"
+
     try:
         client = _get_client()
         resp = await client.aio.models.generate_content(
             model=settings.gemini_model,
             contents=contents,
             config={
-                "system_instruction": _SYSTEM,
+                "system_instruction": system_prompt,
                 "response_mime_type": "application/json",
                 "response_json_schema": _RESPONSE_SCHEMA,
                 # 512 оказалось мало на практике (реальный инцидент, прод):

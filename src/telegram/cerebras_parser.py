@@ -93,13 +93,20 @@ async def parse_with_cerebras(text: str, channel_config: dict | None = None) -> 
     if not settings.telegram_llm_fallback_enabled or not settings.cerebras_api_key:
         return None
 
+    system_prompt = _SYSTEM
+    if channel_config:
+        from src.telegram.channel_outcome_context import get_channel_outcome_context
+        context = await get_channel_outcome_context(channel_config.get("channel_id"))
+        if context:
+            system_prompt = f"{_SYSTEM}\n\n{context}"
+
     try:
         client = _get_client()
         resp = await client.chat.completions.create(
             model=settings.cerebras_model,
             max_tokens=512,
             messages=[
-                {"role": "system", "content": _SYSTEM},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": text[:4000]},
             ],
             tools=[_TOOL],

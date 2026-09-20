@@ -21622,5 +21622,444 @@ class TestBotRegistrySharedAcrossModules(unittest.TestCase):
             bot_registry.current_bot = saved
 
 
+class TestTradeOutcomeTrackerRegistration(unittest.IsolatedAsyncioTestCase):
+    """
+    src.execution.trade_outcome_tracker._register_newly_closed_trades — по
+    запросу пользователя отслеживать движение цены ПОСЛЕ закрытия сделки,
+    чтобы понять, как нужно было бы выставить вход/SL/TP для максимальной
+    прибыли. Тречинг должен начинаться только когда позиция закрыта
+    ПОЛНОСТЬЮ (суммарный объём всех Trade-частей догнал изначально
+    исполненный объём открывающего ордера) — иначе строка тречинга
+    завелась бы на промежуточном частичном закрытии TP1/TP2, а не на
+    реальном финале позиции.
+    """
+
+    async def _make_open_order(self, session, *, symbol_str, amount, filled_amount):
+        from src.db.models import Exchange, Order, Symbol
+
+        exchange = Exchange(name=f"outcome-test-{symbol_str.replace('/', '-')}", is_paper=True)
+        session.add(exchange)
+        await session.flush()
+        symbol = Symbol(
+            exchange_id=exchange.id, symbol=symbol_str,
+            base_asset=symbol_str.split("/")[0], quote_asset="USDT",
+        )
+        session.add(symbol)
+        await session.flush()
+        order = Order(
+            exchange_id=exchange.id, symbol_id=symbol.id, side="buy", order_type="market",
+            amount=amount, price=100.0, status="filled", filled_amount=filled_amount,
+            filled_price=100.0, fee=0.0, market_type="spot",
+        )
+        session.add(order)
+        await session.flush()
+        return symbol, order
+
+    async def _make_trade_leg(
+        self, session, *, symbol_id, order_open_id, direction, entry_price, exit_price, amount, pnl,
+    ):
+        from src.db.models import Trade
+
+        trade = Trade(
+            symbol_id=symbol_id, order_open_id=order_open_id, direction=direction,
+            entry_price=entry_price, exit_price=exit_price, amount=amount, pnl=pnl,
+            pnl_pct=(pnl / (entry_price * amount) * 100) if entry_price and amount else 0.0,
+            is_open=False, closed_at=datetime.now(),
+        )
+        session.add(trade)
+        await session.flush()
+        return trade
+
+    async def test_no_tracking_row_for_partial_close(self):
+        from src.db.session import get_session
+        from src.execution.trade_outcome_tracker import _register_newly_closed_trades
+        from src.db.models import TradeOutcomeTracking
+        from sqlalchemy import select
+
+        async with get_session() as session:
+            symbol, order = await self._make_open_order(
+                session, symbol_str="OUTCPART/USDT", amount=10.0, filled_amount=10.0,
+            )
+            await self._make_trade_leg(
+                session, symbol_id=symbol.id, order_open_id=order.id, direction="long",
+                entry_price=100.0, exit_price=110.0, amount=5.0, pnl=50.0,
+            )
+            await _register_newly_closed_trades(session)
+
+        async with get_session() as session:
+            rows = (
+                await session.execute(
+                    select(TradeOutcomeTracking).where(TradeOutcomeTracking.symbol_id == symbol.id)
+                )
+            ).scalars().all()
+        self.assertEqual(len(rows), 0)
+
+    async def test_tracking_row_created_after_full_close(self):
+        from src.db.session import get_session
+        from src.execution.trade_outcome_tracker import _register_newly_closed_trades
+        from src.db.models import TradeOutcomeTracking
+        from sqlalchemy import select
+
+        async with get_session() as session:
+            symbol, order = await self._make_open_order(
+                session, symbol_str="OUTCFULL/USDT", amount=10.0, filled_amount=10.0,
+            )
+            await self._make_trade_leg(
+                session, symbol_id=symbol.id, order_open_id=order.id, direction="long",
+                entry_price=100.0, exit_price=110.0, amount=5.0, pnl=50.0,
+            )
+            last_leg = await self._make_trade_leg(
+                session, symbol_id=symbol.id, order_open_id=order.id, direction="long",
+                entry_price=100.0, exit_price=120.0, amount=5.0, pnl=100.0,
+            )
+            await _register_newly_closed_trades(session)
+
+        async with get_session() as session:
+            row = (
+                await session.execute(
+                    select(TradeOutcomeTracking).where(TradeOutcomeTracking.symbol_id == symbol.id)
+                )
+            ).scalar_one_or_none()
+        self.assertIsNotNone(row)
+        self.assertEqual(row.trade_id, last_leg.id)
+        self.assertEqual(row.status, "tracking")
+        # close_price — средневзвешенная цена выхода по обеим частям:
+        # (110*5 + 120*5) / 10 = 115
+        self.assertAlmostEqual(float(row.close_price), 115.0, places=4)
+        # baseline_pnl_pct = total_pnl / (entry_price * total_amount) * 100
+        # = 150 / (100 * 10) * 100 = 15.0
+        self.assertAlmostEqual(row.baseline_pnl_pct, 15.0, places=4)
+
+    async def test_registration_is_idempotent(self):
+        """Повторный запуск задачи не должен заводить вторую строку тречинга
+        на ту же уже зарегистрированную позицию."""
+        from src.db.session import get_session
+        from src.execution.trade_outcome_tracker import _register_newly_closed_trades
+        from src.db.models import TradeOutcomeTracking
+        from sqlalchemy import select
+
+        async with get_session() as session:
+            symbol, order = await self._make_open_order(
+                session, symbol_str="OUTCIDEMP/USDT", amount=5.0, filled_amount=5.0,
+            )
+            await self._make_trade_leg(
+                session, symbol_id=symbol.id, order_open_id=order.id, direction="short",
+                entry_price=50.0, exit_price=45.0, amount=5.0, pnl=25.0,
+            )
+            await _register_newly_closed_trades(session)
+            await _register_newly_closed_trades(session)
+
+        async with get_session() as session:
+            rows = (
+                await session.execute(
+                    select(TradeOutcomeTracking).where(TradeOutcomeTracking.symbol_id == symbol.id)
+                )
+            ).scalars().all()
+        self.assertEqual(len(rows), 1)
+
+
+class TestTradeOutcomeTrackerAdvance(unittest.IsolatedAsyncioTestCase):
+    """
+    src.execution.trade_outcome_tracker._advance_one/_finalize_verdict —
+    тречинг завершается, когда цена откатывает от лучшей достигнутой
+    отметки на outcome_tracking_retracement_pct от размера уже пройденного
+    благоприятного движения (локальный экстремум найден), и классифицирует
+    исход: sl_too_tight (закрылись в минус, а цена потом ушла в плюс от
+    входа), tp_too_conservative (закрылись в плюс, а цена ушла заметно
+    дальше), optimal (упущенная прибыль незначительна).
+    """
+
+    def setUp(self):
+        self._saved_retracement = settings.outcome_tracking_retracement_pct
+        self._saved_min_excursion = settings.outcome_tracking_min_excursion_pct
+        self._saved_max_days = settings.outcome_tracking_max_days
+        settings.outcome_tracking_retracement_pct = 30.0
+        settings.outcome_tracking_min_excursion_pct = 1.0
+        settings.outcome_tracking_max_days = 14
+
+    def tearDown(self):
+        settings.outcome_tracking_retracement_pct = self._saved_retracement
+        settings.outcome_tracking_min_excursion_pct = self._saved_min_excursion
+        settings.outcome_tracking_max_days = self._saved_max_days
+
+    def _make_row(self, *, direction, entry_price, close_price, baseline_pnl_pct, close_time=None):
+        from src.db.models import TradeOutcomeTracking
+
+        # status="tracking" — эти объекты не проходят через сессию/flush
+        # (только прямой вызов _advance_one), поэтому колоночный
+        # server_default="tracking" на реальной строке БД здесь сам не
+        # применится, выставляем как оно было бы сразу после INSERT.
+        row = TradeOutcomeTracking(
+            trade_id=1, symbol_id=1, direction=direction, entry_price=entry_price,
+            close_price=close_price, close_time=close_time or datetime.now(),
+            baseline_pnl_pct=baseline_pnl_pct, status="tracking",
+        )
+        row.symbol = MagicMock(symbol="ADVANCE/USDT")
+        row.trade = MagicMock(order_open=MagicMock(market_type="spot"))
+        return row
+
+    async def _advance_with_price(self, row, price):
+        from src.execution.trade_outcome_tracker import _advance_one
+
+        with patch("src.execution.executor.execution_engine") as mock_engine:
+            mock_engine.get_reference_price = AsyncMock(return_value=price)
+            await _advance_one(row)
+
+    async def test_long_sl_too_tight_verdict(self):
+        """Закрылись по стопу в минус (entry=100, close=95, -5%), но цена
+        затем поднялась до 110 (+10% от входа) и откатила на 30% от этого
+        движения (110 -> 95 -> retracement >= 30%*(110-95)=4.5, т.е. цена
+        <= 105.5) — локальный экстремум найден, вход был бы прибыльным."""
+        row = self._make_row(direction="long", entry_price=100.0, close_price=95.0, baseline_pnl_pct=-5.0)
+
+        await self._advance_with_price(row, 110.0)
+        self.assertEqual(row.status, "tracking")
+        await self._advance_with_price(row, 105.0)  # retracement = 5 >= 4.5
+
+        self.assertEqual(row.status, "done")
+        self.assertEqual(row.verdict, "sl_too_tight")
+        self.assertAlmostEqual(row.optimal_pnl_pct, 10.0, places=4)
+        self.assertAlmostEqual(row.missed_pnl_pct, 15.0, places=4)
+
+    async def test_short_tp_too_conservative_verdict(self):
+        """Закрылись в плюс (entry=100, close=90, +10%), но цена продолжила
+        падать до 70 (+30% от входа) прежде чем откатить на 30% от этого
+        движения назад — TP был слишком консервативным."""
+        row = self._make_row(direction="short", entry_price=100.0, close_price=90.0, baseline_pnl_pct=10.0)
+
+        await self._advance_with_price(row, 70.0)
+        self.assertEqual(row.status, "tracking")
+        # excursion = |best(70) - close(90)| = 20; retracement = 79-70 = 9 >= 0.3*20 = 6
+        await self._advance_with_price(row, 79.0)
+
+        self.assertEqual(row.status, "done")
+        self.assertEqual(row.verdict, "tp_too_conservative")
+        self.assertAlmostEqual(row.optimal_pnl_pct, 30.0, places=4)
+        self.assertAlmostEqual(row.missed_pnl_pct, 20.0, places=4)
+
+    async def test_optimal_verdict_when_missed_pnl_negligible(self):
+        """Закрылись почти на самом пике (best_price=110, close=109.5) —
+        упущенная прибыль (missed_pnl_pct=0.5) ниже порога значимости,
+        сделка считается оптимальной, а не premature_exit. Тестирует
+        _finalize_verdict напрямую (не через _advance_one/цены тиков) —
+        сам по себе порог "экскурсия достаточна, чтобы вообще завершить
+        тречинг" (outcome_tracking_min_excursion_pct) и порог "упущенная
+        прибыль незначительна" (_NEGLIGIBLE_MISSED_PNL_PCT) сравнивают
+        разные вещи (% движения цены от close_price vs п.п. PnL от entry_
+        price) и не всегда достижимы одновременно на простых числах."""
+        from src.execution.trade_outcome_tracker import _finalize_verdict
+
+        row = self._make_row(direction="long", entry_price=100.0, close_price=109.5, baseline_pnl_pct=9.5)
+        row.best_price = 110.0
+
+        _finalize_verdict(row)
+
+        self.assertEqual(row.verdict, "optimal")
+        self.assertAlmostEqual(row.optimal_pnl_pct, 10.0, places=4)
+        self.assertAlmostEqual(row.missed_pnl_pct, 0.5, places=4)
+
+    async def test_small_excursion_does_not_trigger_premature_finalize(self):
+        """Движение цены сразу после закрытия меньше outcome_tracking_min_
+        excursion_pct — обычный шум, откат от него НЕ должен завершать
+        тречинг раньше времени."""
+        row = self._make_row(direction="long", entry_price=100.0, close_price=100.0, baseline_pnl_pct=0.0)
+
+        await self._advance_with_price(row, 100.3)  # excursion 0.3% < min 1%
+        await self._advance_with_price(row, 100.05)  # "откат", но excursion всё ещё < 1%
+
+        self.assertEqual(row.status, "tracking")
+        self.assertIsNone(row.verdict)
+
+    async def test_stops_at_max_horizon_without_retracement(self):
+        """Цена без остановки идёт в пользу сделки — откат так и не находится,
+        но защитный потолок outcome_tracking_max_days всё равно завершает
+        тречинг, а не оставляет его бесконечным."""
+        settings.outcome_tracking_max_days = 0  # уже "истёк" на первой же проверке
+        row = self._make_row(
+            direction="long", entry_price=100.0, close_price=100.0, baseline_pnl_pct=0.0,
+            close_time=datetime.now() - timedelta(days=1),
+        )
+
+        await self._advance_with_price(row, 105.0)
+
+        self.assertEqual(row.status, "stopped_max_horizon")
+        self.assertIsNotNone(row.verdict)
+
+    async def test_skips_when_reference_price_unavailable(self):
+        """execution_engine.get_reference_price может вернуть None (биржа
+        недоступна) — тречинг должен просто подождать следующего цикла, а
+        не упасть и не завершиться с мусорными данными."""
+        row = self._make_row(direction="long", entry_price=100.0, close_price=100.0, baseline_pnl_pct=0.0)
+
+        await self._advance_with_price(row, None)
+
+        self.assertEqual(row.status, "tracking")
+        self.assertIsNone(row.last_price)
+        self.assertIsNone(row.best_price)
+
+
+class TestChannelOutcomeContext(unittest.IsolatedAsyncioTestCase):
+    """
+    src.telegram.channel_outcome_context.get_channel_outcome_context — по
+    запросу пользователя "обучать LLM" на данных отслеживания цены после
+    закрытия: обогащает системный промпт LLM-фолбэков парсера сигналов
+    (llm_parser.py и остальные *_parser.py) кратким контекстом по
+    фактическим исходам СДЕЛОК канала. Строго информационно — контекст
+    явно оговаривает, что им нельзя пользоваться, чтобы менять/придумывать
+    цены, только для confidence/is_signal при неоднозначном сообщении.
+    """
+
+    def setUp(self):
+        from src.telegram.channel_outcome_context import _cache
+        _cache.clear()
+        self._saved_enabled = settings.llm_channel_outcome_context_enabled
+        settings.llm_channel_outcome_context_enabled = True
+
+    def tearDown(self):
+        from src.telegram.channel_outcome_context import _cache
+        _cache.clear()
+        settings.llm_channel_outcome_context_enabled = self._saved_enabled
+
+    async def _setup_channel_with_tracking(self, *, channel_id, verdict, missed_pnl_pct):
+        from src.db.session import get_session
+        from src.db.models import (
+            Exchange, Symbol, Order, Trade, TelegramChannel, TelegramSignal, TradeOutcomeTracking,
+        )
+
+        async with get_session() as session:
+            exchange = Exchange(name=f"ctx-test-{channel_id}", is_paper=True)
+            session.add(exchange)
+            await session.flush()
+            symbol = Symbol(exchange_id=exchange.id, symbol="CTXCOIN/USDT", base_asset="CTXCOIN", quote_asset="USDT")
+            session.add(symbol)
+            await session.flush()
+            order = Order(
+                exchange_id=exchange.id, symbol_id=symbol.id, side="buy", order_type="market",
+                amount=1.0, price=100.0, status="filled", filled_amount=1.0, filled_price=100.0,
+                fee=0.0, market_type="spot",
+            )
+            session.add(order)
+            await session.flush()
+            trade = Trade(
+                symbol_id=symbol.id, order_open_id=order.id, direction="long",
+                entry_price=100.0, exit_price=95.0, amount=1.0, pnl=-5.0, pnl_pct=-5.0,
+                is_open=False, closed_at=datetime.now(),
+            )
+            session.add(trade)
+            await session.flush()
+            session.add(TradeOutcomeTracking(
+                trade_id=trade.id, symbol_id=symbol.id, direction="long", entry_price=100.0,
+                close_price=95.0, close_time=datetime.now(), baseline_pnl_pct=-5.0,
+                status="done", verdict=verdict, optimal_pnl_pct=10.0, missed_pnl_pct=missed_pnl_pct,
+            ))
+            channel = TelegramChannel(channel_id=channel_id, channel_title="Test Channel")
+            session.add(channel)
+            await session.flush()
+            session.add(TelegramSignal(
+                channel_id=channel.id, raw_message="test", message_date=datetime.now(),
+                executed_order_id=order.id, executed_trade_id=trade.id,
+            ))
+            await session.commit()
+
+    async def test_returns_none_without_any_tracking_data(self):
+        from src.telegram.channel_outcome_context import get_channel_outcome_context
+
+        result = await get_channel_outcome_context("@no_such_channel_outcome_test")
+        self.assertIsNone(result)
+
+    async def test_returns_none_when_disabled(self):
+        from src.telegram.channel_outcome_context import get_channel_outcome_context
+
+        await self._setup_channel_with_tracking(
+            channel_id="@ctx_disabled_test", verdict="sl_too_tight", missed_pnl_pct=15.0,
+        )
+        settings.llm_channel_outcome_context_enabled = False
+
+        result = await get_channel_outcome_context("@ctx_disabled_test")
+        self.assertIsNone(result)
+
+    async def test_returns_sl_too_tight_context(self):
+        from src.telegram.channel_outcome_context import get_channel_outcome_context
+
+        await self._setup_channel_with_tracking(
+            channel_id="@ctx_sl_test", verdict="sl_too_tight", missed_pnl_pct=15.0,
+        )
+
+        result = await get_channel_outcome_context("@ctx_sl_test")
+        self.assertIsNotNone(result)
+        self.assertIn("stop-loss", result)
+        self.assertIn("do NOT use this to alter, invent, or adjust", result)
+
+    async def test_result_is_cached(self):
+        from src.telegram.channel_outcome_context import get_channel_outcome_context, _build_context
+
+        await self._setup_channel_with_tracking(
+            channel_id="@ctx_cache_test", verdict="tp_too_conservative", missed_pnl_pct=8.0,
+        )
+
+        first = await get_channel_outcome_context("@ctx_cache_test")
+        with patch(
+            "src.telegram.channel_outcome_context._build_context", new=AsyncMock(side_effect=AssertionError),
+        ):
+            second = await get_channel_outcome_context("@ctx_cache_test")
+        self.assertEqual(first, second)
+
+
+class TestLLMParserChannelOutcomeContext(unittest.IsolatedAsyncioTestCase):
+    """
+    llm_parser.parse_with_llm должен обогащать системный промпт контекстом
+    по исходам сделок канала, когда он доступен (см. TestChannelOutcomeContext
+    выше) — но НЕ ломать вызов, когда его нет или channel_config не передан.
+    """
+
+    def setUp(self):
+        self._saved_enabled = settings.telegram_llm_fallback_enabled
+        self._saved_key = settings.anthropic_api_key
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = "test-key"
+        import src.telegram.llm_parser as llm_parser_module
+        llm_parser_module._client = None
+
+    def tearDown(self):
+        settings.telegram_llm_fallback_enabled = self._saved_enabled
+        settings.anthropic_api_key = self._saved_key
+        import src.telegram.llm_parser as llm_parser_module
+        llm_parser_module._client = None
+
+    async def test_system_prompt_includes_channel_context_when_available(self):
+        from src.telegram.llm_parser import parse_with_llm
+
+        fake_response = MagicMock()
+        fake_block = MagicMock(type="tool_use", name="emit_signal", input={"is_signal": False, "confidence": 0.9})
+        fake_response.content = [fake_block]
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=fake_response)
+
+        with patch("src.telegram.llm_parser._get_client", return_value=mock_client), \
+                patch(
+                    "src.telegram.channel_outcome_context.get_channel_outcome_context",
+                    new=AsyncMock(return_value="Historical note: test context sentinel."),
+                ):
+            await parse_with_llm("some ambiguous message", {"channel_id": "@ctx_wired_test"})
+
+        sent_system = mock_client.messages.create.await_args.kwargs["system"]
+        self.assertIn("Historical note: test context sentinel.", sent_system)
+
+    async def test_no_context_lookup_without_channel_config(self):
+        from src.telegram.llm_parser import parse_with_llm
+
+        fake_response = MagicMock()
+        fake_block = MagicMock(type="tool_use", name="emit_signal", input={"is_signal": False, "confidence": 0.9})
+        fake_response.content = [fake_block]
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=fake_response)
+
+        with patch("src.telegram.llm_parser._get_client", return_value=mock_client):
+            await parse_with_llm("some ambiguous message", None)
+
+        sent_system = mock_client.messages.create.await_args.kwargs["system"]
+        self.assertNotIn("Historical note", sent_system)
+
+
 if __name__ == "__main__":
     unittest.main()

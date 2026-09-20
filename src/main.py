@@ -203,6 +203,11 @@ class TradingBot:
             IntervalTrigger(hours=settings.performance_snapshot_interval_hours),
             id="performance_snapshot",
         )
+        self.scheduler.add_job(
+            self._track_closed_trade_outcomes,
+            IntervalTrigger(minutes=settings.outcome_tracking_check_interval_minutes),
+            id="trade_outcome_tracker",
+        )
         self.scheduler.start()
         logger.info("✅ Планировщик запущен")
         await self._save_performance_snapshot()
@@ -714,6 +719,22 @@ class TradingBot:
                     self.ml_inference.load_model("volatility_predictor", vol_result["model_path"])
         except Exception as e:
             logger.error(f"Ошибка переобучения ML-моделей: {e}")
+
+    async def _track_closed_trade_outcomes(self):
+        """
+        Периодическая задача: найти новые полностью закрытые позиции и
+        обновить прогресс уже отслеживаемых — см. src/execution/trade_
+        outcome_tracker.py (по запросу пользователя: отследить движение
+        цены после закрытия сделки, чтобы понять, как нужно было бы
+        выставить вход/SL/TP для максимальной прибыли).
+        """
+        if not settings.outcome_tracking_enabled:
+            return
+        try:
+            from src.execution.trade_outcome_tracker import track_closed_trade_outcomes
+            await track_closed_trade_outcomes()
+        except Exception as e:
+            logger.error(f"Ошибка отслеживания исходов закрытых сделок: {e}")
 
     async def _start_telegram_monitoring(self):
         """Загрузить активные каналы из БД и запустить их мониторинг.

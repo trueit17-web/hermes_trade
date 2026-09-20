@@ -219,6 +219,63 @@ class Trade(Base):
     )
 
 
+class TradeOutcomeTracking(Base):
+    """
+    Движение цены ПОСЛЕ закрытия сделки — по запросу пользователя: понять,
+    как нужно было бы выставить вход/SL/TP, чтобы поймать максимум
+    доступной прибыли, вместо той, что реально зафиксирована. Одна строка
+    на позицию (Trade.id последней/закрывающей части — см. trade_id,
+    совпадает с TelegramSignal.executed_trade_id для сигнальных сделок).
+
+    Отслеживание идёт, пока не найден локальный экстремум (см.
+    trade_outcome_tracker.py): пока цена продолжает идти в пользу
+    исходного направления сделки, best_price подтягивается за ней; как
+    только цена откатывает от best_price на outcome_tracking_retracement_
+    pct от размера достигнутого движения — дальше ждать бессмысленно
+    (пик уже пройден), тречинг завершается (status="done"). Ограничено
+    сверху outcome_tracking_max_days на случай, если цена вообще не
+    разворачивается (защита от бесконечного трекинга).
+    """
+    __tablename__ = "trade_outcome_tracking"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trade_id: Mapped[int] = mapped_column(ForeignKey("trades.id"), nullable=False, unique=True)
+    symbol_id: Mapped[int] = mapped_column(ForeignKey("symbols.id"), nullable=False)
+    direction: Mapped[str] = mapped_column(String(10), nullable=False)  # long, short
+    entry_price: Mapped[float] = mapped_column(DECIMAL, nullable=False)
+    close_price: Mapped[float] = mapped_column(DECIMAL, nullable=False)
+    close_time: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # PnL% (от номинала, без плеча/комиссий) на момент реального закрытия —
+    # база для сравнения с optimal_pnl_pct ниже.
+    baseline_pnl_pct: Mapped[float] = mapped_column(Float, nullable=False)
+    best_price: Mapped[float | None] = mapped_column(DECIMAL)
+    best_price_at: Mapped[datetime | None] = mapped_column(DateTime)
+    worst_price: Mapped[float | None] = mapped_column(DECIMAL)
+    worst_price_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_price: Mapped[float | None] = mapped_column(DECIMAL)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(
+        String(20), default="tracking"
+    )  # tracking, done, stopped_max_horizon
+    # Итоговый вывод — выставляется, когда status переходит в done/
+    # stopped_max_horizon: sl_too_tight (закрылись в минус, а цена потом
+    # ушла в плюс от входа), tp_too_conservative (закрылись в плюс, а цена
+    # ушла заметно дальше), optimal (реальный выход и так был близок к
+    # лучшему), premature_exit (не подходит под первые два, но упущенная
+    # прибыль всё равно значима).
+    verdict: Mapped[str | None] = mapped_column(String(30))
+    # Оценочный PnL%, если бы вышли по best_price вместо close_price —
+    # ОЦЕНКА без учёта комиссий/проскальзывания на гипотетическом выходе
+    # (в отличие от baseline_pnl_pct, который посчитан по реальным cделкам).
+    optimal_pnl_pct: Mapped[float | None] = mapped_column(Float)
+    missed_pnl_pct: Mapped[float | None] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    trade: Mapped["Trade"] = relationship()
+    symbol: Mapped["Symbol"] = relationship()
+
+
 class Candle(Base):
     """Свеча (OHLCV)."""
     __tablename__ = "candles"

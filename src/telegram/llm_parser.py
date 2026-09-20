@@ -113,12 +113,19 @@ async def parse_with_llm(
     else:
         user_message = text[:4000]
 
+    system_prompt = _SYSTEM
+    if channel_config:
+        from src.telegram.channel_outcome_context import get_channel_outcome_context
+        context = await get_channel_outcome_context(channel_config.get("channel_id"))
+        if context:
+            system_prompt = f"{_SYSTEM}\n\n{context}"
+
     try:
         client = _get_client()
         resp = await client.messages.create(
             model=settings.anthropic_model,
             max_tokens=512,
-            system=_SYSTEM,
+            system=system_prompt,
             tools=[_TOOL],
             tool_choice={"type": "tool", "name": "emit_signal"},
             messages=[{"role": "user", "content": user_message}],

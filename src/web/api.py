@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import selectinload
 
 import src.bot_registry as bot_registry
@@ -27,6 +27,7 @@ from src.db.models import (
     TelegramChannel,
     TelegramSignal,
     Trade,
+    TradeOutcomeTracking,
 )
 from src.db.models import (
     Strategy as StrategyModel,
@@ -1342,6 +1343,39 @@ async def get_trade_detail(trade_id: int):
                 )
             ).scalar_one_or_none()
 
+        # Тречинг цены после закрытия (см. src/execution/trade_outcome_
+        # tracker.py) заведён на Trade.id ПОСЛЕДНЕЙ части позиции — тот же
+        # id, что и group[-1], а не обязательно запрошенный в URL trade_id
+        # (открывшая карточку строка на дашборде и так всегда последняя
+        # часть, см. GET /trades, но здесь подстраховываемся явно).
+        outcome_tracking_row = (
+            await session.execute(
+                select(TradeOutcomeTracking).where(TradeOutcomeTracking.trade_id == group[-1].id)
+            )
+        ).scalar_one_or_none()
+        outcome_tracking = None
+        if outcome_tracking_row is not None:
+            outcome_tracking = {
+                "status": outcome_tracking_row.status,
+                "close_price": float(outcome_tracking_row.close_price),
+                "best_price": (
+                    float(outcome_tracking_row.best_price)
+                    if outcome_tracking_row.best_price is not None else None
+                ),
+                "worst_price": (
+                    float(outcome_tracking_row.worst_price)
+                    if outcome_tracking_row.worst_price is not None else None
+                ),
+                "verdict": outcome_tracking_row.verdict,
+                "baseline_pnl_pct": outcome_tracking_row.baseline_pnl_pct,
+                "optimal_pnl_pct": outcome_tracking_row.optimal_pnl_pct,
+                "missed_pnl_pct": outcome_tracking_row.missed_pnl_pct,
+                "last_checked_at": (
+                    outcome_tracking_row.last_checked_at.isoformat() + "Z"
+                    if outcome_tracking_row.last_checked_at else None
+                ),
+            }
+
         return {
             "trade_id": trade_id,
             "symbol": trade.symbol.symbol if trade.symbol else None,
@@ -1388,7 +1422,65 @@ async def get_trade_detail(trade_id: int):
                 }
                 for log in logs
             ],
+            "outcome_tracking": outcome_tracking,
         }
+
+
+@app.get("/analytics/trade-outcomes")
+async def get_trade_outcome_analysis(limit: int = 20):
+    """
+    Сводка по отслеживанию цены после закрытия сделок (см. src/execution/
+    trade_outcome_tracker.py) — по запросу пользователя: посмотреть, как
+    нужно было бы выставить вход/SL/TP для максимальной прибыли. Считает
+    только уже завершённые (status != "tracking") строки — для сделок в
+    процессе тречинга best_price/verdict ещё не окончательны.
+    """
+    async with get_session() as session:
+        finished = (
+            await session.execute(
+                select(TradeOutcomeTracking)
+                .options(selectinload(TradeOutcomeTracking.symbol))
+                .where(TradeOutcomeTracking.status != "tracking")
+            )
+        ).scalars().all()
+
+        tracking_count = (
+            await session.execute(
+                select(func.count()).select_from(TradeOutcomeTracking)
+                .where(TradeOutcomeTracking.status == "tracking")
+            )
+        ).scalar_one()
+
+    verdict_counts: dict[str, int] = {}
+    for row in finished:
+        verdict_counts[row.verdict or "unknown"] = verdict_counts.get(row.verdict or "unknown", 0) + 1
+
+    biggest_misses = sorted(
+        (r for r in finished if (r.missed_pnl_pct or 0) > 0),
+        key=lambda r: r.missed_pnl_pct or 0,
+        reverse=True,
+    )[:limit]
+
+    return {
+        "tracking_count": tracking_count,
+        "finished_count": len(finished),
+        "verdict_counts": verdict_counts,
+        "biggest_misses": [
+            {
+                "trade_id": r.trade_id,
+                "symbol": r.symbol.symbol if r.symbol else None,
+                "direction": r.direction,
+                "verdict": r.verdict,
+                "close_price": float(r.close_price),
+                "best_price": float(r.best_price) if r.best_price is not None else None,
+                "baseline_pnl_pct": r.baseline_pnl_pct,
+                "optimal_pnl_pct": r.optimal_pnl_pct,
+                "missed_pnl_pct": r.missed_pnl_pct,
+                "close_time": r.close_time.isoformat() + "Z" if r.close_time else None,
+            }
+            for r in biggest_misses
+        ],
+    }
 
 
 @app.post("/trades/{trade_id}/recalculate")
