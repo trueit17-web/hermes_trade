@@ -454,7 +454,7 @@ def is_locked_teaser(text: str) -> bool:
     return bool(_LOCKED_TEASER_PATTERN.search(text))
 
 
-_PARTIAL_UPDATE_PATTERN = re.compile(r"забрал\w*\s+\S+\s+(?:тейк|цель\w*)", re.IGNORECASE)
+_PARTIAL_UPDATE_PATTERN = re.compile(r"забрал\w*\s+\S+\s+(?:тейк|цел[ьи]\w*)", re.IGNORECASE)
 _DEPOSIT_PATTERN = re.compile(r"депозит", re.IGNORECASE)
 
 
@@ -473,6 +473,13 @@ def is_position_update_report(text: str) -> bool:
     достаточно специфично, чтобы не путать с настоящим сигналом (там
     "тейк"/"цель" встречается только со списком целевых цен, без слова
     "забрали" перед ними).
+
+    Реальный инцидент (прод, @kripto_signaly3/@kripto_signalyX,
+    2026-09-20): "забрали ВСЕ цели" не матчилось — "цель\\w*" требует
+    буквально "цель" (с мягким знаком), а во множественном числе/косвенных
+    падежах мягкий знак пропадает ("цели", "целей", "целям", как и у любого
+    существительного 3-го склонения), а не заменяется суффиксом после
+    "цель". Паттерн исправлен на "цел[ьи]\\w*", чтобы покрыть обе формы.
     """
     return bool(_PARTIAL_UPDATE_PATTERN.search(text) and _DEPOSIT_PATTERN.search(text))
 

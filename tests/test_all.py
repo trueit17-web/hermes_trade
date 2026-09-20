@@ -4826,6 +4826,22 @@ class TestPositionUpdateReportNotParsedAsSignal(unittest.IsolatedAsyncioTestCase
         text = "#BCH/USDT - Короткая🔴\n\nТочка входа: 221.33\n\nЦель 1: 220.15\nЦель 2: 219.93"
         self.assertFalse(is_position_update_report(text))
 
+    def test_detects_zabrali_vse_tseli_plural_variant(self):
+        """
+        Реальный инцидент (прод, @kripto_signaly3/@kripto_signalyX,
+        2026-09-20): "забрали ВСЕ цели" (множественное число) не
+        матчилось паттерном "цель\\w*" — во множественном числе/косвенных
+        падежах существительного "цель" мягкий знак пропадает ("цели", а
+        не "цельи"), поэтому "цель\\w*" как префикс не покрывал "цели".
+        """
+        from src.telegram.channel_monitor import is_position_update_report
+
+        text = (
+            "▪️ **INJ**, забрали все цели, зафиксировал сделку полностью. \n\n"
+            "прибыль: 61.13$\nактуальный депозит: 387.84$"
+        )
+        self.assertTrue(is_position_update_report(text))
+
     async def test_parse_telegram_signal_returns_none_without_calling_llm(self):
         from src.telegram.channel_monitor import parse_telegram_signal
         import src.telegram.llm_parser as llm_parser_module
