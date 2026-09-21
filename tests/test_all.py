@@ -3731,6 +3731,47 @@ class TestTelegramSignalParser(unittest.TestCase):
         result = self.parse("BTC/USDT Long SL 68000 TP 72000")
         self.assertIsNone(result)
 
+    def test_single_letter_ticker_with_explicit_quote(self):
+        """
+        Реальный инцидент (прод, @Treyding_Signaly_Kripto): "#W/USDT -
+        Длинная🟢" не матчился вообще — тикер "W" (Wormhole, реальная
+        однобуквенная монета на Bybit) короче прежнего минимума в 2 буквы
+        ([A-Z]{2,10}) в обоих паттернах пары (явный "/USDT" и хэштег).
+        """
+        text = (
+            "#W/USDT - Длинная🟢\n\n"
+            "Точка входа: `0.0118`\n"
+            "Стоп-лосс: `0.01108`\n\n"
+            "Цель 1: `0.01217`\n"
+            "Цель 2: `0.01247`\n"
+            "Цель 3: `0.01388`\n\n"
+            "Кредитное плечо: x16"
+        )
+        result = self.parse(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "W/USDT")
+        self.assertEqual(result["side"], "long")
+        self.assertEqual(result["entry"], 0.0118)
+        self.assertEqual(result["sl"], 0.01108)
+        self.assertEqual(result["take_profits"], [0.01217, 0.01247, 0.01388])
+        self.assertEqual(result["leverage"], 16.0)
+
+    def test_single_letter_ticker_hashtag_without_quote(self):
+        """Тот же класс инцидента, что и test_single_letter_ticker_with_
+        explicit_quote выше, но для хэштег-варианта без quote-валюты
+        (см. test_real_world_wif_short_market_entry_signal) — "#W SHORT"."""
+        text = (
+            "#W SHORT \n"
+            "Плечо: 10х  \n"
+            "Диапазон входа: по рынку   \n"
+            "Тейки: 0.30 0.29 0.28\n"
+            "Стоп: 0.32"
+        )
+        result = self.parse(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "W/USDT")
+        self.assertEqual(result["side"], "short")
+
     def test_cyrillic_stop_keyword_matches(self):
         result = self.parse("BTC/USDT Long 69000 Стоп: 68000 TP 72000")
         self.assertIsNotNone(result)
