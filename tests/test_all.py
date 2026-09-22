@@ -4977,6 +4977,24 @@ class TestPositionUpdateReportNotParsedAsSignal(unittest.IsolatedAsyncioTestCase
         )
         self.assertTrue(is_position_update_report(text))
 
+    def test_detects_report_without_deposit_mention(self):
+        """
+        Реальный инцидент (прод, @signalyp, 2026-09-22): "#ARB, забрал
+        первый тейк и вышел в безубыток, закрыл 50% позиции" не
+        матчилось — канал не упомянул депозит вообще. Условие "И
+        депозит" убрано: конструкция "забрал(и) ... тейк/цель" уже
+        достаточно специфична сама по себе (см. docstring выше).
+        """
+        from src.telegram.channel_monitor import is_position_update_report
+
+        text = (
+            "#**ARB**, забрал первый тейк и вышел в безубыток, закрыл 50% позиции.\n"
+            "#**MANTA** получили отработку, забрали наш первый тейк. "
+            "Закрыл 50% позиции и вышел в безубыток.\n\n"
+            "Смотрю за рынком и ищу новые точки входа."
+        )
+        self.assertTrue(is_position_update_report(text))
+
     async def test_parse_telegram_signal_returns_none_without_calling_llm(self):
         from src.telegram.channel_monitor import parse_telegram_signal
         import src.telegram.llm_parser as llm_parser_module

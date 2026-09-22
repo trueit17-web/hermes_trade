@@ -455,7 +455,6 @@ def is_locked_teaser(text: str) -> bool:
 
 
 _PARTIAL_UPDATE_PATTERN = re.compile(r"забрал\w*\s+\S+\s+(?:тейк|цел[ьи]\w*)", re.IGNORECASE)
-_DEPOSIT_PATTERN = re.compile(r"депозит", re.IGNORECASE)
 
 
 def is_position_update_report(text: str) -> bool:
@@ -480,8 +479,19 @@ def is_position_update_report(text: str) -> bool:
     падежах мягкий знак пропадает ("цели", "целей", "целям", как и у любого
     существительного 3-го склонения), а не заменяется суффиксом после
     "цель". Паттерн исправлен на "цел[ьи]\\w*", чтобы покрыть обе формы.
+
+    Реальный инцидент (прод, @signalyp, 2026-09-22): "#ARB, забрал первый
+    тейк и вышел в безубыток, закрыл 50% позиции" не матчилось — канал не
+    упомянул депозит вообще, только сам факт частичного закрытия. Условие
+    "И депозит" убрано: сама конструкция "забрал(и) ... тейк/цель"
+    ("забрали" сразу перед числом целевого уровня) уже достаточно
+    специфична сама по себе — в настоящем сигнале "тейк"/"цель" всегда
+    встречается только со списком целевых цен, без слова "забрал(и)"
+    перед ними (см. test_does_not_flag_ordinary_signal_with_take_profit_
+    list/test_does_not_flag_ordinary_signal_with_target_list), упоминание
+    депозита было лишним дополнительным условием, а не необходимым.
     """
-    return bool(_PARTIAL_UPDATE_PATTERN.search(text) and _DEPOSIT_PATTERN.search(text))
+    return bool(_PARTIAL_UPDATE_PATTERN.search(text))
 
 
 _DAILY_SUMMARY_PATTERN = re.compile(r"прибыль\s+\S*канала\s+за\s+последние\s+\d+\s*час", re.IGNORECASE)
