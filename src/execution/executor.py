@@ -3519,18 +3519,35 @@ class ExecutionEngine:
             canonical = exchange_symbol.split(":")[0]
             if canonical in tracked:
                 continue
-            await self._auto_adopt_untracked_futures_position(canonical, raw)
+            await self._auto_adopt_untracked_futures_position(canonical, raw, exchange)
 
-    async def _auto_adopt_untracked_futures_position(self, symbol: str, raw: dict) -> None:
+    async def _auto_adopt_untracked_futures_position(self, symbol: str, raw: dict, exchange) -> None:
         """
         Взять под защиту фьючерсную позицию, которую бот никогда не открывал
         сам (не осталось ни исходного Telegram-сигнала, ни ордера в БД —
         в отличие от adopt_unconfirmed_futures_position, где known intended
-        SL/TP берётся из ОТКЛОНЁННОГО TelegramSignal). Единственный источник
-        данных — сама позиция с биржи (raw, уже получен вызывающим кодом
-        через fetch_positions() — второй запрос не нужен): side/entryPrice/
-        leverage/initialMargin — тот же набор полей, что использует "adopt
-        excess" в _reconcile_futures_position для уже отслеживаемых позиций.
+        SL/TP берётся из ОТКЛОНЁННОГО TelegramSignal). Основной источник
+        данных — сама позиция с биржи (side/entryPrice/leverage/
+        initialMargin — тот же набор полей, что использует "adopt excess" в
+        _reconcile_futures_position для уже отслеживаемых позиций), но raw
+        (снимок из bulk fetch_positions(), уже полученный вызывающим кодом)
+        здесь используется только чтобы РЕШИТЬ, стоит ли вообще подхватывать
+        — реальные amount/entry_price берутся из повторного точечного
+        fetch_position() ниже.
+
+        Реальный инцидент (прод, APT/USDT, 2026-09-22): позиция реально
+        закрылась в 01:02 (бот сам обнаружил и зафиксировал закрытие по
+        сработавшему биржевому SL), но в 12:47 (11+ часов спустя) bulk
+        fetch_positions() всё ещё вернул для неё "призрачную" строку с
+        ненулевым contracts и УСТАРЕВШИМ entryPrice — позиция была
+        по-новой "подхвачена" с тем же самым SL-триггером, что и год назад,
+        который к текущей цене уже был по невалидную сторону ("expect
+        Falling, but trigger_price >= current"), и через минуту сверка
+        обнаружила, что подхватывать было уже нечего. adopt_unconfirmed_
+        futures_position (сестринский метод выше) уже подстраховывается
+        точно так же — перепроверяет позицию через ТОЧЕЧНЫЙ fetch_position()
+        перед тем как ей довериться, а не берёт снимок bulk-листинга как
+        есть; здесь раньше такой перепроверки не было.
 
         SL считается тем же дефолтным % от входа, что и для Telegram-сигнала
         без указанного каналом SL (settings.telegram_signals_default_sl_pct)
@@ -3540,13 +3557,39 @@ class ExecutionEngine:
         открыл (см. changelog/отчёт пользователю), бот только не даёт ей
         остаться без стоп-лосса.
 
-        Если биржа не вернула side/entryPrice — данных недостаточно для
-        безопасного подхвата, откатываемся на старое поведение (только
+        Если биржа не вернула side/entryPrice (ни в raw, ни при повторной
+        проверке), либо точечная проверка показывает contracts=0 (позиция
+        уже закрыта, bulk-снимок устарел) — данных недостаточно/нечего
+        подхватывать, откатываемся на старое поведение (только
         предупреждение, без изменений в БД/real_positions).
         """
-        contracts = float(raw.get("contracts") or 0)
         side = raw.get("side")
         entry_price = raw.get("entryPrice")
+        if side not in ("long", "short") or not isinstance(entry_price, (int, float)) or entry_price <= 0:
+            contracts = float(raw.get("contracts") or 0)
+            logger.warning(
+                f"⚠️ На бирже открыта позиция {symbol} ({contracts} контрактов), которую "
+                f"бот НЕ отслеживает — она не защищена SL/TP ботом. Проверьте вручную на бирже."
+            )
+            return
+
+        try:
+            fresh = await exchange.fetch_position(self._ccxt_symbol(exchange, symbol))
+            contracts = float(fresh.get("contracts") or 0)
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось перепроверить позицию {symbol} для авто-подхвата: {e}")
+            return
+        if contracts == 0:
+            # bulk fetch_positions() вернул устаревший снимок закрытой позиции
+            # (см. докстринг выше, реальный инцидент APT/USDT) — подхватывать
+            # нечего, тихо выходим без предупреждения (позиция реально не
+            # открыта, это не проблема, которую нужно замечать пользователю).
+            return
+        fresh_entry_price = fresh.get("entryPrice")
+        if isinstance(fresh_entry_price, (int, float)) and fresh_entry_price > 0:
+            entry_price = fresh_entry_price
+        side = fresh.get("side") or side
+
         if side not in ("long", "short") or not isinstance(entry_price, (int, float)) or entry_price <= 0:
             logger.warning(
                 f"⚠️ На бирже открыта позиция {symbol} ({contracts} контрактов), которую "

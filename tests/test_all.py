@@ -12057,6 +12057,7 @@ class TestAutoAdoptUntrackedFuturesPosition(unittest.IsolatedAsyncioTestCase):
         self.risk_manager.state.open_positions.pop("AUTOADOPT1/USDT", None)
         self.risk_manager.state.open_positions.pop("AUTOADOPT2/USDT", None)
         self.risk_manager.state.open_positions.pop("AUTOADOPT3/USDT", None)
+        self.risk_manager.state.open_positions.pop("AUTOADOPT4/USDT", None)
         self.risk_manager.state.open_positions_count = len(self.risk_manager.state.open_positions)
 
     async def test_adopts_short_position_with_full_exchange_data(self):
@@ -12064,13 +12065,16 @@ class TestAutoAdoptUntrackedFuturesPosition(unittest.IsolatedAsyncioTestCase):
         settings.telegram_signals_default_sl_pct = 3.0
         exchange = AsyncMock()
         exchange.create_market_buy_order.return_value = {"id": "auto-sl-1"}  # закрывающая сторона шорта
+        exchange.fetch_position = AsyncMock(return_value={
+            "contracts": 5.0, "side": "short", "entryPrice": 100.0,
+        })
         self.engine._exchanges["futures"] = exchange
 
         raw = {
             "symbol": "AUTOADOPT1/USDT:USDT", "contracts": 5.0, "side": "short",
             "entryPrice": 100.0, "leverage": 10.0, "initialMargin": 50.0,
         }
-        await self.engine._auto_adopt_untracked_futures_position("AUTOADOPT1/USDT", raw)
+        await self.engine._auto_adopt_untracked_futures_position("AUTOADOPT1/USDT", raw, exchange)
 
         self.assertIn("AUTOADOPT1/USDT", self.engine.real_positions)
         pos = self.engine.real_positions["AUTOADOPT1/USDT"]
@@ -12104,7 +12108,7 @@ class TestAutoAdoptUntrackedFuturesPosition(unittest.IsolatedAsyncioTestCase):
         raw = {"symbol": "AUTOADOPT2/USDT:USDT", "contracts": 3.0, "entryPrice": 50.0}
 
         with self.assertLogs("src.execution.executor", level="WARNING") as cm:
-            await self.engine._auto_adopt_untracked_futures_position("AUTOADOPT2/USDT", raw)
+            await self.engine._auto_adopt_untracked_futures_position("AUTOADOPT2/USDT", raw, AsyncMock())
 
         self.assertTrue(any("AUTOADOPT2/USDT" in m and "НЕ отслеживает" in m for m in cm.output))
         self.assertNotIn("AUTOADOPT2/USDT", self.engine.real_positions)
@@ -12115,22 +12119,49 @@ class TestAutoAdoptUntrackedFuturesPosition(unittest.IsolatedAsyncioTestCase):
         raw = {"symbol": "AUTOADOPT2/USDT:USDT", "contracts": 3.0, "side": "long", "entryPrice": None}
 
         with self.assertLogs("src.execution.executor", level="WARNING") as cm:
-            await self.engine._auto_adopt_untracked_futures_position("AUTOADOPT2/USDT", raw)
+            await self.engine._auto_adopt_untracked_futures_position("AUTOADOPT2/USDT", raw, AsyncMock())
 
         self.assertTrue(any("НЕ отслеживает" in m for m in cm.output))
         self.assertNotIn("AUTOADOPT2/USDT", self.engine.real_positions)
+
+    async def test_skips_silently_when_position_already_closed_on_recheck(self):
+        """
+        Реальный инцидент (прод, APT/USDT, 2026-09-22): позиция реально
+        закрылась в 01:02 (бот сам это обнаружил и зафиксировал), но bulk
+        fetch_positions() ещё 11+ часов возвращал для неё призрачную строку
+        с ненулевым contracts. Точечный fetch_position() должен вернуть
+        contracts=0 — авто-подхват должен тихо отказаться, а не завести
+        новую фантомную позицию со старым устаревшим SL-триггером.
+        """
+        self.engine.exchange_id = "bybit"
+        exchange = AsyncMock()
+        exchange.fetch_position = AsyncMock(return_value={"contracts": 0.0, "side": "long", "entryPrice": 0.7923})
+        self.engine._exchanges["futures"] = exchange
+
+        raw = {
+            "symbol": "AUTOADOPT4/USDT:USDT", "contracts": 5798.3, "side": "long",
+            "entryPrice": 0.7923, "leverage": 10.0,
+        }
+        await self.engine._auto_adopt_untracked_futures_position("AUTOADOPT4/USDT", raw, exchange)
+
+        self.assertNotIn("AUTOADOPT4/USDT", self.engine.real_positions)
+        exchange.create_market_buy_order.assert_not_called()
+        exchange.create_market_sell_order.assert_not_called()
 
     async def test_no_sl_placed_when_default_sl_pct_disabled(self):
         self.engine.exchange_id = "bybit"
         settings.telegram_signals_default_sl_pct = 0
         exchange = AsyncMock()
+        exchange.fetch_position = AsyncMock(return_value={
+            "contracts": 2.0, "side": "long", "entryPrice": 20.0,
+        })
         self.engine._exchanges["futures"] = exchange
 
         raw = {
             "symbol": "AUTOADOPT3/USDT:USDT", "contracts": 2.0, "side": "long",
             "entryPrice": 20.0, "leverage": 5.0,
         }
-        await self.engine._auto_adopt_untracked_futures_position("AUTOADOPT3/USDT", raw)
+        await self.engine._auto_adopt_untracked_futures_position("AUTOADOPT3/USDT", raw, exchange)
 
         self.assertIn("AUTOADOPT3/USDT", self.engine.real_positions)
         pos = self.engine.real_positions["AUTOADOPT3/USDT"]
@@ -12156,6 +12187,9 @@ class TestAutoAdoptUntrackedFuturesPosition(unittest.IsolatedAsyncioTestCase):
                 "entryPrice": 10.0, "leverage": 2.0,
             },
         ])
+        self.engine.exchange.fetch_position = AsyncMock(return_value={
+            "contracts": 1.0, "side": "long", "entryPrice": 10.0,
+        })
         self.engine.exchange.create_market_sell_order.return_value = {"id": "auto-sl-e2e"}
 
         await self.engine.reconcile_real_positions()
