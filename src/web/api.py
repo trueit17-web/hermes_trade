@@ -462,6 +462,7 @@ async def get_status():
     return {
         "trading_mode": settings.trading_mode,
         "active_trading_mode": settings.active_trading_mode,
+        "use_exchange_sandbox": settings.use_exchange_sandbox,
         "market_type": settings.market_type,
         "is_paper": settings.is_paper,
         "startup_capital": settings.startup_capital_usdt,
@@ -2630,14 +2631,14 @@ async def adopt_untracked_position(signal_id: int):
 
 
 @app.get("/performance")
-async def get_performance():
-    """Производительность бота (последние снимки)."""
+async def get_performance(limit: int = 100, hours: int | None = None):
+    """Производительность бота (последние снимки, новые первыми); hours — только за последние N часов."""
+    limit = max(1, min(limit, 5000))
+    query = select(PerformanceSnapshot).order_by(PerformanceSnapshot.snapshot_time.desc()).limit(limit)
+    if hours:
+        query = query.where(PerformanceSnapshot.snapshot_time >= utcnow() - timedelta(hours=hours))
     async with get_session() as session:
-        snapshots = (
-            await session.execute(
-                select(PerformanceSnapshot).order_by(PerformanceSnapshot.snapshot_time.desc()).limit(100)
-            )
-        ).scalars().all()
+        snapshots = (await session.execute(query)).scalars().all()
         return {
             "snapshots": [
                 {

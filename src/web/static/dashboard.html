@@ -4,31 +4,74 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>CryptoBot Pro — Dashboard</title>
+<meta name="color-scheme" content="dark light">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script>
+  // Тема применяется до первой отрисовки — без вспышки тёмного фона в светлой теме.
+  try {
+    const saved = localStorage.getItem("cb-theme");
+    if (saved) document.documentElement.dataset.theme = saved;
+  } catch (e) {}
+</script>
 <style>
   :root {
-    --bg: #0f1117;
-    --panel: #1a1d2e;
-    --panel-border: #2d3148;
-    --text: #e2e8f0;
-    --text-dim: #64748b;
+    --bg: #0b0d14;
+    --panel: #131722;
+    --panel-2: #1a1f2e;
+    --panel-border: #252b3b;
+    --hover: rgba(255,255,255,.035);
+    --text: #e6e9f2;
+    /* Было #64748b — контраст ниже 4.5:1 на тёмном фоне, мелкий текст
+       подписей читался с трудом. */
+    --text-dim: #8b93a7;
     --green: #10b981;
-    --red: #ef4444;
+    --red: #f43f5e;
     --yellow: #f59e0b;
     /* Единый акцентный индиго на все интерактивные/информационные
-       поверхности (кнопки, активные состояния, статус-точки) — вместо
-       раздельных фиолетового/синего, как раньше. */
-    --accent: #6366f1;
+       поверхности (кнопки, активные состояния, статус-точки). */
+    --accent: #7c83ff;
+    --accent-soft: rgba(124,131,255,.14);
     --blue: var(--accent);
+    --shadow: 0 1px 2px rgba(0,0,0,.25), 0 8px 24px -12px rgba(0,0,0,.45);
+    --radius: 14px;
     --sidebar-width: 240px;
+    --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #f4f6fb;
+    --panel: #ffffff;
+    --panel-2: #f0f2f8;
+    --panel-border: #e1e5ef;
+    --hover: rgba(15,23,42,.04);
+    --text: #0f172a;
+    --text-dim: #5b6478;
+    --green: #059669;
+    --red: #e11d48;
+    --yellow: #d97706;
+    --accent: #4f46e5;
+    --accent-soft: rgba(79,70,229,.10);
+    --shadow: 0 1px 2px rgba(15,23,42,.06), 0 8px 24px -14px rgba(15,23,42,.18);
   }
   * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
   body {
     margin: 0;
     background: var(--bg);
     color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-family: var(--font-sans);
     font-size: 14px;
+    -webkit-font-smoothing: antialiased;
+    font-feature-settings: "cv11", "ss01";
   }
+  /* Цифры одинаковой ширины — колонки цен/PnL не "прыгают" при обновлении. */
+  table, .stat-card .value, .metric-value, .order-card-kv, .trade-detail-grid { font-variant-numeric: tabular-nums; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  ::selection { background: var(--accent-soft); }
+  * { scrollbar-width: thin; scrollbar-color: var(--panel-border) transparent; }
   /* Левый сайдбар вместо верхних вкладок — тот же паттерн навигации, что
      и в референсном дизайне (секции + пункты с иконками), плюс тонкий
      топбар в main для живых оперативных индикаторов (режим/рынок/WS),
@@ -81,8 +124,14 @@
     font-weight: 600;
     margin-bottom: 2px;
   }
-  .tab-btn.nav-item:hover { background: #232640; color: var(--text); filter: none; }
-  .tab-btn.nav-item.active { background: rgba(99,102,241,.15); color: var(--accent); border: none; }
+  .tab-btn.nav-item:hover { background: var(--hover); color: var(--text); filter: none; }
+  .tab-btn.nav-item.active { background: var(--accent-soft); color: var(--accent); border: none; }
+  .nav-item .kbd { margin-left: auto; }
+  .kbd {
+    font-family: var(--font-mono); font-size: 10.5px; color: var(--text-dim);
+    border: 1px solid var(--panel-border); border-bottom-width: 2px;
+    border-radius: 5px; padding: 0 5px; line-height: 16px;
+  }
   .nav-item .icon { font-size: 16px; width: 20px; text-align: center; flex-shrink: 0; }
   .nav-bottom { padding: 12px; border-top: 1px solid var(--panel-border); }
   .badges { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 4px 10px; }
@@ -93,7 +142,8 @@
     font-weight: 600;
     letter-spacing: 0.02em;
   }
-  .badge-mode-paper { background: rgba(99,102,241,.15); color: var(--blue); }
+  .badge-mode-paper { background: var(--accent-soft); color: var(--blue); }
+  .badge-demo { background: rgba(245,158,11,.14); color: var(--yellow); }
   .badge-mode-real { background: rgba(239,68,68,.15); color: var(--red); }
   .badge-running { background: rgba(16,185,129,.15); color: var(--green); }
   .badge-paused { background: rgba(245,158,11,.15); color: var(--yellow); }
@@ -115,16 +165,29 @@
   }
   .logout-btn:hover { border-color: var(--red); color: var(--red); filter: none; }
 
-  main { margin-left: var(--sidebar-width); padding: 24px 32px 60px; }
+  main { margin-left: var(--sidebar-width); padding: 0 32px 60px; }
+  /* Топбар прилипает к верху при прокрутке — переключатели режима/рынка и
+     статус WS всегда под рукой на длинной вкладке "Дашборд". */
   .topbar {
+    position: sticky; top: 0; z-index: 50;
     display: flex;
     align-items: center;
     flex-wrap: wrap;
     gap: 14px;
-    margin-bottom: 24px;
-    padding-bottom: 20px;
+    margin: 0 -32px 24px;
+    padding: 14px 32px;
     border-bottom: 1px solid var(--panel-border);
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    backdrop-filter: saturate(160%) blur(10px);
+    -webkit-backdrop-filter: saturate(160%) blur(10px);
   }
+  .topbar-spacer { flex: 1; }
+  .icon-btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: var(--panel); border: 1px solid var(--panel-border);
+    color: var(--text-dim); padding: 7px 10px; border-radius: 9px; font-size: 13px; font-weight: 500;
+  }
+  .icon-btn:hover { color: var(--text); border-color: var(--accent); filter: none; }
   .stats {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -132,13 +195,21 @@
     margin-bottom: 20px;
   }
   .stat-card {
-    background: var(--panel);
+    position: relative;
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
     border: 1px solid var(--panel-border);
-    border-radius: 12px;
-    padding: 14px 16px;
+    border-radius: var(--radius);
+    padding: 16px 18px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
   }
-  .stat-card .label { color: var(--text-dim); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
-  .stat-card .value { font-size: 22px; font-weight: 700; margin-top: 4px; }
+  .stat-card .label { color: var(--text-dim); font-size: 12px; font-weight: 500; display: flex; align-items: center; gap: 6px; }
+  .stat-card .value { font-size: 24px; font-weight: 700; margin-top: 6px; letter-spacing: -.01em; }
+  .stat-card .sub { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+  .stat-card .meter { height: 4px; border-radius: 4px; background: var(--panel-border); margin-top: 10px; overflow: hidden; }
+  .stat-card .meter > span { display: block; height: 100%; border-radius: 4px; background: var(--accent); transition: width .4s ease; }
+  .stat-card .meter > span.warn { background: var(--yellow); }
+  .stat-card .meter > span.crit { background: var(--red); }
   .value.pos { color: var(--green); }
   .value.neg { color: var(--red); }
 
@@ -155,9 +226,9 @@
     background: var(--panel);
     color: var(--text);
     padding: 9px 16px;
-    border-radius: 8px;
+    border-radius: 9px;
     font-weight: 600;
-    transition: filter .1s;
+    transition: filter .12s, border-color .12s, background .12s, color .12s;
   }
   button:hover { filter: brightness(1.2); }
   button:disabled { opacity: .5; cursor: default; }
@@ -242,17 +313,17 @@
   section {
     background: var(--panel);
     border: 1px solid var(--panel-border);
-    border-radius: 12px;
+    border-radius: var(--radius);
     margin-bottom: 20px;
     overflow: hidden;
+    box-shadow: var(--shadow);
   }
   section > h2 {
-    font-size: 13px;
-    text-transform: uppercase;
-    letter-spacing: .05em;
-    color: var(--text-dim);
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text);
     margin: 0;
-    padding: 14px 16px 10px;
+    padding: 16px 16px 12px;
   }
   /* Таблица не растягивается на всю ширину контейнера — каждая колонка
      занимает ровно столько места, сколько нужно её содержимому (+1 символ
@@ -267,10 +338,10 @@
   th, td { text-align: left; padding: 8px 0.5ch; font-size: 13px; white-space: nowrap; max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
   th:first-child, td:first-child { padding-left: 16px; }
   th:last-child, td:last-child { padding-right: 16px; }
-  thead th { color: var(--text-dim); font-weight: 600; border-bottom: 1px solid var(--panel-border); }
-  tbody tr { border-bottom: 1px solid var(--panel-border); }
+  thead th { color: var(--text-dim); font-weight: 500; font-size: 12px; background: var(--panel-2); border-bottom: 1px solid var(--panel-border); padding-top: 9px; padding-bottom: 9px; }
+  tbody tr { border-bottom: 1px solid var(--panel-border); transition: background .12s; }
   tbody tr:last-child { border-bottom: none; }
-  tbody tr:hover { background: rgba(255,255,255,.02); }
+  tbody tr:hover { background: var(--hover); }
   .empty-row td { color: var(--text-dim); text-align: center; padding: 24px; }
 
   .sortable-th { cursor: pointer; user-select: none; }
@@ -298,7 +369,7 @@
   .toggle input { opacity: 0; width: 0; height: 0; }
   .slider {
     position: absolute; cursor: pointer; inset: 0;
-    background-color: #333c52;
+    background-color: var(--panel-border);
     transition: .15s;
     border-radius: 999px;
   }
@@ -481,11 +552,12 @@
   #lastUpdated { color: var(--text-dim); font-size: 12px; }
   .ws-indicator { display: flex; align-items: center; gap: 6px; font-size: 12px; }
   .toast {
-    position: fixed; bottom: 20px; right: 20px;
+    position: fixed; bottom: 20px; right: 20px; z-index: 300;
     background: var(--panel); border: 1px solid var(--panel-border);
-    padding: 12px 18px; border-radius: 8px;
+    border-left: 3px solid var(--accent);
+    padding: 12px 18px; border-radius: 10px; box-shadow: var(--shadow);
     font-size: 13px; opacity: 0; transform: translateY(8px);
-    transition: .2s; pointer-events: none;
+    transition: .2s; pointer-events: none; max-width: min(420px, calc(100vw - 40px));
   }
   .toast.show { opacity: 1; transform: translateY(0); }
 
@@ -528,7 +600,7 @@
   .settings-group {
     background: var(--panel);
     border: 1px solid var(--panel-border);
-    border-radius: 12px;
+    border-radius: var(--radius);
     padding: 14px 16px;
     margin-bottom: 16px;
     break-inside: avoid;
@@ -578,7 +650,8 @@
   .side-panel {
     background: var(--panel);
     border: 1px solid var(--panel-border);
-    border-radius: 12px;
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
     margin-bottom: 20px;
     overflow: hidden;
   }
@@ -754,7 +827,7 @@
     max-height: 480px;
     overflow-y: auto;
     border-top: 1px solid var(--panel-border);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-family: var(--font-mono);
     font-size: 11.5px;
   }
   /* Вкладка "Логи" отдана логам целиком (не делит окно со вкладкой
@@ -776,6 +849,69 @@
   .log-INFO .log-level { color: var(--blue); }
   .log-WARNING .log-level { color: var(--yellow); }
   .log-ERROR .log-level, .log-CRITICAL .log-level { color: var(--red); }
+
+  /* lightweight-charts рисует панели внутри собственной <table> — общие
+     правила таблиц дашборда (td max-width:320px, паддинги, рамки строк,
+     hover) урезали график эквити до ~400px по ширине. */
+  .tv-lightweight-charts table { width: auto; }
+  .tv-lightweight-charts tr { border: none; background: none; }
+  .tv-lightweight-charts tr:hover { background: none; }
+  .tv-lightweight-charts td, .tv-lightweight-charts th {
+    padding: 0; max-width: none; overflow: visible; white-space: normal; text-overflow: clip;
+  }
+
+  /* === Палитра команд (Ctrl/⌘+K) === */
+  .cmdk-backdrop {
+    position: fixed; inset: 0; z-index: 400; display: none;
+    background: rgba(5,7,12,.55); backdrop-filter: blur(3px);
+    align-items: flex-start; justify-content: center; padding-top: 12vh;
+  }
+  .cmdk-backdrop.open { display: flex; }
+  .cmdk {
+    width: min(560px, calc(100vw - 32px));
+    background: var(--panel); border: 1px solid var(--panel-border);
+    border-radius: 14px; box-shadow: 0 24px 64px rgba(0,0,0,.45); overflow: hidden;
+  }
+  .cmdk input {
+    width: 100%; font: inherit; font-size: 15px; border: none; outline: none;
+    background: transparent; color: var(--text); padding: 16px 18px;
+    border-bottom: 1px solid var(--panel-border);
+  }
+  .cmdk-list { max-height: 360px; overflow-y: auto; padding: 6px; }
+  .cmdk-item {
+    display: flex; align-items: center; gap: 10px; width: 100%;
+    padding: 9px 12px; border-radius: 8px; border: none; background: transparent;
+    color: var(--text); font-weight: 500; text-align: left;
+  }
+  .cmdk-item .cmdk-group { margin-left: auto; font-size: 11px; color: var(--text-dim); font-weight: 400; }
+  .cmdk-item.selected { background: var(--accent-soft); color: var(--accent); }
+  .cmdk-empty { padding: 18px; color: var(--text-dim); text-align: center; }
+
+  /* === График эквити на вкладке "Дашборд" === */
+  .equity-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding: 16px 16px 4px; }
+  .equity-head h2 { margin: 0; font-size: 14px; font-weight: 600; }
+  .equity-range { display: flex; gap: 4px; }
+  .equity-range button { padding: 4px 10px; font-size: 12px; font-weight: 500; background: transparent; border-color: transparent; color: var(--text-dim); }
+  .equity-range button.active { background: var(--accent-soft); color: var(--accent); }
+  .equity-kpis { display: flex; gap: 24px; flex-wrap: wrap; padding: 0 16px 8px; font-size: 12px; color: var(--text-dim); }
+  .equity-kpis b { display: block; font-size: 15px; color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .equity-chart { height: 240px; margin: 0 8px 8px; }
+
+  /* === ML-модели: skill/статус === */
+  .ml-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; padding: 0 16px 16px; }
+  .ml-card { border: 1px solid var(--panel-border); border-radius: 12px; padding: 14px 16px; background: var(--panel-2); }
+  .ml-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+  .ml-card-title { font-weight: 600; }
+  .ml-kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 12.5px; }
+  .ml-kv dt { color: var(--text-dim); }
+  .ml-kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+  .ml-note { font-size: 12px; color: var(--text-dim); margin-top: 10px; line-height: 1.45; }
+  .chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+  .chip-ok { background: rgba(16,185,129,.14); color: var(--green); }
+  .chip-warn { background: rgba(245,158,11,.14); color: var(--yellow); }
+  .chip-bad { background: rgba(244,63,94,.14); color: var(--red); }
+  .chip-dim { background: var(--hover); color: var(--text-dim); }
+  .chip-accent { background: var(--accent-soft); color: var(--accent); }
 
   /* На узких экранах сайдбар ложится верхним баром: логотип слева,
      кнопки вкладок — в один ряд с горизонтальной прокруткой (а не
@@ -815,9 +951,15 @@
      32px (десктопный) на экране в 360-400px не остаётся места под сам
      контент; таблицы и так скроллятся отдельно (.table-wrap), поэтому
      сужать боковые поля main можно безопасно. */
+  @media (max-width: 860px) {
+    main { padding: 0 20px 48px; }
+    .topbar { margin: 0 -20px 20px; padding: 12px 20px; }
+    .kbd, .cmdk-hint { display: none; }
+  }
   @media (max-width: 480px) {
-    main { padding: 14px 12px 40px; }
-    .topbar { gap: 8px; margin-bottom: 16px; padding-bottom: 14px; }
+    main { padding: 0 12px 40px; }
+    .topbar { gap: 8px; margin: 0 -12px 16px; padding: 10px 12px; }
+    .equity-chart { height: 200px; }
     .stats { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
     .controls { gap: 8px; margin-bottom: 16px; }
     section { margin-bottom: 14px; }
@@ -844,8 +986,8 @@
     gap: 16px;
     flex-wrap: wrap;
     align-items: center;
-    background: rgba(99,102,241,.08);
-    border-radius: 6px;
+    background: var(--accent-soft);
+    border-radius: 8px;
     padding: 8px 12px;
     font-size: 13px;
     margin-bottom: 12px;
@@ -876,13 +1018,13 @@
   <div class="logo">⚙️ CryptoBot<span> Pro</span></div>
   <nav class="nav">
     <div class="nav-section">Обзор</div>
-    <button class="tab-btn nav-item active" data-tab="dashboard"><span class="icon">📊</span> Дашборд</button>
+    <button class="tab-btn nav-item active" data-tab="dashboard"><span class="icon">📊</span> Дашборд <span class="kbd">1</span></button>
     <div class="nav-section">Торговля</div>
-    <button class="tab-btn nav-item" data-tab="manual"><span class="icon">💱</span> Ручная торговля</button>
+    <button class="tab-btn nav-item" data-tab="manual"><span class="icon">💱</span> Ручная торговля <span class="kbd">2</span></button>
     <div class="nav-section">Система</div>
-    <button class="tab-btn nav-item" data-tab="settings"><span class="icon">⚙️</span> Настройки</button>
-    <button class="tab-btn nav-item" data-tab="training"><span class="icon">🧠</span> Обучение</button>
-    <button class="tab-btn nav-item" data-tab="logs"><span class="icon">📜</span> Логи</button>
+    <button class="tab-btn nav-item" data-tab="settings"><span class="icon">⚙️</span> Настройки <span class="kbd">3</span></button>
+    <button class="tab-btn nav-item" data-tab="training"><span class="icon">🧠</span> Обучение <span class="kbd">4</span></button>
+    <button class="tab-btn nav-item" data-tab="logs"><span class="icon">📜</span> Логи <span class="kbd">5</span></button>
   </nav>
   <div class="nav-bottom">
     <div class="badges" id="headerBadges"></div>
@@ -906,11 +1048,28 @@
     <span id="wsStatusLabel" class="muted">офлайн</span>
   </span>
   <div id="lastUpdated">—</div>
+  <div class="topbar-spacer"></div>
+  <button type="button" class="icon-btn" id="btnCommandPalette" title="Палитра команд">🔎 <span>Команды</span> <span class="kbd cmdk-hint">Ctrl K</span></button>
+  <button type="button" class="icon-btn" id="btnThemeToggle" title="Светлая / тёмная тема">🌓</button>
 </div>
 
 <div id="tabDashboard" class="tab-panel">
 
   <div class="stats" id="statCards"></div>
+
+  <section id="equitySection">
+    <div class="equity-head">
+      <h2>Динамика баланса</h2>
+      <div class="equity-range" id="equityRange">
+        <button type="button" data-hours="24">24ч</button>
+        <button type="button" data-hours="168" class="active">7д</button>
+        <button type="button" data-hours="720">30д</button>
+        <button type="button" data-hours="0">Всё</button>
+      </div>
+    </div>
+    <div class="equity-kpis" id="equityKpis"></div>
+    <div class="equity-chart" id="equityChart"></div>
+  </section>
 
   <div class="controls">
     <button id="btnPauseResume" class="btn-warn">…</button>
@@ -959,7 +1118,7 @@
 
   <section>
     <h2>Последние сделки</h2>
-    <div class="log-filters" style="padding:0 0 12px">
+    <div class="log-filters" style="padding:0 16px 12px">
       <input type="text" id="tradesPairFilter" placeholder="Фильтр по паре (напр. BTC)" style="flex:0 0 200px" autocomplete="off" name="trades-pair-filter" data-lpignore="true" data-1p-ignore>
     </div>
     <div class="table-wrap">
@@ -1019,14 +1178,15 @@
 <div id="tabTraining" class="tab-panel" style="display:none">
   <section>
     <h2>ML модели</h2>
-    <div id="mlReadiness" class="muted" style="margin-bottom:10px;">Загрузка…</div>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>Тип</th><th>Активная версия</th><th>Метрики</th></tr></thead>
-        <tbody id="mlActiveBody"><tr class="empty-row"><td colspan="3">Загрузка…</td></tr></tbody>
-      </table>
+    <div id="mlReadiness" class="muted" style="padding:0 16px 12px;">Загрузка…</div>
+    <div class="ml-cards" id="mlActiveCards"><div class="muted">Загрузка…</div></div>
+    <div class="ml-note" style="padding:0 16px 12px;">
+      Метрики считаются на отложенном <b>хронологическом</b> test-наборе (данные после периода обучения).
+      <b>Skill</b> — улучшение log-loss/MAE относительно базовой линии (частоты классов / среднего):
+      модель со skill ≤ 0 не влияет на торговлю. Новая версия активируется автоматически, только если
+      она лучше текущей на свежих данных, иначе остаётся «теневой».
     </div>
-    <button type="button" id="btnToggleMlModels" class="btn-ghost" style="margin-top:10px;">Выбрать модель</button>
+    <button type="button" id="btnToggleMlModels" class="btn-ghost" style="margin:0 16px 14px;">Все версии</button>
     <div id="mlAllModelsWrap" style="display:none; margin-top:10px;">
       <div class="table-wrap">
         <table>
@@ -1039,7 +1199,7 @@
 
   <section>
     <h2>Историческая загрузка сигналов канала</h2>
-    <div class="muted" style="margin-bottom:10px;">
+    <div class="muted" style="padding:0 16px 12px; line-height:1.5;">
       Подгружает прошлые сообщения Telegram-канала (не живой поток) и разбирает
       их тем же парсером, что и живые сигналы — в отдельную таблицу, не влияющую
       на статистику канала. Затем симуляция прогоняет распознанные сигналы по
@@ -1064,15 +1224,15 @@
 
   <section>
     <h2>Модель качества сигнала</h2>
-    <div class="muted" style="margin-bottom:10px;">
+    <div class="muted" style="padding:0 16px 12px; line-height:1.5;">
       Классификатор "убыточный ли сигнал", обученный на признаках, известных ещё
       ДО исполнения (геометрия SL/TP канала, плечо, время публикации) и метке
       win/loss/break-even из симуляции выше. Обучается сразу на всех каналах.
       Появляется в общем списке моделей вверху вкладки под типом
       signal_quality_classifier.
     </div>
-    <div id="sqReadiness" class="muted" style="margin-bottom:10px;">Загрузка…</div>
-    <button type="button" id="btnTrainSignalQuality" class="btn-primary">Обучить модель</button>
+    <div id="sqReadiness" class="muted" style="padding:0 16px 12px;">Загрузка…</div>
+    <button type="button" id="btnTrainSignalQuality" class="btn-primary" style="margin:0 16px 16px;">Обучить модель</button>
   </section>
 </div>
 
@@ -1194,6 +1354,13 @@
 
 <div class="toast" id="toast"></div>
 
+<div class="cmdk-backdrop" id="cmdkBackdrop" aria-hidden="true">
+  <div class="cmdk" role="dialog" aria-label="Палитра команд">
+    <input type="text" id="cmdkInput" placeholder="Команда, вкладка или символ позиции…" autocomplete="off" spellcheck="false">
+    <div class="cmdk-list" id="cmdkList" role="listbox"></div>
+  </div>
+</div>
+
 <script>
 const REFRESH_MS = 5000;
 let lastStatus = null;
@@ -1269,12 +1436,29 @@ function fmtStepType(stepType) {
   return STEP_TYPE_LABELS_RU[stepType] || stepType;
 }
 
+let toastTimer = null;
 function showToast(msg, isError = false) {
   const t = document.getElementById("toast");
   t.textContent = msg;
-  t.style.borderColor = isError ? "var(--red)" : "var(--panel-border)";
+  t.style.borderLeftColor = isError ? "var(--red)" : "var(--accent)";
   t.classList.add("show");
-  setTimeout(() => t.classList.remove("show"), 3000);
+  // Без сброса предыдущего таймера новый тост гас раньше времени — по
+  // таймеру предыдущего.
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove("show"), isError ? 6000 : 3500);
+}
+
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function chartThemeOptions() {
+  const border = cssVar("--panel-border");
+  return {
+    layout: { background: { color: "transparent" }, textColor: cssVar("--text-dim"), fontFamily: cssVar("--font-sans") },
+    grid: { vertLines: { color: border }, horzLines: { color: border } },
+    rightPriceScale: { borderColor: border },
+  };
 }
 
 async function api(path, opts = {}) {
@@ -1412,8 +1596,11 @@ function renderHeader(status) {
   if (status.risk_state.kill_switch) { stateClass = "badge-killed"; stateText = "KILL SWITCH"; }
   else if (status.risk_state.paused) { stateClass = "badge-paused"; stateText = "Пауза"; }
 
+  const demoBadge = !status.is_paper && status.use_exchange_sandbox
+    ? `<span class="badge badge-demo" title="Реальный режим на демо-счёте биржи (use_exchange_sandbox)">DEMO</span>` : "";
   badges.innerHTML = `
     <span class="badge ${modeClass}">${modeText}</span>
+    ${demoBadge}
     <span class="badge ${stateClass}">${stateText}</span>
   `;
 
@@ -1438,24 +1625,65 @@ function renderHeader(status) {
   document.getElementById("btnMarketFutures").classList.toggle("active", marketType === "futures");
 }
 
+function meterClass(ratio) {
+  return ratio >= 0.9 ? "crit" : ratio >= 0.6 ? "warn" : "";
+}
+
+function statMeter(ratio) {
+  const r = Math.max(0, Math.min(1, Number(ratio) || 0));
+  return `<div class="meter"><span class="${meterClass(r)}" style="width:${(r * 100).toFixed(1)}%"></span></div>`;
+}
+
 function renderStats(status, trades) {
   const rs = status.risk_state;
   const wins = trades.filter(t => t.outcome === "win").length;
   const closedTrades = trades.filter(t => !t.is_open);
   const winRate = closedTrades.length ? (wins / closedTrades.length * 100) : null;
 
+  const balance = status.paper_balance;
+  const dailyLossUsage = rs.daily_loss_limit ? Math.max(0, -rs.daily_pnl) / rs.daily_loss_limit : 0;
+  const drawdownUsage = rs.max_drawdown_pct ? Math.max(0, rs.total_drawdown_pct) / rs.max_drawdown_pct : 0;
+  const positionsUsage = rs.max_open_positions ? rs.open_positions_count / rs.max_open_positions : 0;
+
   const cards = [
-    { label: status.is_paper ? "Баланс (paper)" : "Баланс (real)", value: status.paper_balance !== null && status.paper_balance !== undefined ? `$${fmt(status.paper_balance)}` : "—" },
-    { label: "Дневной PnL", value: `${fmt(rs.daily_pnl)} USDT`, cls: rs.daily_pnl >= 0 ? "pos" : "neg" },
-    { label: "Открытые позиции", value: `${rs.open_positions_count} / ${rs.max_open_positions}` },
-    { label: "Win rate (посл. сделки)", value: winRate === null ? "—" : `${fmt(winRate, 1)}%` },
-    { label: "Просадка", value: `${fmt(rs.total_drawdown_pct, 1)}%` },
+    {
+      label: status.is_paper ? "💼 Баланс (paper)" : "💼 Баланс (real)",
+      value: balance !== null && balance !== undefined ? `$${fmt(balance)}` : "—",
+      sub: rs.current_balance ? `эквити риск-модуля $${fmt(rs.current_balance)}` : "",
+    },
+    {
+      label: "📅 Дневной PnL",
+      value: `${rs.daily_pnl >= 0 ? "+" : ""}${fmt(rs.daily_pnl)} USDT`, cls: rs.daily_pnl >= 0 ? "pos" : "neg",
+      sub: rs.daily_loss_limit_reached
+        ? `<span class="chip chip-bad">лимит убытка достигнут</span>`
+        : `лимит убытка ${fmt(rs.daily_loss_limit, 0)} USDT`,
+      meter: dailyLossUsage,
+    },
+    {
+      label: "📂 Открытые позиции",
+      value: `${rs.open_positions_count} / ${rs.max_open_positions}`,
+      sub: rs.max_total_notional_pct ? `нагрузка ${fmt(rs.total_notional_pct, 1)}% из ${fmt(rs.max_total_notional_pct, 0)}%` : "",
+      meter: positionsUsage,
+    },
+    {
+      label: "🎯 Win rate",
+      value: winRate === null ? "—" : `${fmt(winRate, 1)}%`,
+      sub: closedTrades.length ? `по ${closedTrades.length} посл. сделкам` : "",
+    },
+    {
+      label: "📉 Просадка",
+      value: `${fmt(rs.total_drawdown_pct, 2)}%`, cls: rs.total_drawdown_pct > 0 ? "neg" : "pos",
+      sub: `максимум ${fmt(rs.max_drawdown_pct, 0)}%`,
+      meter: drawdownUsage,
+    },
   ];
 
   document.getElementById("statCards").innerHTML = cards.map(c => `
     <div class="stat-card">
       <div class="label">${c.label}</div>
       <div class="value ${c.cls || ""}">${c.value}</div>
+      ${c.sub ? `<div class="sub">${c.sub}</div>` : ""}
+      ${c.meter !== undefined ? statMeter(c.meter) : ""}
     </div>
   `).join("");
 }
@@ -1797,10 +2025,8 @@ async function initTradeChart(containerId, opts) {
   // td выше: реальная причина в унаследованном max-width:320px+overflow:
   // hidden с общего правила td, воспроизведено и локализовано отдельно.)
   const chart = LightweightCharts.createChart(container, {
-    layout: { background: { color: "transparent" }, textColor: "#e2e8f0" },
-    grid: { vertLines: { color: "#2d3148" }, horzLines: { color: "#2d3148" } },
-    timeScale: { timeVisible: true, secondsVisible: false, borderColor: "#2d3148" },
-    rightPriceScale: { borderColor: "#2d3148" },
+    ...chartThemeOptions(),
+    timeScale: { timeVisible: true, secondsVisible: false, borderColor: cssVar("--panel-border") },
     handleScroll: true,
     handleScale: true,
     autoSize: true,
@@ -2769,12 +2995,64 @@ function initTradeDetailChart(d) {
   });
 }
 
+const ML_MODEL_NAMES = {
+  direction_classifier: "Направление цены (5ч)",
+  volatility_predictor: "Волатильность (5ч)",
+  signal_quality_classifier: "Качество Telegram-сигнала",
+};
+
+function skillChip(metrics) {
+  const skill = metrics ? metrics.skill : undefined;
+  if (skill === undefined || skill === null) {
+    return `<span class="chip chip-dim" title="Обучена до версии 1.3.0: метрики посчитаны на случайном (не хронологическом) разбиении и завышены">skill не измерен</span>`;
+  }
+  const cls = skill > 0 ? "chip-ok" : "chip-bad";
+  return `<span class="chip ${cls}" title="Улучшение loss относительно базовой линии на отложенных данных">skill ${skill > 0 ? "+" : ""}${fmt(skill * 100, 1)}%</span>`;
+}
+
 function fmtModelMetrics(m) {
-  return m.metrics ? Object.entries(m.metrics).map(([k, v]) => `${k}=${v}`).join(", ") : "—";
+  const x = m.metrics || {};
+  const parts = [];
+  if (x.skill !== undefined) parts.push(`skill ${fmt(x.skill * 100, 1)}%`);
+  if (x.log_loss !== undefined) parts.push(`log-loss ${fmt(x.log_loss, 3)} (база ${fmt(x.baseline_log_loss, 3)})`);
+  if (x.balanced_accuracy !== undefined) parts.push(`bal.acc ${fmt(x.balanced_accuracy * 100, 1)}%`);
+  else if (x.accuracy !== undefined) parts.push(`acc ${fmt(x.accuracy * 100, 1)}%`);
+  if (x.mae !== undefined) parts.push(`MAE ${fmt(x.mae, 5)}${x.baseline_mae !== undefined ? ` (база ${fmt(x.baseline_mae, 5)})` : ""}`);
+  if (x.promotion && x.promotion.reason) parts.push(x.promotion.reason);
+  return parts.length ? escapeHtml(parts.join(" · ")) : "—";
+}
+
+function mlCardHtml(active, latest) {
+  const x = active.metrics || {};
+  const rows = [];
+  const add = (k, v) => { if (v !== undefined && v !== null && v !== "") rows.push(`<dt>${k}</dt><dd>${v}</dd>`); };
+  if (x.log_loss !== undefined) add("Log-loss / база", `${fmt(x.log_loss, 4)} / ${fmt(x.baseline_log_loss, 4)}`);
+  if (x.balanced_accuracy !== undefined) add("Balanced accuracy", `${fmt(x.balanced_accuracy * 100, 1)}%`);
+  if (x.accuracy !== undefined) add("Accuracy / база", `${fmt(x.accuracy * 100, 1)}%${x.baseline_accuracy !== undefined ? ` / ${fmt(x.baseline_accuracy * 100, 1)}%` : ""}`);
+  if (x.f1_macro !== undefined) add("F1 (macro)", fmt(x.f1_macro, 3));
+  if (x.mae !== undefined) add("MAE / база", `${fmt(x.mae, 5)}${x.baseline_mae !== undefined ? ` / ${fmt(x.baseline_mae, 5)}` : ""}`);
+  const samples = [x.train_samples, x.val_samples, x.test_samples].filter(v => v !== undefined);
+  if (samples.length) add("Train / val / test", samples.map(v => fmt(v, 0)).join(" / "));
+  let note = "";
+  if (latest && latest.version !== active.version) {
+    const reason = latest.metrics && latest.metrics.promotion ? latest.metrics.promotion.reason : "";
+    note = `Последняя обученная версия v${latest.version} — теневая${reason ? `: ${escapeHtml(reason)}` : ""}.`;
+  } else if (x.promotion && x.promotion.reason) {
+    note = `Активирована: ${escapeHtml(x.promotion.reason)}.`;
+  }
+  return `
+    <div class="ml-card">
+      <div class="ml-card-head">
+        <span class="ml-card-title">${escapeHtml(ML_MODEL_NAMES[active.model_type] || active.model_type)}</span>
+        <span><span class="chip chip-accent">v${active.version}</span> ${skillChip(x)}</span>
+      </div>
+      <dl class="ml-kv">${rows.join("") || `<dt>Метрики</dt><dd>—</dd>`}</dl>
+      ${note ? `<div class="ml-note">${note}</div>` : ""}
+    </div>`;
 }
 
 async function renderMlModels() {
-  const activeBody = document.getElementById("mlActiveBody");
+  const activeCards = document.getElementById("mlActiveCards");
   const body = document.getElementById("mlBody");
   const readinessEl = document.getElementById("mlReadiness");
 
@@ -2783,8 +3061,8 @@ async function renderMlModels() {
     const directionMark = r.direction_ready ? "✅" : "⏳";
     const volatilityMark = r.volatility_ready ? "✅" : "⏳";
     readinessEl.innerHTML =
-      `Данных для обучения: <b>${r.total_features}</b> строк ` +
-      `(размечено под direction: ${r.labeled_direction}, под volatility: ${r.labeled_volatility}; нужно ≥${r.min_training_samples}) ` +
+      `Данных для обучения: <b>${fmt(r.total_features, 0)}</b> строк ` +
+      `(размечено под direction: ${fmt(r.labeled_direction, 0)}, под volatility: ${fmt(r.labeled_volatility, 0)}; нужно ≥${r.min_training_samples}) ` +
       `${directionMark} direction / ${volatilityMark} volatility` +
       ` &nbsp;·&nbsp; Сделок для запуска переобучения: ${r.trades_count} / ${r.min_trades_for_retrain_attempt}`;
   } catch (err) {
@@ -2796,27 +3074,25 @@ async function renderMlModels() {
     const models = data.models || [];
     if (!models.length) {
       const emptyMsg = "Моделей пока нет — недостаточно данных для обучения (см. статистику выше)";
-      activeBody.innerHTML = `<tr class="empty-row"><td colspan="3">${emptyMsg}</td></tr>`;
+      activeCards.innerHTML = `<div class="muted">${emptyMsg}</div>`;
       body.innerHTML = `<tr class="empty-row"><td colspan="5">${emptyMsg}</td></tr>`;
       return;
     }
 
+    const latestByType = {};
+    models.forEach(m => {
+      if (!latestByType[m.model_type] || m.version > latestByType[m.model_type].version) latestByType[m.model_type] = m;
+    });
     const activeModels = models.filter(m => m.is_active);
-    activeBody.innerHTML = activeModels.length
-      ? activeModels.map(m => `
-        <tr>
-          <td>${m.model_type}</td>
-          <td>v${m.version}</td>
-          <td class="muted">${fmtModelMetrics(m)}</td>
-        </tr>
-      `).join("")
-      : `<tr class="empty-row"><td colspan="3">Нет активной модели</td></tr>`;
+    activeCards.innerHTML = activeModels.length
+      ? activeModels.map(m => mlCardHtml(m, latestByType[m.model_type])).join("")
+      : `<div class="muted">Нет активной модели</div>`;
 
     body.innerHTML = models.map(m => `
       <tr>
-        <td>${m.model_type}</td>
+        <td>${escapeHtml(ML_MODEL_NAMES[m.model_type] || m.model_type)}</td>
         <td>v${m.version}</td>
-        <td>${m.is_active ? "✅" : "—"}</td>
+        <td>${m.is_active ? `<span class="chip chip-ok">активна</span>` : m.is_shadow ? `<span class="chip chip-dim">теневая</span>` : "—"}</td>
         <td class="muted">${fmtModelMetrics(m)}</td>
         <td>${m.is_active ? "" : `<button class="btn-ghost" data-activate-model="${m.model_type}" data-activate-version="${m.version}">Активировать</button>`}</td>
       </tr>
@@ -2838,8 +3114,8 @@ async function renderMlModels() {
       });
     });
   } catch (err) {
-    activeBody.innerHTML = `<tr class="empty-row"><td colspan="3">Ошибка загрузки: ${err.message}</td></tr>`;
-    body.innerHTML = `<tr class="empty-row"><td colspan="5">Ошибка загрузки: ${err.message}</td></tr>`;
+    activeCards.innerHTML = `<div class="muted">Ошибка загрузки: ${escapeHtml(err.message)}</div>`;
+    body.innerHTML = `<tr class="empty-row"><td colspan="5">Ошибка загрузки: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
 
@@ -2848,7 +3124,7 @@ document.getElementById("btnToggleMlModels").addEventListener("click", () => {
   const btn = document.getElementById("btnToggleMlModels");
   const isHidden = wrap.style.display === "none";
   wrap.style.display = isHidden ? "" : "none";
-  btn.textContent = isHidden ? "Скрыть список моделей" : "Выбрать модель";
+  btn.textContent = isHidden ? "Скрыть версии" : "Все версии";
 });
 
 async function renderBackfillStats() {
@@ -3577,6 +3853,9 @@ function switchTab(tab) {
   if (tab === "settings") {
     loadSettings();
   }
+  // Секции этих вкладок обновляются только пока вкладка видна (см.
+  // doRefreshAll) — при переходе сразу подтягиваем свежие данные.
+  if (tab === "dashboard" || tab === "settings") refreshAll();
   if (tab === "training") {
     renderMlModels();
     renderBackfillStats();
@@ -4169,7 +4448,7 @@ document.getElementById("btnResumeLogs").addEventListener("click", reloadLogsLiv
 });
 
 setInterval(() => {
-  if (currentTab === "logs") {
+  if (currentTab === "logs" && !document.hidden) {
     loadConnections();
     loadSystemMetrics();
     loadModuleList();
@@ -4292,26 +4571,50 @@ document.getElementById("sellAllToUsdtBtn").addEventListener("click", async () =
   }
 });
 
-async function refreshAll() {
+// Один запрос обновления за раз: плановый опрос, события WebSocket и
+// кнопки раньше запускали refreshAll параллельно, и при медленном ответе
+// сервера запросы накладывались друг на друга. Повторный вызов во время
+// выполнения не теряется — ставится ОДИН догоняющий прогон.
+let refreshInFlight = null;
+let refreshQueued = false;
+let lastEquityLoad = 0;
+
+function refreshAll() {
+  if (refreshInFlight) {
+    refreshQueued = true;
+    return refreshInFlight;
+  }
+  refreshInFlight = doRefreshAll().finally(() => {
+    refreshInFlight = null;
+    if (refreshQueued) {
+      refreshQueued = false;
+      refreshAll();
+    }
+  });
+  return refreshInFlight;
+}
+
+async function doRefreshAll() {
   try {
     const status = await api("/status");
     lastStatus = status;
     renderHeader(status);
     renderPositions(status);
     renderManualPositions(status);
-    const trades = await renderTrades();
-    renderStats(status, trades || []);
-    await renderTradeOutcomes();
-    await renderStrategies();
-    await renderTelegram();
-    await renderProtections();
-    await renderBalances();
-    if (currentTab === "manual") await renderManualTrades();
-    if (currentTab === "training") {
-      await renderMlModels();
-      await renderBackfillStats();
-      await renderSignalQualityReadiness();
+    // Независимые секции грузятся параллельно, и только для видимой
+    // вкладки — раньше все ~9 эндпоинтов опрашивались последовательно
+    // каждые 5с, даже когда открыты "Настройки" или "Логи".
+    const tasks = [renderTrades().then(trades => renderStats(status, trades || [])), renderProtections()];
+    if (currentTab === "dashboard") {
+      tasks.push(renderTradeOutcomes(), renderTelegram(), renderBalances());
+      if (Date.now() - lastEquityLoad > 60000) tasks.push(renderEquity());
     }
+    if (currentTab === "settings") tasks.push(renderStrategies());
+    if (currentTab === "manual") tasks.push(renderManualTrades());
+    if (currentTab === "training") tasks.push(renderMlModels(), renderBackfillStats(), renderSignalQualityReadiness());
+    const results = await Promise.allSettled(tasks);
+    const failed = results.find(r => r.status === "rejected");
+    if (failed) throw failed.reason;
     document.getElementById("lastUpdated").textContent =
       "Обновлено: " + new Date().toLocaleTimeString("ru-RU");
   } catch (err) {
@@ -4492,10 +4795,216 @@ function connectWebSocket() {
   ws.onerror = () => ws.close();
 }
 
+
+// === График эквити (PerformanceSnapshot, почасовые снимки) ===
+let equityChart = null;
+let equitySeries = null;
+let equityHours = 168;
+
+function hexToRgba(hex, alpha) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex || "");
+  if (!m) return `rgba(124,131,255,${alpha})`;
+  const n = parseInt(m[1], 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+}
+
+function maxDrawdownPct(values) {
+  let peak = -Infinity, worst = 0;
+  for (const v of values) {
+    peak = Math.max(peak, v);
+    if (peak > 0) worst = Math.min(worst, (v / peak - 1) * 100);
+  }
+  return worst;
+}
+
+async function renderEquity() {
+  lastEquityLoad = Date.now();
+  const container = document.getElementById("equityChart");
+  const kpis = document.getElementById("equityKpis");
+  if (!container || !window.LightweightCharts) return;
+  const query = equityHours ? `?hours=${equityHours}&limit=5000` : "?limit=5000";
+  const data = await api("/performance" + query);
+  const snapshots = (data.snapshots || []).filter(x => x.time && x.total_balance !== null).reverse();
+  const seen = new Set();
+  const points = [];
+  for (const x of snapshots) {
+    const t = Math.floor(Date.parse(x.time) / 1000);
+    if (!Number.isFinite(t) || seen.has(t)) continue;
+    seen.add(t);
+    points.push({ time: t, value: Number(x.total_balance) });
+  }
+  if (points.length < 2) {
+    kpis.innerHTML = `<span>Недостаточно снимков баланса за выбранный период — они сохраняются раз в час.</span>`;
+    if (equitySeries) equitySeries.setData([]);
+    return;
+  }
+
+  const first = points[0].value, last = points[points.length - 1].value;
+  const change = last - first;
+  const changePct = first ? (change / first) * 100 : 0;
+  const latest = snapshots[snapshots.length - 1];
+  const up = change >= 0;
+  const color = up ? cssVar("--green") : cssVar("--red");
+
+  if (!equityChart) {
+    equityChart = LightweightCharts.createChart(container, {
+      ...chartThemeOptions(),
+      autoSize: true,
+      handleScroll: false,
+      handleScale: false,
+      timeScale: { timeVisible: true, secondsVisible: false, borderColor: cssVar("--panel-border") },
+      crosshair: { horzLine: { labelVisible: true }, vertLine: { labelVisible: true } },
+    });
+    equitySeries = equityChart.addAreaSeries({
+      lineWidth: 2,
+      priceFormat: { type: "price", precision: 2, minMove: 0.01 },
+    });
+  }
+  equitySeries.applyOptions({ lineColor: color, topColor: hexToRgba(color, 0.28), bottomColor: hexToRgba(color, 0.02) });
+  equitySeries.setData(points);
+  equityChart.timeScale().fitContent();
+
+  const sign = up ? "+" : "";
+  kpis.innerHTML = `
+    <span>Изменение<b class="${up ? "pnl-pos" : "pnl-neg"}">${sign}${fmt(change)} USDT (${sign}${fmt(changePct, 2)}%)</b></span>
+    <span>Макс. просадка за период<b>${fmt(maxDrawdownPct(points.map(p => p.value)), 2)}%</b></span>
+    <span>Нереализованный PnL<b class="${latest.open_pnl >= 0 ? "pnl-pos" : "pnl-neg"}">${fmt(latest.open_pnl)} USDT</b></span>
+    <span>Win rate (всё время)<b>${latest.win_rate === null ? "—" : fmt(latest.win_rate, 1) + "%"}</b></span>
+    <span>Sharpe<b>${latest.sharpe_ratio === null ? "—" : fmt(latest.sharpe_ratio, 3)}</b></span>`;
+}
+
+document.getElementById("equityRange").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-hours]");
+  if (!btn) return;
+  equityHours = Number(btn.dataset.hours);
+  document.querySelectorAll("#equityRange button").forEach(b => b.classList.toggle("active", b === btn));
+  renderEquity().catch(err => showToast(`Ошибка графика баланса: ${err.message}`, true));
+});
+
+// === Тема ===
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  try { localStorage.setItem("cb-theme", theme); } catch (e) {}
+  const opts = chartThemeOptions();
+  if (equityChart) {
+    equityChart.applyOptions(opts);
+    renderEquity().catch(() => {});
+  }
+  chartInstances.forEach(chart => { try { chart.applyOptions(opts); } catch (e) {} });
+}
+
+function toggleTheme() {
+  applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
+}
+
+document.getElementById("btnThemeToggle").addEventListener("click", toggleTheme);
+
+// === Палитра команд (Ctrl/⌘+K) ===
+const TAB_COMMANDS = [
+  ["dashboard", "📊 Дашборд"], ["manual", "💱 Ручная торговля"], ["settings", "⚙️ Настройки"],
+  ["training", "🧠 Обучение"], ["logs", "📜 Логи"],
+];
+
+function paletteCommands() {
+  const cmds = TAB_COMMANDS.map(([tab, title]) => ({ title, group: "Перейти", run: () => switchTab(tab) }));
+  cmds.push(
+    { title: "↻ Обновить данные", group: "Действие", run: () => refreshAll() },
+    { title: "🌓 Переключить тему", group: "Действие", run: toggleTheme },
+    { title: "🔍 Фильтр сделок по паре", group: "Действие", run: () => { switchTab("dashboard"); setTimeout(() => document.getElementById("tradesPairFilter").focus(), 50); } },
+    { title: "⚠️ Логи: только WARNING+", group: "Действие", run: () => {
+      switchTab("logs");
+      document.getElementById("logLevelFilter").value = "WARNING";
+      document.getElementById("logLevelFilter").dispatchEvent(new Event("change"));
+    } },
+  );
+  const positions = (lastStatus && lastStatus.paper_positions) ? Object.keys(lastStatus.paper_positions) : [];
+  positions.forEach(sym => cmds.push({
+    title: `📈 ${sym}`, group: "Позиция",
+    run: () => {
+      switchTab("dashboard");
+      const row = [...document.querySelectorAll("#positionsBody tr")].find(tr => tr.textContent.includes(sym));
+      if (row) { row.scrollIntoView({ behavior: "smooth", block: "center" }); row.click(); }
+    },
+  }));
+  return cmds;
+}
+
+let paletteItems = [];
+let paletteIndex = 0;
+
+function renderPalette() {
+  const q = document.getElementById("cmdkInput").value.trim().toLowerCase();
+  paletteItems = paletteCommands().filter(c => !q || c.title.toLowerCase().includes(q) || c.group.toLowerCase().includes(q));
+  paletteIndex = Math.min(paletteIndex, Math.max(paletteItems.length - 1, 0));
+  const list = document.getElementById("cmdkList");
+  list.innerHTML = paletteItems.length
+    ? paletteItems.map((c, i) => `<button type="button" class="cmdk-item${i === paletteIndex ? " selected" : ""}" data-idx="${i}" role="option">${escapeHtml(c.title)}<span class="cmdk-group">${escapeHtml(c.group)}</span></button>`).join("")
+    : `<div class="cmdk-empty">Ничего не найдено</div>`;
+  const sel = list.querySelector(".selected");
+  if (sel) sel.scrollIntoView({ block: "nearest" });
+}
+
+function openPalette() {
+  const backdrop = document.getElementById("cmdkBackdrop");
+  backdrop.classList.add("open");
+  backdrop.setAttribute("aria-hidden", "false");
+  const input = document.getElementById("cmdkInput");
+  input.value = "";
+  paletteIndex = 0;
+  renderPalette();
+  input.focus();
+}
+
+function closePalette() {
+  const backdrop = document.getElementById("cmdkBackdrop");
+  backdrop.classList.remove("open");
+  backdrop.setAttribute("aria-hidden", "true");
+}
+
+function runPaletteItem(i) {
+  const item = paletteItems[i];
+  closePalette();
+  if (item) item.run();
+}
+
+document.getElementById("btnCommandPalette").addEventListener("click", openPalette);
+document.getElementById("cmdkInput").addEventListener("input", () => { paletteIndex = 0; renderPalette(); });
+document.getElementById("cmdkInput").addEventListener("keydown", (e) => {
+  if (e.key === "ArrowDown") { e.preventDefault(); paletteIndex = Math.min(paletteIndex + 1, paletteItems.length - 1); renderPalette(); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); paletteIndex = Math.max(paletteIndex - 1, 0); renderPalette(); }
+  else if (e.key === "Enter") { e.preventDefault(); runPaletteItem(paletteIndex); }
+  else if (e.key === "Escape") { closePalette(); }
+});
+document.getElementById("cmdkList").addEventListener("click", (e) => {
+  const btn = e.target.closest(".cmdk-item");
+  if (btn) runPaletteItem(Number(btn.dataset.idx));
+});
+document.getElementById("cmdkBackdrop").addEventListener("click", (e) => {
+  if (e.target.id === "cmdkBackdrop") closePalette();
+});
+
+// Горячие клавиши: Ctrl/⌘+K — палитра, 1–5 — вкладки, R — обновить (вне полей ввода).
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    document.getElementById("cmdkBackdrop").classList.contains("open") ? closePalette() : openPalette();
+    return;
+  }
+  const el = e.target;
+  const typing = el && (el.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName));
+  if (typing || e.ctrlKey || e.metaKey || e.altKey) return;
+  const idx = Number(e.key) - 1;
+  if (idx >= 0 && idx < TAB_COMMANDS.length) { switchTab(TAB_COMMANDS[idx][0]); return; }
+  if (e.key === "r" || e.key === "к") refreshAll();
+});
+
 connectWebSocket();
 
 refreshAll();
-setInterval(refreshAll, REFRESH_MS);
+// Свёрнутая вкладка браузера не опрашивает сервер; при возврате — сразу
+// свежие данные, не дожидаясь следующего тика.
+setInterval(() => { if (!document.hidden) refreshAll(); }, REFRESH_MS);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshAll(); });
 // Заголовки таблиц (th) — статичный HTML, присутствуют в документе уже на
 // момент загрузки страницы, а не появляются через innerHTML — их не видит
 // MutationObserver в applyCellTooltips (ловит только НОВЫЕ узлы). Без этого

@@ -7200,6 +7200,8 @@ class TestStatusExposesExchangeOrderId(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn(symbol, status["paper_positions"])
         self.assertEqual(status["paper_positions"][symbol]["order_id_exchange"], "status-open-ex-1")
+        # Бейдж DEMO на дашборде (real-режим на демо-счёте биржи).
+        self.assertEqual(status["use_exchange_sandbox"], settings.use_exchange_sandbox)
 
 
 class TestTradeDetail(unittest.IsolatedAsyncioTestCase):
@@ -22442,3 +22444,34 @@ class TestStrategyDataIncludesAllMLFeatures(unittest.TestCase):
         data = TradingBot._build_strategy_data(MagicMock(), "BTC/USDT", 100.0, latest)
         for col in ML_FEATURE_COLS:
             self.assertEqual(data[col], 1.23, col)
+
+
+class TestPerformanceEndpointFilters(unittest.IsolatedAsyncioTestCase):
+    """GET /performance: limit ограничен сверху, hours отсекает старые снимки (график эквити)."""
+
+    async def test_hours_filter_and_limit(self):
+        from datetime import timedelta
+
+        from sqlalchemy import delete
+
+        from src.db.models import PerformanceSnapshot
+        from src.db.session import get_session
+        from src.utils.timeutils import utcnow
+        from src.web.api import get_performance
+
+        now = utcnow()
+        async with get_session() as session:
+            await session.execute(delete(PerformanceSnapshot))
+            for hours_ago in (1, 2, 30, 100):
+                session.add(PerformanceSnapshot(
+                    snapshot_time=now - timedelta(hours=hours_ago), total_balance=1000.0 + hours_ago,
+                    open_pnl=0.0, realized_pnl=0.0, daily_pnl=0.0, weekly_pnl=0.0,
+                    num_open_positions=0, num_trades_today=0,
+                ))
+            await session.commit()
+
+        recent = await get_performance(limit=100, hours=24)
+        self.assertEqual([s["total_balance"] for s in recent["snapshots"]], [1001.0, 1002.0])
+        limited = await get_performance(limit=2)
+        self.assertEqual(len(limited["snapshots"]), 2)
+        self.assertEqual(len((await get_performance(limit=0))["snapshots"]), 1)
