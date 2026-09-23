@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import signal
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -456,7 +457,7 @@ async def get_status():
     balance = (
         execution_engine.get_paper_balance()
         if settings.is_paper
-        else await execution_engine.get_real_balance()
+        else await _cached_exchange_call("real_balance", execution_engine.get_real_balance)
     )
 
     return {
@@ -489,8 +490,44 @@ async def get_balances():
     """
     if settings.is_paper:
         return {"balances": [], "trading_mode": settings.trading_mode}
-    balances = await execution_engine.get_all_balances()
+    balances = await _cached_all_balances()
     return {"balances": balances or [], "trading_mode": settings.trading_mode}
+
+
+# Биржевые балансы — REST-запросы к бирже (get_all_balances — это ещё и
+# fetch_ticker на КАЖДУЮ валюту). Дашборд опрашивал /status и /balances
+# каждые 5с из каждой открытой вкладки, добавляя десятки запросов и
+# провоцируя rate-limit ("Too many visits") для торговых запросов бота.
+# Короткий TTL-кэш + один общий запрос на всех одновременных клиентов.
+# Ключ включает сам экземпляр движка — подмена движка (тесты, смена биржи)
+# не отдаёт чужие данные.
+_EXCHANGE_CACHE_TTL_SECONDS = {"real_balance": 10.0, "all_balances": 15.0}
+_exchange_cache: dict[str, dict] = {}
+_exchange_cache_locks: dict[str, asyncio.Lock] = {}
+
+
+async def _cached_exchange_call(key: str, fetch):
+    lock = _exchange_cache_locks.setdefault(key, asyncio.Lock())
+    context = (id(execution_engine), settings.trading_mode, settings.market_type, settings.active_exchange)
+    async with lock:
+        entry = _exchange_cache.get(key)
+        if (
+            entry is not None
+            and entry["context"] == context
+            and time.monotonic() - entry["at"] < _EXCHANGE_CACHE_TTL_SECONDS[key]
+        ):
+            return entry["data"]
+        data = await fetch()
+        _exchange_cache[key] = {"context": context, "at": time.monotonic(), "data": data}
+        return data
+
+
+def _invalidate_exchange_cache() -> None:
+    _exchange_cache.clear()
+
+
+async def _cached_all_balances():
+    return await _cached_exchange_call("all_balances", execution_engine.get_all_balances)
 
 
 @app.post("/balances/sell-to-usdt")
@@ -508,6 +545,7 @@ async def sell_balances_to_usdt():
         raise HTTPException(status_code=400, detail="Недоступно в paper-режиме — нет реальных биржевых балансов")
 
     result = await execution_engine.sweep_balances_to_usdt()
+    _invalidate_exchange_cache()
     logger.warning(
         f"💱 Конвертация остатков в USDT через дашборд: продано {len(result['sold'])}, "
         f"пропущено {len(result['skipped'])}, ошибок {len(result['errors'])}"
@@ -1993,12 +2031,17 @@ async def redeploy_status():
 @app.get("/telegram/channels")
 async def list_telegram_channels():
     """Список Telegram каналов."""
+    # Дашборд опрашивает этот эндпоинт каждые 5с — раньше он подгружал ВСЕ
+    # сигналы каждого канала целиком (с текстом сообщений) ради len().
     async with get_session() as session:
-        channels = (
-            await session.execute(
-                select(TelegramChannel).options(selectinload(TelegramChannel.signals))
-            )
-        ).scalars().all()
+        channels = (await session.execute(select(TelegramChannel))).scalars().all()
+        signal_counts = dict(
+            (
+                await session.execute(
+                    select(TelegramSignal.channel_id, func.count()).group_by(TelegramSignal.channel_id)
+                )
+            ).all()
+        )
         return {
             "channels": [
                 {
@@ -2012,7 +2055,7 @@ async def list_telegram_channels():
                     "position_size_pct": c.position_size_pct,
                     "market": c.market,
                     "exact_execution": c.exact_execution,
-                    "signals_count": len(c.signals),
+                    "signals_count": signal_counts.get(c.id, 0),
                     "created_at": c.created_at.isoformat() + "Z" if c.created_at else None,
                 }
                 for c in channels
@@ -2292,51 +2335,70 @@ async def telegram_channels_stats():
     tracked = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
     open_order_ids_global = {pos.get("order_id") for pos in tracked.values() if pos.get("order_id") is not None}
 
+    # Два агрегирующих запроса на все каналы вместо двух запросов на
+    # КАЖДЫЙ канал (N+1) с загрузкой полных строк сигналов.
     async with get_session() as session:
         channels = (await session.execute(select(TelegramChannel))).scalars().all()
+        signal_rows = (
+            await session.execute(
+                select(
+                    TelegramSignal.channel_id,
+                    TelegramSignal.decision,
+                    TelegramSignal.quality_score,
+                    TelegramSignal.executed_order_id,
+                    Trade.id,
+                    Trade.outcome,
+                ).outerjoin(Trade, TelegramSignal.executed_trade_id == Trade.id)
+            )
+        ).all()
+
+        per_channel: dict[int, dict] = {}
+        for channel_db_id, decision, quality, order_id, trade_id, outcome in signal_rows:
+            agg = per_channel.setdefault(channel_db_id, {
+                "total": 0, "executed": 0, "closed": 0, "wins": 0, "scores": [], "order_ids": [],
+            })
+            agg["total"] += 1
+            if quality is not None:
+                agg["scores"].append(quality)
+            if decision != "executed":
+                continue
+            agg["executed"] += 1
+            if trade_id is not None:
+                agg["closed"] += 1
+                agg["wins"] += outcome == "win"
+            if order_id is not None:
+                agg["order_ids"].append(order_id)
+
+        # total_pnl раньше суммировал только s.executed_trade — а эта ссылка
+        # проставляется ИСКЛЮЧИТЕЛЬНО на финальном закрытии позиции целиком
+        # (_link_telegram_signal_trade вызывается из main.py только в ветке
+        # is_partial=False), поэтому PnL уже сработавших частичных TP у ещё
+        # открытых позиций канала нигде не учитывался. Берём ВСЕ Trade-леги
+        # по всем исполненным ордерам канала (частичные закрытия по
+        # TP1/TP2/... и финальное), а не только финально-связанный.
+        all_order_ids = {oid for agg in per_channel.values() for oid in agg["order_ids"]}
+        leg_pnl: dict[int, list[float]] = {}
+        if all_order_ids:
+            for order_open_id, pnl in (
+                await session.execute(
+                    select(Trade.order_open_id, Trade.pnl).where(Trade.order_open_id.in_(all_order_ids))
+                )
+            ).all():
+                leg_pnl.setdefault(order_open_id, []).append(float(pnl))
 
         result = []
         for c in channels:
-            signals = (
-                await session.execute(
-                    select(TelegramSignal)
-                    .options(selectinload(TelegramSignal.executed_trade))
-                    .where(TelegramSignal.channel_id == c.id)
-                )
-            ).scalars().all()
-
-            executed = [s for s in signals if s.decision == "executed"]
-            closed_trades = [s.executed_trade for s in executed if s.executed_trade is not None]
-            wins = sum(1 for t in closed_trades if t.outcome == "win")
-            scored = [s.quality_score for s in signals if s.quality_score is not None]
-
-            # total_pnl раньше суммировал только s.executed_trade — а эта
-            # ссылка проставляется ИСКЛЮЧИТЕЛЬНО на финальном закрытии
-            # позиции целиком (_link_telegram_signal_trade вызывается из
-            # main.py только в ветке is_partial=False), поэтому PnL уже
-            # сработавших частичных TP у ещё открытых позиций канала нигде
-            # не учитывался — тот же класс бага, что и в истории сигналов
-            # (см. renderChannelSignalsTable/_trade_data), только на уровне
-            # агрегированной статистики канала. Берём ВСЕ Trade-леги по всем
-            # исполненным ордерам канала (частичные закрытия по TP1/TP2/...
-            # и финальное), а не только финально-связанный.
-            order_ids = [s.executed_order_id for s in executed if s.executed_order_id is not None]
-            all_legs = []
-            if order_ids:
-                all_legs = (
-                    await session.execute(select(Trade).where(Trade.order_open_id.in_(order_ids)))
-                ).scalars().all()
-
-            open_now = sum(1 for oid in order_ids if oid in open_order_ids_global)
-
+            agg = per_channel.get(c.id, {"total": 0, "executed": 0, "closed": 0, "wins": 0, "scores": [], "order_ids": []})
+            legs = [pnl for oid in set(agg["order_ids"]) for pnl in leg_pnl.get(oid, [])]
+            scored = agg["scores"]
             result.append({
                 "channel_id": c.id,
-                "total_signals": len(signals),
-                "executed": len(executed),
-                "open_now": open_now,
-                "closed_trades": len(closed_trades),
-                "win_rate": round(wins / len(closed_trades) * 100, 1) if closed_trades else None,
-                "total_pnl": round(sum(float(t.pnl) for t in all_legs), 2) if all_legs else None,
+                "total_signals": agg["total"],
+                "executed": agg["executed"],
+                "open_now": sum(1 for oid in agg["order_ids"] if oid in open_order_ids_global),
+                "closed_trades": agg["closed"],
+                "win_rate": round(agg["wins"] / agg["closed"] * 100, 1) if agg["closed"] else None,
+                "total_pnl": round(sum(legs), 2) if legs else None,
                 "avg_quality": round(sum(scored) / len(scored), 2) if scored else None,
                 "size_multiplier": await expectancy_sizing.size_multiplier(channel_key(c.channel_id)),
             })

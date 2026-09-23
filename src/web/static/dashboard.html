@@ -4504,8 +4504,15 @@ function drawBalancesTable() {
   });
 }
 
-async function renderBalances() {
+let lastBalancesLoad = 0;
+
+async function renderBalances(force = false) {
   const section = document.getElementById("balancesSection");
+  // Свёрнутой секции нужен только факт "есть ли что показать" — не
+  // дёргаем биржу каждые 5с ради скрытой таблицы.
+  const collapsed = document.getElementById("balancesWrap").style.display === "none";
+  if (!force && collapsed && Date.now() - lastBalancesLoad < 60000) return;
+  lastBalancesLoad = Date.now();
   try {
     const data = await api("/balances");
     lastBalances = data.balances || [];
@@ -4534,6 +4541,7 @@ document.getElementById("balancesToggleBtn").addEventListener("click", () => {
   const collapsed = wrap.style.display === "none";
   wrap.style.display = collapsed ? "" : "none";
   document.getElementById("balancesToggleBtn").textContent = collapsed ? "▾ Свернуть" : "▸ Развернуть";
+  if (collapsed) renderBalances(true);
 });
 
 document.getElementById("sellAllToUsdtBtn").addEventListener("click", async () => {

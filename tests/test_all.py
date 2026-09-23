@@ -22475,3 +22475,96 @@ class TestPerformanceEndpointFilters(unittest.IsolatedAsyncioTestCase):
         limited = await get_performance(limit=2)
         self.assertEqual(len(limited["snapshots"]), 2)
         self.assertEqual(len((await get_performance(limit=0))["snapshots"]), 1)
+
+
+class TestExchangeCallCache(unittest.IsolatedAsyncioTestCase):
+    """/status и /balances больше не дёргают биржу на каждый опрос дашборда."""
+
+    def setUp(self):
+        from src.web import api
+        api._invalidate_exchange_cache()
+
+    def tearDown(self):
+        from src.web import api
+        api._invalidate_exchange_cache()
+
+    async def test_repeated_calls_hit_exchange_once(self):
+        from src.web import api
+
+        engine = MagicMock()
+        engine.get_all_balances = AsyncMock(return_value=[{"currency": "USDT", "total": 1.0}])
+        with patch("src.web.api.execution_engine", engine):
+            first = await api._cached_all_balances()
+            second = await api._cached_all_balances()
+        self.assertEqual(first, second)
+        engine.get_all_balances.assert_awaited_once()
+
+    async def test_concurrent_calls_share_one_request(self):
+        from src.web import api
+
+        engine = MagicMock()
+
+        async def slow():
+            await asyncio.sleep(0)
+            return []
+
+        engine.get_all_balances = AsyncMock(side_effect=slow)
+        with patch("src.web.api.execution_engine", engine):
+            await asyncio.gather(*(api._cached_all_balances() for _ in range(5)))
+        engine.get_all_balances.assert_awaited_once()
+
+    async def test_market_switch_invalidates(self):
+        from src.web import api
+
+        engine = MagicMock()
+        engine.get_real_balance = AsyncMock(side_effect=[100.0, 200.0])
+        saved = settings.market_type
+        try:
+            with patch("src.web.api.execution_engine", engine):
+                settings.market_type = "spot"
+                self.assertEqual(await api._cached_exchange_call("real_balance", engine.get_real_balance), 100.0)
+                settings.market_type = "futures"
+                self.assertEqual(await api._cached_exchange_call("real_balance", engine.get_real_balance), 200.0)
+        finally:
+            settings.market_type = saved
+
+
+class TestTelegramChannelsListCounts(unittest.IsolatedAsyncioTestCase):
+    async def test_signals_count_via_aggregate(self):
+        from src.db.models import TelegramChannel, TelegramSignal
+        from src.db.session import get_session
+        from src.utils.timeutils import utcnow
+        from src.web.api import list_telegram_channels
+
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@count_agg_test", channel_title="Count", active=True)
+            session.add(channel)
+            await session.flush()
+            for _ in range(3):
+                session.add(TelegramSignal(
+                    channel_id=channel.id, raw_message="x", message_date=utcnow(),
+                    parsed_pair="BTC/USDT", parsed_side="long", decision="rejected",
+                ))
+            await session.commit()
+
+        data = await list_telegram_channels()
+        row = next(c for c in data["channels"] if c["channel_id"] == "@count_agg_test")
+        self.assertEqual(row["signals_count"], 3)
+
+
+class TestMLSampleReusesComputedIndicators(unittest.TestCase):
+    """_process_symbol передаёт в _record_ml_training_sample уже посчитанные
+    индикаторы — extract_features_for_ml не должен считать их повторно."""
+
+    def test_no_recompute_when_indicators_present(self):
+        from src.data_ingest.feature_engine import FeatureEngine
+
+        engine = FeatureEngine()
+        n = 60
+        df = pd.DataFrame({
+            "close": np.linspace(100, 110, n), "rsi_14": np.linspace(40, 60, n),
+        }, index=pd.date_range("2026-01-01", periods=n, freq="h"))
+        with patch.object(engine, "compute_all_indicators", side_effect=AssertionError("recomputed")):
+            result = engine.extract_features_for_ml(df, include_target=True)
+        self.assertIn("target_direction", result.columns)
+        self.assertIn("rsi_14", result.columns)

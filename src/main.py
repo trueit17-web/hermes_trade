@@ -2088,7 +2088,10 @@ class TradingBot:
         features = self.feature_engine.compute_all_indicators(df)
         latest_features = features.iloc[-1]
 
-        await self._record_ml_training_sample(symbol, df)
+        # Уже посчитанные индикаторы: extract_features_for_ml пересчитывает
+        # их только если в кадре нет rsi_14 — раньше сюда шли сырые свечи, и
+        # все индикаторы считались дважды на каждый символ каждой итерации.
+        await self._record_ml_training_sample(symbol, features)
 
         # Сбор данных для стратегий
         strategy_data = self._build_strategy_data(symbol, close, latest_features)
