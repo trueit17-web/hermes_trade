@@ -3,6 +3,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+_PRIOR_WINS = 2.0
+_PRIOR_LOSSES = 2.0
+
 
 class SignalQualityScorer:
     """
@@ -23,30 +26,28 @@ class SignalQualityScorer:
         (TelegramSignal.executed_trade -> Trade.outcome).
         """
         from sqlalchemy import select
-        from sqlalchemy.orm import selectinload
 
-        from src.db.models import TelegramChannel, TelegramSignal
+        from src.db.models import TelegramChannel, TelegramSignal, Trade
         from src.db.session import get_session
 
+        # Один JOIN-запрос вместо запроса на каждый канал (N+1).
         try:
             async with get_session() as session:
-                channels = (await session.execute(select(TelegramChannel))).scalars().all()
-                for channel in channels:
-                    signals = (
-                        await session.execute(
-                            select(TelegramSignal)
-                            .options(selectinload(TelegramSignal.executed_trade))
-                            .where(TelegramSignal.channel_id == channel.id)
-                        )
-                    ).scalars().all()
-                    for s in signals:
-                        if s.executed_trade is not None and s.executed_trade.outcome is not None:
-                            self.update_channel_stats(
-                                channel.channel_id, s.executed_trade.outcome == "win",
-                            )
+                rows = (
+                    await session.execute(
+                        select(TelegramChannel.channel_id, Trade.outcome)
+                        .join(TelegramSignal, TelegramSignal.channel_id == TelegramChannel.id)
+                        .join(Trade, TelegramSignal.executed_trade_id == Trade.id)
+                        .where(Trade.outcome.is_not(None))
+                        .order_by(TelegramSignal.id)
+                    )
+                ).all()
         except Exception as e:
             logger.warning(f"Не удалось восстановить channel_stats из БД: {e}")
             return
+
+        for channel_id, outcome in rows:
+            self.update_channel_stats(channel_id, outcome == "win")
 
         if self.channel_stats:
             logger.info(
@@ -77,6 +78,22 @@ class SignalQualityScorer:
 
         logger.debug(f"Канал {channel_id}: win_rate={stats['win_rate']:.2%}, signals={total}")
 
+    def smoothed_win_rate(self, channel_id: str) -> float:
+        """
+        Win-rate канала с байесовским сглаживанием (априорное Beta(2, 2)):
+        канал с одной выигрышной сделкой раньше получал win_rate=1.0 и
+        максимальный бонус к качеству; теперь оценка растёт по мере
+        накопления истории: 1/1 -> 0.6, 8/10 -> 0.71, 80/100 -> 0.79.
+        """
+        stats = self.channel_stats.get(channel_id)
+        if not stats:
+            return 0.5
+        good = stats.get("good_signals")
+        bad = stats.get("bad_signals")
+        if good is None or bad is None:
+            return stats.get("win_rate", 0.5)
+        return (good + _PRIOR_WINS) / (good + bad + _PRIOR_WINS + _PRIOR_LOSSES)
+
     def score_signal(
         self,
         signal: dict,
@@ -93,9 +110,7 @@ class SignalQualityScorer:
         score = 0.0
 
         # 1. Историческая точность канала — до 35%
-        stats = self.channel_stats.get(channel_id, {})
-        channel_win_rate = stats.get("win_rate", 0.5)
-        score += channel_win_rate * 0.35
+        score += self.smoothed_win_rate(channel_id) * 0.35
 
         # 2. Уверенность сигнала (если есть) — до 35%
         confidence = signal.get("confidence", 0.5)
@@ -142,6 +157,15 @@ class SignalQualityScorer:
                     score += 0.05
                 elif rr_ratio >= 1.0:
                     score += 0.02
+
+        # 6. ML-модель качества сигнала (если обучена и лучше базовой линии):
+        # сдвиг относительно средней доли убыточных сигналов, так что в
+        # среднем по потоку сигналов поправка ~0 и не смещает пороги каналов.
+        p_loss = signal.get("ml_loss_proba")
+        if p_loss is not None:
+            from src.config import settings
+            base_rate = signal.get("ml_base_loss_rate", 0.5)
+            score += settings.ml_signal_quality_weight * (base_rate - p_loss)
 
         # Ограничиваем 0-1
         score = max(0.0, min(1.0, score))

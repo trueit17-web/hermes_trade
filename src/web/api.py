@@ -1677,15 +1677,11 @@ async def activate_ml_model(model_type: str, version: int):
 async def trigger_retrain():
     """Запустить переобучение моделей (direction_classifier + volatility_predictor)."""
     logger.info("Запуск переобучения ML моделей...")
-    result = await model_trainer.train_direction_classifier()
-    if result:
-        logger.info(f"Direction classifier переобучен: v{result['version']}")
-        await model_registry.activate_model("direction_classifier", result["version"])
-
-    vol_result = await model_trainer.train_volatility_predictor()
-    if vol_result:
-        logger.info(f"Volatility predictor переобучен: v{vol_result['version']}")
-        await model_registry.activate_model("volatility_predictor", vol_result["version"])
+    # Активацию решает сам тренер: новая версия становится активной, только
+    # если она лучше текущей на свежих отложенных данных (поле "promoted").
+    training_data = await model_trainer.feature_store.get_features_for_training()
+    result = await model_trainer.train_direction_classifier(training_data=training_data)
+    vol_result = await model_trainer.train_volatility_predictor(training_data=training_data)
 
     return {
         "success": result is not None or vol_result is not None,
@@ -1709,15 +1705,12 @@ async def train_signal_quality_model():
     """
     Обучить классификатор качества сигнала (train_signal_quality_
     classifier) на всех уже размеченных HistoricalSignal — тот же паттерн,
-    что и /ml/retrain: при успехе новая версия сразу активируется через
-    model_registry (деактивируя предыдущие), при недостатке данных
+    что и /ml/retrain: новая версия активируется, только если она лучше
+    текущей (result["promoted"]); при недостатке данных
     (< MIN_TRAINING_SAMPLES) вернёт success=false без ошибки.
     """
     logger.info("Запуск обучения signal quality classifier...")
     result = await model_trainer.train_signal_quality_classifier()
-    if result:
-        logger.info(f"Signal quality classifier обучен: v{result['version']}")
-        await model_registry.activate_model("signal_quality_classifier", result["version"])
     return {"success": result is not None, "result": result}
 
 

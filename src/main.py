@@ -33,7 +33,7 @@ from src.db.session import get_session
 from src.event_bus import event_bus
 from src.execution.decision_logger import decision_logger
 from src.execution.executor import execution_engine
-from src.ml import feature_store, ml_inference, model_registry, model_trainer
+from src.ml import ML_FEATURE_COLS, feature_store, ml_inference, model_registry, model_trainer
 from src.risk import expectancy_sizing
 from src.risk.protections import (
     GLOBAL_KEY,
@@ -688,6 +688,13 @@ class TradingBot:
     async def _retrain_ml(self):
         """Переобучение ML моделей."""
         try:
+            from src.telegram.signal_quality_training import get_signal_quality_dataset_summary
+            if (await get_signal_quality_dataset_summary()).get("ready"):
+                await model_trainer.train_signal_quality_classifier()
+        except Exception as e:
+            logger.error(f"Ошибка переобучения signal quality classifier: {e}")
+
+        try:
             from sqlalchemy import func, select
 
             from src.db.models import Trade
@@ -704,19 +711,11 @@ class TradingBot:
                 return
 
             logger.info(f"ML retraining: {trades_count} сделок")
-            result = await model_trainer.train_direction_classifier()
-            if result:
-                logger.info(f"✅ Direction classifier: v{result['version']}")
-                await model_registry.activate_model("direction_classifier", result["version"])
-                if self.ml_inference:
-                    self.ml_inference.load_model("direction_classifier", result["model_path"])
-
-            vol_result = await model_trainer.train_volatility_predictor()
-            if vol_result:
-                logger.info(f"✅ Volatility predictor: v{vol_result['version']}")
-                await model_registry.activate_model("volatility_predictor", vol_result["version"])
-                if self.ml_inference:
-                    self.ml_inference.load_model("volatility_predictor", vol_result["model_path"])
+            # Тренер сам сравнивает новую версию с активной и активирует её
+            # только если она лучше (см. ModelTrainer._train).
+            training_data = await feature_store.get_features_for_training()
+            await model_trainer.train_direction_classifier(training_data=training_data)
+            await model_trainer.train_volatility_predictor(training_data=training_data)
         except Exception as e:
             logger.error(f"Ошибка переобучения ML-моделей: {e}")
 
@@ -837,6 +836,26 @@ class TradingBot:
             settings.telegram_signals_quality_threshold, settings.telegram_signals_auto_execute,
             5.0, settings.market_type, False,
         )
+
+    async def _ml_signal_loss_estimate(self, side, entry, sl, tp, signal_event: dict) -> dict | None:
+        """Оценка signal_quality_classifier для сигнала (None — модели нет/без skill/нет SL)."""
+        if not settings.ml_signal_quality_enabled or not entry or not sl:
+            return None
+        from src.telegram.signal_quality_training import extract_signal_features
+        try:
+            take_profits = signal_event.get("parsed_take_profits") or None
+            features = extract_signal_features(
+                side, float(entry), float(sl), float(tp) if tp else None,
+                [float(x) for x in take_profits] if take_profits else None,
+                signal_event.get("parsed_leverage"),
+                signal_event.get("signal_posted_at") or utcnow(),
+            )
+            if features is None:
+                return None
+            return await ml_inference.predict_signal_loss_proba(features)
+        except Exception as e:
+            logger.debug(f"ML-оценка качества сигнала недоступна: {e}")
+            return None
 
     async def _on_telegram_signal(self, signal_event: dict):
         """Обработка Telegram сигнала."""
@@ -967,15 +986,20 @@ class TradingBot:
         # игнорировалась. Итоговый quality был у любого сигнала практически
         # одинаковым (около win_rate*0.35 + 0.025) независимо от того, что
         # реально было в сообщении канала.
+        ml_estimate = await self._ml_signal_loss_estimate(side, entry, sl, tp, signal_event)
         quality = signal_quality_scorer.score_signal(
             {
                 "side": side, "entry": entry, "sl": sl, "tp": tp,
                 "confidence": signal_event.get("parsed_confidence", 1.0),
+                "ml_loss_proba": ml_estimate["p_loss"] if ml_estimate else None,
+                "ml_base_loss_rate": ml_estimate["base_loss_rate"] if ml_estimate else 0.5,
             },
             channel_id,
         )
+        ml_note = f" | ML P(убыток)={ml_estimate['p_loss']:.2f}" if ml_estimate else ""
         logger.info(
-            f"📲 Telegram сигнал: {pair} {side.upper()} | quality={quality:.2f} (порог канала {quality_threshold:.2f})"
+            f"📲 Telegram сигнал: {pair} {side.upper()} | quality={quality:.2f}{ml_note} "
+            f"(порог канала {quality_threshold:.2f})"
         )
 
         decision = "pending"
@@ -1929,8 +1953,13 @@ class TradingBot:
         отдельным методом, чтобы тот же набор фичей мог собрать и
         get_ml_forecast (разовый инференс по запросу для бейджа на
         дашборде, см. её докстринг), не дублируя список полей.
+
+        Все признаки, на которых обучаются ML-модели (ML_FEATURE_COLS),
+        добавляются всегда — раньше часть из них (roc_*, return_10/20,
+        realized_vol_60, close_position, ...) сюда не попадала, и на
+        инференсе модель получала вместо них 0 (расхождение train/serve).
         """
-        return {
+        data = {
             "symbol": symbol,
             "timeframe": "1h",
             "close": close,
@@ -1971,6 +2000,10 @@ class TradingBot:
             "hour": latest_features.get("hour", 0),
             "day_of_week": latest_features.get("day_of_week", 0),
         }
+        for col in ML_FEATURE_COLS:
+            if col not in data:
+                data[col] = latest_features.get(col)
+        return data
 
     async def get_ml_forecast(self, symbol: str, market_type: str = "spot") -> dict | None:
         """

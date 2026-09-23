@@ -130,6 +130,18 @@ class Settings(BaseSettings):
     ml_active_model_version: int = 1
     ml_optuna_trials: int = 30
     ml_optuna_min_samples: int = 150
+    # Доли хронологического разбиения train/val/test (val — подбор
+    # гиперпараметров и early stopping, test — честная отложенная оценка и
+    # сравнение претендента с текущей активной моделью).
+    ml_val_fraction: float = 0.15
+    ml_test_fraction: float = 0.15
+    # Вклад модели качества сигнала в итоговый quality Telegram-сигнала:
+    # quality += weight * (базовая доля убыточных - P(убыток)). Модель без
+    # доказанного преимущества над базовой линией (skill <= 0) не влияет.
+    ml_signal_quality_enabled: bool = True
+    ml_signal_quality_weight: float = 0.5
+    # Сколько последних неактивных версий каждой модели хранить на диске.
+    ml_keep_model_files: int = 5
 
     # === Риск ===
     risk_daily_loss_limit_usd: float = 500.0

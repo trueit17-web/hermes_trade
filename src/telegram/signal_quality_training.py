@@ -93,7 +93,7 @@ async def build_signal_quality_training_data() -> pd.DataFrame | None:
                     HistoricalSignal.parsed_entry.is_not(None),
                     HistoricalSignal.parsed_sl.is_not(None),
                     HistoricalSignal.parsed_side.is_not(None),
-                )
+                ).order_by(HistoricalSignal.message_date)
             )
         ).scalars().all()
 
@@ -111,6 +111,8 @@ async def build_signal_quality_training_data() -> pd.DataFrame | None:
         if features is None:
             continue
         features["target"] = 1.0 if row.simulated_outcome == "loss" else 0.0
+        # Не признак — ключ хронологического разбиения train/val/test.
+        features["message_date"] = row.message_date
         data.append(features)
 
     return pd.DataFrame(data) if data else None

@@ -9417,17 +9417,19 @@ class TestPredictionUsesNamedFeatures(unittest.IsolatedAsyncioTestCase):
         from src.ml import MLInference, ModelTrainer
 
         rng = np.random.default_rng(7)
-        n = 150
+        n = 300
+        natr = rng.uniform(0.5, 5.0, n)
         df = pd.DataFrame({
             "rsi_14": rng.uniform(20, 80, n),
-            "natr_14": rng.uniform(0.5, 5.0, n),
+            "natr_14": natr,
             "realized_vol_20": rng.uniform(0.01, 0.05, n),
             "realized_vol_60": rng.uniform(0.01, 0.05, n),
             "volume_ratio": rng.uniform(0.5, 2.0, n),
             "atr_14": rng.uniform(10, 500, n),
             "return_1": rng.normal(0, 0.01, n),
             "return_3": rng.normal(0, 0.02, n),
-            "label_volatility": rng.uniform(0.01, 0.05, n),
+            # Обучаемая зависимость: модель без skill > 0 инференс не отдаёт.
+            "label_volatility": natr * 0.01 + rng.normal(0, 0.001, n),
         })
         result = await ModelTrainer().train_volatility_predictor(training_data=df)
         self.assertIsNotNone(result)
@@ -21100,10 +21102,11 @@ class TestSignalQualityApiEndpoints(unittest.IsolatedAsyncioTestCase):
             result = await get_signal_quality_dataset_summary()
         self.assertEqual(result, fake_summary)
 
-    async def test_train_endpoint_activates_model_on_success(self):
+    async def test_train_endpoint_leaves_activation_to_trainer(self):
+        """Активацию решает тренер (champion/challenger), эндпоинт сам не активирует."""
         from src.web.api import train_signal_quality_model
 
-        fake_result = {"version": 2, "metrics": {"accuracy": 0.7}}
+        fake_result = {"version": 2, "metrics": {"accuracy": 0.7}, "promoted": False}
         with patch("src.web.api.model_trainer.train_signal_quality_classifier",
                     AsyncMock(return_value=fake_result)), \
              patch("src.web.api.model_registry.activate_model", AsyncMock(return_value=True)) as mock_activate:
@@ -21111,7 +21114,7 @@ class TestSignalQualityApiEndpoints(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(result["result"], fake_result)
-        mock_activate.assert_awaited_once_with("signal_quality_classifier", 2)
+        mock_activate.assert_not_awaited()
 
     async def test_train_endpoint_reports_failure_without_error_when_no_data(self):
         from src.web.api import train_signal_quality_model
@@ -22204,3 +22207,238 @@ class TestLLMParserChannelOutcomeContext(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FakeProbaModel:
+    """Модель-заглушка с заданными классами и вероятностями."""
+
+    def __init__(self, classes, proba):
+        self.classes_ = np.array(classes)
+        self._proba = np.array([proba])
+        self.feature_importances_ = np.ones(1)
+        self.last_X = None
+
+    def predict_proba(self, X):
+        self.last_X = X
+        return self._proba
+
+
+class TestMLDirectionProbaMapping(unittest.IsolatedAsyncioTestCase):
+    """
+    predict_direction брал proba[1]/proba[-1] по ПОЗИЦИИ: при классах
+    [-1, 0, 1] proba[1] — это P(нейтрально), а proba[-1] — P(роста), т.е.
+    "P(up)" и "P(down)" были перепутаны. Теперь сопоставление по classes_.
+    """
+
+    async def test_probabilities_mapped_by_class_label(self):
+        from src.ml import MLInference
+
+        inference = MLInference()
+        inference._models["direction_classifier"] = {
+            "model": _FakeProbaModel([-1, 0, 1], [0.1, 0.2, 0.7]),
+            "feature_cols": ["rsi_14"],
+            "metrics": {"skill": 0.05},
+        }
+        result = await inference.predict_direction({"rsi_14": 55.0})
+        self.assertAlmostEqual(result["proba_up"], 0.7)
+        self.assertAlmostEqual(result["proba_down"], 0.1)
+        self.assertAlmostEqual(result["proba_neutral"], 0.2)
+
+    async def test_float_class_labels_supported(self):
+        from src.ml import MLInference
+
+        inference = MLInference()
+        inference._models["direction_classifier"] = {
+            "model": _FakeProbaModel([-1.0, 1.0], [0.3, 0.7]),
+            "feature_cols": ["rsi_14"],
+        }
+        result = await inference.predict_direction({"rsi_14": 55.0})
+        self.assertAlmostEqual(result["proba_up"], 0.7)
+        self.assertAlmostEqual(result["proba_down"], 0.3)
+        self.assertAlmostEqual(result["proba_neutral"], 0.0)
+
+    async def test_missing_feature_is_nan_not_zero(self):
+        from src.ml import MLInference
+
+        fake = _FakeProbaModel([-1, 0, 1], [0.3, 0.4, 0.3])
+        inference = MLInference()
+        inference._models["direction_classifier"] = {"model": fake, "feature_cols": ["rsi_14", "roc_5"]}
+        await inference.predict_direction({"rsi_14": 40.0, "roc_5": None})
+        self.assertEqual(fake.last_X["rsi_14"].iloc[0], 40.0)
+        self.assertTrue(np.isnan(fake.last_X["roc_5"].iloc[0]))
+
+    async def test_model_without_skill_is_not_used(self):
+        from src.ml import MLInference
+
+        inference = MLInference()
+        inference._models["direction_classifier"] = {
+            "model": _FakeProbaModel([-1, 0, 1], [0.1, 0.2, 0.7]),
+            "feature_cols": ["rsi_14"],
+            "metrics": {"skill": -0.01},
+        }
+        self.assertIsNone(await inference.predict_direction({"rsi_14": 55.0}))
+
+
+class TestChronologicalSplit(unittest.TestCase):
+    """Случайный train_test_split на автокоррелированных свечах давал утечку будущего."""
+
+    def test_parts_are_ordered_in_time(self):
+        from src.ml import chronological_split
+
+        times = pd.date_range("2026-01-01", periods=100, freq="h")
+        frame = pd.DataFrame({"timestamp": times[::-1], "x": range(100)})
+        train, val, test = chronological_split(frame, "timestamp", 0.15, 0.15)
+        self.assertLess(frame.loc[train, "timestamp"].max(), frame.loc[val, "timestamp"].min())
+        self.assertLess(frame.loc[val, "timestamp"].max(), frame.loc[test, "timestamp"].min())
+        self.assertEqual(len(test), 15)
+
+    def test_purge_gap_removes_overlapping_labels(self):
+        from src.ml import chronological_split
+
+        times = pd.date_range("2026-01-01", periods=100, freq="h")
+        frame = pd.DataFrame({"timestamp": times, "x": range(100)})
+        train, val, test = chronological_split(frame, "timestamp", 0.15, 0.15, purge=pd.Timedelta(hours=5))
+        gap_train_val = frame.loc[val, "timestamp"].min() - frame.loc[train, "timestamp"].max()
+        gap_val_test = frame.loc[test, "timestamp"].min() - frame.loc[val, "timestamp"].max()
+        self.assertGreater(gap_train_val, pd.Timedelta(hours=5))
+        self.assertGreater(gap_val_test, pd.Timedelta(hours=5))
+
+    def test_too_small_returns_none(self):
+        from src.ml import chronological_split
+
+        self.assertIsNone(chronological_split(pd.DataFrame({"x": [1, 2]}), None, 0.15, 0.15))
+
+
+class TestModelPromotionDecision(unittest.TestCase):
+    def test_no_champion_promotes(self):
+        from src.ml import ModelTrainer
+
+        self.assertTrue(ModelTrainer._promotion_decision(None, {"skill": -1})[0])
+
+    def test_better_challenger_promoted(self):
+        from src.ml import ModelTrainer
+
+        cmp = {"comparable": True, "champion_loss": 0.7, "challenger_loss": 0.6}
+        self.assertTrue(ModelTrainer._promotion_decision(cmp, {})[0])
+
+    def test_worse_challenger_not_promoted(self):
+        from src.ml import ModelTrainer
+
+        cmp = {"comparable": True, "champion_loss": 0.6, "challenger_loss": 0.7}
+        self.assertFalse(ModelTrainer._promotion_decision(cmp, {"skill": 0.2})[0])
+
+    def test_incomparable_champion_requires_skill(self):
+        from src.ml import ModelTrainer
+
+        cmp = {"comparable": False}
+        self.assertTrue(ModelTrainer._promotion_decision(cmp, {"skill": 0.1})[0])
+        self.assertFalse(ModelTrainer._promotion_decision(cmp, {"skill": 0.0})[0])
+
+
+class TestDirectionClassifierTraining(unittest.IsolatedAsyncioTestCase):
+    """Сквозное обучение: хронологический split, метрики на test, активация и сброс кэша инференса."""
+
+    async def test_trains_on_learnable_data_and_activates(self):
+        from src.ml import ModelTrainer, ml_inference, model_registry
+
+        rng = np.random.default_rng(3)
+        n = 400
+        rsi = rng.uniform(10, 90, n)
+        label = np.where(rsi > 60, 1, np.where(rsi < 40, -1, 0))
+        df = pd.DataFrame({
+            "timestamp": pd.date_range("2026-01-01", periods=n, freq="h"),
+            "rsi_14": rsi,
+            "natr_14": rng.uniform(0.5, 5.0, n),
+            "obv": rng.uniform(1e6, 1e9, n),
+            "label_direction": label,
+        })
+        ml_inference._models["direction_classifier"] = {"stale": True}
+
+        result = await ModelTrainer().train_direction_classifier(training_data=df)
+
+        self.assertIsNotNone(result)
+        self.assertNotIn("obv", result["feature_cols"])
+        self.assertEqual(result["metrics"]["split"], "chronological")
+        self.assertGreater(result["metrics"]["skill"], 0)
+        self.assertIn("log_loss", result["metrics"])
+        active = await model_registry.get_active_model("direction_classifier")
+        if result["promoted"]:
+            self.assertEqual(active["version"], result["version"])
+            self.assertNotIn("direction_classifier", ml_inference._models)
+
+        prediction = await ml_inference.predict_direction({"rsi_14": 85.0, "natr_14": 2.0})
+        if result["promoted"]:
+            self.assertGreater(prediction["proba_up"], prediction["proba_down"])
+
+    async def test_single_class_training_returns_none(self):
+        from src.ml import ModelTrainer
+
+        n = 200
+        df = pd.DataFrame({
+            "timestamp": pd.date_range("2026-01-01", periods=n, freq="h"),
+            "rsi_14": np.linspace(10, 90, n),
+            "label_direction": np.zeros(n),
+        })
+        self.assertIsNone(await ModelTrainer().train_direction_classifier(training_data=df))
+
+
+class TestSignalLossProbaInference(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_model_without_skill_ignored(self):
+        from src.ml import MLInference
+
+        inference = MLInference()
+        inference._models["signal_quality_classifier"] = {
+            "model": _FakeProbaModel([0, 1], [0.2, 0.8]), "feature_cols": ["leverage"],
+        }
+        self.assertIsNone(await inference.predict_signal_loss_proba({"leverage": 10.0}))
+
+    async def test_skilled_model_returns_loss_proba_and_base_rate(self):
+        from src.ml import MLInference
+
+        inference = MLInference()
+        inference._models["signal_quality_classifier"] = {
+            "model": _FakeProbaModel([0, 1], [0.2, 0.8]), "feature_cols": ["leverage"],
+            "metrics": {"skill": 0.1, "class_prior": {"0": 0.6, "1": 0.4}}, "version": 3,
+        }
+        result = await inference.predict_signal_loss_proba({"leverage": 10.0})
+        self.assertAlmostEqual(result["p_loss"], 0.8)
+        self.assertAlmostEqual(result["base_loss_rate"], 0.4)
+        self.assertEqual(result["version"], 3)
+
+
+class TestQualityScorerBayesianAndML(unittest.TestCase):
+    def _signal(self, **extra):
+        return {"side": "long", "entry": 100.0, "sl": 95.0, "tp": 110.0, "confidence": 0.8, **extra}
+
+    def test_single_win_not_treated_as_perfect_channel(self):
+        from src.telegram.quality_scorer import SignalQualityScorer
+
+        scorer = SignalQualityScorer()
+        scorer.update_channel_stats("new_ch", True)
+        self.assertAlmostEqual(scorer.smoothed_win_rate("new_ch"), 0.6)
+        self.assertEqual(scorer.smoothed_win_rate("unknown"), 0.5)
+
+    def test_ml_adjustment_direction(self):
+        from src.telegram.quality_scorer import SignalQualityScorer
+
+        scorer = SignalQualityScorer()
+        base = scorer.score_signal(self._signal(), "ch")
+        good = scorer.score_signal(self._signal(ml_loss_proba=0.1, ml_base_loss_rate=0.4), "ch")
+        bad = scorer.score_signal(self._signal(ml_loss_proba=0.9, ml_base_loss_rate=0.4), "ch")
+        neutral = scorer.score_signal(self._signal(ml_loss_proba=0.4, ml_base_loss_rate=0.4), "ch")
+        self.assertGreater(good, base)
+        self.assertLess(bad, base)
+        self.assertAlmostEqual(neutral, base)
+
+
+class TestStrategyDataIncludesAllMLFeatures(unittest.TestCase):
+    """Признаки, на которых обучалась модель, но не попадавшие в strategy_data, на инференсе были 0."""
+
+    def test_all_ml_feature_cols_present(self):
+        from src.main import TradingBot
+        from src.ml import ML_FEATURE_COLS
+
+        latest = pd.Series({c: 1.23 for c in ML_FEATURE_COLS})
+        data = TradingBot._build_strategy_data(MagicMock(), "BTC/USDT", 100.0, latest)
+        for col in ML_FEATURE_COLS:
+            self.assertEqual(data[col], 1.23, col)
