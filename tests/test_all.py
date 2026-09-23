@@ -22568,3 +22568,84 @@ class TestMLSampleReusesComputedIndicators(unittest.TestCase):
             result = engine.extract_features_for_ml(df, include_target=True)
         self.assertIn("target_direction", result.columns)
         self.assertIn("rsi_14", result.columns)
+
+
+class TestTradeHistoryFallbackExcludesRecordedPartialCloses(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент (прод, RENDER/USDT): после 3 частичных TP позиция
+    закрылась биржевым SL, но фолбэк по истории сделок суммировал с
+    финальным закрытием и продажи частичных TP, которые бот уже записал сам
+    (1715.4 против 1143.7) -> "слишком расходятся", снято без PnL.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+        self._saved = (settings.market_type, settings.trading_mode)
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+
+    async def asyncTearDown(self):
+        settings.market_type, settings.trading_mode = self._saved
+        await self.engine.close()
+
+    async def test_final_close_found_despite_earlier_partial_tp_fills(self):
+        from datetime import UTC
+
+        from sqlalchemy import select
+
+        from src.db.models import Order, Trade
+        from src.db.session import get_session
+
+        symbol = "PARTIALHIST/USDT"
+        opened_at = datetime.now() - timedelta(days=2)
+        partial_closed_at = datetime.now() - timedelta(hours=5)
+        async with get_session() as session:
+            exchange_id, symbol_id = await self.engine._resolve_symbol_id(session, symbol)
+            opening = Order(
+                exchange_id=exchange_id, symbol_id=symbol_id, side="buy", order_type="market",
+                amount=1715.4, price=1.6, status="filled", filled_amount=1715.4, filled_price=1.6,
+                fee=0.0, fee_currency="USDT", client_order_id="partialhist-open",
+            )
+            tp_close = Order(
+                exchange_id=exchange_id, symbol_id=symbol_id, side="sell", order_type="market",
+                amount=571.7, price=1.9, status="filled", filled_amount=571.7, filled_price=1.9,
+                fee=0.0, fee_currency="USDT", client_order_id="partialhist-tp1",
+                order_id_exchange="tp1-exchange-order",
+            )
+            session.add_all([opening, tp_close])
+            await session.flush()
+            session.add(Trade(
+                symbol_id=symbol_id, direction="long", entry_price=1.6, exit_price=1.9, amount=571.7,
+                pnl=171.5, pnl_pct=18.75, outcome="win", is_open=False, closed_at=partial_closed_at,
+                order_open_id=opening.id, order_close_id=tp_close.id,
+            ))
+            await session.commit()
+            opening_id = opening.id
+
+        def ts(dt):
+            return int(dt.replace(tzinfo=UTC).timestamp() * 1000)
+
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_my_trades = AsyncMock(return_value=[
+            {"id": "t-tp1", "order": "tp1-exchange-order", "side": "sell", "amount": 571.7,
+             "price": 1.9, "cost": 571.7 * 1.9, "timestamp": ts(partial_closed_at - timedelta(seconds=2))},
+            {"id": "t-sl", "order": "sl-final-order", "side": "sell", "amount": 1143.7,
+             "price": 1.7, "cost": 1143.7 * 1.7, "timestamp": ts(datetime.now() - timedelta(minutes=3)),
+             "fee": {"cost": 1.0, "currency": "USDT"}},
+        ])
+        pos = {
+            "amount": 1143.7, "entry_price": 1.6, "side": "long", "strategy_id": None,
+            "entry_fee": 0.0, "order_id": opening_id, "opened_at": opened_at, "market_type": "futures",
+        }
+        self.engine.real_positions[symbol] = pos
+
+        result = await self.engine._finalize_via_recent_trade_history(symbol, pos)
+
+        self.assertTrue(result)
+        async with get_session() as session:
+            trades = (
+                await session.execute(select(Trade).where(Trade.order_open_id == opening_id).order_by(Trade.id))
+            ).scalars().all()
+        self.assertEqual(len(trades), 2)
+        self.assertAlmostEqual(float(trades[-1].amount), 1143.7, places=4)
+        self.assertAlmostEqual(float(trades[-1].exit_price), 1.7, places=6)

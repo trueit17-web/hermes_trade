@@ -2,7 +2,7 @@
 import asyncio
 import logging
 import uuid
-from datetime import UTC
+from datetime import UTC, datetime
 
 # ccxt.pro (не отдельный платный пакет, а часть того же ccxt, что уже
 # стоит в requirements.txt) — прямой подкласс ccxt.async_support для
@@ -3983,6 +3983,37 @@ class ExecutionEngine:
         )
         return True
 
+    async def _recorded_close_fills(self, pos: dict) -> tuple[set[str], datetime | None]:
+        """
+        Биржевые id ордеров/сделок и время последнего закрытия, уже
+        записанных ботом по этой позиции (частичные TP и т.п.). order_id_
+        exchange у внешних закрытий — это id сделок через запятую.
+        """
+        order_id = pos.get("order_id")
+        if not order_id:
+            return set(), None
+        try:
+            async with get_session() as session:
+                rows = (
+                    await session.execute(
+                        select(Order.order_id_exchange, Trade.closed_at)
+                        .select_from(Trade)
+                        .outerjoin(Order, Trade.order_close_id == Order.id)
+                        .where(Trade.order_open_id == order_id)
+                    )
+                ).all()
+        except Exception as e:
+            logger.debug(f"Не удалось получить записанные закрытия позиции (order_id={order_id}): {e}")
+            return set(), None
+        known_ids: set[str] = set()
+        last_closed_at = None
+        for exchange_ids, closed_at in rows:
+            if exchange_ids:
+                known_ids.update(x.strip() for x in str(exchange_ids).split(",") if x.strip())
+            if closed_at is not None and (last_closed_at is None or closed_at > last_closed_at):
+                last_closed_at = closed_at
+        return known_ids, last_closed_at
+
     async def _finalize_via_recent_trade_history(self, symbol: str, pos: dict) -> bool:
         """
         Общий случай (в отличие от _finalize_externally_closed_position выше,
@@ -4050,10 +4081,24 @@ class ExecutionEngine:
             # UTC, и даёт неверный epoch вне контейнеров с TZ=UTC — сначала
             # явно проставляем tzinfo=UTC, как и utcnow_timestamp.
             opened_at_ts = opened_at.replace(tzinfo=UTC).timestamp() * 1000
+            # Частичные закрытия этой же позиции (TP1/TP2/...), которые бот
+            # уже сам записал, тоже лежат в истории после opened_at — раньше
+            # они суммировались с финальным закрытием. Реальный инцидент
+            # (прод, RENDER/USDT после 3 частичных TP): 1715.4 против
+            # отслеживаемых 1143.7 -> "слишком расходятся", позиция снята
+            # без PnL, открывающий ордер помечен rejected. Исключаем их по id
+            # биржевых ордеров из БД и считаем окно от последнего из них.
+            known_ids, last_recorded_close = await self._recorded_close_fills(pos)
+            since_ts = opened_at_ts
+            if last_recorded_close is not None:
+                since_ts = max(since_ts, last_recorded_close.replace(tzinfo=UTC).timestamp() * 1000)
             closing_side = "sell" if pos.get("side", "long") == "long" else "buy"
             closing_trades = [
                 t for t in recent
-                if str(t.get("side", "")).lower() == closing_side and (t.get("timestamp") or 0) >= opened_at_ts
+                if str(t.get("side", "")).lower() == closing_side
+                and (t.get("timestamp") or 0) >= since_ts
+                and str(t.get("order") or "") not in known_ids
+                and str(t.get("id") or "") not in known_ids
             ]
             if not closing_trades:
                 logger.warning(
