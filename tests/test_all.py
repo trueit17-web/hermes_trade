@@ -23110,3 +23110,55 @@ class TestTelegramChannelSizingApi(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(HTTPException):
             await update_telegram_channel(ch_id, TelegramChannelUpdate(leverage_mode="yolo"))
+
+
+class TestCandleFetchRateLimitRetry(unittest.IsolatedAsyncioTestCase):
+    """
+    Прод: из 131 ошибки Bybit "Too many visits" (10006) на загрузке свечей
+    84 пришлись на минуту :00, остальные на :15/:30/:45 — моменты закрытия
+    свечей, когда биржа временно режет публичный API. Символ пропускал
+    итерацию (устаревшая цена/проверка SL-TP). Теперь — повтор с паузой.
+    """
+
+    async def _ingest(self, side_effect):
+        import ccxt.async_support as ccxt  # noqa: F401
+
+        from src.data_ingest.market_data import MarketDataIngest
+
+        ingest = MarketDataIngest("bybit")
+        ingest.exchange = MagicMock()
+        ingest.exchange.fetch_ohlcv = AsyncMock(side_effect=side_effect)
+        return ingest
+
+    async def test_recovers_after_rate_limit(self):
+        import ccxt.async_support as ccxt
+
+        candle = [[1790262000000, 1.0, 1.1, 0.9, 1.05, 100.0]]
+        ingest = await self._ingest([ccxt.RateLimitExceeded("10006"), ccxt.RateLimitExceeded("10006"), candle])
+        with patch("src.data_ingest.market_data.asyncio.sleep", new=AsyncMock()) as sleep:
+            df = await ingest.fetch_ohlcv("BTC/USDT", "1h", limit=3)
+        self.assertIsNotNone(df)
+        self.assertEqual(len(df), 1)
+        self.assertEqual(ingest.exchange.fetch_ohlcv.await_count, 3)
+        self.assertEqual(sleep.await_count, 2)
+
+    async def test_gives_up_after_retries(self):
+        import ccxt.async_support as ccxt
+
+        ingest = await self._ingest(ccxt.RateLimitExceeded("10006"))
+        with patch("src.data_ingest.market_data.asyncio.sleep", new=AsyncMock()), \
+             self.assertLogs("src.data_ingest.market_data", level="ERROR"):
+            df = await ingest.fetch_ohlcv("BTC/USDT", "1h", limit=3)
+        self.assertIsNone(df)
+        self.assertEqual(ingest.exchange.fetch_ohlcv.await_count, 4)
+
+    async def test_other_errors_not_retried(self):
+        import ccxt.async_support as ccxt
+
+        ingest = await self._ingest(ccxt.BadSymbol("no market"))
+        with patch("src.data_ingest.market_data.asyncio.sleep", new=AsyncMock()) as sleep, \
+             self.assertLogs("src.data_ingest.market_data", level="ERROR"):
+            df = await ingest.fetch_ohlcv("NOPE/USDT", "1h", limit=3)
+        self.assertIsNone(df)
+        self.assertEqual(ingest.exchange.fetch_ohlcv.await_count, 1)
+        sleep.assert_not_awaited()

@@ -1,6 +1,7 @@
 """Сбор рыночных данных с бирж через ccxt (REST + WebSocket планирование)."""
 import asyncio
 import logging
+import random
 
 import ccxt.async_support as ccxt
 import pandas as pd
@@ -9,6 +10,10 @@ from src.config import settings
 from src.utils.ccxt_helpers import ccxt_symbol
 
 logger = logging.getLogger(__name__)
+
+# Паузы между повторами при rate-limit биржи на загрузке свечей (секунды,
+# плюс случайные до +50%, чтобы повторы разных символов не совпадали).
+_RATE_LIMIT_RETRY_DELAYS = (1.0, 2.5, 5.0)
 
 
 class MarketDataIngest:
@@ -81,6 +86,29 @@ class MarketDataIngest:
             await self.futures_exchange.close()
             logger.info(f"[{self.exchange_id}] Фьючерсное соединение закрыто")
 
+    async def _fetch_ohlcv_with_retry(self, exchange, request_symbol, timeframe, limit, since):
+        """
+        Bybit отвечает "Too many visits" (10006 -> ccxt.RateLimitExceeded)
+        в моменты закрытия свечей, когда за ними одновременно идут все
+        клиенты биржи: из 131 такой ошибки на проде 84 пришлись на минуту
+        :00, остальные — на :15/:30/:45, при нашем темпе ~1 запрос в
+        несколько секунд. Раньше символ просто пропускал итерацию (цена и
+        проверка SL/TP по нему — устаревшие). Короткий повтор с нарастающей
+        паузой почти всегда проходит.
+        """
+        for attempt in range(len(_RATE_LIMIT_RETRY_DELAYS) + 1):
+            try:
+                return await exchange.fetch_ohlcv(request_symbol, timeframe=timeframe, limit=limit, since=since)
+            except (ccxt.RateLimitExceeded, ccxt.DDoSProtection):
+                if attempt == len(_RATE_LIMIT_RETRY_DELAYS):
+                    raise
+                delay = _RATE_LIMIT_RETRY_DELAYS[attempt] * (1 + random.random() * 0.5)
+                logger.debug(
+                    f"[{self.exchange_id}] rate-limit на свечах {request_symbol} {timeframe}, "
+                    f"повтор через {delay:.1f}с"
+                )
+                await asyncio.sleep(delay)
+
     async def fetch_ohlcv(
         self,
         symbol: str,
@@ -112,12 +140,7 @@ class MarketDataIngest:
         request_symbol = ccxt_symbol(exchange, symbol) if market_type == "futures" else symbol
 
         try:
-            ohlcv = await exchange.fetch_ohlcv(
-                request_symbol,
-                timeframe=timeframe,
-                limit=limit,
-                since=since,
-            )
+            ohlcv = await self._fetch_ohlcv_with_retry(exchange, request_symbol, timeframe, limit, since)
 
             if not ohlcv:
                 logger.warning(f"[{self.exchange_id}] Пустой ответ для {symbol} {timeframe}")
