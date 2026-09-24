@@ -1197,13 +1197,19 @@
         <input type="checkbox" id="channelExactExecutionInput">
         Точно как в сигнале
       </label>
+      <select id="channelLeverageModeInput" title="Фьючерсы: как согласовать SL канала с плечом">
+        <option value="cap_sl">SL: урезать под плечо</option>
+        <option value="fit_leverage">SL канала, плечо под него</option>
+      </select>
+      <input type="number" id="channelRiskInput" placeholder="Риск %" min="0" max="10" step="0.1"
+             title="% баланса, теряемый при срабатывании SL (размер позиции от риска). Пусто — фиксированный размер">
       <button type="submit" class="btn-primary" title="Добавить канал">+</button>
       <button type="button" id="btnRestartBot" class="btn-warn" title="Перезапустить бота">🔄</button>
     </form>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Канал</th><th>ID</th><th>Порог</th><th>Размер (%)</th><th>Рынок</th><th>Авто</th><th title="Исполнять сигнал ровно как прислан (без общих автоправок/капов/expectancy sizing); портфельные лимиты и kill switch по-прежнему действуют">Точно</th><th>Сигналов</th><th>Исполнено</th><th title="Сколько из исполненных сигналов канала сейчас реально открыто">Открытых</th><th>Win rate</th><th>PnL</th><th>Sizing</th><th>Активен</th><th></th></tr></thead>
-        <tbody id="telegramBody"><tr class="empty-row"><td colspan="15">Загрузка…</td></tr></tbody>
+        <thead><tr><th>Канал</th><th>ID</th><th>Порог</th><th>Размер (%)</th><th>Рынок</th><th>Авто</th><th title="Исполнять сигнал ровно как прислан (без общих автоправок/капов/expectancy sizing); портфельные лимиты и kill switch по-прежнему действуют">Точно</th><th title="Фьючерсы: как согласовать SL канала с плечом — урезать SL под плечо (по умолчанию) или сохранить SL канала и понизить плечо">SL / плечо</th><th title="Риск на сделку: при срабатывании SL теряется этот % баланса (объём = риск / расстояние до SL). Пусто — фиксированный размер из колонки «Размер»">Риск</th><th>Сигналов</th><th>Исполнено</th><th title="Сколько из исполненных сигналов канала сейчас реально открыто">Открытых</th><th>Win rate</th><th>PnL</th><th>Sizing</th><th>Активен</th><th></th></tr></thead>
+        <tbody id="telegramBody"><tr class="empty-row"><td colspan="17">Загрузка…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -3655,7 +3661,7 @@ async function renderTelegram() {
     const statsById = Object.fromEntries((statsData.channels || []).map(s => [s.channel_id, s]));
 
     if (!channels.length) {
-      body.innerHTML = `<tr class="empty-row"><td colspan="15">Каналы не настроены</td></tr>`;
+      body.innerHTML = `<tr class="empty-row"><td colspan="17">Каналы не настроены</td></tr>`;
       return;
     }
     body.innerHTML = channels.map(c => {
@@ -3699,6 +3705,17 @@ async function renderTelegram() {
              <span class="slider"></span>
            </label>`
         : (c.exact_execution ? "✅" : "—");
+      const levModeCell = editing
+        ? `<select class="channel-levmode-input" data-channel-id="${c.id}" title="Как согласовать SL канала с плечом на фьючерсах">
+             <option value="cap_sl" ${c.leverage_mode !== "fit_leverage" ? "selected" : ""}>Урезать SL</option>
+             <option value="fit_leverage" ${c.leverage_mode === "fit_leverage" ? "selected" : ""}>Плечо под SL</option>
+           </select>`
+        : (c.leverage_mode === "fit_leverage" ? "плечо под SL" : "урезать SL");
+      const riskCell = editing
+        ? `<input type="number" class="channel-risk-input" data-channel-id="${c.id}"
+                  value="${c.risk_per_trade_pct ?? ""}" step="0.1" min="0" max="10" placeholder="—" style="width:64px;"
+                  title="% баланса, теряемый при срабатывании SL. Пусто или 0 — фиксированный размер">`
+        : (c.risk_per_trade_pct ? `${fmt(c.risk_per_trade_pct, 2)}%` : "—");
       return `
       <tr class="channel-row" data-channel-id="${c.id}" title="Показать историю сигналов">
         <td><span class="expand-arrow">▸</span>${titleCell}</td>
@@ -3708,6 +3725,8 @@ async function renderTelegram() {
         <td>${marketCell}</td>
         <td>${autoexecCell}</td>
         <td>${exactCell}</td>
+        <td>${levModeCell}</td>
+        <td>${riskCell}</td>
         <td>${s.total_signals ?? c.signals_count}</td>
         <td>${s.executed ?? 0}</td>
         <td>${s.open_now ?? 0}</td>
@@ -3720,7 +3739,7 @@ async function renderTelegram() {
           <button class="btn-icon-danger" data-delete-channel="${c.id}" title="Удалить">✕</button>
         </td>
       </tr>
-      <tr class="channel-signals-row" data-channel-signals="${c.id}" style="display:none"><td colspan="15"></td></tr>
+      <tr class="channel-signals-row" data-channel-signals="${c.id}" style="display:none"><td colspan="17"></td></tr>
     `;
     }).join("");
 
@@ -3863,6 +3882,48 @@ async function renderTelegram() {
       });
     });
 
+    body.querySelectorAll(".channel-levmode-input").forEach(select => {
+      select.closest("td").classList.add("channel-editable");
+      select.addEventListener("click", (e) => e.stopPropagation());
+      select.addEventListener("change", async () => {
+        const id = select.dataset.channelId;
+        const value = select.value;
+        try {
+          await api(`/telegram/channels/${id}`, {
+            method: "PATCH", body: JSON.stringify({ leverage_mode: value }),
+          });
+          showToast(value === "fit_leverage"
+            ? "SL канала сохраняется, плечо подгоняется под него"
+            : "SL канала урезается под плечо (по умолчанию)");
+        } catch (err) {
+          select.value = value === "fit_leverage" ? "cap_sl" : "fit_leverage";
+          showToast(`Ошибка: ${err.message}`, true);
+        }
+      });
+    });
+
+    body.querySelectorAll(".channel-risk-input").forEach(input => {
+      input.closest("td").classList.add("channel-editable");
+      input.addEventListener("click", (e) => e.stopPropagation());
+      input.addEventListener("change", async () => {
+        const id = input.dataset.channelId;
+        const raw = input.value.trim();
+        const value = raw === "" ? 0 : parseFloat(raw);
+        if (isNaN(value) || value < 0 || value > 10) {
+          showToast("Риск на сделку — число от 0 до 10 (% баланса)", true);
+          return;
+        }
+        try {
+          await api(`/telegram/channels/${id}`, {
+            method: "PATCH", body: JSON.stringify({ risk_per_trade_pct: value }),
+          });
+          showToast(value > 0 ? `Размер от риска: ${value}% баланса на сделку` : "Размер от риска выключен");
+        } catch (err) {
+          showToast(`Ошибка: ${err.message}`, true);
+        }
+      });
+    });
+
     body.querySelectorAll(".channel-exact-input").forEach(input => {
       input.closest("td").classList.add("channel-editable");
       input.addEventListener("click", (e) => e.stopPropagation());
@@ -3881,7 +3942,7 @@ async function renderTelegram() {
       });
     });
   } catch (err) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="15">Ошибка загрузки: ${err.message}</td></tr>`;
+    body.innerHTML = `<tr class="empty-row"><td colspan="17">Ошибка загрузки: ${err.message}</td></tr>`;
   }
 }
 
@@ -4173,6 +4234,8 @@ document.getElementById("addChannelForm").addEventListener("submit", async (e) =
   const market = document.getElementById("channelMarketInput").value;
   const autoExecute = document.getElementById("channelAutoExecuteInput").checked;
   const exactExecution = document.getElementById("channelExactExecutionInput").checked;
+  const leverageMode = document.getElementById("channelLeverageModeInput").value;
+  const riskPct = parseFloat(document.getElementById("channelRiskInput").value);
 
   if (!channelId) return;
 
@@ -4187,6 +4250,8 @@ document.getElementById("addChannelForm").addEventListener("submit", async (e) =
         market: market,
         auto_execute: autoExecute,
         exact_execution: exactExecution,
+        leverage_mode: leverageMode,
+        risk_per_trade_pct: riskPct > 0 ? riskPct : null,
       }),
     });
     showToast(

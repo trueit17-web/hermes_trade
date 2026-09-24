@@ -22974,3 +22974,139 @@ class TestRecalculateFixesPnlWithoutFreshExchangeData(unittest.IsolatedAsyncioTe
             stored = (await session.execute(select(Trade).where(Trade.id == trade_id))).scalar_one()
         self.assertAlmostEqual(float(stored.pnl), expected, places=4)
         self.assertEqual(stored.outcome, "win")
+
+
+class TestTradingMathFitLeverageAndRiskSizing(unittest.TestCase):
+    def test_fit_leverage_keeps_sl_within_margin_limit(self):
+        from src.utils.trading_math import fit_leverage_to_stop
+        # SL 4% от входа, лимит 40% маржи -> плечо не выше 10x
+        self.assertEqual(fit_leverage_to_stop(100.0, 96.0, 40.0, 25.0), 10.0)
+        # Плечо канала и так ниже — не повышаем
+        self.assertEqual(fit_leverage_to_stop(100.0, 96.0, 40.0, 5.0), 5.0)
+        # Очень далёкий SL — не ниже 1x
+        self.assertEqual(fit_leverage_to_stop(100.0, 50.0, 40.0, 20.0), 1.0)
+        # Шорт — та же дистанция
+        self.assertEqual(fit_leverage_to_stop(100.0, 104.0, 40.0, 25.0), 10.0)
+
+    def test_risk_based_size(self):
+        from src.utils.trading_math import risk_based_size_pct
+        size, capped = risk_based_size_pct(100.0, 96.0, 0.5, 25.0)
+        self.assertAlmostEqual(size, 12.5)
+        self.assertFalse(capped)
+        size, capped = risk_based_size_pct(100.0, 99.9, 0.5, 25.0)
+        self.assertEqual(size, 25.0)
+        self.assertTrue(capped)
+
+
+class TestTelegramFitLeverageAndRiskSizing(unittest.IsolatedAsyncioTestCase):
+    """
+    Режим канала "fit_leverage": SL канала сохраняется, плечо понижается под
+    лимит % маржи (вместо урезания SL). risk_per_trade_pct: объём позиции =
+    риск / расстояние до SL. Анализ канала Vipka: урезанный SL превращал
+    будущие прибыльные сделки в убыточные (50 против 73 прибыльных из 128).
+    """
+
+    def setUp(self):
+        self._saved = {k: getattr(settings, k) for k in (
+            "trading_mode", "telegram_signals_max_sl_pct_of_margin", "telegram_signals_min_sl_pct_of_margin",
+            "telegram_signals_max_leverage", "futures_leverage", "telegram_risk_sizing_max_position_pct",
+        )}
+        settings.trading_mode = "real"
+        settings.telegram_signals_max_sl_pct_of_margin = 40.0
+        settings.telegram_signals_min_sl_pct_of_margin = 12.0
+        settings.telegram_signals_max_leverage = 15.0
+        settings.telegram_risk_sizing_max_position_pct = 25.0
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(settings, k, v)
+
+    async def _run(self, **extra):
+        import src.main as main_module
+        bot = main_module.TradingBot()
+        event = {
+            "parsed_pair": "BTC/USDT", "parsed_side": "long",
+            "parsed_entry": 50000.0, "parsed_sl": 48000.0, "parsed_tp": 55000.0,
+            "parsed_leverage": 25, "channel_market_type": "futures", "channel_id": "@fit_test",
+            "channel_position_size_pct": 5.0,
+        }
+        event.update(extra)
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal(event)
+        return mock_engine.create_order.await_args.kwargs
+
+    async def test_cap_mode_still_tightens_sl(self):
+        # Плечо 25 -> 15 (лимит), SL 4% > 40%/15 = 2.67% -> SL урезан.
+        kwargs = await self._run()
+        self.assertEqual(kwargs["leverage"], 15.0)
+        self.assertAlmostEqual(kwargs["stop_loss"], 50000 * (1 - 0.40 / 15))
+
+    async def test_fit_mode_keeps_channel_sl_and_lowers_leverage(self):
+        # SL канала 4% -> плечо не выше 40%/4% = 10x, SL не трогается.
+        kwargs = await self._run(channel_leverage_mode="fit_leverage")
+        self.assertEqual(kwargs["stop_loss"], 48000.0)
+        self.assertEqual(kwargs["leverage"], 10.0)
+        self.assertIn("SL не урезан", kwargs["notes"])
+
+    async def test_fit_mode_does_not_widen_tight_sl(self):
+        # SL 0.2% теснее минимума 12% маржи при 15x — в режиме fit не раздвигается.
+        kwargs = await self._run(channel_leverage_mode="fit_leverage", parsed_sl=49900.0)
+        self.assertEqual(kwargs["stop_loss"], 49900.0)
+        self.assertEqual(kwargs["leverage"], 15.0)
+
+    async def test_fit_mode_ignored_on_spot(self):
+        kwargs = await self._run(channel_leverage_mode="fit_leverage", channel_market_type="spot")
+        self.assertEqual(kwargs["stop_loss"], 48000.0)
+
+    async def test_risk_sizing_amount(self):
+        # 0.5% от 10000 = 50 USDT риска при SL 4% -> позиция 1250 USDT = 0.025 BTC.
+        kwargs = await self._run(channel_leverage_mode="fit_leverage", channel_risk_per_trade_pct=0.5)
+        self.assertAlmostEqual(kwargs["amount"], 1250.0 / 50000.0)
+        self.assertIn("размер от риска", kwargs["notes"])
+
+    async def test_risk_sizing_capped_for_tight_sl(self):
+        # SL 0.2% -> 0.5/0.002 = 250% баланса -> потолок 25% = 2500 USDT.
+        kwargs = await self._run(
+            channel_leverage_mode="fit_leverage", channel_risk_per_trade_pct=0.5, parsed_sl=49900.0,
+        )
+        self.assertAlmostEqual(kwargs["amount"], 2500.0 / 50000.0)
+        self.assertIn("потолок", kwargs["notes"])
+
+    async def test_without_risk_uses_fixed_size(self):
+        kwargs = await self._run(channel_leverage_mode="fit_leverage")
+        self.assertAlmostEqual(kwargs["amount"], 500.0 / 50000.0)
+
+    def test_estimated_size_for_notional_limit(self):
+        from src.main import TradingBot
+        self.assertAlmostEqual(TradingBot._estimated_signal_size_pct(50000.0, 48000.0, 5.0, 0.5), 12.5)
+        self.assertEqual(TradingBot._estimated_signal_size_pct(50000.0, 48000.0, 5.0, None), 5.0)
+        self.assertEqual(TradingBot._estimated_signal_size_pct(50000.0, None, 5.0, 0.5), 5.0)
+
+
+class TestTelegramChannelSizingApi(unittest.IsolatedAsyncioTestCase):
+    async def test_update_validates_mode_and_zero_risk_disables(self):
+        from fastapi import HTTPException
+
+        from src.db.models import TelegramChannel
+        from src.db.session import get_session
+        from src.web.api import TelegramChannelUpdate, list_telegram_channels, update_telegram_channel
+
+        async with get_session() as session:
+            ch = TelegramChannel(channel_id="@sizing_api_test", channel_title="Sizing", active=True)
+            session.add(ch)
+            await session.commit()
+            ch_id = ch.id
+
+        await update_telegram_channel(ch_id, TelegramChannelUpdate(leverage_mode="fit_leverage", risk_per_trade_pct=0.5))
+        row = next(c for c in (await list_telegram_channels())["channels"] if c["id"] == ch_id)
+        self.assertEqual(row["leverage_mode"], "fit_leverage")
+        self.assertEqual(row["risk_per_trade_pct"], 0.5)
+
+        await update_telegram_channel(ch_id, TelegramChannelUpdate(risk_per_trade_pct=0))
+        row = next(c for c in (await list_telegram_channels())["channels"] if c["id"] == ch_id)
+        self.assertIsNone(row["risk_per_trade_pct"])
+
+        with self.assertRaises(HTTPException):
+            await update_telegram_channel(ch_id, TelegramChannelUpdate(leverage_mode="yolo"))

@@ -54,7 +54,13 @@ from src.telegram.channel_monitor import (
 from src.telegram.notifier import edit_notification, send_notification
 from src.utils.logging import drain_pending_log_records, logger, setup_logging
 from src.utils.timeutils import utcnow
-from src.utils.trading_math import breakeven_stop_price, halfway_to_entry_stop_price
+from src.utils.trading_math import (
+    breakeven_stop_price,
+    fit_leverage_to_stop,
+    halfway_to_entry_stop_price,
+    risk_based_size_pct,
+    stop_distance_fraction,
+)
 from src.web.api import app as web_app
 from src.web.settings_store import load_settings_overrides
 from src.web.websocket import setup_websocket_broadcast
@@ -852,6 +858,31 @@ class TradingBot:
             5.0, settings.market_type, False,
         )
 
+    @staticmethod
+    def _estimated_signal_size_pct(entry, sl, position_size_pct: float, risk_per_trade_pct: float | None) -> float:
+        """Оценка размера позиции для проверки лимита суммарной нагрузки ДО исполнения."""
+        if risk_per_trade_pct and risk_per_trade_pct > 0 and entry and sl:
+            size, _ = risk_based_size_pct(entry, sl, risk_per_trade_pct, settings.telegram_risk_sizing_max_position_pct)
+            return size
+        return position_size_pct
+
+    async def _get_channel_sizing_settings(self, channel_id: str) -> tuple[str, float | None]:
+        """
+        Режим согласования SL с плечом (leverage_mode) и риск на сделку
+        (risk_per_trade_pct) канала — отдельно от _get_channel_settings,
+        читается так же "вживую" из БД на каждый сигнал.
+        """
+        db_id = self._telegram_channel_db_ids.get(channel_id)
+        if db_id is not None:
+            try:
+                async with get_session() as session:
+                    channel = await session.get(TelegramChannel, db_id)
+                    if channel is not None:
+                        return channel.leverage_mode or "cap_sl", channel.risk_per_trade_pct
+            except Exception as e:
+                logger.warning(f"Не удалось прочитать настройки размера канала {channel_id}: {e}")
+        return "cap_sl", None
+
     async def _ml_signal_loss_estimate(self, side, entry, sl, tp, signal_event: dict) -> dict | None:
         """Оценка signal_quality_classifier для сигнала (None — модели нет/без skill/нет SL)."""
         if not settings.ml_signal_quality_enabled or not entry or not sl:
@@ -933,6 +964,9 @@ class TradingBot:
         signal_event["channel_position_size_pct"] = position_size_pct
         signal_event["channel_market_type"] = market_type
         signal_event["channel_exact_execution"] = exact_execution
+        leverage_mode, risk_per_trade_pct = await self._get_channel_sizing_settings(channel_id)
+        signal_event["channel_leverage_mode"] = leverage_mode
+        signal_event["channel_risk_per_trade_pct"] = risk_per_trade_pct
 
         if entry is None:
             # Сигнал "по рынку" ("Диапазон входа: по рынку" — см.
@@ -1062,7 +1096,9 @@ class TradingBot:
                     f"🚫 Сигнал по {pair} отклонён: достигнут лимит открытых позиций "
                     f"({risk_manager.state.open_positions_count}/{risk_manager.state.max_open_positions})"
                 )
-            elif risk_manager.state.check_max_total_notional(position_size_pct):
+            elif risk_manager.state.check_max_total_notional(
+                self._estimated_signal_size_pct(entry, sl, position_size_pct, risk_per_trade_pct)
+            ):
                 # Тот же класс защиты, что и check_max_positions выше, но
                 # по СУММЕ размера позиций, а не по их числу — см. докстринг
                 # risk_max_total_notional_pct в config.py (реальный
@@ -1074,9 +1110,10 @@ class TradingBot:
                 # в _execute_telegram_signal), поэтому оценка консервативная
                 # сверху, если множитель канала < 1.
                 decision = "rejected"
+                estimated_size_pct = self._estimated_signal_size_pct(entry, sl, position_size_pct, risk_per_trade_pct)
                 signal_event["reject_reason"] = (
                     f"суммарная экспозиция портфеля превысит лимит "
-                    f"({risk_manager.state.total_notional_pct() + position_size_pct:.1f}% > "
+                    f"({risk_manager.state.total_notional_pct() + estimated_size_pct:.1f}% > "
                     f"{risk_manager.profile.max_total_notional_pct:.1f}%)"
                 )
                 logger.info(f"🚫 Сигнал по {pair} отклонён: {signal_event['reject_reason']}")
@@ -1364,6 +1401,7 @@ class TradingBot:
         # дневной лимит убытка) exact_execution НЕ отключает — это защита
         # всего счёта, а не автоправка конкретного сигнала.
         exact_execution = signal_event.get("channel_exact_execution", False)
+        risk_per_trade_pct = signal_event.get("channel_risk_per_trade_pct")
 
         symbol = pair
         order_side = "buy" if side == "long" else "sell"
@@ -1373,6 +1411,14 @@ class TradingBot:
         # отсутствии (ручное подтверждение старого сигнала без известного
         # канала, см. POST /telegram/signals/{id}/decide) — global fallback.
         market_type = signal_event.get("channel_market_type", settings.market_type)
+        # "fit_leverage": SL канала не трогаем (ни раздвигание слишком
+        # близкого, ни урезание слишком далёкого) — вместо этого ниже
+        # понижаем плечо, пока SL не уложится в лимит % маржи.
+        fit_leverage_mode = (
+            not exact_execution
+            and market_type == "futures"
+            and signal_event.get("channel_leverage_mode") == "fit_leverage"
+        )
 
         # Человекочитаемый журнал автоматических правок исходного сигнала
         # канала (дефолтный SL, капы SL/плеча ниже) — попадает в Order.notes
@@ -1441,6 +1487,7 @@ class TradingBot:
         # ниже (min ожидается <= max, см. докстринг настройки).
         if (
             not exact_execution
+            and not fit_leverage_mode
             and sl is not None
             and market_type == "futures"
             and settings.telegram_signals_min_sl_pct_of_margin > 0
@@ -1468,8 +1515,25 @@ class TradingBot:
         # то же, что реально применится к ордеру (см. leverage_to_set в
         # executor._execute_real_order): указанное каналом (уже урезанное
         # выше, если превышало лимит), иначе глобальный дефолт.
+        if fit_leverage_mode and sl is not None:
+            effective_leverage = leverage or settings.futures_leverage
+            max_sl_pct = settings.telegram_signals_max_sl_pct_of_margin or 50.0
+            fitted = fit_leverage_to_stop(entry, sl, max_sl_pct, effective_leverage)
+            if fitted < effective_leverage:
+                distance_pct = stop_distance_fraction(entry, sl) * 100
+                logger.info(
+                    f"⚖️ Сигнал по {pair}: SL канала {distance_pct:.2f}% сохранён, плечо "
+                    f"{effective_leverage:.0f}x → {fitted:.0f}x (SL ≤ {max_sl_pct:.0f}% маржи)"
+                )
+                signal_changes.append(
+                    f"плечо {effective_leverage:.0f}x → {fitted:.0f}x под SL канала {distance_pct:.2f}% "
+                    f"(SL ≤ {max_sl_pct:.0f}% маржи, SL не урезан)"
+                )
+                leverage = fitted
+
         if (
             not exact_execution
+            and not fit_leverage_mode
             and sl is not None
             and market_type == "futures"
             and settings.telegram_signals_max_sl_pct_of_margin > 0
@@ -1525,6 +1589,18 @@ class TradingBot:
                 signal_event["reject_reason"] = "канал в минусе по матожиданию (expectancy sizing отключил канал)"
                 return None
         base_size_pct = signal_event.get("channel_position_size_pct", 5.0)
+        if risk_per_trade_pct and risk_per_trade_pct > 0 and sl:
+            # Размер от риска: срабатывание SL стоит risk_per_trade_pct %
+            # баланса, какой бы далёкий SL ни дал канал (вместо одинакового
+            # объёма, при котором далёкий SL означал в разы больший убыток).
+            base_size_pct, capped = risk_based_size_pct(
+                entry, sl, risk_per_trade_pct, settings.telegram_risk_sizing_max_position_pct,
+            )
+            signal_changes.append(
+                f"размер от риска: {risk_per_trade_pct:g}% баланса при SL "
+                f"{stop_distance_fraction(entry, sl) * 100:.2f}% → позиция {base_size_pct:.2f}% баланса"
+                + (" (упёрлась в потолок объёма)" if capped else "")
+            )
         size_pct = base_size_pct * mult
         position_value = balance * (size_pct / 100)
         amount = position_value / entry

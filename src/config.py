@@ -277,6 +277,10 @@ class Settings(BaseSettings):
     # этим лимитом не капается — это отдельная, напрямую администрируемая
     # настройка. 0 — не ограничивать.
     telegram_signals_max_leverage: float = 25.0
+    # Потолок объёма позиции (% баланса) при размере от риска
+    # (TelegramChannel.risk_per_trade_pct): при очень близком SL формула
+    # "риск / расстояние до SL" дала бы позицию на весь баланс и больше.
+    telegram_risk_sizing_max_position_pct: float = 25.0
     # Максимальный возраст САМОГО СООБЩЕНИЯ канала в Telegram (секунды) на
     # момент проверки сигнала (см. signal_posted_at в channel_monitor.py —
     # реальная метка времени сообщения Telethon, а не время завершения

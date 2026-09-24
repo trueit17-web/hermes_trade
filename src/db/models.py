@@ -339,6 +339,16 @@ class TelegramChannel(Base):
     # доверия конкретному каналу — если он не укажет SL, позиция откроется
     # вообще без биржевой защиты.
     exact_execution: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # Как согласовывать SL канала с плечом на фьючерсах:
+    # "cap_sl" — урезать слишком далёкий SL под % маржи при плече (как было);
+    # "fit_leverage" — оставить SL канала и понизить плечо так, чтобы SL
+    # укладывался в тот же % маржи (USDT-риск при фиксированном объёме от
+    # плеча не зависит, а ликвидация гарантированно дальше SL).
+    leverage_mode: Mapped[str] = mapped_column(String(20), default="cap_sl", server_default="cap_sl")
+    # Если задан — размер позиции считается от риска: при срабатывании SL
+    # теряется risk_per_trade_pct % баланса (объём = риск / расстояние до
+    # SL), вместо фиксированного position_size_pct.
+    risk_per_trade_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(

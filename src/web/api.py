@@ -205,6 +205,9 @@ class StrategyUpdateRequest(BaseModel):
     params: dict = Field(default_factory=dict)
 
 
+_LEVERAGE_MODES = ("cap_sl", "fit_leverage")
+
+
 class TelegramChannelCreate(BaseModel):
     """Создание Telegram канала."""
     channel_id: str
@@ -216,6 +219,8 @@ class TelegramChannelCreate(BaseModel):
     position_size_pct: float = 5.0
     market: str = "spot"
     exact_execution: bool = False
+    leverage_mode: str = "cap_sl"
+    risk_per_trade_pct: float | None = None
 
 
 class TelegramChannelUpdate(BaseModel):
@@ -226,6 +231,9 @@ class TelegramChannelUpdate(BaseModel):
     position_size_pct: float | None = None
     market: str | None = None
     exact_execution: bool | None = None
+    leverage_mode: str | None = None
+    # 0 или отрицательное — выключить размер от риска (вернуться к position_size_pct).
+    risk_per_trade_pct: float | None = None
 
 
 class TelegramSignalDecision(BaseModel):
@@ -2061,6 +2069,8 @@ async def list_telegram_channels():
                     "position_size_pct": c.position_size_pct,
                     "market": c.market,
                     "exact_execution": c.exact_execution,
+                    "leverage_mode": c.leverage_mode or "cap_sl",
+                    "risk_per_trade_pct": c.risk_per_trade_pct,
                     "signals_count": signal_counts.get(c.id, 0),
                     "created_at": c.created_at.isoformat() + "Z" if c.created_at else None,
                 }
@@ -2081,6 +2091,8 @@ async def create_telegram_channel(channel: TelegramChannelCreate):
     """
     if channel.market not in ("spot", "futures"):
         raise HTTPException(status_code=400, detail="market должен быть spot или futures")
+    if channel.leverage_mode not in _LEVERAGE_MODES:
+        raise HTTPException(status_code=400, detail="leverage_mode должен быть cap_sl или fit_leverage")
 
     async with get_session() as session:
         existing = (
@@ -2101,6 +2113,8 @@ async def create_telegram_channel(channel: TelegramChannelCreate):
             position_size_pct=channel.position_size_pct,
             market=channel.market,
             exact_execution=channel.exact_execution,
+            leverage_mode=channel.leverage_mode,
+            risk_per_trade_pct=channel.risk_per_trade_pct if channel.risk_per_trade_pct and channel.risk_per_trade_pct > 0 else None,
             active=True,
         )
         session.add(new_channel)
@@ -2129,6 +2143,8 @@ async def create_telegram_channel(channel: TelegramChannelCreate):
             "parser_type": new_channel.parser_type,
             "auto_execute": new_channel.auto_execute,
             "exact_execution": new_channel.exact_execution,
+            "leverage_mode": new_channel.leverage_mode,
+            "risk_per_trade_pct": new_channel.risk_per_trade_pct,
         }}
 
 
@@ -2144,6 +2160,8 @@ async def update_telegram_channel(channel_id: int, update: TelegramChannelUpdate
     """
     if update.market is not None and update.market not in ("spot", "futures"):
         raise HTTPException(status_code=400, detail="market должен быть spot или futures")
+    if update.leverage_mode is not None and update.leverage_mode not in _LEVERAGE_MODES:
+        raise HTTPException(status_code=400, detail="leverage_mode должен быть cap_sl или fit_leverage")
 
     async with get_session() as session:
         channel = await session.get(TelegramChannel, channel_id)
@@ -2151,6 +2169,8 @@ async def update_telegram_channel(channel_id: int, update: TelegramChannelUpdate
             raise HTTPException(status_code=404, detail="Канал не найден")
 
         updates = update.model_dump(exclude_unset=True)
+        if "risk_per_trade_pct" in updates and (updates["risk_per_trade_pct"] or 0) <= 0:
+            updates["risk_per_trade_pct"] = None
         for key, value in updates.items():
             setattr(channel, key, value)
         await session.commit()
@@ -2636,6 +2656,8 @@ async def decide_telegram_signal(signal_id: int, decision: TelegramSignalDecisio
             "channel_position_size_pct": signal.channel.position_size_pct if signal.channel else 5.0,
             "channel_market_type": signal.channel.market if signal.channel else settings.market_type,
             "channel_exact_execution": signal.channel.exact_execution if signal.channel else False,
+            "channel_leverage_mode": signal.channel.leverage_mode if signal.channel else "cap_sl",
+            "channel_risk_per_trade_pct": signal.channel.risk_per_trade_pct if signal.channel else None,
         }
         pair = signal.parsed_pair
 
