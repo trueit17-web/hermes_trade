@@ -22727,3 +22727,67 @@ class TestChartCandlesTimeframe(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as ctx:
             await api_module.get_chart_candles(symbol="BTC/USDT", timeframe="7h")
         self.assertEqual(ctx.exception.status_code, 400)
+
+
+class TestRestoredPositionsRegisterSizeInRealMode(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент (прод): в real-режиме после рестарта все
+    восстановленные позиции регистрировались в risk_manager с долей 0% —
+    баланс для расчёта доли брался только в paper-режиме. Суммарная
+    нагрузка (total_notional_pct) занижалась, и лимит
+    max_total_notional_pct не учитывал уже открытые позиции.
+    """
+
+    async def test_size_pct_computed_from_real_balance(self):
+        import src.main as main_module
+        from src.execution.executor import execution_engine
+        from src.risk.risk_manager import risk_manager
+
+        saved_trading_mode = settings.trading_mode
+        saved_positions = dict(execution_engine.real_positions)
+        settings.trading_mode = "real"
+        execution_engine.real_positions.clear()
+        execution_engine.real_positions["RESTSIZE/USDT"] = {
+            "amount": 250.0, "entry_price": 2.0, "side": "long",
+            "stop_loss": 1.8, "take_profit": 2.4, "strategy_id": "manual", "market_type": "futures",
+        }
+        bot = main_module.TradingBot()
+        try:
+            with patch.object(execution_engine, "get_real_balance", AsyncMock(return_value=10000.0)):
+                await bot._sync_open_positions_from_execution_engine()
+            size = risk_manager.state.open_positions["RESTSIZE/USDT"]
+        finally:
+            settings.trading_mode = saved_trading_mode
+            execution_engine.real_positions.clear()
+            execution_engine.real_positions.update(saved_positions)
+            risk_manager.on_position_closed("RESTSIZE/USDT")
+
+        # notional 250 * 2.0 = 500 USDT от баланса 10000 = 5%
+        self.assertAlmostEqual(size, 5.0)
+
+    async def test_balance_unavailable_logs_warning_and_keeps_zero(self):
+        import src.main as main_module
+        from src.execution.executor import execution_engine
+        from src.risk.risk_manager import risk_manager
+
+        saved_trading_mode = settings.trading_mode
+        saved_positions = dict(execution_engine.real_positions)
+        settings.trading_mode = "real"
+        execution_engine.real_positions.clear()
+        execution_engine.real_positions["RESTSIZE2/USDT"] = {
+            "amount": 1.0, "entry_price": 1.0, "side": "long", "strategy_id": "manual", "market_type": "futures",
+        }
+        bot = main_module.TradingBot()
+        try:
+            with patch.object(execution_engine, "get_real_balance", AsyncMock(return_value=None)), \
+                 self.assertLogs("src.utils.logging", level="WARNING") as cm:
+                await bot._sync_open_positions_from_execution_engine()
+            size = risk_manager.state.open_positions["RESTSIZE2/USDT"]
+        finally:
+            settings.trading_mode = saved_trading_mode
+            execution_engine.real_positions.clear()
+            execution_engine.real_positions.update(saved_positions)
+            risk_manager.on_position_closed("RESTSIZE2/USDT")
+
+        self.assertEqual(size, 0.0)
+        self.assertTrue(any("Не удалось получить баланс биржи" in m for m in cm.output))

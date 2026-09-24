@@ -404,7 +404,22 @@ class TradingBot:
         # self.open_positions, SL/TP по ним не проверялись бы после
         # рестарта вообще.
         source = execution_engine.paper_positions if settings.is_paper else execution_engine.real_positions
-        balance = execution_engine.paper_balance if settings.is_paper else None
+        # Доля позиции в risk_manager (size_pct) — от того же баланса, что и
+        # при открытии (get_real_balance в real-режиме). Раньше в real-режиме
+        # здесь был None, и после КАЖДОГО рестарта все восстановленные
+        # позиции регистрировались с долей 0% — total_notional_pct
+        # занижался, и лимит max_total_notional_pct их не учитывал.
+        if settings.is_paper:
+            balance = execution_engine.paper_balance
+        elif source:
+            balance = await execution_engine.get_real_balance()
+            if not balance:
+                logger.warning(
+                    "⚠️ Не удалось получить баланс биржи при восстановлении позиций — "
+                    "их доля в лимите суммарной нагрузки учтена как 0%"
+                )
+        else:
+            balance = None
 
         order_ids = [
             pos["order_id"] for pos in source.values()
