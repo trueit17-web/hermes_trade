@@ -22791,3 +22791,123 @@ class TestRestoredPositionsRegisterSizeInRealMode(unittest.IsolatedAsyncioTestCa
 
         self.assertEqual(size, 0.0)
         self.assertTrue(any("Не удалось получить баланс биржи" in m for m in cm.output))
+
+
+class TestRecalculateClosedShortTrade(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент (прод, AVAX/USDT short, 2 ноги): "Пересчитать по
+    бирже" считал PnL только по формуле лонга — прибыльные TP1 (+32.94) и
+    безубыток (+0.19) превратились в -37.82 и -5.12.
+    """
+
+    async def test_short_legs_recomputed_with_short_formula(self):
+        from sqlalchemy import select
+
+        from src.db.models import Order, Trade
+        from src.db.session import get_session
+        from src.execution.executor import ExecutionEngine
+
+        engine = ExecutionEngine()
+        saved_mode = settings.trading_mode
+        settings.trading_mode = "real"
+        engine.is_paper = False
+        engine.exchange = AsyncMock()
+        try:
+            async with get_session() as session:
+                exchange_id, symbol_id = await engine._resolve_symbol_id(session, "RECSHORT/USDT")
+                opening = Order(
+                    exchange_id=exchange_id, symbol_id=symbol_id, side="sell", order_type="market",
+                    amount=442.3, price=10.137, status="filled", filled_amount=442.3, filled_price=10.137,
+                    fee=2.46597731, fee_currency="USDT", market_type="futures",
+                    client_order_id="recshort-open", order_id_exchange="recshort-open-ex",
+                )
+                tp1 = Order(
+                    exchange_id=exchange_id, symbol_id=symbol_id, side="buy", order_type="market",
+                    amount=221.1, price=9.977, status="filled", filled_amount=221.1, filled_price=9.977,
+                    fee=1.21325309, fee_currency="USDT", market_type="futures",
+                    client_order_id="recshort-tp1", order_id_exchange="recshort-tp1-ex",
+                )
+                be = Order(
+                    exchange_id=exchange_id, symbol_id=symbol_id, side="buy", order_type="market",
+                    amount=221.2, price=10.125, status="filled", filled_amount=221.2, filled_price=10.125,
+                    fee=1.2318075, fee_currency="USDT", market_type="futures",
+                    client_order_id="recshort-be", order_id_exchange="recshort-be-ex",
+                )
+                session.add_all([opening, tp1, be])
+                await session.flush()
+                leg1 = Trade(
+                    symbol_id=symbol_id, direction="short", entry_price=10.137, exit_price=9.977, amount=221.1,
+                    pnl=32.94, pnl_pct=1.47, outcome="win", is_open=False, closed_at=datetime.now(),
+                    order_open_id=opening.id, order_close_id=tp1.id,
+                )
+                leg2 = Trade(
+                    symbol_id=symbol_id, direction="short", entry_price=10.137, exit_price=10.125, amount=221.2,
+                    pnl=0.19, pnl_pct=0.01, outcome="win", is_open=False, closed_at=datetime.now(),
+                    order_open_id=opening.id, order_close_id=be.id,
+                )
+                session.add_all([leg1, leg2])
+                await session.commit()
+                trade_id, opening_id = leg2.id, opening.id
+
+            fills = {
+                "recshort-open-ex": (442.3, 10.137, 2.46597731),
+                "recshort-tp1-ex": (221.1, 9.977, 1.21325309),
+                "recshort-be-ex": (221.2, 10.125, 1.2318075),
+            }
+
+            async def fake_fill(order_ref, symbol, exchange=None, **kwargs):
+                amount, price, fee = fills[order_ref]
+                return {"average": price, "amount": amount, "fee": {"cost": fee, "currency": "USDT"}, "trade_ids": []}
+
+            with patch.object(engine, "_fetch_fill_details_via_trades", AsyncMock(side_effect=fake_fill)):
+                result = await engine.recalculate_closed_trade(trade_id)
+        finally:
+            settings.trading_mode = saved_mode
+
+        async with get_session() as session:
+            legs = (
+                await session.execute(select(Trade).where(Trade.order_open_id == opening_id).order_by(Trade.id))
+            ).scalars().all()
+        entry_fee_1 = 2.46597731 * 221.1 / 442.3
+        entry_fee_2 = 2.46597731 * 221.2 / 442.3
+        expected_1 = (10.137 - 9.977) * 221.1 - entry_fee_1 - 1.21325309
+        expected_2 = (10.137 - 10.125) * 221.2 - entry_fee_2 - 1.2318075
+        self.assertAlmostEqual(float(legs[0].pnl), expected_1, places=4)
+        self.assertAlmostEqual(float(legs[1].pnl), expected_2, places=4)
+        self.assertEqual(legs[0].outcome, "win")
+        self.assertTrue(result["updated"])
+        self.assertAlmostEqual(result["pnl"], expected_1 + expected_2, places=4)
+        self.assertEqual(result["outcome"], "win")
+
+
+class TestSyncStopLossKeepsMovedLevel(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент (прод, AVAX/USDT short): после TP1 SL перенесён в
+    безубыток (10.126), но real_positions[...]["stop_loss"] оставался
+    исходным (10.406) — сверка объёма через минуту переставила биржевой SL
+    обратно на исходный уровень.
+    """
+
+    async def test_moved_stop_loss_is_remembered(self):
+        from src.execution.executor import ExecutionEngine
+
+        engine = ExecutionEngine()
+        engine.real_positions["SLMOVE/USDT"] = {
+            "amount": 221.2, "entry_price": 10.137, "side": "short", "stop_loss": 10.406,
+            "sl_order_id": "sl-1", "market_type": "futures",
+        }
+        engine._exchange_for = MagicMock(return_value=AsyncMock())
+        engine._amend_stop_loss_order = AsyncMock(return_value="sl-1")
+        try:
+            await engine.sync_stop_loss_order("SLMOVE/USDT", 221.2, 10.1258)
+            self.assertEqual(engine.real_positions["SLMOVE/USDT"]["stop_loss"], 10.1258)
+
+            # Повторная синхронизация по сохранённому уровню (как делает сверка
+            # объёма) больше не откатывает SL на исходный.
+            pos = engine.real_positions["SLMOVE/USDT"]
+            await engine.sync_stop_loss_order("SLMOVE/USDT", 221.2, pos.get("stop_loss"))
+            last_call = engine._amend_stop_loss_order.await_args_list[-1]
+            self.assertEqual(last_call.args[4], 10.1258)
+        finally:
+            engine.real_positions.pop("SLMOVE/USDT", None)
+            await engine.close()

@@ -2250,6 +2250,14 @@ class ExecutionEngine:
         pos = self.real_positions.get(symbol)
         if pos is None:
             return
+        # Запоминаем актуальный уровень SL в учёте движка. Раньше перенос SL
+        # (безубыток/трейлинг после TP) менялся только в main.py, а здесь
+        # оставался исходный — и любая следующая пересинхронизация по
+        # pos["stop_loss"] (сверка объёма и т.п.) возвращала на биржу
+        # старый SL. Реальный инцидент (прод, AVAX/USDT short): через
+        # минуту после TP1 безубыточный SL 10.126 откатился на 10.406.
+        if stop_loss_price:
+            pos["stop_loss"] = stop_loss_price
         exchange = self._exchange_for(pos)
         old_sl_order_id = pos.get("sl_order_id")
 
@@ -3232,7 +3240,15 @@ class ExecutionEngine:
                 leg.amount = amount
                 leg.entry_price = entry_price
                 leg.exit_price = exit_price
-                pnl = (exit_price - entry_price) * amount - entry_fee_quote - exit_fee
+                # Для шорта прибыль — это падение цены. Раньше здесь была
+                # только формула лонга: реальный инцидент (прод, AVAX/USDT
+                # short) — кнопка "Пересчитать по бирже" перезаписала
+                # прибыльные TP1 (+32.94) и безубыток (+0.19) в -37.82 и
+                # -5.12, сделка стала "убыточной".
+                direction = (leg.direction or "").lower()
+                is_short = direction == "short" or (not direction and opening_order.side == "sell")
+                price_move = (entry_price - exit_price) if is_short else (exit_price - entry_price)
+                pnl = price_move * amount - entry_fee_quote - exit_fee
                 leg.pnl = pnl
                 leg.pnl_pct = (pnl / (entry_price * amount) * 100) if entry_price and amount else 0.0
                 leg.outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "break-even")
