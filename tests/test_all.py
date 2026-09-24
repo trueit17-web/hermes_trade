@@ -22911,3 +22911,66 @@ class TestSyncStopLossKeepsMovedLevel(unittest.IsolatedAsyncioTestCase):
         finally:
             engine.real_positions.pop("SLMOVE/USDT", None)
             await engine.close()
+
+
+class TestRecalculateFixesPnlWithoutFreshExchangeData(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент (прод, AVAX/USDT #556): после фикса формулы шорта
+    повторное "Пересчитать по бирже" ничего не меняло — биржа уже не
+    отдавала историю старых ордеров, и функция уходила в ранний выход
+    "нет новых данных", не пересчитав испорченный PnL по данным из БД.
+    """
+
+    async def test_corrupted_short_pnl_fixed_from_stored_orders(self):
+        from sqlalchemy import select
+
+        from src.db.models import Order, Trade
+        from src.db.session import get_session
+        from src.execution.executor import ExecutionEngine
+
+        engine = ExecutionEngine()
+        saved_mode = settings.trading_mode
+        settings.trading_mode = "real"
+        engine.is_paper = False
+        engine.exchange = AsyncMock()
+        try:
+            async with get_session() as session:
+                exchange_id, symbol_id = await engine._resolve_symbol_id(session, "RECNODATA/USDT")
+                opening = Order(
+                    exchange_id=exchange_id, symbol_id=symbol_id, side="sell", order_type="market",
+                    amount=442.3, price=10.137, status="filled", filled_amount=442.3, filled_price=10.137,
+                    fee=2.46597731, fee_currency="USDT", market_type="futures",
+                    client_order_id="recnodata-open", order_id_exchange="recnodata-open-ex",
+                )
+                tp1 = Order(
+                    exchange_id=exchange_id, symbol_id=symbol_id, side="buy", order_type="market",
+                    amount=221.1, price=9.977, status="filled", filled_amount=221.1, filled_price=9.977,
+                    fee=1.21325309, fee_currency="USDT", market_type="futures",
+                    client_order_id="recnodata-tp1", order_id_exchange="recnodata-tp1-ex",
+                )
+                session.add_all([opening, tp1])
+                await session.flush()
+                leg = Trade(
+                    symbol_id=symbol_id, direction="short", entry_price=10.137, exit_price=9.977, amount=221.1,
+                    pnl=-37.82196297749947, pnl_pct=-1.69, outcome="loss", is_open=False, closed_at=datetime.now(),
+                    order_open_id=opening.id, order_close_id=tp1.id,
+                )
+                session.add(leg)
+                await session.commit()
+                trade_id = leg.id
+
+            with patch.object(engine, "_fetch_fill_details_via_trades", AsyncMock(return_value=None)):
+                result = await engine.recalculate_closed_trade(trade_id)
+                again = await engine.recalculate_closed_trade(trade_id)
+        finally:
+            settings.trading_mode = saved_mode
+
+        expected = (10.137 - 9.977) * 221.1 - 2.46597731 * 221.1 / 442.3 - 1.21325309
+        self.assertTrue(result["updated"])
+        self.assertAlmostEqual(result["pnl"], expected, places=4)
+        self.assertEqual(result["outcome"], "win")
+        self.assertEqual(again, {"updated": False})
+        async with get_session() as session:
+            stored = (await session.execute(select(Trade).where(Trade.id == trade_id))).scalar_one()
+        self.assertAlmostEqual(float(stored.pnl), expected, places=4)
+        self.assertEqual(stored.outcome, "win")

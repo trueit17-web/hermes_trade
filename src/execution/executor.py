@@ -3206,10 +3206,13 @@ class ExecutionEngine:
                     order.order_id_exchange = ",".join(fill["trade_ids"])
                 refreshed = True
 
-            if not refreshed:
-                return {"updated": False}
-
+            # Даже если биржа ничего нового не отдала (ордера старше окна её
+            # истории), PnL всё равно пересчитывается по уже сохранённым в
+            # БД данным ордеров — иначе испорченный ранее PnL (см. инцидент
+            # с формулой шорта ниже) было бы невозможно исправить повторным
+            # пересчётом: функция уходила в ранний выход "нет новых данных".
             base_currency = symbol.split("/")[0]
+            pnl_changed = False
             total_amount = 0.0
             total_pnl = 0.0
             for leg in legs:
@@ -3249,12 +3252,17 @@ class ExecutionEngine:
                 is_short = direction == "short" or (not direction and opening_order.side == "sell")
                 price_move = (entry_price - exit_price) if is_short else (exit_price - entry_price)
                 pnl = price_move * amount - entry_fee_quote - exit_fee
+                if leg.pnl is None or abs(float(leg.pnl) - pnl) > 1e-6:
+                    pnl_changed = True
                 leg.pnl = pnl
                 leg.pnl_pct = (pnl / (entry_price * amount) * 100) if entry_price and amount else 0.0
                 leg.outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "break-even")
                 total_amount += amount
                 total_pnl += pnl
 
+            if not refreshed and not pnl_changed:
+                await session.rollback()
+                return {"updated": False}
             await session.commit()
 
         total_pnl_pct = (total_pnl / (float(opening_order.filled_price) * total_amount) * 100) if total_amount else 0.0
