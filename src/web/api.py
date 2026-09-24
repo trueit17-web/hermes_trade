@@ -986,12 +986,16 @@ async def get_position_detail(symbol: str):
     }
 
 
+_CHART_TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
+
+
 @app.get("/chart/candles")
 async def get_chart_candles(
     symbol: str, market_type: str = "spot", limit: int = 200, since_ms: int | None = None,
+    timeframe: str = "1h",
 ):
     """
-    OHLCV-свечи (1h) для графика цены в развороте подробностей позиции/
+    OHLCV-свечи (timeframe, по умолчанию 1h) для графика цены в развороте подробностей позиции/
     сделки на дашборде (см. renderPositionDetail/renderTradeDetail →
     initTradeChart). Данные нигде не персистятся (таблица candles в БД
     заведена, но ничего в неё не пишет — см. db/models.py), поэтому каждый
@@ -1003,11 +1007,13 @@ async def get_chart_candles(
     (since_ms не передаётся), для закрытой сделки — от времени открытия
     минус запас, чтобы захватить контекст ДО входа.
     """
+    if timeframe not in _CHART_TIMEFRAMES:
+        raise HTTPException(status_code=400, detail=f"timeframe должен быть одним из {', '.join(_CHART_TIMEFRAMES)}")
     bot = bot_registry.current_bot
     if bot is None or bot.ingest is None:
         raise HTTPException(status_code=503, detail="Бот ещё не инициализирован")
     limit = max(1, min(limit, 500))
-    df = await bot.ingest.fetch_ohlcv(symbol, "1h", limit=limit, since=since_ms, market_type=market_type)
+    df = await bot.ingest.fetch_ohlcv(symbol, timeframe, limit=limit, since=since_ms, market_type=market_type)
     if df is None or df.empty:
         return {"candles": []}
     return {

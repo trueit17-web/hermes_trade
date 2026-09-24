@@ -22693,3 +22693,37 @@ class TestParenthesizedLeverage(unittest.TestCase):
         self.assertEqual(result["pair"], "POL/USDT")
         self.assertEqual(result["side"], "long")
         self.assertEqual(result["leverage"], 2.0)
+
+
+class TestChartCandlesTimeframe(unittest.IsolatedAsyncioTestCase):
+    """Переключатель таймфрейма графика в развороте позиции/сделки."""
+
+    def setUp(self):
+        import src.bot_registry as bot_registry
+        self.bot_registry = bot_registry
+        self._saved = bot_registry.current_bot
+
+    def tearDown(self):
+        self.bot_registry.current_bot = self._saved
+
+    async def test_timeframe_passed_to_ingest(self):
+        import src.web.api as api_module
+        from src.main import TradingBot
+
+        bot = TradingBot()
+        bot.ingest = AsyncMock()
+        bot.ingest.fetch_ohlcv = AsyncMock(return_value=None)
+        self.bot_registry.current_bot = bot
+        await api_module.get_chart_candles(symbol="BTC/USDT", timeframe="15m", limit=50)
+        bot.ingest.fetch_ohlcv.assert_awaited_once_with(
+            "BTC/USDT", "15m", limit=50, since=None, market_type="spot",
+        )
+
+    async def test_unknown_timeframe_rejected(self):
+        from fastapi import HTTPException
+
+        import src.web.api as api_module
+
+        with self.assertRaises(HTTPException) as ctx:
+            await api_module.get_chart_candles(symbol="BTC/USDT", timeframe="7h")
+        self.assertEqual(ctx.exception.status_code, 400)

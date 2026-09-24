@@ -402,7 +402,7 @@
     width: 14px;
     color: var(--text-dim);
   }
-  .channel-signals-row td { background: rgba(0,0,0,.15); padding: 0; }
+  .channel-signals-row td { background: var(--panel-2); padding: 0; }
   .nested-table { width: auto; border-collapse: collapse; }
   .nested-table th, .nested-table td { padding: 6px 0.5ch; font-size: 12px; white-space: nowrap; max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
   .nested-table th:first-child, .nested-table td:first-child { padding-left: 14px; }
@@ -425,7 +425,7 @@
      будто наложенной на середину свечей вместо правого края.
   */
   .trade-detail-row td {
-    background: rgba(0,0,0,.15);
+    background: var(--panel-2);
     padding: 14px 16px;
     max-width: none;
     overflow: visible;
@@ -860,6 +860,39 @@
     padding: 0; max-width: none; overflow: visible; white-space: normal; text-overflow: clip;
   }
 
+  /* === График сделки/позиции (в стиле терминала биржи) === */
+  .chart-toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+  .chart-toolbar .spacer { flex: 1; }
+  .chart-seg { display: flex; gap: 2px; background: var(--panel-2); border: 1px solid var(--panel-border); border-radius: 8px; padding: 2px; }
+  .chart-seg button {
+    padding: 3px 9px; font-size: 12px; font-weight: 500; border: none; background: transparent;
+    color: var(--text-dim); border-radius: 6px;
+  }
+  .chart-seg button:hover { color: var(--text); filter: none; }
+  .chart-seg button.active { background: var(--accent-soft); color: var(--accent); }
+  .chart-icon-btn { padding: 3px 9px; font-size: 13px; }
+  .chart-legend {
+    position: absolute; top: 6px; left: 8px; z-index: 3; pointer-events: none;
+    font-family: var(--font-mono); font-size: 11.5px; line-height: 1.5;
+    padding: 3px 7px; border-radius: 6px;
+    background: color-mix(in srgb, var(--panel) 75%, transparent);
+  }
+  .chart-legend .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .chart-legend .k { color: var(--text-dim); margin-right: 3px; }
+  .chart-legend .title { font-family: var(--font-sans); font-weight: 600; color: var(--text); }
+  .chart-pos-strip {
+    display: flex; gap: 6px 18px; flex-wrap: wrap; align-items: baseline;
+    font-size: 12.5px; padding: 7px 10px; margin-bottom: 8px;
+    border-radius: 8px; background: var(--panel-2); border: 1px solid var(--panel-border);
+  }
+  .chart-pos-strip .k { color: var(--text-dim); margin-right: 4px; }
+  .chart-pos-strip b { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .chart-block.chart-fullscreen {
+    position: fixed; inset: 0; z-index: 450; margin: 0; padding: 16px 20px;
+    background: var(--bg); display: flex; flex-direction: column;
+  }
+  .chart-block.chart-fullscreen .trade-chart-container { flex: 1; height: auto; }
+
   /* === Палитра команд (Ctrl/⌘+K) === */
   .cmdk-backdrop {
     position: fixed; inset: 0; z-index: 400; display: none;
@@ -971,7 +1004,7 @@
      340px (а не 260px, как было изначально) — заметно удобнее целиться
      мышью при масштабировании/панорамировании узкого 1h-графика. */
   .trade-chart-container {
-    height: 340px;
+    height: 420px;
     border-radius: 6px;
     overflow: hidden;
     margin-bottom: 8px;
@@ -1003,7 +1036,9 @@
     gap: 16px;
     align-items: flex-start;
   }
-  .chart-source-col { flex: 1 1 0; min-width: 0; }
+  .chart-source-col { flex: 2 1 0; min-width: 0; }
+  /* График шире колонки с источником сигнала — ему нужна ширина. */
+  .chart-source-col:last-child { flex: 3 1 0; }
   @media (max-width: 700px) {
     .chart-source-row { flex-direction: column; }
   }
@@ -1925,14 +1960,31 @@ function chartContainerId(prefix, key) {
   return `${prefix}-${String(key).replace(/[^a-zA-Z0-9]/g, "_")}`;
 }
 
+const CHART_TIMEFRAMES = [
+  ["1m", "1м", 60], ["5m", "5м", 300], ["15m", "15м", 900],
+  ["1h", "1ч", 3600], ["4h", "4ч", 14400], ["1d", "1Д", 86400],
+];
+const CHART_UP = "#20b26c";
+const CHART_DOWN = "#ef454a";
+const CHART_MAS = [[7, "#f7a600"], [25, "#e84393"], [99, "#8e7cff"]];
+
 function chartBlockHtml(prefix, key) {
   const id = chartContainerId(prefix, key);
   return `
-    <div class="trade-detail-block">
-      <div class="trade-detail-header">
-        <h4>График цены</h4>
-        <button type="button" class="btn-ghost chart-reset-btn">⤢ Сбросить масштаб</button>
+    <div class="trade-detail-block chart-block" data-chart-id="${id}">
+      <div class="chart-toolbar">
+        <div class="chart-seg chart-tf">
+          ${CHART_TIMEFRAMES.map(([tf, label]) => `<button type="button" data-tf="${tf}">${label}</button>`).join("")}
+        </div>
+        <div class="chart-seg chart-ind">
+          <button type="button" data-ind="ma" title="Скользящие средние MA7 / MA25 / MA99">MA</button>
+          <button type="button" data-ind="vol" title="Объём торгов">Объём</button>
+        </div>
+        <span class="spacer"></span>
+        <button type="button" class="btn-ghost chart-icon-btn chart-reset-btn" title="Показать сделку целиком">⤢</button>
+        <button type="button" class="btn-ghost chart-icon-btn chart-fs-btn" title="Во весь экран (Esc — выйти)">⛶</button>
       </div>
+      <div class="chart-pos-strip" id="${id}-pos" style="display:none"></div>
       <div class="ml-forecast-badge" id="${id}-ml" style="display:none"></div>
       <div class="trade-chart-container" id="${id}">
         <div class="muted" style="padding:10px 16px">Загрузка графика…</div>
@@ -1941,24 +1993,245 @@ function chartBlockHtml(prefix, key) {
   `;
 }
 
-// Живые chart-объекты и текущий видимый диапазон (from/to), по containerId
-// — оба нужны, чтобы фоновое обновление дашборда (renderPositions()/
-// renderTrades() перестраивают ВСЮ таблицу целиком раз в REFRESH_MS,
-// уничтожая старый canvas) не сбрасывало масштаб/панораму, которые
-// пользователь только что настроил руками. Раньше initTradeChart каждый
-// раз безусловно звал fitContent() — с точки зрения пользователя график
-// "прыгал" обратно к исходному виду каждые несколько секунд, что и делало
-// им невозможно пользоваться (реальная жалоба).
+// Живые chart-объекты и видимый диапазон (по containerId+таймфрейму) —
+// фоновое обновление дашборда (renderPositions()/renderTrades() раз в
+// REFRESH_MS) не должно сбрасывать масштаб/панораму, которые пользователь
+// настроил руками: раньше график "прыгал" к исходному виду каждые
+// несколько секунд, пользоваться им было невозможно (реальная жалоба).
 const chartInstances = new Map();
 const chartVisibleRanges = new Map();
+// Выбор пользователя по каждому графику: таймфрейм, MA, объём, живой таймер.
+const chartStates = new Map();
 
-// Рисует candlestick-график (lightweight-charts, см. <script> в <head>) по
-// свечам с биржи (GET /chart/candles — свечи нигде не хранятся в БД,
-// запрашиваются заново каждый раз) с линиями входа/SL/TP и маркерами
-// точек входа/выхода. opts.exits — точки ЗАКРЫТИЯ (частичные TP или
-// финальное закрытие), КАЖДАЯ явно помечена и выделена цветом по PnL —
-// то, что просил пользователь для истории сделок, а не только графика цены
-// как такового.
+function chartTfSeconds(tf) {
+  const row = CHART_TIMEFRAMES.find(([t]) => t === tf);
+  return row ? row[2] : 3600;
+}
+
+// Самый мелкий таймфрейм, при котором вся сделка укладывается примерно в
+// 300 свечей — короткая сделка видна детально, многодневная не обрезается.
+function autoChartTimeframe(openedMs, endMs) {
+  const spanSec = Math.max(60, (endMs - openedMs) / 1000);
+  const fit = CHART_TIMEFRAMES.find(([, , sec]) => spanSec / sec <= 300);
+  return fit ? fit[0] : "1d";
+}
+
+function chartPricePrecision(candles) {
+  const v = Math.max(...candles.slice(-50).map(c => Math.abs(c.close)));
+  if (v >= 1000) return 2;
+  if (v >= 100) return 3;
+  if (v >= 1) return 4;
+  if (v >= 0.1) return 5;
+  if (v >= 0.01) return 6;
+  return 8;
+}
+
+function chartSma(candles, period) {
+  const out = [];
+  let sum = 0;
+  for (let i = 0; i < candles.length; i++) {
+    sum += candles[i].close;
+    if (i >= period) sum -= candles[i - period].close;
+    if (i >= period - 1) out.push({ time: candles[i].time, value: sum / period });
+  }
+  return out;
+}
+
+function fmtCompact(n) {
+  if (n === null || n === undefined || !Number.isFinite(n)) return "—";
+  return Number(n).toLocaleString("ru-RU", { notation: "compact", maximumFractionDigits: 2 });
+}
+
+function isShortSide(side) {
+  return side === "short" || side === "sell";
+}
+
+function stopChartLive(state) {
+  if (state && state.liveTimer) {
+    clearInterval(state.liveTimer);
+    state.liveTimer = null;
+  }
+}
+
+function wireChartToolbar(containerId) {
+  const block = document.querySelector(`.chart-block[data-chart-id="${containerId}"]`);
+  if (!block || block.dataset.wired) return;
+  block.dataset.wired = "1";
+  const state = () => chartStates.get(containerId);
+  block.querySelector(".chart-tf").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-tf]");
+    if (!btn || !state() || state().tf === btn.dataset.tf) return;
+    state().tf = btn.dataset.tf;
+    initTradeChart(containerId, state().opts);
+  });
+  block.querySelector(".chart-ind").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-ind]");
+    if (!btn || !state()) return;
+    if (btn.dataset.ind === "ma") state().showMA = !state().showMA;
+    if (btn.dataset.ind === "vol") state().showVol = !state().showVol;
+    applyChartIndicators(containerId);
+    syncChartToolbar(containerId);
+  });
+  block.querySelector(".chart-reset-btn").addEventListener("click", () => {
+    const st = state();
+    if (!st) return;
+    chartVisibleRanges.delete(`${containerId}:${st.tf}`);
+    applyDefaultChartRange(containerId);
+  });
+  block.querySelector(".chart-fs-btn").addEventListener("click", () => {
+    block.classList.toggle("chart-fullscreen");
+    restoreChartRangeAfterResize(containerId);
+  });
+}
+
+function syncChartToolbar(containerId) {
+  const block = document.querySelector(`.chart-block[data-chart-id="${containerId}"]`);
+  const st = chartStates.get(containerId);
+  if (!block || !st) return;
+  block.querySelectorAll(".chart-tf button").forEach(b => b.classList.toggle("active", b.dataset.tf === st.tf));
+  block.querySelector('.chart-ind button[data-ind="ma"]').classList.toggle("active", st.showMA);
+  block.querySelector('.chart-ind button[data-ind="vol"]').classList.toggle("active", st.showVol);
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  document.querySelectorAll(".chart-block.chart-fullscreen").forEach(b => {
+    b.classList.remove("chart-fullscreen");
+    restoreChartRangeAfterResize(b.dataset.chartId);
+  });
+});
+
+// После смены размера (полный экран и обратно) библиотека сохраняет ширину
+// свечи, и слева появляется пустое поле — возвращаем прежний диапазон.
+function restoreChartRangeAfterResize(containerId) {
+  const st = chartStates.get(containerId);
+  const chart = chartInstances.get(containerId);
+  if (!st || !chart) return;
+  const saved = chartVisibleRanges.get(`${containerId}:${st.tf}`);
+  setTimeout(() => {
+    try {
+      if (saved) chart.timeScale().setVisibleRange(saved);
+      else applyDefaultChartRange(containerId);
+    } catch (e) { applyDefaultChartRange(containerId); }
+  }, 60);
+}
+
+function applyChartIndicators(containerId) {
+  const st = chartStates.get(containerId);
+  const chart = chartInstances.get(containerId);
+  if (!st || !chart || !st.series) return;
+  st.series.mas.forEach(m => m.applyOptions({ visible: st.showMA }));
+  st.series.volume.applyOptions({ visible: st.showVol });
+  // Сверху — место под OHLC-легенду, чтобы она не перекрывала свечи.
+  chart.priceScale("right").applyOptions({ scaleMargins: { top: 0.16, bottom: st.showVol ? 0.22 : 0.06 } });
+}
+
+// По умолчанию — сама сделка с небольшим контекстом до входа (и после
+// выхода у закрытой); у открытой позиции правый край — текущая свеча.
+function applyDefaultChartRange(containerId) {
+  const st = chartStates.get(containerId);
+  const chart = chartInstances.get(containerId);
+  if (!st || !chart || !st.candles || !st.candles.length) return;
+  const candles = st.candles;
+  const tfSec = chartTfSeconds(st.tf);
+  const first = candles[0].time;
+  const last = candles[candles.length - 1].time;
+  let from = Math.max(first, last - 120 * tfSec);
+  let to = last;
+  if (st.openSec) from = Math.max(first, Math.min(from, st.openSec - 15 * tfSec));
+  if (st.closeSec) to = Math.min(last, st.closeSec + 15 * tfSec);
+  try { chart.timeScale().setVisibleRange({ from, to }); } catch (e) { chart.timeScale().fitContent(); }
+}
+
+function chartLegendHtml(st, bar, maValues) {
+  if (!bar) return "";
+  const p = st.precision;
+  const change = bar.open ? (bar.close - bar.open) / bar.open * 100 : 0;
+  const cls = bar.close >= bar.open ? "pnl-pos" : "pnl-neg";
+  const tfLabel = (CHART_TIMEFRAMES.find(([t]) => t === st.tf) || [])[1] || st.tf;
+  const num = v => Number(v).toFixed(p);
+  let html = `<div class="row"><span class="title">${escapeHtml(st.opts.symbol)} · ${tfLabel}</span>
+    <span><span class="k">O</span><span class="${cls}">${num(bar.open)}</span></span>
+    <span><span class="k">H</span><span class="${cls}">${num(bar.high)}</span></span>
+    <span><span class="k">L</span><span class="${cls}">${num(bar.low)}</span></span>
+    <span><span class="k">C</span><span class="${cls}">${num(bar.close)}</span></span>
+    <span class="${cls}">${change >= 0 ? "+" : ""}${change.toFixed(2)}%</span>
+    ${st.showVol && bar.volume !== undefined ? `<span><span class="k">Vol</span>${fmtCompact(bar.volume)}</span>` : ""}</div>`;
+  if (st.showMA && maValues.some(v => v !== null)) {
+    html += `<div class="row">${CHART_MAS.map(([period, color], i) =>
+      maValues[i] === null ? "" : `<span style="color:${color}">MA${period} ${num(maValues[i])}</span>`).join("")}</div>`;
+  }
+  return html;
+}
+
+function updateChartLegend(containerId, time) {
+  const st = chartStates.get(containerId);
+  if (!st || !st.legendEl || !st.candles.length) return;
+  const idx = time === undefined ? st.candles.length - 1 : st.candles.findIndex(c => c.time === time);
+  const bar = st.candles[idx < 0 ? st.candles.length - 1 : idx];
+  const maValues = st.maData.map(data => {
+    const point = data.find(x => x.time === bar.time);
+    return point ? point.value : null;
+  });
+  st.legendEl.innerHTML = chartLegendHtml(st, bar, maValues);
+}
+
+// Полоса над графиком: сторона/плечо, вход, текущая цена или выход, PnL.
+function updateChartPositionStrip(containerId) {
+  const st = chartStates.get(containerId);
+  const el = document.getElementById(`${containerId}-pos`);
+  if (!st || !el || !st.opts.entryPrice) return;
+  const o = st.opts;
+  const short = isShortSide(o.side);
+  const sideHtml = `<span class="chip ${short ? "chip-bad" : "chip-ok"}">${short ? "SHORT" : "LONG"}${o.leverage && o.leverage > 1 ? ` ${fmt(o.leverage, 1)}x` : ""}</span>`;
+  const parts = [sideHtml, `<span><span class="k">Вход</span><b>${fmtPrice(o.entryPrice)}</b></span>`];
+  if (!o.closedAt) {
+    const last = st.candles.length ? st.candles[st.candles.length - 1].close : o.currentPrice;
+    if (last) {
+      const movePct = (last / o.entryPrice - 1) * 100 * (short ? -1 : 1);
+      const roe = movePct * (o.leverage || 1);
+      const pnlUsd = o.amount ? (last - o.entryPrice) * o.amount * (short ? -1 : 1) : null;
+      const cls = movePct >= 0 ? "pnl-pos" : "pnl-neg";
+      const sign = movePct >= 0 ? "+" : "";
+      parts.push(`<span><span class="k">Цена</span><b>${fmtPrice(Number(last.toFixed(st.precision)))}</b></span>`);
+      parts.push(`<span><span class="k">Движение</span><b class="${cls}">${sign}${fmt(movePct, 2)}%</b></span>`);
+      if (o.leverage && o.leverage > 1) parts.push(`<span><span class="k">ROE</span><b class="${cls}">${sign}${fmt(roe, 2)}%</b></span>`);
+      if (pnlUsd !== null) parts.push(`<span><span class="k">PnL ≈</span><b class="${cls}">${pnlUsd >= 0 ? "+" : ""}${fmt(pnlUsd, 2)} USDT</b></span>`);
+    }
+    if (o.stopLoss) {
+      const slDist = (o.stopLoss / (st.candles.length ? st.candles[st.candles.length - 1].close : o.entryPrice) - 1) * 100;
+      parts.push(`<span><span class="k">До SL</span><b>${fmt(slDist, 2)}%</b></span>`);
+    }
+  } else {
+    if (o.exitPrice) parts.push(`<span><span class="k">Выход (средн.)</span><b>${fmtPrice(o.exitPrice)}</b></span>`);
+    if (o.pnl !== undefined && o.pnl !== null) {
+      const cls = o.pnl >= 0 ? "pnl-pos" : "pnl-neg";
+      const sign = o.pnl >= 0 ? "+" : "";
+      parts.push(`<span><span class="k">PnL</span><b class="${cls}">${sign}${fmt(o.pnl, 2)} USDT${o.pnlPct !== undefined && o.pnlPct !== null ? ` (${sign}${fmt(o.pnlPct, 2)}%)` : ""}</b></span>`);
+    }
+    if (o.openedAt && o.closedAt) {
+      parts.push(`<span><span class="k">В сделке</span><b>${fmtDuration((new Date(o.closedAt) - new Date(o.openedAt)) / 1000)}</b></span>`);
+    }
+    if (o.bestPrice) parts.push(`<span><span class="k">Лучшая цена после выхода</span><b>${fmtPrice(o.bestPrice)}</b></span>`);
+  }
+  el.innerHTML = parts.join("");
+  el.style.display = "";
+}
+
+function fmtDuration(sec) {
+  if (!Number.isFinite(sec) || sec < 0) return "—";
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
+  if (d) return `${d}д ${h}ч`;
+  if (h) return `${h}ч ${m}м`;
+  return `${m}м`;
+}
+
+// Свечной график по свечам с биржи (GET /chart/candles — свечи нигде не
+// хранятся в БД) в стиле терминала биржи: таймфреймы, объём, MA7/25/99,
+// OHLC-легенда под курсором, зона прибыли/убытка от цены входа, линии
+// входа/SL/TP (достигнутые TP — пунктиром), маркеры входа и каждой точки
+// закрытия (частичные TP и финальное — с PnL ноги), у открытой позиции —
+// живое обновление последней свечи.
 async function initTradeChart(containerId, opts) {
   const container = document.getElementById(containerId);
   if (!container) return;
@@ -1967,42 +2240,50 @@ async function initTradeChart(containerId, opts) {
     return;
   }
 
-  // renderPositions()/renderTrades() теперь переносят уже загруженный
-  // detail-узел как живой DOM-элемент между перестройками таблицы (см. их
-  // комментарии про preservedDetailRows), поэтому initTradeChart в
-  // норме вызывается ровно один раз за сессию разворота строки. На
-  // случай, если он всё же вызовется повторно для того же containerId
-  // (например, "Пересчитать по бирже" перезагружает подробности сделки),
-  // явно удаляем старый chart-объект — без .remove() он остаётся висеть
-  // в памяти со своими подписками/RAF-циклом, даже когда его canvas уже
-  // вырезан из DOM следующей строкой (container.innerHTML = "").
+  const openedMs = opts.openedAt ? new Date(opts.openedAt).getTime() : null;
+  const closedMs = opts.closedAt ? new Date(opts.closedAt).getTime() : null;
+  let st = chartStates.get(containerId);
+  if (!st) {
+    st = {
+      tf: openedMs ? autoChartTimeframe(openedMs, closedMs || Date.now()) : "1h",
+      showMA: true,
+      showVol: true,
+    };
+    chartStates.set(containerId, st);
+  }
+  st.opts = opts;
+  stopChartLive(st);
+  wireChartToolbar(containerId);
+  syncChartToolbar(containerId);
+
+  // Повторный вызов для того же containerId (смена таймфрейма, "Пересчитать
+  // по бирже") — старый chart-объект удаляем явно, иначе он остаётся в
+  // памяти со своими подписками/RAF-циклом.
   const oldChart = chartInstances.get(containerId);
   if (oldChart) {
-    try { oldChart.remove(); } catch (e) { /* уже удалён/невалиден — не страшно */ }
+    try { oldChart.remove(); } catch (e) { /* уже удалён */ }
     chartInstances.delete(containerId);
   }
 
-  const HOUR_MS = 3600 * 1000;
-  const openedMs = opts.openedAt ? new Date(opts.openedAt).getTime() : null;
-  const closedMs = opts.closedAt ? new Date(opts.closedAt).getTime() : null;
-
+  const tf = st.tf;
+  const tfSec = chartTfSeconds(tf);
+  const tfMs = tfSec * 1000;
+  const PAD = 40;
   let sinceMs = null;
   let limit = 200;
-  if (openedMs) {
-    if (closedMs) {
-      const spanHours = Math.max(1, Math.ceil((closedMs - openedMs) / HOUR_MS));
-      sinceMs = openedMs - 20 * HOUR_MS;
-      limit = Math.min(500, spanHours + 40);
-    } else {
-      const spanHours = Math.max(1, Math.ceil((Date.now() - openedMs) / HOUR_MS));
-      limit = Math.min(500, spanHours + 30);
-    }
+  if (openedMs && closedMs) {
+    const spanBars = Math.max(1, Math.ceil((closedMs - openedMs) / tfMs));
+    sinceMs = openedMs - PAD * tfMs;
+    limit = Math.min(500, spanBars + 2 * PAD);
+  } else if (openedMs) {
+    const spanBars = Math.max(1, Math.ceil((Date.now() - openedMs) / tfMs));
+    limit = Math.min(500, Math.max(150, spanBars + 60));
   }
 
   let candles;
   try {
     const params = new URLSearchParams({
-      symbol: opts.symbol, market_type: opts.marketType || "spot", limit: String(limit),
+      symbol: opts.symbol, market_type: opts.marketType || "spot", limit: String(limit), timeframe: tf,
     });
     if (sinceMs !== null) params.set("since_ms", String(Math.floor(sinceMs)));
     const data = await api(`/chart/candles?${params.toString()}`);
@@ -2016,68 +2297,115 @@ async function initTradeChart(containerId, opts) {
     return;
   }
 
+  st.candles = candles;
+  st.precision = chartPricePrecision(candles);
+  const candleTimes = new Set(candles.map(c => c.time));
+  const snap = (ms) => {
+    const t = Math.floor(ms / 1000 / tfSec) * tfSec;
+    return candleTimes.has(t) ? t : null;
+  };
+  st.openSec = openedMs ? Math.floor(openedMs / 1000 / tfSec) * tfSec : null;
+  st.closeSec = closedMs ? Math.floor(closedMs / 1000 / tfSec) * tfSec : null;
+  const priceFormat = { type: "price", precision: st.precision, minMove: 1 / 10 ** st.precision };
+  const short = isShortSide(opts.side);
+
   container.innerHTML = "";
-  // autoSize:true вместо ручных width/height + собственного ResizeObserver
-  // — библиотека сама следит за размером контейнера через свой внутренний
-  // ResizeObserver, один источник правды вместо двух. (Ценовая шкала,
-  // рендерившаяся не у правого края контейнера, а где-то посередине
-  // графика, была вызвана НЕ гонкой resize-логики — см. .trade-detail-row
-  // td выше: реальная причина в унаследованном max-width:320px+overflow:
-  // hidden с общего правила td, воспроизведено и локализовано отдельно.)
+  // autoSize:true — библиотека сама следит за размером контейнера (в т.ч.
+  // при переходе в полноэкранный режим).
   const chart = LightweightCharts.createChart(container, {
     ...chartThemeOptions(),
-    timeScale: { timeVisible: true, secondsVisible: false, borderColor: cssVar("--panel-border") },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    timeScale: {
+      timeVisible: tfSec < 86400, secondsVisible: false,
+      borderColor: cssVar("--panel-border"), rightOffset: 6,
+    },
     handleScroll: true,
     handleScale: true,
     autoSize: true,
   });
   chartInstances.set(containerId, chart);
+
+  // Зона прибыли/убытка: заливка между ценой и уровнем входа на время
+  // жизни позиции — зелёная, когда позиция в плюсе, красная — в минусе.
+  let zone = null;
+  if (opts.entryPrice && st.openSec) {
+    const good = hexToRgba(CHART_UP, 0.30), goodEdge = hexToRgba(CHART_UP, 0.05);
+    const bad = hexToRgba(CHART_DOWN, 0.30), badEdge = hexToRgba(CHART_DOWN, 0.05);
+    zone = chart.addBaselineSeries({
+      baseValue: { type: "price", price: opts.entryPrice },
+      topFillColor1: short ? bad : good, topFillColor2: short ? badEdge : goodEdge,
+      bottomFillColor1: short ? goodEdge : badEdge, bottomFillColor2: short ? good : bad,
+      topLineColor: "rgba(0,0,0,0)", bottomLineColor: "rgba(0,0,0,0)",
+      lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+      crosshairMarkerVisible: false, priceFormat,
+    });
+    const until = st.closeSec || Infinity;
+    zone.setData(candles.filter(c => c.time >= st.openSec && c.time <= until).map(c => ({ time: c.time, value: c.close })));
+  }
+
+  const volume = chart.addHistogramSeries({
+    priceScaleId: "vol", priceFormat: { type: "volume" },
+    priceLineVisible: false, lastValueVisible: false,
+  });
+  chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+  const volumePoint = c => ({ time: c.time, value: c.volume, color: hexToRgba(c.close >= c.open ? CHART_UP : CHART_DOWN, 0.45) });
+  volume.setData(candles.map(volumePoint));
+
   const series = chart.addCandlestickSeries({
-    upColor: "#10b981", downColor: "#ef4444",
-    borderUpColor: "#10b981", borderDownColor: "#ef4444",
-    wickUpColor: "#10b981", wickDownColor: "#ef4444",
+    upColor: CHART_UP, downColor: CHART_DOWN,
+    borderUpColor: CHART_UP, borderDownColor: CHART_DOWN,
+    wickUpColor: CHART_UP, wickDownColor: CHART_DOWN,
+    priceFormat,
   });
   series.setData(candles);
 
-  if (opts.entryPrice) {
-    series.createPriceLine({
-      price: opts.entryPrice, color: "#6366f1", lineWidth: 1,
-      lineStyle: LightweightCharts.LineStyle.Dashed, title: "Вход",
+  st.maData = CHART_MAS.map(([period]) => chartSma(candles, period));
+  const mas = CHART_MAS.map(([, color], i) => {
+    const line = chart.addLineSeries({
+      color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+      crosshairMarkerVisible: false, priceFormat,
     });
+    line.setData(st.maData[i]);
+    return line;
+  });
+  st.series = { candles: series, volume, mas, zone };
+  applyChartIndicators(containerId);
+
+  const Dashed = LightweightCharts.LineStyle.Dashed;
+  const Dotted = LightweightCharts.LineStyle.Dotted;
+  if (opts.entryPrice) {
+    series.createPriceLine({ price: opts.entryPrice, color: cssVar("--accent"), lineWidth: 1, lineStyle: Dashed, title: "Вход" });
   }
   if (opts.stopLoss) {
-    series.createPriceLine({
-      price: opts.stopLoss, color: "#ef4444", lineWidth: 1,
-      lineStyle: LightweightCharts.LineStyle.Dashed, title: "SL",
-    });
+    series.createPriceLine({ price: opts.stopLoss, color: CHART_DOWN, lineWidth: 1, lineStyle: Dashed, title: "SL" });
   }
   (opts.takeProfits || []).forEach((tp, i) => {
     series.createPriceLine({
-      price: tp.price, color: "#10b981", lineWidth: 1,
-      lineStyle: LightweightCharts.LineStyle.Dashed, title: `TP${i + 1}`,
+      price: tp.price, color: tp.hit ? hexToRgba(CHART_UP, 0.55) : CHART_UP, lineWidth: 1,
+      lineStyle: tp.hit ? Dotted : Dashed, title: `TP${i + 1}${tp.hit ? " ✓" : ""}`,
     });
   });
+  if (opts.bestPrice) {
+    series.createPriceLine({ price: opts.bestPrice, color: "#f7a600", lineWidth: 1, lineStyle: Dotted, title: "Лучшая после выхода" });
+  }
 
   const markers = [];
-  if (openedMs) {
+  const entryTime = openedMs ? snap(openedMs) : null;
+  if (entryTime !== null) {
     markers.push({
-      time: Math.floor(openedMs / 1000), position: "belowBar",
-      color: "#6366f1", shape: "arrowUp", text: "Вход",
+      time: entryTime, position: short ? "aboveBar" : "belowBar",
+      color: cssVar("--accent"), shape: short ? "arrowDown" : "arrowUp",
+      text: `${short ? "Шорт" : "Лонг"} ${fmtPrice(opts.entryPrice)}`,
     });
   }
-  // Точки закрытия — крупнее (size:2) и подписаны, чтобы явно выделяться
-  // на фоне обычных свечей, как просил пользователь ("точку закрытия
-  // позиции пометь и выдели"); зелёный/красный — по знаку PnL этой ноги.
   (opts.exits || []).forEach(exit => {
-    if (!exit.time) return;
+    const time = exit.time ? snap(exit.time) : null;
+    if (time === null) return;
     const win = exit.pnl >= 0;
     markers.push({
-      time: Math.floor(exit.time / 1000),
-      position: win ? "aboveBar" : "belowBar",
-      color: win ? "#10b981" : "#ef4444",
-      shape: "circle",
-      size: 2,
-      text: exit.label || "Закрыто",
+      time, position: win ? "aboveBar" : "belowBar",
+      color: win ? CHART_UP : CHART_DOWN, shape: "circle", size: 2,
+      text: `${exit.label || "Закрыто"} ${win ? "+" : ""}${fmt(exit.pnl, 2)}`,
     });
   });
   if (markers.length) {
@@ -2085,40 +2413,65 @@ async function initTradeChart(containerId, opts) {
     series.setMarkers(markers);
   }
 
-  // Восстановить видимый диапазон, если пользователь уже настраивал
-  // масштаб/панораму этого графика раньше в этой же сессии (см.
-  // chartVisibleRanges выше). Иначе — по умолчанию показываем ХВОСТ
-  // истории (последние DEFAULT_WINDOW свечей, т.е. ТЕКУЩИЕ/самые свежие),
-  // а не fitContent(): тот растягивает на весь запрошенный диапазон
-  // (может быть от самого входа в позицию до сейчас — дни истории),
-  // из-за чего последние свечи оказывались сжаты в узкую полоску у
-  // правого края и разглядеть текущее движение цены было неудобно.
-  const savedRange = chartVisibleRanges.get(containerId);
-  const DEFAULT_WINDOW = 100;
+  st.legendEl = document.createElement("div");
+  st.legendEl.className = "chart-legend";
+  container.appendChild(st.legendEl);
+  updateChartLegend(containerId);
+  chart.subscribeCrosshairMove(param => updateChartLegend(containerId, param && param.time ? param.time : undefined));
+  updateChartPositionStrip(containerId);
+
+  const rangeKey = `${containerId}:${tf}`;
+  const savedRange = chartVisibleRanges.get(rangeKey);
   if (savedRange) {
-    try { chart.timeScale().setVisibleRange(savedRange); } catch (e) { chart.timeScale().fitContent(); }
-  } else if (candles.length > DEFAULT_WINDOW) {
-    try {
-      chart.timeScale().setVisibleRange({
-        from: candles[candles.length - DEFAULT_WINDOW].time,
-        to: candles[candles.length - 1].time,
-      });
-    } catch (e) { chart.timeScale().fitContent(); }
+    try { chart.timeScale().setVisibleRange(savedRange); } catch (e) { applyDefaultChartRange(containerId); }
   } else {
-    chart.timeScale().fitContent();
+    applyDefaultChartRange(containerId);
   }
   chart.timeScale().subscribeVisibleTimeRangeChange(range => {
-    if (range) chartVisibleRanges.set(containerId, range);
+    if (range) chartVisibleRanges.set(rangeKey, range);
   });
 
-  const resetBtn = container.parentElement && container.parentElement.querySelector(".chart-reset-btn");
-  if (resetBtn) {
-    resetBtn.onclick = () => {
-      chartVisibleRanges.delete(containerId);
-      chart.timeScale().fitContent();
-    };
+  if (!closedMs) {
+    st.liveTimer = setInterval(() => refreshChartLive(containerId, chart), 10000);
   }
+}
 
+// Живое обновление открытой позиции: последние свечи раз в 10с, пока
+// график виден (свёрнутая строка/скрытая вкладка браузера — пропуск).
+async function refreshChartLive(containerId, chart) {
+  const st = chartStates.get(containerId);
+  const container = document.getElementById(containerId);
+  if (!st || chartInstances.get(containerId) !== chart) {
+    stopChartLive(st);
+    return;
+  }
+  if (document.hidden || !container || !container.isConnected || container.offsetParent === null) return;
+  let fresh;
+  try {
+    const params = new URLSearchParams({
+      symbol: st.opts.symbol, market_type: st.opts.marketType || "spot", limit: "3", timeframe: st.tf,
+    });
+    fresh = (await api(`/chart/candles?${params.toString()}`)).candles || [];
+  } catch (e) {
+    return;
+  }
+  if (chartInstances.get(containerId) !== chart) return;
+  for (const c of fresh) {
+    const lastTime = st.candles[st.candles.length - 1].time;
+    if (c.time < lastTime) continue;
+    if (c.time === lastTime) st.candles[st.candles.length - 1] = c;
+    else st.candles.push(c);
+    st.series.candles.update(c);
+    st.series.volume.update({ time: c.time, value: c.volume, color: hexToRgba(c.close >= c.open ? CHART_UP : CHART_DOWN, 0.45) });
+    if (st.series.zone && st.openSec && c.time >= st.openSec) st.series.zone.update({ time: c.time, value: c.close });
+  }
+  st.maData = CHART_MAS.map(([period]) => chartSma(st.candles, period));
+  st.series.mas.forEach((line, i) => {
+    const data = st.maData[i];
+    if (data.length) line.update(data[data.length - 1]);
+  });
+  updateChartLegend(containerId);
+  updateChartPositionStrip(containerId);
 }
 
 // Честный ML-бейдж (см. докстринг GET /ml/forecast в api.py) — только
@@ -2252,6 +2605,10 @@ function initPositionChart(d) {
   initTradeChart(id, {
     symbol: d.symbol,
     marketType: d.market_type,
+    side: d.side,
+    leverage: d.leverage,
+    amount: d.amount,
+    currentPrice: d.current_price,
     openedAt: d.opened_at,
     closedAt: null,
     entryPrice: d.entry_price,
@@ -2974,23 +3331,31 @@ function renderTradeDetail(d) {
 function initTradeDetailChart(d) {
   const id = chartContainerId("trade-chart", d.trade_id);
   const legs = d.legs || [];
-  const exits = legs
-    .filter(leg => leg.closed_at)
-    .map((leg, i) => ({
-      time: new Date(leg.closed_at).getTime(),
-      pnl: leg.pnl,
-      label: legs.length > 1 ? `Закрыт #${i + 1}` : "Закрыт",
-    }));
+  const closedLegs = legs.filter(leg => leg.closed_at);
+  const exits = closedLegs.map((leg, i) => ({
+    time: new Date(leg.closed_at).getTime(),
+    pnl: leg.pnl,
+    label: closedLegs.length > 1 ? `#${i + 1}` : "Выход",
+  }));
+  const exitAmount = closedLegs.reduce((sum, leg) => sum + (leg.exit_price ? leg.amount : 0), 0);
+  const exitPrice = exitAmount
+    ? closedLegs.reduce((sum, leg) => sum + (leg.exit_price ? leg.exit_price * leg.amount : 0), 0) / exitAmount
+    : null;
   const takeProfits = d.opening_order && d.opening_order.take_profit !== null && d.opening_order.take_profit !== undefined
     ? [{ price: d.opening_order.take_profit }] : [];
   initTradeChart(id, {
     symbol: d.symbol,
     marketType: d.market_type,
+    side: d.direction,
     openedAt: d.created_at,
     closedAt: d.closed_at,
     entryPrice: d.entry_price,
+    exitPrice,
+    pnl: d.pnl,
+    pnlPct: d.pnl_pct,
     stopLoss: d.opening_order ? d.opening_order.stop_loss : null,
     takeProfits,
+    bestPrice: d.outcome_tracking ? d.outcome_tracking.best_price : null,
     exits,
   });
 }
