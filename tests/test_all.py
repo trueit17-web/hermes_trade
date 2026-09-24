@@ -22649,3 +22649,47 @@ class TestTradeHistoryFallbackExcludesRecordedPartialCloses(unittest.IsolatedAsy
         self.assertEqual(len(trades), 2)
         self.assertAlmostEqual(float(trades[-1].amount), 1143.7, places=4)
         self.assertAlmostEqual(float(trades[-1].exit_price), 1.7, places=6)
+
+
+class TestParenthesizedLeverage(unittest.TestCase):
+    """
+    Реальный инцидент (прод, Crypto Pirates Channel): "МОНЕТА: $POL/USDT
+    (2-5x)" — плечо в скобках после пары без ключевого слова не
+    распознавалось, позиция открылась с дефолтным плечом 1x.
+    """
+
+    def test_range_in_parentheses_takes_lower_bound(self):
+        from src.telegram.channel_monitor import extract_leverage
+        self.assertEqual(extract_leverage("МОНЕТА: $POL/USDT (2-5x)"), 2.0)
+        self.assertEqual(extract_leverage("POL/USDT (2-5х)"), 2.0)
+
+    def test_single_value_and_prefix_forms(self):
+        from src.telegram.channel_monitor import extract_leverage
+        self.assertEqual(extract_leverage("BTC/USDT (10x) LONG"), 10.0)
+        self.assertEqual(extract_leverage("ETH/USDT (x20)"), 20.0)
+        self.assertEqual(extract_leverage("ETH/USDT (x2-x5)"), 2.0)
+
+    def test_numbers_in_parentheses_without_multiplier_ignored(self):
+        from src.telegram.channel_monitor import extract_leverage
+        self.assertIsNone(extract_leverage("Цель 1 (5%)"))
+        self.assertIsNone(extract_leverage("TP1 (1)"))
+        self.assertIsNone(extract_leverage("Пара (2-5)"))
+
+    def test_keyword_leverage_still_takes_priority(self):
+        from src.telegram.channel_monitor import extract_leverage
+        self.assertEqual(extract_leverage("ETH/USDT (2-5x)\nПлечо: 10х"), 10.0)
+
+    def test_full_signal_in_channel_format(self):
+        from src.telegram.channel_monitor import parse_with_regex
+        result = parse_with_regex(
+            "МОНЕТА: $POL/USDT (2-5x)\n"
+            "НАПРАВЛЕНИЕ: ЛОНГ📈\n"
+            "➖➖➖➖➖➖➖\n"
+            "ВХОД: 0.0995\n"
+            "ЦЕЛИ: 0.105 - 0.11 - 0.1175\n"
+            "СТОП: 0.09"
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "POL/USDT")
+        self.assertEqual(result["side"], "long")
+        self.assertEqual(result["leverage"], 2.0)

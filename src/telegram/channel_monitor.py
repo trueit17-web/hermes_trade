@@ -1113,6 +1113,19 @@ _BARE_LEVERAGE_PATTERN_SUFFIX = re.compile(
 )
 
 
+# "МОНЕТА: $POL/USDT (2-5x)" — плечо в скобках без ключевого слова, обычно
+# сразу после пары (реальный инцидент, прод: не распознавалось, позиция
+# открылась с дефолтным плечом 1x). Множитель x/х внутри скобок обязателен,
+# чтобы не путать с любым другим числом в скобках. Диапазон — нижняя
+# граница, как и "Плечо: 25-30х" в _LEVERAGE_PATTERN выше.
+_PAREN_LEVERAGE_PATTERN = re.compile(
+    r"\(\s*(\d+(?:\.\d+)?)\s*[xXхХ]?\s*(?:[-–—]\s*\d+(?:\.\d+)?\s*)?[xXхХ]\s*\)"
+)
+_PAREN_LEVERAGE_PATTERN_PREFIX = re.compile(
+    r"\(\s*[xXхХ]\s*(\d+(?:\.\d+)?)(?:\s*[-–—]\s*[xXхХ]?\s*\d+(?:\.\d+)?)?\s*\)"
+)
+
+
 def extract_leverage(text: str) -> float | None:
     """
     Извлечь кредитное плечо, явно указанное каналом (не все каналы его
@@ -1125,6 +1138,8 @@ def extract_leverage(text: str) -> float | None:
         _LEVERAGE_PATTERN.search(text)
         or _BARE_LEVERAGE_PATTERN.search(text)
         or _BARE_LEVERAGE_PATTERN_SUFFIX.search(text)
+        or _PAREN_LEVERAGE_PATTERN.search(text)
+        or _PAREN_LEVERAGE_PATTERN_PREFIX.search(text)
     )
     if not match:
         return None
