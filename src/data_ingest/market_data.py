@@ -44,6 +44,12 @@ class MarketDataIngest:
         self.futures_exchange: ccxt.Exchange | None = None
         self.candles_buffer: dict[str, pd.DataFrame] = {}
         self._running = False
+        # Ленивое подключение фьючерсного клиента идёт через await
+        # load_markets() (секунды) — без блокировки параллельные вызовы
+        # (основной цикл + /chart/candles с дашборда сразу после рестарта)
+        # создавали каждый свой клиент, последний перезаписывал предыдущий,
+        # и тот уходил в GC незакрытым: "Unclosed client session" в логах.
+        self._futures_lock = asyncio.Lock()
 
     def _build_exchange(self, futures: bool) -> ccxt.Exchange:
         options = {"defaultType": "swap", "defaultSubType": "linear"} if futures else {"defaultType": "spot"}
@@ -51,14 +57,26 @@ class MarketDataIngest:
             return getattr(ccxt, self.exchange_id)({"enableRateLimit": True, "options": options})
         return getattr(ccxt, self.exchange_id)({"enableRateLimit": True})
 
+    @staticmethod
+    async def _close_quietly(exchange: ccxt.Exchange | None) -> None:
+        if exchange is None:
+            return
+        try:
+            await exchange.close()
+        except Exception as e:
+            logger.debug(f"Не удалось закрыть клиент биржи: {e}")
+
     async def initialize(self):
         """Инициализация подключения к бирже (спотовый клиент)."""
+        exchange = None
         try:
-            self.exchange = self._build_exchange(futures=False)
-            await self.exchange.load_markets()
+            exchange = self._build_exchange(futures=False)
+            await exchange.load_markets()
+            self.exchange = exchange
             logger.info(f"[{self.exchange_id}] Подключено, рынки загружены")
         except Exception as e:
             logger.error(f"Ошибка инициализации {self.exchange_id}: {e}")
+            await self._close_quietly(exchange)
             self.exchange = None
 
     async def _ensure_futures_exchange(self) -> ccxt.Exchange | None:
@@ -67,14 +85,19 @@ class MarketDataIngest:
         комментарий класса)."""
         if self.futures_exchange is not None:
             return self.futures_exchange
-        try:
-            exchange = self._build_exchange(futures=True)
-            await exchange.load_markets()
-            self.futures_exchange = exchange
-            logger.info(f"[{self.exchange_id}] Фьючерсный market-data клиент подключён")
-        except Exception as e:
-            logger.error(f"Ошибка инициализации фьючерсного market-data клиента {self.exchange_id}: {e}")
-            self.futures_exchange = None
+        async with self._futures_lock:
+            if self.futures_exchange is not None:
+                return self.futures_exchange
+            exchange = None
+            try:
+                exchange = self._build_exchange(futures=True)
+                await exchange.load_markets()
+                self.futures_exchange = exchange
+                logger.info(f"[{self.exchange_id}] Фьючерсный market-data клиент подключён")
+            except Exception as e:
+                logger.error(f"Ошибка инициализации фьючерсного market-data клиента {self.exchange_id}: {e}")
+                await self._close_quietly(exchange)
+                self.futures_exchange = None
         return self.futures_exchange
 
     async def close(self):

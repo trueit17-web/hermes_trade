@@ -23222,6 +23222,110 @@ class TestTelegramChannelSizingApi(unittest.IsolatedAsyncioTestCase):
             await update_telegram_channel(ch_id, TelegramChannelUpdate(leverage_mode="yolo"))
 
 
+class TestLazyExchangeClientsNotLeaked(unittest.IsolatedAsyncioTestCase):
+    """
+    Прод 2026-09-25, сразу после редеплоя: "Unclosed client session" от
+    aiohttp. Параллельные запросы свечей фьючерсного символа (основной
+    цикл + /chart/candles дашборда) лениво поднимали каждый свой
+    фьючерсный клиент; один перезаписывал другой, и тот уходил в GC
+    незакрытым. Также клиент не закрывался при падении load_markets().
+    """
+
+    @staticmethod
+    async def _yield_for(delay):
+        # Не asyncio.sleep: conftest глобально подменяет его на мгновенный
+        # AsyncMock, и тогда параллельные вызовы не перемежаются вообще.
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        loop.call_later(delay, fut.set_result, None)
+        await fut
+
+    def _fake_exchange(self, *, fail=False, delay=0.05):
+        ex = MagicMock()
+
+        async def load_markets():
+            await self._yield_for(delay)
+            if fail:
+                raise RuntimeError("boom")
+
+        ex.load_markets = AsyncMock(side_effect=load_markets)
+        ex.close = AsyncMock()
+        return ex
+
+    async def test_concurrent_futures_client_created_once(self):
+        from src.data_ingest.market_data import MarketDataIngest
+
+        ingest = MarketDataIngest("bybit")
+        created = []
+
+        def build(futures):
+            ex = self._fake_exchange()
+            created.append(ex)
+            return ex
+
+        with patch.object(ingest, "_build_exchange", side_effect=build):
+            results = await asyncio.gather(*(ingest._ensure_futures_exchange() for _ in range(3)))
+
+        self.assertEqual(len(created), 1)
+        self.assertTrue(all(r is created[0] for r in results))
+
+    async def test_failed_futures_client_is_closed(self):
+        from src.data_ingest.market_data import MarketDataIngest
+
+        ingest = MarketDataIngest("bybit")
+        failing = self._fake_exchange(fail=True, delay=0)
+        with patch.object(ingest, "_build_exchange", return_value=failing):
+            result = await ingest._ensure_futures_exchange()
+
+        self.assertIsNone(result)
+        failing.close.assert_awaited_once()
+
+    async def test_failed_spot_client_is_closed(self):
+        from src.data_ingest.market_data import MarketDataIngest
+
+        ingest = MarketDataIngest("bybit")
+        failing = self._fake_exchange(fail=True, delay=0)
+        with patch.object(ingest, "_build_exchange", return_value=failing):
+            await ingest.initialize()
+
+        self.assertIsNone(ingest.exchange)
+        failing.close.assert_awaited_once()
+
+    async def test_executor_concurrent_lazy_connect_once(self):
+        from src.execution.executor import ExecutionEngine
+
+        engine = ExecutionEngine()
+        engine.exchange_id = "bybit"
+        created = []
+
+        async def connect(exchange_id, market_type):
+            await self._yield_for(0.05)
+            ex = self._fake_exchange()
+            created.append(ex)
+            return ex
+
+        with patch.object(engine, "_connect_exchange", side_effect=connect), \
+                patch.object(engine, "_start_watch_task"):
+            results = await asyncio.gather(*(engine._ensure_exchange_connected("futures") for _ in range(3)))
+
+        self.assertEqual(len(created), 1)
+        self.assertTrue(all(r is created[0] for r in results))
+
+    async def test_executor_connect_closes_client_when_load_markets_fails(self):
+        from src.execution.executor import ExecutionEngine
+
+        engine = ExecutionEngine()
+        failing = self._fake_exchange(fail=True, delay=0)
+        fake_ccxt = MagicMock()
+        fake_ccxt.bybit = MagicMock(return_value=failing)
+        with patch("src.execution.executor.ccxt", fake_ccxt), \
+                patch.object(settings, "use_exchange_sandbox", False):
+            with self.assertRaises(RuntimeError):
+                await engine._connect_exchange("bybit", "futures")
+
+        failing.close.assert_awaited_once()
+
+
 class TestCandleFetchRateLimitRetry(unittest.IsolatedAsyncioTestCase):
     """
     Прод: из 131 ошибки Bybit "Too many visits" (10006) на загрузке свечей

@@ -111,6 +111,10 @@ class ExecutionEngine:
         # который резолвит клиент по market_type САМОЙ позиции, а не по
         # текущему тумблеру.
         self._exchanges: dict[str, ccxt.Exchange] = {}
+        # См. _ensure_exchange_connected: два параллельных сигнала на ещё
+        # не подключённый рынок иначе создали бы по клиенту, и один из них
+        # остался бы незакрытым.
+        self._connect_lock = asyncio.Lock()
         # Долгоживущие задачи push-прослушивания ордеров по WebSocket
         # (ccxt.pro watch_orders) — по одной на market_type, см.
         # _start_watch_task/_watch_orders_loop/_stop_watch_tasks. В
@@ -484,7 +488,16 @@ class ExecutionEngine:
                 # hyperliquid-testnet.xyz).
                 exchange.set_sandbox_mode(True)
 
-        await exchange.load_markets()
+        try:
+            await exchange.load_markets()
+        except Exception:
+            # Без close() клиент с уже открытой aiohttp-сессией уходит в GC
+            # незакрытым — "Unclosed client session" в логах.
+            try:
+                await exchange.close()
+            except Exception as close_error:
+                logger.debug(f"Не удалось закрыть клиент {exchange_id} [{market_type}]: {close_error}")
+            raise
         return exchange
 
     async def _ensure_exchange_connected(self, market_type: str) -> ccxt.Exchange | None:
@@ -503,13 +516,17 @@ class ExecutionEngine:
             return existing
         if self.exchange_id is None:
             return None
-        try:
-            exchange = await self._connect_exchange(self.exchange_id, market_type)
-        except Exception as e:
-            logger.error(f"Не удалось подключиться к {self.exchange_id} [{market_type}] для нового ордера: {e}")
-            return None
-        self._exchanges[market_type] = exchange
-        self._start_watch_task(market_type)
+        async with self._connect_lock:
+            existing = self._exchanges.get(market_type)
+            if existing is not None:
+                return existing
+            try:
+                exchange = await self._connect_exchange(self.exchange_id, market_type)
+            except Exception as e:
+                logger.error(f"Не удалось подключиться к {self.exchange_id} [{market_type}] для нового ордера: {e}")
+                return None
+            self._exchanges[market_type] = exchange
+            self._start_watch_task(market_type)
         logger.info(
             f"🔗 Execution Engine: лениво подключено к {self.exchange_id} [{market_type}] — "
             f"сигнал требует этот рынок."
