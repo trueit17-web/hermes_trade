@@ -1479,60 +1479,120 @@ async def get_trade_detail(trade_id: int):
         }
 
 
+_TRADE_OUTCOME_VERDICTS = ("optimal", "sl_too_tight", "tp_too_conservative", "premature_exit")
+_TRADE_OUTCOME_FILTERS = ("tracking", "finished", *_TRADE_OUTCOME_VERDICTS)
+
+
+def _provisional_optimal_pnl_pct(row: TradeOutcomeTracking) -> float | None:
+    """
+    Оценка PnL% при выходе по лучшей цене ДО финализации тречинга (см.
+    trade_outcome_tracker._finalize_verdict — та же формула) — для строк
+    "В процессе" optimal/missed в БД ещё пустые, а показать "сколько уже
+    упущено на текущий момент" на дашборде полезно.
+    """
+    if row.best_price is None:
+        return None
+    entry = float(row.entry_price)
+    if not entry:
+        return None
+    best = float(row.best_price)
+    return (best - entry) / entry * 100 if row.direction == "long" else (entry - best) / entry * 100
+
+
+def _trade_outcome_row(r: TradeOutcomeTracking) -> dict:
+    optimal = r.optimal_pnl_pct
+    missed = r.missed_pnl_pct
+    if r.status == "tracking" and optimal is None:
+        optimal = _provisional_optimal_pnl_pct(r)
+        missed = optimal - r.baseline_pnl_pct if optimal is not None else None
+    return {
+        "trade_id": r.trade_id,
+        "symbol": r.symbol.symbol if r.symbol else None,
+        "direction": r.direction,
+        "status": r.status,
+        "verdict": r.verdict,
+        "entry_price": float(r.entry_price),
+        "close_price": float(r.close_price),
+        "best_price": float(r.best_price) if r.best_price is not None else None,
+        "best_price_at": r.best_price_at.isoformat() + "Z" if r.best_price_at else None,
+        "worst_price": float(r.worst_price) if r.worst_price is not None else None,
+        "last_price": float(r.last_price) if r.last_price is not None else None,
+        "baseline_pnl_pct": r.baseline_pnl_pct,
+        "optimal_pnl_pct": optimal,
+        "missed_pnl_pct": missed,
+        "close_time": r.close_time.isoformat() + "Z" if r.close_time else None,
+    }
+
+
 @app.get("/analytics/trade-outcomes")
-async def get_trade_outcome_analysis(limit: int = 20):
+async def get_trade_outcome_analysis(limit: int = 20, filter: str | None = None):
     """
     Сводка по отслеживанию цены после закрытия сделок (см. src/execution/
     trade_outcome_tracker.py) — по запросу пользователя: посмотреть, как
-    нужно было бы выставить вход/SL/TP для максимальной прибыли. Считает
-    только уже завершённые (status != "tracking") строки — для сделок в
-    процессе тречинга best_price/verdict ещё не окончательны.
+    нужно было бы выставить вход/SL/TP для максимальной прибыли. Счётчики
+    вердиктов — только по уже завершённым (status != "tracking") строкам:
+    для сделок в процессе тречинга best_price/verdict ещё не окончательны.
+
+    filter — клик по плитке сводки на дашборде: "tracking" (в процессе,
+    свежие сверху), "finished" (все завершённые, свежие сверху) или один
+    из вердиктов (самые большие упущенные сверху). Без filter — прежнее
+    поведение: самые большие упущенные среди завершённых (biggest_misses).
     """
+    if filter and filter not in _TRADE_OUTCOME_FILTERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Неизвестный фильтр: {filter}. Допустимо: {', '.join(_TRADE_OUTCOME_FILTERS)}",
+        )
+    limit = max(1, min(limit, 200))
     async with get_session() as session:
-        finished = (
+        counts_rows = (
             await session.execute(
-                select(TradeOutcomeTracking)
-                .options(selectinload(TradeOutcomeTracking.symbol))
-                .where(TradeOutcomeTracking.status != "tracking")
+                select(TradeOutcomeTracking.status, TradeOutcomeTracking.verdict, func.count())
+                .group_by(TradeOutcomeTracking.status, TradeOutcomeTracking.verdict)
             )
-        ).scalars().all()
+        ).all()
 
-        tracking_count = (
-            await session.execute(
-                select(func.count()).select_from(TradeOutcomeTracking)
-                .where(TradeOutcomeTracking.status == "tracking")
+        query = select(TradeOutcomeTracking).options(selectinload(TradeOutcomeTracking.symbol))
+        if filter == "tracking":
+            query = query.where(TradeOutcomeTracking.status == "tracking").order_by(
+                TradeOutcomeTracking.close_time.desc()
             )
-        ).scalar_one()
+        elif filter == "finished":
+            query = query.where(TradeOutcomeTracking.status != "tracking").order_by(
+                TradeOutcomeTracking.close_time.desc()
+            )
+        elif filter:
+            query = query.where(
+                TradeOutcomeTracking.status != "tracking", TradeOutcomeTracking.verdict == filter,
+            ).order_by(
+                func.coalesce(TradeOutcomeTracking.missed_pnl_pct, 0).desc(),
+                TradeOutcomeTracking.close_time.desc(),
+            )
+        else:
+            query = query.where(
+                TradeOutcomeTracking.status != "tracking", TradeOutcomeTracking.missed_pnl_pct > 0,
+            ).order_by(TradeOutcomeTracking.missed_pnl_pct.desc())
+        rows = (await session.execute(query.limit(limit))).scalars().all()
 
+    tracking_count = 0
+    finished_count = 0
     verdict_counts: dict[str, int] = {}
-    for row in finished:
-        verdict_counts[row.verdict or "unknown"] = verdict_counts.get(row.verdict or "unknown", 0) + 1
+    for status, verdict, count in counts_rows:
+        if status == "tracking":
+            tracking_count += count
+            continue
+        finished_count += count
+        verdict_counts[verdict or "unknown"] = verdict_counts.get(verdict or "unknown", 0) + count
 
-    biggest_misses = sorted(
-        (r for r in finished if (r.missed_pnl_pct or 0) > 0),
-        key=lambda r: r.missed_pnl_pct or 0,
-        reverse=True,
-    )[:limit]
-
+    serialized = [_trade_outcome_row(r) for r in rows]
     return {
         "tracking_count": tracking_count,
-        "finished_count": len(finished),
+        "finished_count": finished_count,
         "verdict_counts": verdict_counts,
-        "biggest_misses": [
-            {
-                "trade_id": r.trade_id,
-                "symbol": r.symbol.symbol if r.symbol else None,
-                "direction": r.direction,
-                "verdict": r.verdict,
-                "close_price": float(r.close_price),
-                "best_price": float(r.best_price) if r.best_price is not None else None,
-                "baseline_pnl_pct": r.baseline_pnl_pct,
-                "optimal_pnl_pct": r.optimal_pnl_pct,
-                "missed_pnl_pct": r.missed_pnl_pct,
-                "close_time": r.close_time.isoformat() + "Z" if r.close_time else None,
-            }
-            for r in biggest_misses
-        ],
+        "filter": filter or None,
+        "rows": serialized,
+        # Обратная совместимость: прежний ключ со списком без фильтра.
+        "biggest_misses": serialized if not filter else [],
     }
 
 

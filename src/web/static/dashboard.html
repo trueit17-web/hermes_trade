@@ -756,6 +756,23 @@
   .metric-value.metric-warn { color: var(--yellow); }
   .metric-value.metric-crit { color: var(--red); }
   .metric-sub { font-size: 11px; color: var(--text-dim); }
+  /* Плитки сводки "Анализ исходов сделок" — клик применяет фильтр по
+     статусу/вердикту к таблице под ними (повторный клик — сброс). */
+  .metric-card.metric-card-filter {
+    cursor: pointer; text-align: left; border: 0; border-radius: 0; font: inherit; font-weight: 400; color: inherit;
+    box-shadow: inset 0 0 0 1px transparent; transition: box-shadow .12s, background .12s;
+  }
+  .metric-card.metric-card-filter:hover { background: var(--panel-2); filter: none; }
+  .metric-card.metric-card-filter:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .metric-card.metric-card-filter.active {
+    background: var(--accent-soft);
+    box-shadow: inset 0 0 0 1px var(--accent);
+  }
+  .outcome-filter-bar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin: 0; padding: 10px 16px; font-size: 13px; color: var(--text-dim);
+  }
+  .outcome-filter-bar strong { color: var(--text); font-weight: 600; }
 
   .log-filters {
     display: flex;
@@ -1170,6 +1187,7 @@
     <div class="metric-grid metric-grid-wide" id="tradeOutcomesSummary">
       <div class="muted" style="padding:12px 16px">Загрузка…</div>
     </div>
+    <div class="outcome-filter-bar" id="tradeOutcomesFilterBar"></div>
     <div class="table-wrap">
       <table>
         <thead><tr><th>Символ</th><th>Вердикт</th><th>Цена закрытия</th><th>Лучшая цена</th><th>PnL факт.</th><th>PnL оптимально</th><th>Упущено</th><th>Закрыта</th></tr></thead>
@@ -3006,49 +3024,233 @@ function verdictBadge(verdict) {
 // 1.1.0): понять постфактум, как нужно было бы выставить вход/SL/TP для
 // максимальной прибыли. tracking_count — сделки ещё в процессе (best_
 // price/вердикт не окончательны), finished_count — уже классифицированные.
+//
+// Клик по плитке сводки — фильтр таблицы по статусу/вердикту (?filter=,
+// повторный клик по активной плитке — сброс к "самым большим упущенным").
+// Строки таблицы разворачиваются в те же подробности, что и у закрытых
+// сделок (GET /trades/{id}/detail: ордера, график, журнал решений) плюс
+// блок "Исход после закрытия" — отдельные карты состояния и префикс
+// графика "outcome-chart", чтобы одна и та же сделка могла быть раскрыта
+// одновременно и здесь, и в "Истории сделок" без конфликта id графика.
+const OUTCOME_PAGE_SIZE = 15;
+let tradeOutcomesFilter = "";
+const expandedOutcomes = new Map();
+const expandedOutcomeDetails = new Map();
+const outcomeRowsById = new Map();
+
+const OUTCOME_FILTER_TITLES = {
+  "": "самые большие упущенные (завершённые)",
+  tracking: "в процессе отслеживания",
+  finished: "все завершённые",
+  optimal: "вердикт «Оптимально»",
+  sl_too_tight: "вердикт «SL слишком тесный»",
+  tp_too_conservative: "вердикт «TP слишком консервативный»",
+  premature_exit: "вердикт «Ранний выход»",
+};
+
+function setTradeOutcomesFilter(filter) {
+  tradeOutcomesFilter = tradeOutcomesFilter === filter ? "" : filter;
+  // Раскрытые строки относятся к прежней выборке — после смены фильтра
+  // они либо исчезнут, либо окажутся не на своём месте.
+  expandedOutcomes.clear();
+  expandedOutcomeDetails.clear();
+  const body = document.getElementById("tradeOutcomesBody");
+  if (body) body.innerHTML = `<tr class="empty-row"><td colspan="8">Загрузка…</td></tr>`;
+  renderTradeOutcomes();
+}
+
+function fmtSignedPct(v) {
+  if (v === null || v === undefined) return "—";
+  return `${v >= 0 ? "+" : ""}${fmt(v, 2)}%`;
+}
+
+function outcomeStatusLabel(r) {
+  if (r.status === "tracking") return `<span class="badge badge-verdict-premature_exit" title="Ждём локальный экстремум цены — вердикт ещё не окончательный">В процессе</span>`;
+  return verdictBadge(r.verdict);
+}
+
 async function renderTradeOutcomes() {
   const summaryEl = document.getElementById("tradeOutcomesSummary");
   const bodyEl = document.getElementById("tradeOutcomesBody");
+  const barEl = document.getElementById("tradeOutcomesFilterBar");
+  const filter = tradeOutcomesFilter;
+  const preservedDetailRows = new Map();
+  bodyEl.querySelectorAll("tr.trade-detail-row[data-outcome-detail]").forEach(tr => {
+    const cell = tr.querySelector("td");
+    if (cell && cell.dataset.loaded === "1") preservedDetailRows.set(tr.dataset.outcomeDetail, tr);
+  });
   try {
-    const data = await api("/analytics/trade-outcomes?limit=15");
+    const filterParam = filter ? `&filter=${encodeURIComponent(filter)}` : "";
+    const data = await api(`/analytics/trade-outcomes?limit=${OUTCOME_PAGE_SIZE}${filterParam}`);
+    // Пока ждали ответ, пользователь мог кликнуть другую плитку — этот
+    // ответ уже не для текущего фильтра, его отрисует следующий вызов.
+    if (filter !== tradeOutcomesFilter) return;
     const counts = data.verdict_counts || {};
     const cards = [
-      { label: "В процессе", value: data.tracking_count, sub: "ждём локальный экстремум цены" },
-      { label: "Завершено", value: data.finished_count, sub: "вердикт окончательный" },
-      { label: "Оптимально", value: counts.optimal || 0, sub: "выход был близок к лучшему" },
-      { label: "SL слишком тесный", value: counts.sl_too_tight || 0, sub: "закрылись в минус, цена ушла в плюс" },
-      { label: "TP слишком консервативный", value: counts.tp_too_conservative || 0, sub: "цена ушла заметно дальше TP" },
-      { label: "Ранний выход", value: counts.premature_exit || 0, sub: "упущенная прибыль значима" },
+      { key: "tracking", label: "В процессе", value: data.tracking_count, sub: "ждём локальный экстремум цены" },
+      { key: "finished", label: "Завершено", value: data.finished_count, sub: "вердикт окончательный" },
+      { key: "optimal", label: "Оптимально", value: counts.optimal || 0, sub: "выход был близок к лучшему" },
+      { key: "sl_too_tight", label: "SL слишком тесный", value: counts.sl_too_tight || 0, sub: "закрылись в минус, цена ушла в плюс" },
+      { key: "tp_too_conservative", label: "TP слишком консервативный", value: counts.tp_too_conservative || 0, sub: "цена ушла заметно дальше TP" },
+      { key: "premature_exit", label: "Ранний выход", value: counts.premature_exit || 0, sub: "упущенная прибыль значима" },
     ];
     summaryEl.innerHTML = cards.map(c => `
-      <div class="metric-card">
+      <button type="button" class="metric-card metric-card-filter${filter === c.key ? " active" : ""}"
+              data-outcome-filter="${c.key}" aria-pressed="${filter === c.key}"
+              title="${filter === c.key ? "Сбросить фильтр" : "Показать только: " + c.label}">
         <span class="metric-label">${c.label}</span>
         <span class="metric-value">${c.value}</span>
         <span class="metric-sub">${c.sub}</span>
-      </div>
+      </button>
     `).join("");
+    summaryEl.querySelectorAll("[data-outcome-filter]").forEach(btn => {
+      btn.addEventListener("click", () => setTradeOutcomesFilter(btn.dataset.outcomeFilter));
+    });
 
-    const misses = data.biggest_misses || [];
-    if (!misses.length) {
-      bodyEl.innerHTML = `<tr class="empty-row"><td colspan="8">Пока нет завершённых наблюдений с упущенной прибылью</td></tr>`;
+    const rows = data.rows || data.biggest_misses || [];
+    const activeCard = cards.find(c => c.key === filter);
+    const shownNote = activeCard && activeCard.value > rows.length ? ` · показаны ${rows.length} из ${activeCard.value}` : "";
+    barEl.innerHTML = `
+      <span>Показано: <strong>${OUTCOME_FILTER_TITLES[filter] || filter}</strong>${shownNote}</span>
+      ${filter ? `<button type="button" class="btn-ghost" id="tradeOutcomesResetBtn">✕ Сбросить фильтр</button>` : `<span class="muted">— кликните по плитке, чтобы отфильтровать</span>`}
+    `;
+    const resetBtn = document.getElementById("tradeOutcomesResetBtn");
+    if (resetBtn) resetBtn.addEventListener("click", () => setTradeOutcomesFilter(filter));
+
+    if (!rows.length) {
+      bodyEl.innerHTML = `<tr class="empty-row"><td colspan="8">${filter ? "Нет сделок с таким статусом" : "Пока нет завершённых наблюдений с упущенной прибылью"}</td></tr>`;
       return;
     }
-    bodyEl.innerHTML = misses.map(r => `
-      <tr>
-        <td class="side-${r.direction === 'long' ? 'long' : 'short'}">${r.symbol || "—"}</td>
-        <td>${verdictBadge(r.verdict)}</td>
+    outcomeRowsById.clear();
+    rows.forEach(r => outcomeRowsById.set(String(r.trade_id), r));
+    bodyEl.innerHTML = rows.map(r => {
+      const missed = r.missed_pnl_pct;
+      const provisional = r.status === "tracking" ? ` <span class="muted" title="Пока идёт отслеживание — оценка на текущий момент">*</span>` : "";
+      return `
+      <tr class="trade-row" data-outcome-id="${r.trade_id}" title="Показать подробности сделки">
+        <td class="side-${r.direction === 'long' ? 'long' : 'short'}"><span class="expand-arrow">▸</span>${r.symbol || "—"}</td>
+        <td>${outcomeStatusLabel(r)}</td>
         <td>${fmtPrice(r.close_price)}</td>
         <td>${r.best_price !== null ? fmtPrice(r.best_price) : "—"}</td>
-        <td class="${r.baseline_pnl_pct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${r.baseline_pnl_pct >= 0 ? "+" : ""}${fmt(r.baseline_pnl_pct, 2)}%</td>
-        <td class="pnl-pos">${r.optimal_pnl_pct >= 0 ? "+" : ""}${fmt(r.optimal_pnl_pct, 2)}%</td>
-        <td class="pnl-neg">+${fmt(r.missed_pnl_pct, 2)}%</td>
+        <td class="${r.baseline_pnl_pct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${fmtSignedPct(r.baseline_pnl_pct)}</td>
+        <td class="${(r.optimal_pnl_pct ?? 0) >= 0 ? 'pnl-pos' : 'pnl-neg'}">${fmtSignedPct(r.optimal_pnl_pct)}${provisional}</td>
+        <td class="${missed !== null && missed > 0 ? 'pnl-neg' : 'muted'}">${missed !== null && missed !== undefined ? (missed > 0 ? "+" + fmt(missed, 2) + "%" : fmt(missed, 2) + "%") : "—"}${provisional}</td>
         <td class="muted">${r.close_time ? new Date(r.close_time).toLocaleString("ru-RU") : "—"}</td>
       </tr>
-    `).join("");
+      <tr class="trade-detail-row" data-outcome-detail="${r.trade_id}" style="display:none"><td colspan="8"></td></tr>
+    `;
+    }).join("");
+
+    preservedDetailRows.forEach((liveRow, id) => {
+      const freshRow = bodyEl.querySelector(`tr[data-outcome-detail="${id}"]`);
+      if (freshRow) freshRow.replaceWith(liveRow);
+    });
+
+    bodyEl.querySelectorAll(".trade-row[data-outcome-id]").forEach(row => {
+      row.addEventListener("click", () => toggleOutcomeDetail(row));
+      const id = row.dataset.outcomeId;
+      if (expandedOutcomes.has(id)) {
+        const detailsRow = bodyEl.querySelector(`tr[data-outcome-detail="${id}"]`);
+        detailsRow.style.display = "";
+        row.querySelector(".expand-arrow").textContent = "▾";
+        if (!preservedDetailRows.has(id)) {
+          const cached = expandedOutcomes.get(id);
+          const cell = detailsRow.querySelector("td");
+          if (cached) {
+            cell.innerHTML = cached;
+            cell.dataset.loaded = "1";
+            wireOutcomeDetailButtons(cell, id);
+            const detail = expandedOutcomeDetails.get(id);
+            if (detail) initTradeDetailChart(detail, "outcome-chart");
+          } else {
+            loadOutcomeDetailInto(cell, id);
+          }
+        }
+      }
+    });
   } catch (err) {
-    summaryEl.innerHTML = `<div class="muted" style="padding:12px 16px">Ошибка загрузки: ${err.message}</div>`;
-    bodyEl.innerHTML = `<tr class="empty-row"><td colspan="8">Ошибка загрузки: ${err.message}</td></tr>`;
+    summaryEl.innerHTML = `<div class="muted" style="padding:12px 16px">Ошибка загрузки: ${escapeHtml(err.message)}</div>`;
+    bodyEl.innerHTML = `<tr class="empty-row"><td colspan="8">Ошибка загрузки: ${escapeHtml(err.message)}</td></tr>`;
   }
+}
+
+function outcomeSummaryBlockHtml(r) {
+  if (!r) return "";
+  const tracking = r.status === "tracking";
+  return `
+    <div class="trade-detail-block">
+      <h4>Исход после закрытия ${outcomeStatusLabel(r)}</h4>
+      <div class="trade-detail-grid">
+        <div><span class="muted">Вход / закрытие</span><br>${fmtPrice(r.entry_price)} / ${fmtPrice(r.close_price)}</div>
+        <div><span class="muted">Лучшая цена после закрытия</span><br>${r.best_price !== null ? fmtPrice(r.best_price) : "—"}${r.best_price_at ? ` <span class="muted">(${new Date(r.best_price_at).toLocaleString("ru-RU")})</span>` : ""}</div>
+        <div><span class="muted">Худшая цена после закрытия</span><br>${r.worst_price !== null ? fmtPrice(r.worst_price) : "—"}</div>
+        <div><span class="muted">Последняя цена</span><br>${r.last_price !== null ? fmtPrice(r.last_price) : "—"}</div>
+        <div><span class="muted">PnL факт. (от номинала)</span><br><span class="${r.baseline_pnl_pct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${fmtSignedPct(r.baseline_pnl_pct)}</span></div>
+        <div><span class="muted">PnL при выходе по лучшей цене${tracking ? " (пока)" : ""}</span><br>${fmtSignedPct(r.optimal_pnl_pct)}</div>
+        <div><span class="muted">Упущено${tracking ? " (пока)" : ""}</span><br><span class="${(r.missed_pnl_pct ?? 0) > 0 ? 'pnl-neg' : ''}">${fmtSignedPct(r.missed_pnl_pct)}</span></div>
+      </div>
+    </div>
+  `;
+}
+
+async function toggleOutcomeDetail(row) {
+  const id = row.dataset.outcomeId;
+  const detailsRow = document.querySelector(`#tradeOutcomesBody tr[data-outcome-detail="${id}"]`);
+  const arrow = row.querySelector(".expand-arrow");
+  if (detailsRow.style.display !== "none") {
+    detailsRow.style.display = "none";
+    arrow.textContent = "▸";
+    expandedOutcomes.delete(id);
+    return;
+  }
+  expandedOutcomes.set(id, null);
+  detailsRow.style.display = "";
+  arrow.textContent = "▾";
+  const cell = detailsRow.querySelector("td");
+  if (cell.dataset.loaded) return;
+  await loadOutcomeDetailInto(cell, id);
+}
+
+async function loadOutcomeDetailInto(cell, id) {
+  cell.innerHTML = `<div class="muted" style="padding:10px 16px">Загрузка…</div>`;
+  try {
+    const detail = await api(`/trades/${id}/detail`);
+    const tradeHtml = renderTradeDetail(detail, "outcome-chart");
+    // Блок исхода вставляем первым внутри .trade-detail — над графиком.
+    const html = tradeHtml.replace(`<div class="trade-detail">`, `<div class="trade-detail">${outcomeSummaryBlockHtml(outcomeRowsById.get(id))}`);
+    cell.innerHTML = html;
+    cell.dataset.loaded = "1";
+    if (expandedOutcomes.has(id)) expandedOutcomes.set(id, html);
+    expandedOutcomeDetails.set(id, detail);
+    initTradeDetailChart(detail, "outcome-chart");
+    wireOutcomeDetailButtons(cell, id);
+  } catch (err) {
+    cell.innerHTML = `<div class="muted" style="padding:10px 16px">Ошибка загрузки: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function wireOutcomeDetailButtons(cell, id) {
+  const btn = cell.querySelector("#btnRecalcTrade");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    btn.textContent = "Пересчитываю…";
+    try {
+      const result = await api(`/trades/${id}/recalculate`, { method: "POST" });
+      if (result.updated) {
+        showToast(`Сделка пересчитана: PnL ${result.pnl >= 0 ? "+" : ""}${fmt(result.pnl)} (${fmt(result.pnl_pct, 2)}%)`);
+      } else {
+        showToast("Биржа не вернула ничего нового по этой сделке", true);
+      }
+      delete cell.dataset.loaded;
+      await loadOutcomeDetailInto(cell, id);
+      await renderTrades();
+    } catch (err) {
+      showToast(`Ошибка: ${err.message}`, true);
+      btn.disabled = false;
+      btn.textContent = "🔄 Пересчитать по бирже";
+    }
+  });
 }
 
 async function toggleTradeDetail(row) {
@@ -3215,7 +3417,7 @@ function orderCardsRowHtml(openingOrder, leg, label, showOpeningCard = true, dir
   `;
 }
 
-function renderTradeDetail(d) {
+function renderTradeDetail(d, chartPrefix = "trade-chart") {
   // Все "ноги" в d.legs делят один и тот же открывающий ордер (группа
   // собрана на бэкенде по order_open_id) — карточку открывающего ордера
   // показываем только у первой ноги, чтобы не дублировать её на каждом
@@ -3319,7 +3521,7 @@ function renderTradeDetail(d) {
       ${changesBlock}
       <div class="chart-source-row">
         <div class="chart-source-col">${dealBlock}</div>
-        <div class="chart-source-col">${chartBlockHtml("trade-chart", d.trade_id)}</div>
+        <div class="chart-source-col">${chartBlockHtml(chartPrefix, d.trade_id)}</div>
       </div>
       ${ordersHtml}
       ${legsHtml}
@@ -3334,8 +3536,8 @@ function renderTradeDetail(d) {
 // ЗАКРЫТИЯ на каждую "ногу" (частичные TP1/TP2/TP3 закрываются отдельными
 // Trade — см. d.legs), как явно просил пользователь — выделены цветом по
 // знаку PnL этой ноги и подписаны, а не просто последняя свеча графика.
-function initTradeDetailChart(d) {
-  const id = chartContainerId("trade-chart", d.trade_id);
+function initTradeDetailChart(d, chartPrefix = "trade-chart") {
+  const id = chartContainerId(chartPrefix, d.trade_id);
   const legs = d.legs || [];
   const closedLegs = legs.filter(leg => leg.closed_at);
   const exits = closedLegs.map((leg, i) => ({

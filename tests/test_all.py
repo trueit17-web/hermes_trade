@@ -1,6 +1,7 @@
 """Тесты для крипто-трейдер бота."""
 import asyncio
 import unittest
+import uuid
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, AsyncMock, PropertyMock, patch
 
@@ -22475,6 +22476,115 @@ class TestPerformanceEndpointFilters(unittest.IsolatedAsyncioTestCase):
         limited = await get_performance(limit=2)
         self.assertEqual(len(limited["snapshots"]), 2)
         self.assertEqual(len((await get_performance(limit=0))["snapshots"]), 1)
+
+
+class TestTradeOutcomesFilter(unittest.IsolatedAsyncioTestCase):
+    """
+    GET /analytics/trade-outcomes?filter=... — клик по плитке сводки
+    "Анализ исходов сделок" фильтрует таблицу по статусу/вердикту; счётчики
+    плиток при этом не зависят от фильтра.
+    """
+
+    async def asyncSetUp(self):
+        from sqlalchemy import delete
+
+        from src.db.models import Exchange, Order, Symbol, Trade, TradeOutcomeTracking
+        from src.db.session import get_session
+
+        rows = [
+            # (status, verdict, missed, baseline, best)
+            ("tracking", None, None, 2.0, 106.0),
+            ("done", "optimal", 0.1, 5.0, 105.1),
+            ("done", "sl_too_tight", 12.0, -3.0, 109.0),
+            ("done", "sl_too_tight", 4.0, -2.0, 102.0),
+            ("stopped_max_horizon", "premature_exit", 1.5, 1.0, 102.5),
+        ]
+        self.trade_ids = []
+        async with get_session() as session:
+            await session.execute(delete(TradeOutcomeTracking))
+            exchange = Exchange(name=f"outcome-filter-test-{uuid.uuid4().hex[:8]}", is_paper=True)
+            session.add(exchange)
+            await session.flush()
+            symbol = Symbol(exchange_id=exchange.id, symbol="OFT/USDT", base_asset="OFT", quote_asset="USDT")
+            session.add(symbol)
+            await session.flush()
+            for i, (status, verdict, missed, baseline, best) in enumerate(rows):
+                order = Order(
+                    exchange_id=exchange.id, symbol_id=symbol.id, side="buy", order_type="market",
+                    amount=1.0, price=100.0, status="filled", filled_amount=1.0, filled_price=100.0,
+                    fee=0.0, market_type="spot",
+                )
+                session.add(order)
+                await session.flush()
+                trade = Trade(
+                    symbol_id=symbol.id, order_open_id=order.id, direction="long",
+                    entry_price=100.0, exit_price=100.0 + baseline, amount=1.0, pnl=baseline, pnl_pct=baseline,
+                    is_open=False, closed_at=datetime.now() - timedelta(hours=10 - i),
+                )
+                session.add(trade)
+                await session.flush()
+                self.trade_ids.append(trade.id)
+                session.add(TradeOutcomeTracking(
+                    trade_id=trade.id, symbol_id=symbol.id, direction="long", entry_price=100.0,
+                    close_price=100.0 + baseline, close_time=datetime.now() - timedelta(hours=10 - i),
+                    baseline_pnl_pct=baseline, best_price=best, status=status, verdict=verdict,
+                    optimal_pnl_pct=None if status == "tracking" else best - 100.0,
+                    missed_pnl_pct=missed,
+                ))
+            await session.commit()
+
+    async def test_counts_independent_of_filter(self):
+        from src.web.api import get_trade_outcome_analysis
+
+        for f in (None, "tracking", "sl_too_tight"):
+            data = await get_trade_outcome_analysis(limit=20, filter=f)
+            self.assertEqual(data["tracking_count"], 1)
+            self.assertEqual(data["finished_count"], 4)
+            self.assertEqual(data["verdict_counts"], {"optimal": 1, "sl_too_tight": 2, "premature_exit": 1})
+            self.assertEqual(data["filter"], f)
+
+    async def test_default_is_biggest_misses(self):
+        from src.web.api import get_trade_outcome_analysis
+
+        data = await get_trade_outcome_analysis(limit=20)
+        self.assertEqual([r["missed_pnl_pct"] for r in data["rows"]], [12.0, 4.0, 1.5, 0.1])
+        self.assertEqual(data["rows"], data["biggest_misses"])
+
+    async def test_verdict_filter(self):
+        from src.web.api import get_trade_outcome_analysis
+
+        data = await get_trade_outcome_analysis(limit=20, filter="sl_too_tight")
+        self.assertEqual([r["verdict"] for r in data["rows"]], ["sl_too_tight", "sl_too_tight"])
+        self.assertEqual([r["missed_pnl_pct"] for r in data["rows"]], [12.0, 4.0])
+        self.assertEqual(data["biggest_misses"], [])
+
+    async def test_tracking_filter_has_provisional_missed(self):
+        from src.web.api import get_trade_outcome_analysis
+
+        data = await get_trade_outcome_analysis(limit=20, filter="tracking")
+        self.assertEqual(len(data["rows"]), 1)
+        row = data["rows"][0]
+        self.assertEqual(row["status"], "tracking")
+        self.assertEqual(row["trade_id"], self.trade_ids[0])
+        self.assertAlmostEqual(row["optimal_pnl_pct"], 6.0)
+        self.assertAlmostEqual(row["missed_pnl_pct"], 4.0)
+
+    async def test_finished_filter_newest_first(self):
+        from src.web.api import get_trade_outcome_analysis
+
+        data = await get_trade_outcome_analysis(limit=20, filter="finished")
+        self.assertEqual([r["trade_id"] for r in data["rows"]], list(reversed(self.trade_ids[1:])))
+        limited = await get_trade_outcome_analysis(limit=2, filter="finished")
+        self.assertEqual(len(limited["rows"]), 2)
+
+    async def test_unknown_filter_rejected(self):
+        from fastapi import HTTPException
+
+        from src.web.api import get_trade_outcome_analysis
+
+        with self.assertRaises(HTTPException) as ctx:
+            await get_trade_outcome_analysis(limit=20, filter="bogus")
+        self.assertEqual(ctx.exception.status_code, 400)
 
 
 class TestExchangeCallCache(unittest.IsolatedAsyncioTestCase):
