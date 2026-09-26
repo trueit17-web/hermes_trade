@@ -1843,11 +1843,36 @@ class TradingBot:
             if price is None:
                 price = pos["entry_price"]
             amount = pos["amount"]
-            if pos["side"] == "long":
+            entry = pos["entry_price"]
+            unrealized = (price - entry) * amount if pos["side"] == "long" else (entry - price) * amount
+            real_futures = not settings.is_paper and (
+                tracked.get(symbol, {}).get("market_type") or pos.get("market_type")
+            ) == "futures"
+            if real_futures:
+                # Реальный фьючерс: free-баланс биржи уже без маржи позиции
+                # (не без полного номинала) — возвращаем маржу + PnL. Раньше
+                # long считался как спот (+amount*price), и при плече 12x
+                # (ZK/USDT, прод 2026-09-26) equity завышался на номинал минус
+                # маржу (~3.9k USDT): "Просадка" -0.29% -> -2.38%, защита по
+                # max_drawdown ослаблена на ту же сумму. Short, наоборот,
+                # вообще терял свою маржу — ложная просадка.
+                leverage = self._position_leverage(symbol, pos, tracked)
+                equity += amount * entry / leverage + unrealized
+            elif pos["side"] == "long":
                 equity += amount * price
             else:
-                equity += (pos["entry_price"] - price) * amount
+                equity += unrealized
         return equity
+
+    @staticmethod
+    def _position_leverage(symbol: str, pos: dict, tracked: dict) -> float:
+        """Плечо позиции (из кэша биржевой позиции), >= 1; нет данных — 1x."""
+        raw = tracked.get(symbol, {}).get("leverage") or pos.get("leverage")
+        try:
+            leverage = float(raw)
+        except (TypeError, ValueError):
+            return 1.0
+        return leverage if leverage >= 1 else 1.0
 
     def _count_algo_open_positions(self) -> int:
         """

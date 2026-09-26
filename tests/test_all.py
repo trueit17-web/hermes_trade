@@ -7561,6 +7561,61 @@ class TestClosePositionAtomicity(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(symbol, engine.paper_positions)
 
 
+class TestComputeEquityRealFuturesLeverage(unittest.TestCase):
+    """
+    Прод 2026-09-26: ZK/USDT long 12x (номинал ~4.25k, маржа ~355) —
+    "Просадка" скачком -0.29% -> -2.38%. Free-баланс биржи уже без маржи
+    фьючерсной позиции, а _compute_equity прибавлял полный номинал, как для
+    спота. Для реального фьючерса: маржа (номинал на входе / плечо) + PnL.
+    """
+
+    def _equity(self, pos, price, cash=1000.0, paper=False):
+        import src.main as main_module
+
+        bot = main_module.TradingBot()
+        saved_mode = settings.trading_mode
+        saved_real = dict(main_module.execution_engine.real_positions)
+        saved_paper = dict(main_module.execution_engine.paper_positions)
+        try:
+            settings.trading_mode = "paper" if paper else "real"
+            if paper:
+                main_module.execution_engine.paper_positions = {"ZK/USDT": dict(pos)}
+            else:
+                main_module.execution_engine.real_positions = {"ZK/USDT": dict(pos)}
+            bot.open_positions = {"ZK/USDT": dict(pos)}
+            bot.last_prices = {"ZK/USDT": price}
+            return bot._compute_equity(cash)
+        finally:
+            settings.trading_mode = saved_mode
+            main_module.execution_engine.real_positions = saved_real
+            main_module.execution_engine.paper_positions = saved_paper
+
+    def test_leveraged_long_counts_margin_plus_pnl(self):
+        pos = {"side": "long", "entry_price": 1.0, "amount": 1200.0, "market_type": "futures", "leverage": 12.0}
+        # маржа 100 + PnL (1.1-1.0)*1200=120
+        self.assertAlmostEqual(self._equity(pos, 1.1), 1000.0 + 100.0 + 120.0)
+
+    def test_leveraged_short_counts_margin_plus_pnl(self):
+        pos = {"side": "short", "entry_price": 1.0, "amount": 1200.0, "market_type": "futures", "leverage": 12.0}
+        self.assertAlmostEqual(self._equity(pos, 0.9), 1000.0 + 100.0 + 120.0)
+
+    def test_unleveraged_futures_long_unchanged(self):
+        pos = {"side": "long", "entry_price": 1.0, "amount": 100.0, "market_type": "futures", "leverage": 1.0}
+        self.assertAlmostEqual(self._equity(pos, 1.2), 1000.0 + 120.0)
+
+    def test_missing_leverage_treated_as_1x(self):
+        pos = {"side": "long", "entry_price": 1.0, "amount": 100.0, "market_type": "futures"}
+        self.assertAlmostEqual(self._equity(pos, 1.2), 1000.0 + 120.0)
+
+    def test_spot_long_still_full_value(self):
+        pos = {"side": "long", "entry_price": 1.0, "amount": 100.0, "market_type": "spot", "leverage": 5.0}
+        self.assertAlmostEqual(self._equity(pos, 1.2), 1000.0 + 120.0)
+
+    def test_paper_mode_unchanged(self):
+        pos = {"side": "long", "entry_price": 1.0, "amount": 1200.0, "market_type": "futures", "leverage": 12.0}
+        self.assertAlmostEqual(self._equity(pos, 1.1, paper=True), 1000.0 + 1320.0)
+
+
 class TestComputeEquitySkipsUntrackedPositions(unittest.IsolatedAsyncioTestCase):
     """
     self.open_positions (TradingBot) — вторичный кэш execution_engine
