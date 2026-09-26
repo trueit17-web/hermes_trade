@@ -7656,6 +7656,8 @@ class TestRealPositionEquityAndStartupLeverage(unittest.IsolatedAsyncioTestCase)
 
         await engine._refresh_futures_leverage()
 
+        # Без списка символов: Bybit не принимает массив > 1 символа.
+        exchange.fetch_positions.assert_awaited_once_with()
         self.assertEqual(engine.real_positions["ZK/USDT"]["leverage"], 12)
         self.assertEqual(engine.real_positions["ZK/USDT"]["margin_usdt"], 100.0)
         self.assertNotIn("leverage", engine.real_positions["BTC/USDT"])

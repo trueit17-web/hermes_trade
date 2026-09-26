@@ -4342,7 +4342,10 @@ class ExecutionEngine:
         if exchange is None:
             return
         try:
-            positions = await exchange.fetch_positions([self._ccxt_symbol(exchange, s) for s in futures])
+            # Без списка символов: Bybit отвечает "fetchPositions() does not
+            # accept an array with more than one symbol" (прод, 1.7.3) — берём
+            # все позиции аккаунта одним запросом и фильтруем по своим.
+            positions = await exchange.fetch_positions()
         except Exception as e:
             logger.warning(f"⚠️ Не удалось получить плечо фьючерсных позиций при старте: {e}")
             return
