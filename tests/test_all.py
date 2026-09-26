@@ -7616,6 +7616,68 @@ class TestComputeEquityRealFuturesLeverage(unittest.TestCase):
         self.assertAlmostEqual(self._equity(pos, 1.1, paper=True), 1000.0 + 1320.0)
 
 
+class TestRealPositionEquityAndStartupLeverage(unittest.IsolatedAsyncioTestCase):
+    """
+    Прод 2026-09-26, после 1.7.2: база просадки при рестарте считалась в
+    executor.initialize() своей формулой (полный номинал long) и без плеча
+    (restore из БД его не знает), а текущий equity — уже от маржи:
+    старт 189838 против 184274, ложная просадка +2.93%. Теперь одна формула
+    (real_position_equity) и плечо подтягивается с биржи до расчёта базы.
+    """
+
+    def test_formula(self):
+        from src.execution.executor import ExecutionEngine
+
+        eq = ExecutionEngine.real_position_equity
+        fut_long = {"side": "long", "amount": 1200.0, "entry_price": 1.0, "market_type": "futures", "leverage": 12}
+        self.assertAlmostEqual(eq(fut_long), 100.0)
+        self.assertAlmostEqual(eq(fut_long, 1.1), 220.0)
+        fut_short = {**fut_long, "side": "short"}
+        self.assertAlmostEqual(eq(fut_short, 0.9), 220.0)
+        self.assertAlmostEqual(eq({**fut_long, "leverage": None}), 1200.0)
+        self.assertAlmostEqual(eq({**fut_long, "leverage": "12"}), 100.0)
+        spot = {"side": "long", "amount": 10.0, "entry_price": 2.0, "market_type": "spot"}
+        self.assertAlmostEqual(eq(spot, 3.0), 30.0)
+
+    async def test_refresh_futures_leverage_from_exchange(self):
+        from src.execution.executor import ExecutionEngine
+
+        engine = ExecutionEngine()
+        engine.real_positions = {
+            "ZK/USDT": {"side": "long", "amount": 1200.0, "entry_price": 1.0, "market_type": "futures"},
+            "BTC/USDT": {"side": "long", "amount": 1.0, "entry_price": 1.0, "market_type": "spot"},
+        }
+        exchange = MagicMock()
+        exchange.options = {"defaultType": "swap"}
+        exchange.fetch_positions = AsyncMock(return_value=[
+            {"symbol": "ZK/USDT:USDT", "leverage": 12, "initialMargin": 100.0},
+        ])
+        engine._exchanges = {"futures": exchange}
+
+        await engine._refresh_futures_leverage()
+
+        self.assertEqual(engine.real_positions["ZK/USDT"]["leverage"], 12)
+        self.assertEqual(engine.real_positions["ZK/USDT"]["margin_usdt"], 100.0)
+        self.assertNotIn("leverage", engine.real_positions["BTC/USDT"])
+        self.assertAlmostEqual(engine.real_position_equity(engine.real_positions["ZK/USDT"]), 100.0)
+
+    async def test_refresh_futures_leverage_tolerates_exchange_error(self):
+        from src.execution.executor import ExecutionEngine
+
+        engine = ExecutionEngine()
+        engine.real_positions = {
+            "ZK/USDT": {"side": "long", "amount": 1.0, "entry_price": 1.0, "market_type": "futures"},
+        }
+        exchange = MagicMock()
+        exchange.options = {"defaultType": "swap"}
+        exchange.fetch_positions = AsyncMock(side_effect=RuntimeError("boom"))
+        engine._exchanges = {"futures": exchange}
+
+        await engine._refresh_futures_leverage()
+
+        self.assertNotIn("leverage", engine.real_positions["ZK/USDT"])
+
+
 class TestComputeEquitySkipsUntrackedPositions(unittest.IsolatedAsyncioTestCase):
     """
     self.open_positions (TradingBot) — вторичный кэш execution_engine
@@ -10527,8 +10589,7 @@ class TestRealBalanceReseedsRiskState(unittest.IsolatedAsyncioTestCase):
         # того же restored-состояния, а не от жёстко зашитого числа —
         # без открытых позиций оно совпадёт с голым кэшем 4987.65.
         expected_positions_value = sum(
-            pos["amount"] * pos["entry_price"]
-            for pos in engine.real_positions.values() if pos.get("side") == "long"
+            engine.real_position_equity(pos) for pos in engine.real_positions.values()
         )
         expected_baseline = 4987.65 + expected_positions_value
 
@@ -10602,9 +10663,10 @@ class TestRealBalanceReseedsRiskState(unittest.IsolatedAsyncioTestCase):
             # а не от жёстко зашитого числа: главное утверждение теста — что
             # start_balance учитывает ВСЕ восстановленные позиции, а не только
             # свободный кэш.
+            # Та же формула, что и в initialize(): спот long — стоимость
+            # монет, фьючерс — маржа + PnL (см. real_position_equity).
             expected_positions_value = sum(
-                pos["amount"] * pos["entry_price"]
-                for pos in engine.real_positions.values() if pos.get("side") == "long"
+                engine.real_position_equity(pos) for pos in engine.real_positions.values()
             )
             expected_baseline = 12.79 + expected_positions_value
             self.assertAlmostEqual(global_risk_manager.state.start_balance, expected_baseline)

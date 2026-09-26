@@ -380,6 +380,12 @@ class ExecutionEngine:
                     )
 
             await self._rearm_stop_loss_orders_after_restart()
+            # До расчёта базы просадки ниже: плечо восстановленных из БД
+            # фьючерсных позиций иначе неизвестно до первой периодической
+            # сверки, и база считалась бы от полного номинала (1x), а текущий
+            # equity — от маржи: ложная просадка на номинал минус маржу
+            # (прод 2026-09-26, 1.7.2: старт 189838 против 184274).
+            await self._refresh_futures_leverage()
 
             # Проверка баланса
             try:
@@ -409,9 +415,7 @@ class ExecutionEngine:
                 # entry_price здесь так же консервативен, как fallback в
                 # main.py._compute_equity).
                 positions_value = sum(
-                    pos["amount"] * pos["entry_price"]
-                    for pos in self.real_positions.values()
-                    if pos.get("side") == "long"
+                    self.real_position_equity(pos) for pos in self.real_positions.values()
                 )
                 risk_manager.reset_for_real_account(total_usdt + positions_value)
             except Exception as e:
@@ -4329,6 +4333,56 @@ class ExecutionEngine:
         )
         await event_bus.publish(trade_event)
 
+    async def _refresh_futures_leverage(self) -> None:
+        """Подтянуть leverage/margin_usdt открытых фьючерсных позиций с биржи."""
+        futures = {s: p for s, p in self.real_positions.items() if p.get("market_type") == "futures"}
+        if not futures:
+            return
+        exchange = self._exchanges.get("futures")
+        if exchange is None:
+            return
+        try:
+            positions = await exchange.fetch_positions([self._ccxt_symbol(exchange, s) for s in futures])
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось получить плечо фьючерсных позиций при старте: {e}")
+            return
+        for raw in positions if isinstance(positions, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            pos = futures.get((raw.get("symbol") or "").split(":")[0])
+            if pos is None or not raw.get("leverage"):
+                continue
+            pos["leverage"] = raw.get("leverage")
+            pos["margin_usdt"] = raw.get("initialMargin")
+
+    @staticmethod
+    def real_position_equity(pos: dict, price: float | None = None) -> float:
+        """
+        Вклад реальной позиции в капитал поверх free-баланса USDT биржи —
+        одна формула для базы просадки (reset_for_real_account) и текущего
+        equity (main._compute_equity), иначе они расходятся. price=None —
+        по цене входа. Спот long: рыночная стоимость монет; фьючерс (long и
+        short): маржа (номинал на входе / плечо) + нереализованный PnL —
+        free-баланс уменьшается только на маржу, не на номинал. Прод
+        2026-09-26: ZK/USDT 12x считался полным номиналом, equity завышен на
+        ~3.9k USDT.
+        """
+        amount = float(pos.get("amount") or 0.0)
+        entry = float(pos.get("entry_price") or 0.0)
+        current = entry if price is None else float(price)
+        side = pos.get("side")
+        unrealized = (current - entry) * amount if side == "long" else (entry - current) * amount
+        if pos.get("market_type") == "futures":
+            try:
+                leverage = float(pos.get("leverage") or 1.0)
+            except (TypeError, ValueError):
+                leverage = 1.0
+            leverage = max(leverage, 1.0)
+            return amount * entry / leverage + unrealized
+        if side == "long":
+            return amount * current
+        return unrealized
+
     @staticmethod
     def _extract_usdt_balance(balance: dict) -> float:
         return ExecutionEngine._extract_currency_balance(balance, "USDT")
@@ -4539,9 +4593,7 @@ class ExecutionEngine:
                 final_balance = await exchange.fetch_balance()
                 total_usdt = self._extract_currency_balance(final_balance, "USDT", "total")
                 positions_value = sum(
-                    pos["amount"] * pos["entry_price"]
-                    for pos in self.real_positions.values()
-                    if pos.get("side") == "long"
+                    self.real_position_equity(pos) for pos in self.real_positions.values()
                 )
                 risk_manager.reset_for_real_account(total_usdt + positions_value)
             except Exception as e:
