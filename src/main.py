@@ -2948,28 +2948,13 @@ class TradingBot:
         Проставить executed_trade_id у Telegram-сигнала, чей ордер только что
         закрылся, и обновить статистику канала для quality_scorer — без этого
         historical-accuracy компонент оценки качества (35% веса) навсегда
-        оставался бы нейтральным 0.5, ни разу не узнав реальный win rate канала.
+        оставался бы нейтральным 0.5. Та же функция вызывается и при закрытии
+        вне цикла бота (ExecutionEngine._record_external_close); исход — по
+        сумме PnL всех частей позиции (outcome последней части не используется).
         """
-        if order_id is None:
-            return
-        try:
-            async with get_session() as session:
-                result = await session.execute(
-                    select(TelegramSignal)
-                    .options(selectinload(TelegramSignal.channel))
-                    .where(TelegramSignal.executed_order_id == order_id)
-                )
-                signal = result.scalar_one_or_none()
-                if signal:
-                    signal.executed_trade_id = trade_id
-                    channel_id = signal.channel.channel_id if signal.channel else None
-                    await session.commit()
+        from src.telegram.signal_outcomes import link_signal_to_closed_trade
 
-            if channel_id and outcome is not None:
-                from src.telegram.quality_scorer import signal_quality_scorer
-                signal_quality_scorer.update_channel_stats(channel_id, outcome == "win")
-        except Exception as e:
-            logger.warning(f"Не удалось связать Telegram-сигнал со сделкой #{trade_id}: {e}")
+        await link_signal_to_closed_trade(order_id, trade_id)
 
     async def _cleanup(self):
         """Очистка."""

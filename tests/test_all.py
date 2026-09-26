@@ -5755,7 +5755,7 @@ class TestQualityScorerRestoreFromDb(unittest.IsolatedAsyncioTestCase):
     async def test_restore_channel_stats_from_db(self):
         from sqlalchemy import select
         from src.db.session import get_session
-        from src.db.models import TelegramChannel, TelegramSignal, Trade, Symbol, Exchange
+        from src.db.models import TelegramChannel, TelegramSignal, Trade, Symbol, Exchange, Order
         from src.telegram.quality_scorer import SignalQualityScorer
         from src.utils.timeutils import utcnow
 
@@ -5779,17 +5779,27 @@ class TestQualityScorerRestoreFromDb(unittest.IsolatedAsyncioTestCase):
             session.add(channel)
             await session.flush()
 
-            for outcome, pnl in [("win", 10.0), ("win", 5.0), ("loss", -3.0)]:
-                trade = Trade(
-                    symbol_id=symbol.id, direction="long", entry_price=100.0, exit_price=101.0,
-                    amount=1.0, pnl=pnl, pnl_pct=1.0, outcome=outcome, is_open=False, closed_at=utcnow(),
+            # Исход — по Trade-частям ордера открытия (executed_order_id), без
+            # ссылки executed_trade_id: так выглядят позиции, закрытые вне
+            # цикла бота (биржевой SL/TP). Последняя позиция закрыта лишь
+            # наполовину — её исход ещё не известен и не учитывается.
+            for outcome, pnl, closed_amount in [("win", 10.0, 1.0), ("win", 5.0, 1.0), ("loss", -3.0, 1.0), ("win", 7.0, 0.5)]:
+                order = Order(
+                    exchange_id=exchange.id, symbol_id=symbol.id, side="buy", order_type="market",
+                    amount=1.0, price=100.0, status="filled", filled_amount=1.0, filled_price=100.0,
+                    fee=0.0, market_type="spot",
                 )
-                session.add(trade)
+                session.add(order)
                 await session.flush()
+                session.add(Trade(
+                    symbol_id=symbol.id, order_open_id=order.id, direction="long", entry_price=100.0,
+                    exit_price=101.0, amount=closed_amount, pnl=pnl, pnl_pct=1.0, outcome=outcome,
+                    is_open=False, closed_at=utcnow(),
+                ))
                 session.add(TelegramSignal(
                     channel_id=channel.id, raw_message="test", message_date=utcnow(),
                     parsed_pair="TESTCOIN/USDT", parsed_side="long", parsed_entry=100.0,
-                    decision="executed", executed_trade_id=trade.id,
+                    decision="executed", executed_order_id=order.id,
                 ))
             await session.commit()
 
@@ -7103,6 +7113,122 @@ class TestChannelStatsIncludesPartialClosePnl(unittest.IsolatedAsyncioTestCase):
         # closed_trades/win_rate остаются про ПОЛНОСТЬЮ закрытые позиции —
         # эта ещё не закрыта целиком, менять их семантику не нужно.
         self.assertEqual(channel_stats["closed_trades"], 0)
+
+
+class TestChannelHistoryCountsExternallyClosedTrades(unittest.IsolatedAsyncioTestCase):
+    """
+    Прод 2026-09-26: "перестало считать историю каналов". Исход сигнала
+    определялся по ссылке executed_trade_id, которую ставил только обычный
+    путь закрытия в main.py. Позиции, закрытые биржевым SL/TP вне цикла
+    бота (_record_external_close), ссылку не получали: закрытые сделки и
+    win rate канала не росли, quality_scorer исход не узнавал.
+    """
+
+    async def _position(self, legs, order_amount=10.0, channel_suffix=""):
+        from src.db.models import Exchange, Order, Symbol, TelegramChannel, TelegramSignal, Trade
+        from src.db.session import get_session
+        from src.utils.timeutils import utcnow
+
+        tag = uuid.uuid4().hex[:8]
+        async with get_session() as session:
+            exchange = Exchange(name=f"hist-{tag}", is_paper=True)
+            session.add(exchange)
+            await session.flush()
+            symbol = Symbol(exchange_id=exchange.id, symbol=f"H{tag}/USDT", base_asset=f"H{tag}", quote_asset="USDT")
+            session.add(symbol)
+            await session.flush()
+            order = Order(
+                exchange_id=exchange.id, symbol_id=symbol.id, side="buy", order_type="market",
+                amount=order_amount, price=1.0, status="filled", filled_amount=order_amount, filled_price=1.0,
+                fee=0.0, market_type="futures",
+            )
+            session.add(order)
+            await session.flush()
+            trade_ids = []
+            for pnl, amount in legs:
+                t = Trade(
+                    symbol_id=symbol.id, order_open_id=order.id, direction="long", entry_price=1.0,
+                    exit_price=1.0, amount=amount, pnl=pnl, pnl_pct=0.0,
+                    outcome="win" if pnl > 0 else "loss", is_open=False, closed_at=utcnow(),
+                )
+                session.add(t)
+                await session.flush()
+                trade_ids.append(t.id)
+            channel = TelegramChannel(channel_id=f"@hist_{tag}{channel_suffix}", channel_title="Hist", active=True)
+            session.add(channel)
+            await session.flush()
+            signal = TelegramSignal(
+                channel_id=channel.id, raw_message="x", message_date=utcnow(), parsed_pair=symbol.symbol,
+                parsed_side="long", parsed_entry=1.0, decision="executed", executed_order_id=order.id,
+            )
+            session.add(signal)
+            await session.commit()
+            return channel.id, channel.channel_id, order.id, trade_ids, signal.id
+
+    async def test_stats_count_closed_trade_without_link(self):
+        from src.web.api import telegram_channels_stats
+
+        # TP1 +20 на половине, остаток по стопу -5: закрыта целиком, в плюсе.
+        db_id, _, _, _, _ = await self._position([(20.0, 5.0), (-5.0, 5.0)])
+        stats = await telegram_channels_stats()
+        ch = next(s for s in stats["channels"] if s["channel_id"] == db_id)
+        self.assertEqual(ch["closed_trades"], 1)
+        self.assertEqual(ch["win_rate"], 100.0)
+        self.assertAlmostEqual(ch["total_pnl"], 15.0)
+
+    async def test_stats_partial_position_not_closed(self):
+        from src.web.api import telegram_channels_stats
+
+        db_id, _, _, _, _ = await self._position([(20.0, 5.0)])
+        stats = await telegram_channels_stats()
+        ch = next(s for s in stats["channels"] if s["channel_id"] == db_id)
+        self.assertEqual(ch["closed_trades"], 0)
+        self.assertIsNone(ch["win_rate"])
+        self.assertAlmostEqual(ch["total_pnl"], 20.0)
+
+    async def test_link_sets_trade_and_feeds_scorer_total_pnl(self):
+        from src.db.models import TelegramSignal
+        from src.db.session import get_session
+        from src.telegram.quality_scorer import signal_quality_scorer
+        from src.telegram.signal_outcomes import link_signal_to_closed_trade
+
+        _, channel_key_, order_id, trade_ids, signal_id = await self._position([(20.0, 5.0), (-5.0, 5.0)])
+        signal_quality_scorer.channel_stats.pop(channel_key_, None)
+
+        await link_signal_to_closed_trade(order_id, trade_ids[-1])
+        # Повторная связка (например, после рестарта) не засчитывает исход дважды.
+        await link_signal_to_closed_trade(order_id, trade_ids[-1])
+
+        async with get_session() as session:
+            signal = await session.get(TelegramSignal, signal_id)
+            self.assertEqual(signal.executed_trade_id, trade_ids[-1])
+        stats = signal_quality_scorer.channel_stats[channel_key_]
+        self.assertEqual(stats["good_signals"], 1)
+        self.assertEqual(stats["bad_signals"], 0)
+
+    async def test_external_close_links_signal(self):
+        from src.execution.executor import ExecutionEngine
+
+        engine = ExecutionEngine()
+        pos = {"entry_price": 1.0, "entry_fee": 0.0, "side": "long", "order_id": 12345, "amount": 1.0}
+        with patch.object(engine, "_resolve_symbol_id", AsyncMock(return_value=(None, None))), \
+                patch.object(engine, "_resolve_strategy_id", AsyncMock(return_value=None)), \
+                patch.object(engine, "_cancel_order_safe", AsyncMock()), \
+                patch("src.execution.executor.get_session") as get_session_mock, \
+                patch("src.telegram.signal_outcomes.link_signal_to_closed_trade", AsyncMock()) as link:
+            session = MagicMock()
+            session.add = MagicMock()
+            session.flush = AsyncMock()
+            session.commit = AsyncMock()
+            session.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=None)))
+            get_session_mock.return_value.__aenter__ = AsyncMock(return_value=session)
+            get_session_mock.return_value.__aexit__ = AsyncMock(return_value=False)
+            await engine._record_external_close(
+                "EXT/USDT", pos, exit_price=1.1, amount=1.0, exit_fee=0.0,
+                order_id_exchange=None, log_note="test",
+            )
+        link.assert_awaited_once()
+        self.assertEqual(link.await_args.args[0], 12345)
 
 
 class TestChannelStatsOpenNowCount(unittest.IsolatedAsyncioTestCase):

@@ -4245,9 +4245,13 @@ function wireChannelSignalFilters(id, cell) {
   });
 }
 
-async function refreshChannelSignalsTable(id, cell) {
+// quiet=true — фоновое обновление уже показанной таблицы при автообновлении
+// дашборда (restoreExpandedChannel): без заглушки "Загрузка…", чтобы
+// таблица не мигала каждые несколько секунд.
+async function refreshChannelSignalsTable(id, cell, { quiet = false } = {}) {
   const tableWrap = cell.querySelector(".channel-signal-table-wrap");
-  tableWrap.innerHTML = `<div class="muted" style="padding:10px 16px">Загрузка…</div>`;
+  if (!tableWrap) return;
+  if (!quiet) tableWrap.innerHTML = `<div class="muted" style="padding:10px 16px">Загрузка…</div>`;
   try {
     const f = getChannelSignalFilters(id);
     const params = new URLSearchParams({ channel_id: id, limit: "50" });
@@ -4255,11 +4259,14 @@ async function refreshChannelSignalsTable(id, cell) {
     if (f.date) params.set("date", f.date);
     if (f.decision && f.decision !== "all") params.set("decision", f.decision);
     const data = await api(`/telegram/signals?${params.toString()}`);
+    // Пока ждали ответ, строку могли свернуть — не трогаем устаревший DOM.
+    if (quiet && !expandedChannels.has(id)) return;
     tableWrap.innerHTML = renderChannelSignalsTable(data.signals || []);
     cell.dataset.loaded = "1";
     if (expandedChannels.has(id)) expandedChannels.set(id, cell.innerHTML);
     wireSignalDecisionButtons(cell, id);
   } catch (err) {
+    if (quiet) return;
     tableWrap.innerHTML = `<div class="muted" style="padding:10px 16px">Ошибка загрузки: ${err.message}</div>`;
   }
 }
@@ -4318,6 +4325,11 @@ function restoreExpandedChannel(row) {
     cell.dataset.loaded = "1";
     wireChannelSignalFilters(id, cell);
     wireSignalDecisionButtons(cell, id);
+    // Кэш — только чтобы строка не мигала при перестройке таблицы каналов;
+    // сами данные перезапрашиваем, иначе раскрытая история навсегда
+    // оставалась снимком момента раскрытия (новые сигналы и закрытия
+    // сделок не появлялись, пока строку не свернуть и не раскрыть заново).
+    refreshChannelSignalsTable(id, cell, { quiet: true });
   }
 }
 

@@ -27,27 +27,36 @@ class SignalQualityScorer:
         """
         from sqlalchemy import select
 
-        from src.db.models import TelegramChannel, TelegramSignal, Trade
+        from src.db.models import TelegramChannel, TelegramSignal
         from src.db.session import get_session
+        from src.telegram.signal_outcomes import order_outcomes
 
-        # Один JOIN-запрос вместо запроса на каждый канал (N+1).
+        # Исход сигнала — по всем Trade-частям его ордера (см.
+        # signal_outcomes.py), а не по ссылке executed_trade_id: её не было у
+        # позиций, закрытых вне цикла бота (биржевой SL/TP), и такие исходы
+        # после рестарта терялись.
         try:
             async with get_session() as session:
                 rows = (
                     await session.execute(
-                        select(TelegramChannel.channel_id, Trade.outcome)
+                        select(TelegramChannel.channel_id, TelegramSignal.executed_order_id)
                         .join(TelegramSignal, TelegramSignal.channel_id == TelegramChannel.id)
-                        .join(Trade, TelegramSignal.executed_trade_id == Trade.id)
-                        .where(Trade.outcome.is_not(None))
+                        .where(
+                            TelegramSignal.decision == "executed",
+                            TelegramSignal.executed_order_id.is_not(None),
+                        )
                         .order_by(TelegramSignal.id)
                     )
                 ).all()
+                outcomes = await order_outcomes(session, [oid for _, oid in rows])
         except Exception as e:
             logger.warning(f"Не удалось восстановить channel_stats из БД: {e}")
             return
 
-        for channel_id, outcome in rows:
-            self.update_channel_stats(channel_id, outcome == "win")
+        for channel_id, order_id in rows:
+            outcome = outcomes.get(order_id)
+            if outcome is not None and outcome[1]:
+                self.update_channel_stats(channel_id, outcome[0] > 0)
 
         if self.channel_stats:
             logger.info(

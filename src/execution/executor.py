@@ -4315,6 +4315,13 @@ class ExecutionEngine:
         risk_manager.on_trade_closed(pnl)
         risk_manager.on_position_closed(symbol)
         logger.warning(f"{log_note} | PnL: {pnl:+.2f} ({pnl_pct:+.2f}%)")
+        # Связать сигнал канала с закрытием и передать исход в quality_scorer —
+        # раньше это делал только обычный путь закрытия в main.py, и позиции,
+        # закрытые биржевым SL/TP (самый частый путь), в статистику и скоринг
+        # канала не попадали.
+        from src.telegram.signal_outcomes import link_signal_to_closed_trade
+
+        await link_signal_to_closed_trade(order_open_id, trade_id)
 
         trade_event = TradeEvent(
             type="trade_event",

@@ -44,6 +44,7 @@ from src.strategy import strategy_registry
 from src.telegram.history_backfill import backfill_channel_history
 from src.telegram.notifier import send_notification
 from src.telegram.signal_outcome_simulation import simulate_channel_signal_outcomes
+from src.telegram.signal_outcomes import order_outcomes
 from src.telegram.signal_quality_training import (
     get_signal_quality_dataset_summary as _get_signal_quality_dataset_summary,
 )
@@ -2432,59 +2433,49 @@ async def telegram_channels_stats():
                     TelegramSignal.decision,
                     TelegramSignal.quality_score,
                     TelegramSignal.executed_order_id,
-                    Trade.id,
-                    Trade.outcome,
-                ).outerjoin(Trade, TelegramSignal.executed_trade_id == Trade.id)
+                )
             )
         ).all()
 
         per_channel: dict[int, dict] = {}
-        for channel_db_id, decision, quality, order_id, trade_id, outcome in signal_rows:
-            agg = per_channel.setdefault(channel_db_id, {
-                "total": 0, "executed": 0, "closed": 0, "wins": 0, "scores": [], "order_ids": [],
-            })
+        for channel_db_id, decision, quality, order_id in signal_rows:
+            agg = per_channel.setdefault(channel_db_id, {"total": 0, "executed": 0, "scores": [], "order_ids": set()})
             agg["total"] += 1
             if quality is not None:
                 agg["scores"].append(quality)
             if decision != "executed":
                 continue
             agg["executed"] += 1
-            if trade_id is not None:
-                agg["closed"] += 1
-                agg["wins"] += outcome == "win"
             if order_id is not None:
-                agg["order_ids"].append(order_id)
+                agg["order_ids"].add(order_id)
 
-        # total_pnl раньше суммировал только s.executed_trade — а эта ссылка
-        # проставляется ИСКЛЮЧИТЕЛЬНО на финальном закрытии позиции целиком
-        # (_link_telegram_signal_trade вызывается из main.py только в ветке
-        # is_partial=False), поэтому PnL уже сработавших частичных TP у ещё
-        # открытых позиций канала нигде не учитывался. Берём ВСЕ Trade-леги
-        # по всем исполненным ордерам канала (частичные закрытия по
-        # TP1/TP2/... и финальное), а не только финально-связанный.
+        # Закрытые сделки, win rate и PnL — по ВСЕМ Trade-частям ордеров
+        # канала (см. signal_outcomes.order_outcomes), а не по ссылке
+        # executed_trade_id: её не было у позиций, закрытых биржевым SL/TP
+        # вне цикла бота, и такие сделки в статистику канала не попадали
+        # ("перестало считать историю каналов", прод 2026-09-26). PnL
+        # включает и частичные TP ещё открытых позиций.
         all_order_ids = {oid for agg in per_channel.values() for oid in agg["order_ids"]}
-        leg_pnl: dict[int, list[float]] = {}
-        if all_order_ids:
-            for order_open_id, pnl in (
-                await session.execute(
-                    select(Trade.order_open_id, Trade.pnl).where(Trade.order_open_id.in_(all_order_ids))
-                )
-            ).all():
-                leg_pnl.setdefault(order_open_id, []).append(float(pnl))
+        outcomes = await order_outcomes(session, all_order_ids)
 
         result = []
         for c in channels:
-            agg = per_channel.get(c.id, {"total": 0, "executed": 0, "closed": 0, "wins": 0, "scores": [], "order_ids": []})
-            legs = [pnl for oid in set(agg["order_ids"]) for pnl in leg_pnl.get(oid, [])]
+            agg = per_channel.get(c.id, {"total": 0, "executed": 0, "scores": [], "order_ids": set()})
+            channel_outcomes = {oid: outcomes[oid] for oid in agg["order_ids"] if oid in outcomes}
+            closed = [
+                pnl for oid, (pnl, fully_closed) in channel_outcomes.items()
+                if fully_closed and oid not in open_order_ids_global
+            ]
+            wins = sum(1 for pnl in closed if pnl > 0)
             scored = agg["scores"]
             result.append({
                 "channel_id": c.id,
                 "total_signals": agg["total"],
                 "executed": agg["executed"],
                 "open_now": sum(1 for oid in agg["order_ids"] if oid in open_order_ids_global),
-                "closed_trades": agg["closed"],
-                "win_rate": round(agg["wins"] / agg["closed"] * 100, 1) if agg["closed"] else None,
-                "total_pnl": round(sum(legs), 2) if legs else None,
+                "closed_trades": len(closed),
+                "win_rate": round(wins / len(closed) * 100, 1) if closed else None,
+                "total_pnl": round(sum(pnl for pnl, _ in channel_outcomes.values()), 2) if channel_outcomes else None,
                 "avg_quality": round(sum(scored) / len(scored), 2) if scored else None,
                 "size_multiplier": await expectancy_sizing.size_multiplier(channel_key(c.channel_id)),
             })
