@@ -48,6 +48,8 @@ class RiskState:
         self.start_balance = settings.startup_capital_usdt
         self.current_balance = settings.startup_capital_usdt
         self.daily_pnl = 0.0
+        # UTC-день, к которому относится daily_pnl (см. _roll_day_if_needed).
+        self.daily_pnl_date = utcnow().date()
         self.daily_loss_limit_reached = False
         self.daily_loss_reset_time: datetime | None = None
         self.open_positions_count = 0
@@ -71,8 +73,28 @@ class RiskState:
         """Обновить текущий баланс."""
         self.current_balance = balance
 
+    def _roll_day_if_needed(self) -> None:
+        """
+        Обнулить дневной PnL при смене UTC-суток. Раньше daily_pnl
+        сбрасывался только в check_daily_loss_limit_reset и только если лимит
+        убытков В ЭТОТ ДЕНЬ был достигнут — прибыльный день переносился на
+        следующий: прод 2026-09-27, вчерашние +223 USDT фактически расширяли
+        сегодняшний лимит -50 до -273 USDT реального убытка.
+        """
+        today = utcnow().date()
+        if today != self.daily_pnl_date:
+            if self.daily_pnl or self.daily_loss_limit_reached:
+                logger.info(
+                    f"🔄 Daily PnL сброшен (новый день, {today}); за {self.daily_pnl_date}: {self.daily_pnl:+.2f}"
+                )
+            self.daily_pnl = 0.0
+            self.daily_loss_limit_reached = False
+            self.daily_loss_reset_time = None
+            self.daily_pnl_date = today
+
     def update_daily_pnl(self, pnl: float):
         """Обновить daily PnL."""
+        self._roll_day_if_needed()
         self.daily_pnl += pnl
         if self.daily_pnl <= -self.daily_loss_limit_usd:
             self.daily_loss_limit_reached = True
@@ -82,6 +104,7 @@ class RiskState:
 
     def check_daily_loss_limit_reset(self):
         """Проверить, можно ли сбросить daily loss лимит (начало нового дня)."""
+        self._roll_day_if_needed()
         if self.daily_loss_limit_reached:
             now = utcnow()
             if self.daily_loss_reset_time is None:
@@ -285,6 +308,7 @@ class RiskManager:
         self.state.start_balance = settings.startup_capital_usdt
         self.state.current_balance = settings.startup_capital_usdt
         self.state.daily_pnl = 0.0
+        self.state.daily_pnl_date = utcnow().date()
         self.state.daily_loss_limit_reached = False
         self.state.total_drawdown_pct = 0.0
         self.state.max_drawdown_reached = 0.0
@@ -310,6 +334,7 @@ class RiskManager:
         self.state.start_balance = balance
         self.state.current_balance = balance
         self.state.daily_pnl = 0.0
+        self.state.daily_pnl_date = utcnow().date()
         self.state.daily_loss_limit_reached = False
         self.state.total_drawdown_pct = 0.0
         self.state.max_drawdown_reached = 0.0

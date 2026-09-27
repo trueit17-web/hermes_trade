@@ -203,6 +203,40 @@ class TestRiskState(unittest.TestCase):
         self.assertFalse(state.daily_loss_limit_reached)
         self.assertEqual(state.daily_pnl, 0.0)
 
+    def test_profitable_day_does_not_carry_over(self):
+        """
+        Прод 2026-09-27: день закрылся в плюс (+223), лимит не срабатывал —
+        daily_pnl переносился на следующий день и расширял лимит убытков.
+        """
+        state = RiskState()
+        state.daily_loss_limit_usd = 50.0
+        state.update_daily_pnl(223.0)
+        state.daily_pnl_date = state.daily_pnl_date - timedelta(days=1)
+
+        state.check_daily_loss_limit_reset()
+        self.assertEqual(state.daily_pnl, 0.0)
+
+        state.update_daily_pnl(-60.0)
+        self.assertTrue(state.daily_loss_limit_reached, "сегодняшний убыток -60 должен упереться в лимит 50")
+
+    def test_new_day_rolls_on_first_trade_too(self):
+        state = RiskState()
+        state.daily_loss_limit_usd = 50.0
+        state.update_daily_pnl(-60.0)
+        self.assertTrue(state.daily_loss_limit_reached)
+        state.daily_pnl_date = state.daily_pnl_date - timedelta(days=1)
+
+        state.update_daily_pnl(10.0)
+        self.assertAlmostEqual(state.daily_pnl, 10.0)
+        self.assertFalse(state.daily_loss_limit_reached)
+
+    def test_same_day_accumulates(self):
+        state = RiskState()
+        state.update_daily_pnl(5.0)
+        state.check_daily_loss_limit_reset()
+        state.update_daily_pnl(7.0)
+        self.assertAlmostEqual(state.daily_pnl, 12.0)
+
     def test_daily_loss_limit_reset_is_idempotent_when_not_reached(self):
         """Вызов без активного лимита не должен ничего ломать (безопасно
         вызывать на каждой итерации основного цикла, а не только реактивно
