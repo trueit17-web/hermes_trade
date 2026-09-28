@@ -1371,6 +1371,20 @@ class TradingBot:
             tracked[symbol]["notification_message_id"] = message_id
         await execution_engine.set_order_notification_message_id(order.id, message_id)
 
+    @staticmethod
+    async def _signal_reference_price(symbol: str, market_type: str) -> float | None:
+        """Текущая цена для рыночного исполнения сигнала; None — не удалось получить."""
+        try:
+            price = await execution_engine.get_reference_price(symbol, market_type)
+        except Exception as e:
+            logger.debug(f"Не удалось получить рыночную цену {symbol} для сигнала: {e}")
+            return None
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            return None
+        return price if price > 0 else None
+
     async def _execute_telegram_signal(self, signal_event: dict):
         """Исполнение Telegram сигнала. Возвращает созданный Order или None."""
         pair = signal_event.get("parsed_pair", "")
@@ -1420,6 +1434,18 @@ class TradingBot:
             and signal_event.get("channel_leverage_mode") == "fit_leverage"
         )
 
+        # Цена, по которой рыночный ордер реально исполнится, — от неё
+        # считаются дистанция до SL, подбор плеча, капы SL и размер позиции.
+        # Раньше всё это считалось от цены входа из ТЕКСТА сигнала: прод
+        # 2026-09-28, BEAT/USDT — вход канала ~0.1000, исполнение 0.10292
+        # (+2.9%), SL канала 9.86% от входа канала оказался 12.4% от
+        # фактического входа; плечо 4x подобрано под "SL ≤ 40% маржи", а
+        # стоп стоил ~50% маржи (-235 USDT). Нет цены с биржи — как раньше.
+        ref_price = await self._signal_reference_price(symbol, market_type) or entry
+        if not ref_price:
+            signal_event["reject_reason"] = "нет цены входа"
+            return None
+
         # Человекочитаемый журнал автоматических правок исходного сигнала
         # канала (дефолтный SL, капы SL/плеча ниже) — попадает в Order.notes
         # и показывается первой строкой в развороте подробностей на
@@ -1432,6 +1458,10 @@ class TradingBot:
         # показываем той же строкой в подробностях сделки, чтобы было видно,
         # что бот распознал и применил именно ЭТИ доли/правило SL, а не
         # свой обычный дефолт (равные доли, halfway-SL после TP1).
+        if entry and abs(ref_price - entry) / entry > 0.001:
+            signal_changes.append(
+                f"вход по рынку {ref_price:.6g} (канал {entry:.6g}, {(ref_price - entry) / entry * 100:+.2f}%)"
+            )
         if tp_weights:
             pct_list = ", ".join(f"{w * 100:.3g}%" for w in tp_weights)
             signal_changes.append(f"канал указал доли частичного закрытия: {pct_list}")
@@ -1471,7 +1501,7 @@ class TradingBot:
             # честная запись того, что канал реально написал; fallback
             # применяется только к фактически исполняемому ордеру.
             pct = settings.telegram_signals_default_sl_pct / 100
-            sl = entry * (1 - pct) if side == "long" else entry * (1 + pct)
+            sl = ref_price * (1 - pct) if side == "long" else ref_price * (1 + pct)
             logger.info(
                 f"⚠️ Сигнал по {pair} без SL — применён дефолтный защитный SL "
                 f"{settings.telegram_signals_default_sl_pct:.1f}% ({sl:.6f})"
@@ -1495,7 +1525,7 @@ class TradingBot:
             effective_leverage = leverage or settings.futures_leverage
             if effective_leverage and effective_leverage > 0:
                 min_distance = (settings.telegram_signals_min_sl_pct_of_margin / 100) / effective_leverage
-                widened_sl = entry * (1 - min_distance) if side == "long" else entry * (1 + min_distance)
+                widened_sl = ref_price * (1 - min_distance) if side == "long" else ref_price * (1 + min_distance)
                 sl_too_close = sl > widened_sl if side == "long" else sl < widened_sl
                 if sl_too_close:
                     logger.info(
@@ -1518,9 +1548,9 @@ class TradingBot:
         if fit_leverage_mode and sl is not None:
             effective_leverage = leverage or settings.futures_leverage
             max_sl_pct = settings.telegram_signals_max_sl_pct_of_margin or 50.0
-            fitted = fit_leverage_to_stop(entry, sl, max_sl_pct, effective_leverage)
+            fitted = fit_leverage_to_stop(ref_price, sl, max_sl_pct, effective_leverage)
             if fitted < effective_leverage:
-                distance_pct = stop_distance_fraction(entry, sl) * 100
+                distance_pct = stop_distance_fraction(ref_price, sl) * 100
                 logger.info(
                     f"⚖️ Сигнал по {pair}: SL канала {distance_pct:.2f}% сохранён, плечо "
                     f"{effective_leverage:.0f}x → {fitted:.0f}x (SL ≤ {max_sl_pct:.0f}% маржи)"
@@ -1541,7 +1571,7 @@ class TradingBot:
             effective_leverage = leverage or settings.futures_leverage
             if effective_leverage and effective_leverage > 0:
                 max_distance = (settings.telegram_signals_max_sl_pct_of_margin / 100) / effective_leverage
-                capped_sl = entry * (1 - max_distance) if side == "long" else entry * (1 + max_distance)
+                capped_sl = ref_price * (1 - max_distance) if side == "long" else ref_price * (1 + max_distance)
                 sl_too_far = sl < capped_sl if side == "long" else sl > capped_sl
                 if sl_too_far:
                     logger.info(
@@ -1566,6 +1596,13 @@ class TradingBot:
             # market_type здесь — рынок ЭТОГО КАНАЛА, не глобальный тумблер.
             logger.info(f"🚫 Сигнал по {pair} отклонён: short — на споте (реальный режим) шорт не поддерживается")
             signal_event["reject_reason"] = "шорт не поддерживается на споте в реальном режиме"
+            return None
+
+        # Рыночная цена уже прошла SL канала — позиция закрылась бы сразу
+        # в убыток (с учётом проскальзывания — хуже, чем стоп канала).
+        if sl and (ref_price <= sl if side == "long" else ref_price >= sl):
+            logger.info(f"🚫 Сигнал по {pair} отклонён: цена {ref_price} уже за SL канала {sl}")
+            signal_event["reject_reason"] = f"цена {ref_price:.6g} уже прошла SL канала {sl:.6g}"
             return None
 
         if settings.is_paper:
@@ -1594,16 +1631,16 @@ class TradingBot:
             # баланса, какой бы далёкий SL ни дал канал (вместо одинакового
             # объёма, при котором далёкий SL означал в разы больший убыток).
             base_size_pct, capped = risk_based_size_pct(
-                entry, sl, risk_per_trade_pct, settings.telegram_risk_sizing_max_position_pct,
+                ref_price, sl, risk_per_trade_pct, settings.telegram_risk_sizing_max_position_pct,
             )
             signal_changes.append(
                 f"размер от риска: {risk_per_trade_pct:g}% баланса при SL "
-                f"{stop_distance_fraction(entry, sl) * 100:.2f}% → позиция {base_size_pct:.2f}% баланса"
+                f"{stop_distance_fraction(ref_price, sl) * 100:.2f}% → позиция {base_size_pct:.2f}% баланса"
                 + (" (упёрлась в потолок объёма)" if capped else "")
             )
         size_pct = base_size_pct * mult
         position_value = balance * (size_pct / 100)
-        amount = position_value / entry
+        amount = position_value / ref_price
 
         logger.info(f"📝 Ордер: {order_side.upper()} {amount:.6f} {symbol} @ {entry:.2f}")
         order = await execution_engine.create_order(

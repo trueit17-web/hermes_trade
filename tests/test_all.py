@@ -23387,6 +23387,81 @@ class TestTradingMathFitLeverageAndRiskSizing(unittest.TestCase):
         self.assertTrue(capped)
 
 
+class TestTelegramSignalUsesMarketPriceForStop(unittest.IsolatedAsyncioTestCase):
+    """
+    Прод 2026-09-28, BEAT/USDT: вход канала ~0.1000, рыночный ордер исполнен
+    по 0.10292. Плечо подбиралось "SL ≤ 40% маржи" от цены входа из текста
+    сигнала (SL 9.86% → 4x), а от фактического входа до SL было 12.4% —
+    стоп стоил ~50% маржи (-235 USDT). Дистанция до SL, плечо, капы и размер
+    теперь считаются от текущей рыночной цены.
+    """
+
+    def setUp(self):
+        self._saved = {k: getattr(settings, k) for k in (
+            "trading_mode", "telegram_signals_max_sl_pct_of_margin", "telegram_signals_min_sl_pct_of_margin",
+            "telegram_signals_max_leverage", "futures_leverage", "telegram_risk_sizing_max_position_pct",
+        )}
+        settings.trading_mode = "real"
+        settings.telegram_signals_max_sl_pct_of_margin = 40.0
+        settings.telegram_signals_min_sl_pct_of_margin = 12.0
+        settings.telegram_signals_max_leverage = 15.0
+        settings.telegram_risk_sizing_max_position_pct = 25.0
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(settings, k, v)
+
+    async def _run(self, market_price, **extra):
+        import src.main as main_module
+        bot = main_module.TradingBot()
+        event = {
+            "parsed_pair": "BEAT/USDT", "parsed_side": "long",
+            "parsed_entry": 0.1, "parsed_sl": 0.09014, "parsed_tp": 0.13,
+            "parsed_leverage": 11, "channel_market_type": "futures", "channel_id": "@beat_test",
+            "channel_position_size_pct": 5.0, "channel_leverage_mode": "fit_leverage",
+        }
+        event.update(extra)
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.get_reference_price = AsyncMock(return_value=market_price)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal(event)
+        return event, mock_engine.create_order
+
+    async def test_leverage_fitted_to_actual_entry(self):
+        _, create = await self._run(0.10292)
+        kwargs = create.await_args.kwargs
+        # От фактического входа SL 12.42% -> плечо floor(40/12.42) = 3x (а не 4x от цены канала).
+        self.assertEqual(kwargs["leverage"], 3.0)
+        self.assertEqual(kwargs["stop_loss"], 0.09014)
+        self.assertIn("вход по рынку", kwargs["notes"])
+        distance = (0.10292 - 0.09014) / 0.10292
+        self.assertLessEqual(distance * kwargs["leverage"], 0.40)
+
+    async def test_amount_uses_market_price(self):
+        _, create = await self._run(0.10292)
+        self.assertAlmostEqual(create.await_args.kwargs["amount"], 10000 * 0.05 / 0.10292)
+
+    async def test_risk_sizing_uses_market_price(self):
+        _, create = await self._run(0.10292, channel_risk_per_trade_pct=0.5)
+        # 0.5% риска / 12.42% до SL = 4.03% баланса.
+        distance = (0.10292 - 0.09014) / 0.10292
+        expected_value = 10000 * (0.5 / distance) / 100
+        self.assertAlmostEqual(create.await_args.kwargs["amount"], expected_value / 0.10292)
+
+    async def test_rejects_when_price_already_beyond_sl(self):
+        event, create = await self._run(0.0895)
+        create.assert_not_awaited()
+        self.assertIn("уже прошла SL", event["reject_reason"])
+
+    async def test_falls_back_to_signal_entry_without_market_price(self):
+        _, create = await self._run(None)
+        kwargs = create.await_args.kwargs
+        # Старое поведение: от цены канала SL 9.86% -> 4x.
+        self.assertEqual(kwargs["leverage"], 4.0)
+        self.assertNotIn("вход по рынку", kwargs["notes"] or "")
+
+
 class TestTelegramFitLeverageAndRiskSizing(unittest.IsolatedAsyncioTestCase):
     """
     Режим канала "fit_leverage": SL канала сохраняется, плечо понижается под
