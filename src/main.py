@@ -1372,6 +1372,15 @@ class TradingBot:
         await execution_engine.set_order_notification_message_id(order.id, message_id)
 
     @staticmethod
+    def _tracked_entry_price(tracked: dict | None, fallback: float) -> float:
+        """Фактическая цена исполнения из execution_engine, иначе — оценка до ордера."""
+        try:
+            price = float((tracked or {}).get("entry_price") or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+        return price if price > 0 else fallback
+
+    @staticmethod
     async def _signal_reference_price(symbol: str, market_type: str) -> float | None:
         """Текущая цена для рыночного исполнения сигнала; None — не удалось получить."""
         try:
@@ -1673,10 +1682,20 @@ class TradingBot:
             # close_amount), пока попытка закрыть остаток целиком не начала
             # раз за разом падать на бирже с "Insufficient balance" —
             # бот пытался продать чуть больше, чем реально было открыто.
+            #
+            # entry_price — тоже фактическая цена исполнения из
+            # execution_engine, а не цена входа из текста сигнала. Реальный
+            # инцидент (прод, ORDI/USDT 2026-09-29): канал 4.454, рыночный
+            # шорт исполнен по 4.489 — закрытие по отчёту канала о стопе
+            # посчитало PnL и Trade.entry_price от 4.454 (-462 USDT вместо
+            # фактических ~-357), а безубыточный SL после TP1 ставился бы от
+            # неверного входа. После рестарта позиция и так восстанавливалась
+            # с ценой исполнения — поведение до/после рестарта расходилось.
             tracked = execution_engine.get_open_positions().get(symbol)
             actual_amount = tracked["amount"] if tracked else amount
+            actual_entry = self._tracked_entry_price(tracked, entry)
             self.open_positions[symbol] = {
-                "side": side, "entry_price": entry,
+                "side": side, "entry_price": actual_entry,
                 "amount": actual_amount, "strategy_id": "telegram_signal",
                 "rationale": "Telegram сигнал", "sl": sl, "tp": tp,
                 # Реальные цели канала (если их несколько) — _tp_levels()
@@ -2422,7 +2441,7 @@ class TradingBot:
                 tracked = execution_engine.get_open_positions().get(symbol)
                 actual_amount = tracked["amount"] if tracked else amount
                 self.open_positions[symbol] = {
-                    "side": signal.side, "entry_price": entry_price,
+                    "side": signal.side, "entry_price": self._tracked_entry_price(tracked, entry_price),
                     "amount": actual_amount, "strategy_id": signal.strategy_id,
                     "rationale": signal.rationale, "sl": stop_loss,
                     "tp": take_profit, "tp_hit_count": 0,

@@ -23462,6 +23462,60 @@ class TestTelegramSignalUsesMarketPriceForStop(unittest.IsolatedAsyncioTestCase)
         self.assertNotIn("вход по рынку", kwargs["notes"] or "")
 
 
+class TestTelegramPositionUsesFillEntryPrice(unittest.IsolatedAsyncioTestCase):
+    """
+    Прод 2026-09-29, ORDI/USDT: вход канала 4.454, шорт исполнен по 4.489.
+    open_positions хранил цену канала — закрытие по отчёту канала о стопе
+    записало Trade.entry_price=4.454 и PnL -462 вместо фактических ~-357.
+    """
+
+    def setUp(self):
+        self._saved_mode = settings.trading_mode
+        settings.trading_mode = "real"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_mode
+
+    async def _run(self, tracked):
+        import src.main as main_module
+        bot = main_module.TradingBot()
+        bot.active_symbols = ["ORDI/USDT"]
+        event = {
+            "parsed_pair": "ORDI/USDT", "parsed_side": "short",
+            "parsed_entry": 4.454, "parsed_sl": 4.61047, "parsed_tp": 4.07041,
+            "parsed_leverage": 20, "channel_market_type": "futures", "channel_id": "@ordi_test",
+            "channel_position_size_pct": 5.0,
+        }
+        order = MagicMock(id=1119, fee=7.4, client_order_id="c1")
+        with patch("src.main.execution_engine") as mock_engine, \
+                patch.object(bot, "_notify_signal_opened", AsyncMock()):
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.get_reference_price = AsyncMock(return_value=4.489)
+            mock_engine.create_order = AsyncMock(return_value=order)
+            mock_engine.get_open_positions = MagicMock(
+                return_value={"ORDI/USDT": tracked} if tracked is not None else {}
+            )
+            await bot._execute_telegram_signal(event)
+        return bot.open_positions["ORDI/USDT"]
+
+    async def test_registers_actual_fill_price(self):
+        pos = await self._run({"amount": 3000.26, "entry_price": 4.489})
+        self.assertEqual(pos["entry_price"], 4.489)
+        self.assertEqual(pos["amount"], 3000.26)
+
+    async def test_falls_back_to_signal_entry_when_untracked(self):
+        pos = await self._run(None)
+        self.assertEqual(pos["entry_price"], 4.454)
+
+    def test_tracked_entry_price_helper(self):
+        import src.main as main_module
+        f = main_module.TradingBot._tracked_entry_price
+        self.assertEqual(f({"entry_price": 4.489}, 4.454), 4.489)
+        self.assertEqual(f({"entry_price": None}, 4.454), 4.454)
+        self.assertEqual(f({"entry_price": 0}, 4.454), 4.454)
+        self.assertEqual(f(None, 4.454), 4.454)
+
+
 class TestTelegramFitLeverageAndRiskSizing(unittest.IsolatedAsyncioTestCase):
     """
     Режим канала "fit_leverage": SL канала сохраняется, плечо понижается под
