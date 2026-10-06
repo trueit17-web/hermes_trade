@@ -3791,6 +3791,46 @@ class TestTelegramSignalParser(unittest.TestCase):
         self.assertEqual(result["take_profits"], [0.01217, 0.01247, 0.01388])
         self.assertEqual(result["leverage"], 16.0)
 
+    def test_ticker_with_digits_with_explicit_quote(self):
+        """
+        Реальный инцидент (прод, @Treyding_Signaly_Kripto): "#C98/USDT -
+        Длинная🟢" не распознавался ни одним парсером — паттерны пары
+        допускали в тикере только буквы, а "C98" (Coin98) содержит цифры.
+        """
+        text = (
+            "#C98/USDT - Длинная🟢\n\n"
+            "Точка входа: `0.01879`\n"
+            "Стоп-лосс: `0.01828`\n\n"
+            "Цель 1: `0.01888`\n"
+            "Цель 2: `0.01901`\n"
+            "Цель 3: `0.01916`\n"
+            "Цель 4: `0.01928`\n\n"
+            "Кредитное плечо: x19"
+        )
+        result = self.parse(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "C98/USDT")
+        self.assertEqual(result["side"], "long")
+        self.assertEqual(result["entry"], 0.01879)
+        self.assertEqual(result["sl"], 0.01828)
+        self.assertEqual(result["take_profits"], [0.01888, 0.01901, 0.01916, 0.01928])
+        self.assertEqual(result["leverage"], 19.0)
+
+    def test_ticker_with_leading_digits(self):
+        """Тикеры с ведущими цифрами ("1INCH", "1000PEPE") — в хэштеге
+        без quote и в слитном формате "XXXUSDT"."""
+        from src.telegram.channel_monitor import _extract_pair
+        self.assertEqual(_extract_pair("#1INCH SHORT"), "1INCH/USDT")
+        self.assertEqual(_extract_pair("1000PEPEUSDT long"), "1000PEPE/USDT")
+        self.assertEqual(_extract_pair("#C98 LONG"), "C98/USDT")
+
+    def test_digit_only_hashtag_or_amount_is_not_a_ticker(self):
+        """Тикер обязан содержать букву: "#1" (номер цели) и сумма
+        "1000USDT" в тексте не должны сходить за пару."""
+        from src.telegram.channel_monitor import _extract_pair
+        self.assertIsNone(_extract_pair("Цель #1 достигнута"))
+        self.assertIsNone(_extract_pair("Прибыль 1000USDT за неделю"))
+
     def test_single_letter_ticker_hashtag_without_quote(self):
         """Тот же класс инцидента, что и test_single_letter_ticker_with_
         explicit_quote выше, но для хэштег-варианта без quote-валюты
