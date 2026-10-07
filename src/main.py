@@ -2495,6 +2495,30 @@ class TradingBot:
             logger.debug(f"Не удалось сохранить ML-обучающий пример для {symbol}: {e}")
 
     @staticmethod
+    def _first_reachable_tp_index(tp_levels: list[float], entry_price: float, side: str) -> int:
+        """
+        Индекс первого TP-уровня, лежащего в ПРИБЫЛЬНУЮ сторону от
+        фактической цены входа (long: выше входа, short: ниже).
+
+        Цели канала считаются от ЕГО цены входа, а рыночный ордер может
+        исполниться уже за ближайшими из них. Реальный инцидент (прод,
+        RVN/USDT 2026-10-07): шорт, вход канала 0.00224, TP1 0.00221,
+        исполнение 0.002178 — уже ниже TP1. Через минуту цена отскочила
+        до 0.0022, условие "цена <= TP1" выполнилось, и бот закрыл 20%
+        позиции "по TP1" с УБЫТКОМ (-3.61) и подтянул SL по правилу TP1.
+        Такие уже пройденные уровни не считаются достижимыми: их доля
+        остаётся в позиции до следующих целей, а правило "после TP1"
+        применяется к первой реально прибыльной цели.
+
+        Если пройдены ВСЕ уровни — возвращается индекс последнего: цель
+        уже достигнута, позиция закрывается целиком (прежнее поведение).
+        """
+        for i, level in enumerate(tp_levels):
+            if (level > entry_price) if side == "long" else (level < entry_price):
+                return i
+        return max(len(tp_levels) - 1, 0)
+
+    @staticmethod
     def _tp_levels(
         entry_price: float, tp: float | None, strategy_id: str | None = None,
         take_profits: list[float] | None = None,
@@ -2811,6 +2835,7 @@ class TradingBot:
             position.get("take_profits"),
         )
         n_levels = len(tp_levels)
+        first_reachable = self._first_reachable_tp_index(tp_levels, position["entry_price"], side)
 
         reason = None
         level_hit = None
@@ -2823,7 +2848,11 @@ class TradingBot:
             # Цена могла перепрыгнуть сразу через несколько уровней (гэп) —
             # ищем САМЫЙ ДАЛЬНИЙ ещё не достигнутый уровень, а не бьём их
             # по одному на следующих итерациях цикла.
-            for level in range(n_levels - 1, tp_hit_count - 1, -1):
+            # Уровни, уже пройденные в момент входа (см.
+            # _first_reachable_tp_index), не срабатывают — иначе отскок к
+            # ним закрывал долю позиции "по TP" в убыток.
+            lowest_level = max(tp_hit_count, first_reachable)
+            for level in range(n_levels - 1, lowest_level - 1, -1):
                 target = tp_levels[level]
                 reached = current_price >= target if side == "long" else current_price <= target
                 if reached:
@@ -2932,7 +2961,10 @@ class TradingBot:
             # этого сработавшего уровня (0 = TP1), а не счётчик — верно и в
             # случае гэпа, перепрыгнувшего сразу через несколько уровней
             # (см. цикл поиска reason/level_hit выше).
-            if level_hit == 0:
+            # "TP1" для правила SL — первая ДОСТИЖИМАЯ цель: перенос SL на
+            # предыдущий, уже пройденный при входе уровень поставил бы стоп
+            # в убыточную сторону от входа.
+            if level_hit <= first_reachable:
                 # Канал мог явно указать перенос SL в безубыток после TP1
                 # ("...после первой цели ставим стоп в без убыток" —
                 # реальный инцидент, @kripto_signalyX/@kripto_signaly3, см.

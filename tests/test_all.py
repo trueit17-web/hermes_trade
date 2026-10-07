@@ -18181,6 +18181,121 @@ class TestCheckPositionExitNotificationReplyThreading(unittest.IsolatedAsyncioTe
         self.assertIsNone(mock_send.await_args.kwargs["reply_to_message_id"])
 
 
+class TestTpLevelsAlreadyCrossedAtEntry(unittest.IsolatedAsyncioTestCase):
+    """
+    Реальный инцидент (прод, RVN/USDT 2026-10-07): шорт, вход канала
+    0.00224, TP1 0.00221, рыночное исполнение 0.002178 — уже за TP1.
+    Отскок к 0.0022 закрыл 20% позиции "по TP1" с убытком и подтянул SL
+    по правилу TP1. Уровни, пройденные в момент входа, не должны
+    срабатывать, а правило "после TP1" — относиться к первой достижимой цели.
+    """
+
+    TPS = [0.00221, 0.00217, 0.00211, 0.00203, 0.00198]
+
+    def _make_bot(self):
+        try:
+            import src.main as main_module
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        return main_module.TradingBot(), main_module.execution_engine
+
+    def setUp(self):
+        self._saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "paper"
+
+    def tearDown(self):
+        settings.trading_mode = self._saved_trading_mode
+
+    def _setup_short(self, bot, engine, symbol):
+        from src.utils.timeutils import utcnow
+        engine.paper_positions[symbol] = {"side": "short", "entry_price": 0.002178, "amount": 1000.0}
+        bot.open_positions[symbol] = {
+            "side": "short", "entry_price": 0.002178, "amount": 1000.0,
+            "original_amount": 1000.0, "strategy_id": "telegram_signal",
+            "sl": 0.00269, "tp": 0.00198, "take_profits": list(self.TPS),
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+        }
+
+    def test_first_reachable_tp_index(self):
+        try:
+            from src.main import TradingBot
+        except ImportError as e:
+            self.skipTest(f"src.main not importable in this environment: {e}")
+        f = TradingBot._first_reachable_tp_index
+        self.assertEqual(f(self.TPS, 0.002178, "short"), 1)
+        self.assertEqual(f(self.TPS, 0.00224, "short"), 0)
+        self.assertEqual(f([110.0, 120.0], 100.0, "long"), 0)
+        self.assertEqual(f([110.0, 120.0], 115.0, "long"), 1)
+        # Пройдены все цели — последний уровень (цель уже достигнута).
+        self.assertEqual(f([110.0, 120.0], 125.0, "long"), 1)
+        self.assertEqual(f([], 100.0, "long"), 0)
+
+    async def test_bounce_to_crossed_tp1_does_not_close_at_loss(self):
+        bot, engine = self._make_bot()
+        symbol = "TPCROSS1/USDT"
+        self._setup_short(bot, engine, symbol)
+
+        with patch.object(engine, "close_paper_position", new=AsyncMock()) as mock_close, \
+             patch("src.main.send_notification", new=AsyncMock()):
+            closed = await bot._check_position_exit(symbol, 0.0022)
+
+        self.assertFalse(closed)
+        mock_close.assert_not_awaited()
+        pos = bot.open_positions[symbol]
+        self.assertEqual(pos["tp_hit_count"], 0)
+        self.assertEqual(pos["sl"], 0.00269)
+
+    async def test_first_reachable_tp_applies_tp1_sl_rule(self):
+        from src.utils.trading_math import halfway_to_entry_stop_price
+
+        bot, engine = self._make_bot()
+        symbol = "TPCROSS2/USDT"
+        self._setup_short(bot, engine, symbol)
+
+        async def fake_close(**kwargs):
+            engine.paper_positions[symbol]["amount"] -= kwargs["amount"]
+            return {"pnl": 0.8, "pnl_pct": 0.4, "outcome": "win", "trade_id": 1}
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close) as mock_close, \
+             patch("src.main.send_notification", new=AsyncMock()):
+            closed = await bot._check_position_exit(symbol, 0.00217)
+
+        self.assertFalse(closed)
+        self.assertEqual(mock_close.call_args.kwargs["reason"], "take_profit_2")
+        self.assertAlmostEqual(mock_close.call_args.kwargs["amount"], 200.0)
+        pos = bot.open_positions[symbol]
+        # SL — по правилу TP1 (полпути к входу), а не на пройденный при
+        # входе уровень 0.00221 (выше входа, т.е. в убыток для шорта).
+        self.assertAlmostEqual(pos["sl"], halfway_to_entry_stop_price(0.00269, 0.002178))
+        self.assertLess(pos["sl"], 0.00269)
+        self.assertGreater(pos["sl"], 0.002178)
+
+    async def test_all_targets_crossed_closes_whole_position(self):
+        from src.utils.timeutils import utcnow
+
+        bot, engine = self._make_bot()
+        symbol = "TPCROSS3/USDT"
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": 125.0, "amount": 2.0}
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 125.0, "amount": 2.0,
+            "original_amount": 2.0, "strategy_id": "telegram_signal",
+            "sl": 100.0, "tp": 120.0, "take_profits": [110.0, 120.0],
+            "tp_hit_count": 0, "entry_fee": 0.0, "order_id": None, "opened_at": utcnow(),
+        }
+
+        async def fake_close(**kwargs):
+            engine.paper_positions.pop(symbol, None)
+            return {"pnl": 0.0, "pnl_pct": 0.0, "outcome": "breakeven", "trade_id": 1}
+
+        with patch.object(engine, "close_paper_position", side_effect=fake_close) as mock_close, \
+             patch("src.main.send_notification", new=AsyncMock()):
+            closed = await bot._check_position_exit(symbol, 125.0)
+
+        self.assertTrue(closed)
+        self.assertEqual(mock_close.call_args.kwargs["reason"], "take_profit_2")
+        self.assertEqual(mock_close.call_args.kwargs["amount"], 2.0)
+
+
 class TestCheckPositionExitEditsOriginalNotification(unittest.IsolatedAsyncioTestCase):
     """
     По запросу пользователя: закрытие по TP/SL должно РЕДАКТИРОВАТЬ исходное
