@@ -12657,6 +12657,137 @@ class TestFinalizeDiagnosticLogging(unittest.IsolatedAsyncioTestCase):
         # short: pnl = (entry - exit) * amount - fee = (2.266-2.2)*5961.2 - 1.5
         self.assertAlmostEqual(float(trade.pnl), (2.266 - 2.2) * 5961.2 - 1.5, places=2)
 
+    async def _finalize_old_sl_with_order_history(self, symbol, closed_order_side_effect):
+        """Общий сценарий инцидента XRP/USDT: fetch_order упал на окне 500
+        ордеров, история сделок пустая, fetch_closed_order — по сценарию."""
+        from src.db.session import get_session
+        from src.db.models import Order
+
+        settings.market_type = "futures"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        self.engine.exchange = AsyncMock()
+        self.engine.exchange.fetch_order = AsyncMock(
+            side_effect=Exception(
+                "bybit fetchOrder() can only access an order if it is in last 500 orders"
+            )
+        )
+        self.engine.exchange.fetch_order_trades = AsyncMock(return_value=[])
+        self.engine.exchange.fetch_my_trades = AsyncMock(return_value=[])
+        self.engine.exchange.fetch_closed_order = AsyncMock(side_effect=closed_order_side_effect)
+
+        async with get_session() as session:
+            exchange_id, symbol_id = await self.engine._resolve_symbol_id(session, symbol)
+            opening_order = Order(
+                exchange_id=exchange_id, symbol_id=symbol_id,
+                side="buy", order_type="market", amount=2980.0, price=1.5059,
+                status="filled", filled_amount=2980.0, filled_price=1.5059,
+                fee=0.0, fee_currency="USDT",
+                client_order_id=f"{symbol}-open",
+            )
+            session.add(opening_order)
+            await session.commit()
+            opening_order_id = opening_order.id
+
+        pos = {
+            "amount": 2980.0, "entry_price": 1.5059, "side": "long",
+            "strategy_id": None, "entry_fee": 0.0, "order_id": opening_order_id,
+            "opened_at": datetime.now() - timedelta(days=8), "sl_order_id": "sl-xrp-old",
+            "market_type": "futures",
+        }
+        self.engine.real_positions[symbol] = pos
+        # Убыток −466 в этом сценарии записывается в глобальный risk_manager
+        # и взводит дневной лимит убытков — восстанавливаем, чтобы не
+        # отклонять ордера в последующих тестах.
+        from src.risk.risk_manager import risk_manager as global_risk_manager
+        state = global_risk_manager.state
+        saved = (state.daily_pnl, state.daily_loss_limit_reached, state.daily_loss_reset_time)
+        try:
+            result = await self.engine._finalize_externally_closed_position(symbol, pos)
+        finally:
+            state.daily_pnl, state.daily_loss_limit_reached, state.daily_loss_reset_time = saved
+        return result, opening_order_id
+
+    async def test_finalize_by_sl_order_uses_order_history_when_fetch_order_and_trades_fail(self):
+        """
+        Реальный инцидент (прод, XRP/USDT long, открыт 30.09 @ 1.5059, SL
+        1.35 сработал на бирже 08.10): fetch_order по SL-ордеру — "last 500
+        orders", история сделок пустая -> позиция снята без PnL (около
+        −465 USDT потеряно для статистики и daily_pnl). Статус и цена
+        исполнения сработавшего SL должны браться из истории ордеров
+        (fetch_closed_order), не зависящей от обоих ограничений.
+        """
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Trade
+
+        symbol = "XRPHIST1/USDT"
+        closed_order = {
+            "id": "sl-xrp-old", "status": "closed", "filled": 2980.0,
+            "average": 1.35, "price": None,
+            "fee": {"cost": 2.2, "currency": "USDT"},
+        }
+        saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "real"
+        try:
+            with patch("asyncio.sleep", new=AsyncMock()) as sleep_mock:
+                result, opening_order_id = await self._finalize_old_sl_with_order_history(
+                    symbol, [closed_order],
+                )
+        finally:
+            settings.trading_mode = saved_trading_mode
+
+        self.assertTrue(result)
+        self.assertNotIn(symbol, self.engine.real_positions)
+        # Условный SL ищется сначала как trigger-ордер.
+        first_call = self.engine.exchange.fetch_closed_order.await_args_list[0]
+        self.assertEqual(first_call.args[0], "sl-xrp-old")
+        self.assertEqual(first_call.args[2], {"trigger": True})
+        # Ордер старый — ретраи истории сделок с паузами не нужны.
+        sleep_mock.assert_not_awaited()
+        async with get_session() as session:
+            trade = (
+                await session.execute(select(Trade).where(Trade.order_open_id == opening_order_id))
+            ).scalar_one()
+        self.assertAlmostEqual(float(trade.exit_price), 1.35, places=6)
+        self.assertAlmostEqual(float(trade.amount), 2980.0, places=4)
+        # long: pnl = (exit - entry) * amount - fee
+        self.assertAlmostEqual(float(trade.pnl), (1.35 - 1.5059) * 2980.0 - 2.2, places=2)
+
+    async def test_finalize_by_sl_order_history_falls_back_to_plain_order_lookup(self):
+        """Не нашли как trigger-ордер — пробуем как обычный."""
+        symbol = "XRPHIST2/USDT"
+        closed_order = {
+            "id": "sl-xrp-old", "status": "closed", "filled": 2980.0,
+            "average": 1.349, "fee": {"cost": 0.0, "currency": "USDT"},
+        }
+        saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "real"
+        try:
+            result, _ = await self._finalize_old_sl_with_order_history(
+                symbol, [Exception("Order sl-xrp-old was not found."), closed_order],
+            )
+        finally:
+            settings.trading_mode = saved_trading_mode
+        self.assertTrue(result)
+        calls = self.engine.exchange.fetch_closed_order.await_args_list
+        self.assertEqual([c.args[2] for c in calls], [{"trigger": True}, {}])
+
+    async def test_finalize_by_sl_order_history_not_found_returns_false(self):
+        """Ни в истории ордеров, ни в истории сделок ничего — честно False
+        (дальше решает fuzzy-сверка), без падения."""
+        symbol = "XRPHIST3/USDT"
+        saved_trading_mode = settings.trading_mode
+        settings.trading_mode = "real"
+        try:
+            result, _ = await self._finalize_old_sl_with_order_history(
+                symbol, Exception("Order sl-xrp-old was not found."),
+            )
+        finally:
+            settings.trading_mode = saved_trading_mode
+        self.assertFalse(result)
+        self.assertIn(symbol, self.engine.real_positions)
+
     async def test_finalize_by_trade_history_logs_when_no_trades_returned(self):
         settings.market_type = "futures"
         self.engine.exchange = AsyncMock()

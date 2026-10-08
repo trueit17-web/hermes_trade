@@ -3948,6 +3948,7 @@ class ExecutionEngine:
             )
             return False
         order = None
+        order_from_history = False
         try:
             order = await exchange.fetch_order(sl_order_id, self._ccxt_symbol(exchange, symbol))
         except Exception as e:
@@ -3969,6 +3970,8 @@ class ExecutionEngine:
                 f"⚠️ Не удалось проверить статус биржевого SL-ордера {sl_order_id} ({symbol}) "
                 f"через fetch_order ({e}) — пробуем подтвердить по истории сделок этого же ордера."
             )
+            order = await self._fetch_closed_order_beyond_recent_window(exchange, str(sl_order_id), symbol)
+            order_from_history = order is not None
 
         if order is not None:
             status = str(order.get("status") or "").lower()
@@ -3991,13 +3994,16 @@ class ExecutionEngine:
         # ТОЛЬКО ЧТО подтверждён закрытым/исполненным (order is not None) —
         # история сделок биржи иногда на пару секунд отстаёт от статуса
         # ордера (см. докстринг _fetch_fill_details_via_trades). Если же
-        # fetch_order вообще упал (order is None, ордер вне окна видимости
-        # статус-эндпоинта), это почти наверняка старый ордер — если сделки
+        # fetch_order вообще упал (ордер вне окна видимости статус-
+        # эндпоинта — order is None или найден в истории ордеров через
+        # _fetch_closed_order_beyond_recent_window), это почти наверняка
+        # старый ордер — если сделки
         # по нему уже есть в истории, они там независимо от задержки;
         # ждать и повторять нечего, а 6 попыток по 1.5с задержки за раз
         # ощутимо тормозили бы всю сверку позиций при активном аккаунте.
         trade_fill = await self._fetch_fill_details_via_trades(
-            str(sl_order_id), symbol, exchange, **({} if order is not None else {"attempts": 1})
+            str(sl_order_id), symbol, exchange,
+            **({} if order is not None and not order_from_history else {"attempts": 1}),
         )
         if trade_fill:
             exit_price = trade_fill["average"]
@@ -4027,6 +4033,43 @@ class ExecutionEngine:
             log_note=f"🛡️ Биржевой SL сработал сам по себе (вне цикла бота): {symbol}",
         )
         return True
+
+    async def _fetch_closed_order_beyond_recent_window(
+        self, exchange: ccxt.Exchange, order_id: str, symbol: str,
+    ) -> dict | None:
+        """
+        Статус ордера, выпавшего из окна видимости fetch_order у Bybit
+        ("last 500 orders") — через историю ордеров (fetch_closed_order,
+        /v5/order/history), которую ccxt сам советует в этой ошибке.
+
+        Реальный инцидент (прод, XRP/USDT long, открыт 30.09, биржевой SL
+        сработал 08.10): fetch_order по SL-ордеру упал на окне 500 ордеров,
+        а история СДЕЛОК по символу пришла пустой — позиция снята с учёта
+        без PnL (около −465 USDT не попали ни в статистику, ни в
+        daily_pnl). История ордеров не зависит ни от окна 500 ордеров, ни
+        от истории сделок; в ней у сработавшего SL есть статус, filled,
+        average и комиссия. Условный (trigger) ордер Bybit ищется отдельно
+        от обычного, поэтому пробуем оба варианта. Ответ не-dict (биржа
+        метод не поддерживает, мок) считается "не найден".
+        """
+        fetch_closed_order = getattr(exchange, "fetch_closed_order", None)
+        if fetch_closed_order is None:
+            return None
+        ccxt_symbol = self._ccxt_symbol(exchange, symbol)
+        for params in ({"trigger": True}, {}):
+            try:
+                order = await fetch_closed_order(order_id, ccxt_symbol, params)
+            except Exception as e:
+                logger.debug(f"fetch_closed_order({order_id}, {params}) для {symbol}: {e}")
+                continue
+            if isinstance(order, dict):
+                logger.info(
+                    f"🔍 Биржевой SL-ордер {order_id} ({symbol}) найден в истории ордеров: "
+                    f"статус {order.get('status')!r}, filled={order.get('filled')!r}, "
+                    f"average={order.get('average')!r}."
+                )
+                return order
+        return None
 
     async def _recorded_close_fills(self, pos: dict) -> tuple[set[str], datetime | None]:
         """
