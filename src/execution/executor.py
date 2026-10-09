@@ -123,6 +123,12 @@ class ExecutionEngine:
         # следующего события и должен вызываться из СВОЕГО цикла — отсюда
         # отдельная asyncio-задача на каждый подключённый рынок.
         self._watch_tasks: dict[str, asyncio.Task] = {}
+        # Символы, по которым СЕЙЧАС исполняется открывающий реальный ордер
+        # бота (см. _execute_real_order) — позиция на бирже уже может
+        # появиться, а в self.real_positions её ещё нет (ждём подтверждения
+        # исполнения до ~6с и дольше). Авто-подхват "чужих" позиций
+        # (_auto_adopt_untracked_futures_position) такие символы пропускает.
+        self._orders_in_flight: set[str] = set()
         # Кэш тиров risk-limit биржи (fetch_market_leverage_tiers) по
         # (id(exchange), symbol) — см. _leverage_tiers: в отличие от
         # markets (грузятся один раз при коннекте и живут на самом
@@ -2419,7 +2425,18 @@ class ExecutionEngine:
         return None
 
     async def _execute_real_order(self, order_data: dict) -> Order | None:
-        """Реальный ордер через биржу."""
+        """
+        Реальный ордер через биржу. На время исполнения символ помечен в
+        self._orders_in_flight — см. _auto_adopt_untracked_futures_position.
+        """
+        symbol = order_data["symbol"]
+        self._orders_in_flight.add(symbol)
+        try:
+            return await self._execute_real_order_impl(order_data)
+        finally:
+            self._orders_in_flight.discard(symbol)
+
+    async def _execute_real_order_impl(self, order_data: dict) -> Order | None:
         symbol = order_data["symbol"]
         side = order_data["side"]
         amount = order_data["amount"]
@@ -2671,6 +2688,9 @@ class ExecutionEngine:
             # На спот сюда доходит только side=="buy" (short отклонён выше),
             # на фьючерсах — обе стороны: "sell" здесь означает открытие
             # короткой позиции, а не продажу существующего актива.
+            superseded = self.real_positions.get(symbol)
+            if superseded is not None and superseded.get("auto_adopted"):
+                await self._discard_superseded_auto_adoption(symbol, superseded)
             self.real_positions[symbol] = {
                 "amount": net_amount,
                 "entry_price": fill_price,
@@ -3608,6 +3628,15 @@ class ExecutionEngine:
         подхватывать, откатываемся на старое поведение (только
         предупреждение, без изменений в БД/real_positions).
         """
+        if symbol in self._orders_in_flight:
+            # Реальный инцидент (прод, LDO/USDT, 2026-10-09): сверка увидела
+            # позицию, которую бот САМ открывал в этот момент и ещё ждал
+            # подтверждения исполнения, — и подхватила её как чужую (SL 3%
+            # без TP, отдельная запись Order). Через секунду регистрация
+            # ботом своей позиции затёрла подхват, а его биржевой SL остался
+            # висеть на весь объём, и в БД остался второй "filled"-ордер на
+            # тот же объём (при рестарте позиция восстановилась бы двойной).
+            return
         side = raw.get("side")
         entry_price = raw.get("entryPrice")
         if side not in ("long", "short") or not isinstance(entry_price, (int, float)) or entry_price <= 0:
@@ -3623,6 +3652,10 @@ class ExecutionEngine:
             contracts = float(fresh.get("contracts") or 0)
         except Exception as e:
             logger.warning(f"⚠️ Не удалось перепроверить позицию {symbol} для авто-подхвата: {e}")
+            return
+        if symbol in self._orders_in_flight or symbol in self.real_positions:
+            # Пока ждали fetch_position, бот начал (или уже закончил)
+            # открывать собственный ордер по этому символу — см. выше.
             return
         if contracts == 0:
             # bulk fetch_positions() вернул устаревший снимок закрытой позиции
@@ -3667,6 +3700,7 @@ class ExecutionEngine:
             "order_id": order.id, "entry_fee": 0.0, "opened_at": utcnow(),
             "sl_order_id": None, "market_type": "futures",
             "leverage": raw.get("leverage"), "margin_usdt": raw.get("initialMargin"),
+            "auto_adopted": True,
         }
         if stop_loss:
             await self.sync_stop_loss_order(symbol, contracts, stop_loss)
@@ -3685,6 +3719,34 @@ class ExecutionEngine:
                 f"({side}) @ {entry_price} — БЕЗ SL (telegram_signals_default_sl_pct=0). "
                 f"Бот её не открывал, проверьте вручную."
             )
+
+    async def _discard_superseded_auto_adoption(self, symbol: str, adopted: dict) -> None:
+        """
+        Бот регистрирует СВОЮ только что исполненную позицию по символу,
+        который сверка успела авто-подхватить как чужую (гонка с
+        _auto_adopt_untracked_futures_position — см. там инцидент LDO/USDT).
+        Это одна и та же позиция на бирже: биржевой SL подхвата отменяем
+        (иначе он остаётся висеть на весь объём со своим триггером), а его
+        запись Order помечаем rejected — иначе при рестарте
+        _load_open_positions_from_db сложит оба "filled"-ордера в позицию
+        двойного объёма.
+        """
+        await self._cancel_order_safe(symbol, adopted.get("sl_order_id"), self._exchange_for(adopted))
+        order_id = adopted.get("order_id")
+        if order_id is not None:
+            try:
+                async with get_session() as session:
+                    await session.execute(
+                        update(Order).where(Order.id == order_id).values(status="rejected")
+                    )
+                    await session.commit()
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось пометить ордер авто-подхвата {symbol} (id={order_id}) rejected: {e}")
+        logger.warning(
+            f"♻️ {symbol}: авто-подхват оказался собственной позицией бота, ордер которой ещё "
+            f"подтверждался — подхват отменён (SL-ордер {adopted.get('sl_order_id')} снят, "
+            f"запись ордера id={order_id} помечена rejected)."
+        )
 
     async def _reconcile_spot_position(self, symbol: str, pos: dict, balance: dict) -> None:
         """

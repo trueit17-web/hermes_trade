@@ -12382,6 +12382,7 @@ class TestAutoAdoptUntrackedFuturesPosition(unittest.IsolatedAsyncioTestCase):
         self.risk_manager.state.open_positions.pop("AUTOADOPT2/USDT", None)
         self.risk_manager.state.open_positions.pop("AUTOADOPT3/USDT", None)
         self.risk_manager.state.open_positions.pop("AUTOADOPT4/USDT", None)
+        self.risk_manager.state.open_positions.pop("AUTOADOPT5/USDT", None)
         self.risk_manager.state.open_positions_count = len(self.risk_manager.state.open_positions)
 
     async def test_adopts_short_position_with_full_exchange_data(self):
@@ -12494,6 +12495,121 @@ class TestAutoAdoptUntrackedFuturesPosition(unittest.IsolatedAsyncioTestCase):
         exchange.create_market_buy_order.assert_not_called()
         exchange.create_market_sell_order.assert_not_called()
         self.assertIn("AUTOADOPT3/USDT", self.risk_manager.state.open_positions)
+
+    async def test_skips_symbol_with_own_order_in_flight(self):
+        """
+        Реальный инцидент (прод, LDO/USDT, 2026-10-09): сверка увидела
+        позицию, которую бот сам открывал и ещё ждал подтверждения
+        исполнения, и подхватила её как чужую (SL 3%, без TP, отдельный
+        filled-ордер в БД). Символ с ордером "в полёте" трогать нельзя.
+        """
+        self.engine.exchange_id = "bybit"
+        settings.telegram_signals_default_sl_pct = 3.0
+        exchange = AsyncMock()
+        self.engine._exchanges["futures"] = exchange
+        self.engine._orders_in_flight.add("AUTOADOPT5/USDT")
+
+        raw = {
+            "symbol": "AUTOADOPT5/USDT:USDT", "contracts": 32009.1, "side": "long",
+            "entryPrice": 0.4373, "leverage": 2.0,
+        }
+        await self.engine._auto_adopt_untracked_futures_position("AUTOADOPT5/USDT", raw, exchange)
+
+        self.assertNotIn("AUTOADOPT5/USDT", self.engine.real_positions)
+        exchange.fetch_position.assert_not_called()
+        exchange.create_market_sell_order.assert_not_called()
+
+    async def test_skips_when_own_order_starts_during_recheck(self):
+        """Ордер бота стартовал, пока ждали точечный fetch_position."""
+        self.engine.exchange_id = "bybit"
+        settings.telegram_signals_default_sl_pct = 3.0
+        exchange = AsyncMock()
+
+        async def fetch_position(*args, **kwargs):
+            self.engine._orders_in_flight.add("AUTOADOPT5/USDT")
+            return {"contracts": 32009.1, "side": "long", "entryPrice": 0.4373}
+
+        exchange.fetch_position = AsyncMock(side_effect=fetch_position)
+        self.engine._exchanges["futures"] = exchange
+
+        raw = {
+            "symbol": "AUTOADOPT5/USDT:USDT", "contracts": 32009.1, "side": "long",
+            "entryPrice": 0.4373, "leverage": 2.0,
+        }
+        await self.engine._auto_adopt_untracked_futures_position("AUTOADOPT5/USDT", raw, exchange)
+
+        self.assertNotIn("AUTOADOPT5/USDT", self.engine.real_positions)
+        exchange.create_market_sell_order.assert_not_called()
+
+    async def test_execute_real_order_marks_symbol_in_flight(self):
+        seen = []
+
+        async def impl(order_data):
+            seen.append(order_data["symbol"] in self.engine._orders_in_flight)
+            raise RuntimeError("boom")
+
+        with patch.object(self.engine, "_execute_real_order_impl", side_effect=impl):
+            with self.assertRaises(RuntimeError):
+                await self.engine._execute_real_order({"symbol": "AUTOADOPT5/USDT"})
+        self.assertEqual(seen, [True])
+        # Снимается и при исключении.
+        self.assertNotIn("AUTOADOPT5/USDT", self.engine._orders_in_flight)
+
+    async def test_own_fill_supersedes_racing_auto_adoption(self):
+        """
+        Если подхват всё же успел проскочить, регистрация ботом своей
+        позиции должна снять его биржевой SL и пометить его Order rejected
+        (иначе SL на весь объём висит на бирже, а при рестарте позиция
+        восстанавливается из двух filled-ордеров с двойным объёмом).
+        """
+        from sqlalchemy import select
+        from src.db.session import get_session
+        from src.db.models import Order
+
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        settings.telegram_signals_default_sl_pct = 3.0
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        exchange = AsyncMock()
+        exchange.options = {"defaultType": "swap", "defaultSubType": "linear"}
+        exchange.fetch_position = AsyncMock(return_value={
+            "contracts": 100.0, "side": "long", "entryPrice": 2.0,
+        })
+        exchange.create_market_sell_order.return_value = {"id": "auto-sl-5"}
+        self.engine._exchanges["futures"] = exchange
+
+        raw = {
+            "symbol": "AUTOADOPT5/USDT:USDT", "contracts": 100.0, "side": "long",
+            "entryPrice": 2.0, "leverage": 2.0,
+        }
+        await self.engine._auto_adopt_untracked_futures_position("AUTOADOPT5/USDT", raw, exchange)
+        adopted = self.engine.real_positions["AUTOADOPT5/USDT"]
+        self.assertTrue(adopted.get("auto_adopted"))
+        self.assertEqual(adopted["sl_order_id"], "auto-sl-5")
+        adopted_order_id = adopted["order_id"]
+
+        exchange.create_market_buy_order.return_value = {
+            "id": "own-open-5", "filled": 100.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+        exchange.create_market_sell_order.return_value = {"id": "own-sl-5"}
+        order = await self.engine.create_order(
+            symbol="AUTOADOPT5/USDT", side="buy", amount=100.0, price=2.0, order_type="market",
+            stop_loss=1.5,
+        )
+
+        self.assertIsNotNone(order)
+        cancelled = [c.args[0] for c in exchange.cancel_order.await_args_list]
+        self.assertIn("auto-sl-5", cancelled)
+        pos = self.engine.real_positions["AUTOADOPT5/USDT"]
+        self.assertFalse(pos.get("auto_adopted"))
+        self.assertNotEqual(pos["order_id"], adopted_order_id)
+        async with get_session() as session:
+            adopted_order = (
+                await session.execute(select(Order).where(Order.id == adopted_order_id))
+            ).scalar_one()
+        self.assertEqual(adopted_order.status, "rejected")
 
     async def test_reconcile_real_positions_auto_adopts_end_to_end(self):
         settings.market_type = "futures"
