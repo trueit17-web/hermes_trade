@@ -129,6 +129,10 @@ class ExecutionEngine:
         # исполнения до ~6с и дольше). Авто-подхват "чужих" позиций
         # (_auto_adopt_untracked_futures_position) такие символы пропускает.
         self._orders_in_flight: set[str] = set()
+        # (id(exchange), symbol, режим), для которых режим маржи уже
+        # подтверждён биржей — см. _ensure_margin_mode: не дёргать
+        # set_margin_mode на каждом ордере.
+        self._margin_mode_confirmed: set[tuple[int, str, str]] = set()
         # Кэш тиров risk-limit биржи (fetch_market_leverage_tiers) по
         # (id(exchange), symbol) — см. _leverage_tiers: в отличие от
         # markets (грузятся один раз при коннекте и живут на самом
@@ -2424,6 +2428,38 @@ class ExecutionEngine:
             return diff
         return None
 
+    async def _ensure_margin_mode(self, exchange, symbol: str, leverage: float) -> None:
+        """
+        Явно выставить на бирже режим маржи settings.futures_margin_mode
+        ("cross"/"isolated") перед открытием фьючерсной позиции — иначе
+        ордер молча наследует режим, включённый на счёте вручную. На
+        unified-счёте Bybit режим общий на весь счёт (REGULAR_MARGIN =
+        cross), на classic — по паре (поэтому передаётся символ и плечо).
+        "Не изменён" (режим уже нужный) — успех; прочие ошибки — WARNING,
+        ордер всё равно размещается (как и с плечом), а попытка повторится
+        на следующем ордере.
+        """
+        mode = (settings.futures_margin_mode or "cross").lower()
+        if mode not in ("cross", "isolated"):
+            logger.warning(f"⚠️ Неизвестный futures_margin_mode '{mode}' — используем cross.")
+            mode = "cross"
+        key = (id(exchange), symbol, mode)
+        if key in self._margin_mode_confirmed:
+            return
+        try:
+            await exchange.set_margin_mode(
+                mode, self._ccxt_symbol(exchange, symbol), {"leverage": int(leverage)},
+            )
+        except Exception as e:
+            text = str(e).lower()
+            if "not modified" not in text and "110026" not in text:
+                logger.warning(
+                    f"⚠️ Не удалось выставить {mode}-маржу для {symbol}: {e} — "
+                    f"ордер уйдёт в текущем режиме маржи счёта."
+                )
+                return
+        self._margin_mode_confirmed.add(key)
+
     async def _execute_real_order(self, order_data: dict) -> Order | None:
         """
         Реальный ордер через биржу. На время исполнения символ помечен в
@@ -2508,6 +2544,10 @@ class ExecutionEngine:
                         f"{notional:.0f} USDT ({symbol}) — используем {capped}x."
                     )
                     leverage_to_set = capped
+            # Режим маржи — ДО плеча: при переключении isolated→cross на
+            # не-unified счёте Bybit плечо передаётся вместе с режимом, а
+            # set_leverage затем применяется уже к позиции нужного режима.
+            await self._ensure_margin_mode(exchange, symbol, leverage_to_set)
             try:
                 await exchange.set_leverage(int(leverage_to_set), self._ccxt_symbol(exchange, symbol))
             except Exception as e:

@@ -13201,6 +13201,115 @@ class TestWatchOrdersTask(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.engine._watch_tasks, {})
 
 
+class TestFuturesMarginMode(unittest.IsolatedAsyncioTestCase):
+    """
+    По требованию пользователя все фьючерсные ордера открываются на
+    кросс-марже: перед открытием бот явно вызывает set_margin_mode
+    (settings.futures_margin_mode, по умолчанию "cross"), а не наследует
+    режим, включённый на счёте вручную.
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ExecutionEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.close()
+
+    def setUp(self):
+        self._saved = (settings.market_type, settings.trading_mode, settings.futures_margin_mode)
+
+    def tearDown(self):
+        settings.market_type, settings.trading_mode, settings.futures_margin_mode = self._saved
+
+    def _setup_futures(self, mode: str = "cross") -> AsyncMock:
+        settings.market_type = "futures"
+        settings.trading_mode = "real"
+        settings.futures_margin_mode = mode
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        ex = AsyncMock()
+        ex.options = {"defaultType": "swap", "defaultSubType": "linear"}
+        ex.create_market_buy_order.return_value = {
+            "id": "mm-open", "filled": 10.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+        self.engine.exchange = ex
+        return ex
+
+    async def _open(self, symbol: str):
+        return await self.engine.create_order(
+            symbol=symbol, side="buy", amount=10.0, price=2.0, order_type="market",
+            leverage=5,
+        )
+
+    async def test_sets_cross_margin_before_leverage_and_order(self):
+        ex = self._setup_futures()
+        calls = []
+        ex.set_margin_mode.side_effect = lambda *a, **k: calls.append("margin")
+        ex.set_leverage.side_effect = lambda *a, **k: calls.append("leverage")
+        ex.create_market_buy_order.side_effect = lambda *a, **k: (calls.append("order") or {
+            "id": "mm-open", "filled": 10.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        })
+
+        order = await self._open("MMX1/USDT")
+
+        self.assertIsNotNone(order)
+        ex.set_margin_mode.assert_awaited_once_with("cross", "MMX1/USDT:USDT", {"leverage": 5})
+        self.assertEqual(calls[:3], ["margin", "leverage", "order"])
+
+    async def test_margin_mode_not_repeated_for_same_symbol(self):
+        ex = self._setup_futures()
+        await self._open("MMX2/USDT")
+        self.engine.real_positions.pop("MMX2/USDT", None)
+        await self._open("MMX2/USDT")
+        self.assertEqual(ex.set_margin_mode.await_count, 1)
+
+    async def test_not_modified_counts_as_success(self):
+        ex = self._setup_futures()
+        ex.set_margin_mode.side_effect = Exception(
+            'bybit {"retCode":110026,"retMsg":"Cross/isolated margin mode is not modified"}'
+        )
+        order = await self._open("MMX3/USDT")
+        self.assertIsNotNone(order)
+        self.engine.real_positions.pop("MMX3/USDT", None)
+        await self._open("MMX3/USDT")
+        self.assertEqual(ex.set_margin_mode.await_count, 1)
+
+    async def test_other_error_still_places_order_and_retries_next_time(self):
+        ex = self._setup_futures()
+        ex.set_margin_mode.side_effect = Exception("bybit network error")
+        with self.assertLogs("src.execution.executor", level="WARNING") as cm:
+            order = await self._open("MMX4/USDT")
+        self.assertIsNotNone(order)
+        ex.create_market_buy_order.assert_awaited()
+        self.assertTrue(any("cross-маржу" in m for m in cm.output))
+        self.engine.real_positions.pop("MMX4/USDT", None)
+        await self._open("MMX4/USDT")
+        self.assertEqual(ex.set_margin_mode.await_count, 2)
+
+    async def test_isolated_setting_respected(self):
+        ex = self._setup_futures(mode="isolated")
+        await self._open("MMX5/USDT")
+        ex.set_margin_mode.assert_awaited_once_with("isolated", "MMX5/USDT:USDT", {"leverage": 5})
+
+    async def test_spot_order_does_not_touch_margin_mode(self):
+        settings.market_type = "spot"
+        settings.trading_mode = "real"
+        self.engine.is_paper = False
+        self.engine.exchange_id = "bybit"
+        ex = AsyncMock()
+        ex.options = {"defaultType": "spot"}
+        ex.fetch_balance = AsyncMock(return_value={"free": {"MMX6": 0.0}, "MMX6": {"free": 0.0, "used": 0, "total": 0.0}})
+        ex.create_market_buy_order.return_value = {
+            "id": "mm-spot", "filled": 10.0, "average": 2.0, "price": None,
+            "fee": {"cost": 0.01, "currency": "USDT"},
+        }
+        self.engine.exchange = ex
+        await self.engine.create_order(symbol="MMX6/USDT", side="buy", amount=10.0, price=2.0, order_type="market")
+        ex.set_margin_mode.assert_not_awaited()
+
+
 class TestCcxtSymbolTranslationForFutures(unittest.IsolatedAsyncioTestCase):
     """
     Реальный инцидент (прод, месяцами): у ccxt спотовый и linear-swap

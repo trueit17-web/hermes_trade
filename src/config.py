@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     # риск-guard по ликвидации/плечу — отдельный, более поздний этап.
     # Дефолт 1.0 — без усиления, безопасная отправная точка.
     futures_leverage: float = 1.0
+    # Режим маржи фьючерсных ордеров — выставляется на бирже явно перед
+    # каждым открытием (см. ExecutionEngine._ensure_margin_mode), а не
+    # наследуется от того, что было включено на счёте вручную. "cross" —
+    # по требованию пользователя все ордера на кросс-марже; "isolated" —
+    # изолированная маржа.
+    futures_margin_mode: str = "cross"
     binance_api_key: str | None = None
     binance_api_secret: str | None = None
     bybit_api_key: str | None = None
