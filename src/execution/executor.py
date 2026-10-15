@@ -31,6 +31,7 @@ from src.db.models import (
     TelegramSignal,
     Trade,
     TradeDecisionLog,
+    TradeOutcomeTracking,
 )
 from src.db.session import get_session
 from src.event_bus import (
@@ -1124,6 +1125,13 @@ class ExecutionEngine:
                     await session.execute(
                         delete(TradeDecisionLog).where(TradeDecisionLog.trade_id.in_(trade_ids))
                     )
+                    # FK trade_outcome_tracking.trade_id → trades.id без
+                    # ON DELETE: без этого удаление сделок падает с
+                    # ForeignKeyViolation, как только для них начато
+                    # отслеживание исхода (см. trade_outcome_tracker.py).
+                    await session.execute(
+                        delete(TradeOutcomeTracking).where(TradeOutcomeTracking.trade_id.in_(trade_ids))
+                    )
                     await session.execute(delete(Trade).where(Trade.id.in_(trade_ids)))
                 if order_ids:
                     await session.execute(delete(Order).where(Order.id.in_(order_ids)))
@@ -1179,6 +1187,10 @@ class ExecutionEngine:
             if trade_ids:
                 await session.execute(update(TelegramSignal).values(executed_trade_id=None))
                 await session.execute(delete(TradeDecisionLog))
+                # До delete(Trade): FK trade_outcome_tracking.trade_id без
+                # ON DELETE — прод 2026-10-15, кнопка «Очистить тестовые/
+                # демо-данные» падала с ForeignKeyViolation на trades.
+                await session.execute(delete(TradeOutcomeTracking))
                 await session.execute(delete(Trade))
             if order_ids:
                 await session.execute(delete(Order))

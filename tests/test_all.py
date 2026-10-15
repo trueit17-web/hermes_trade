@@ -6259,6 +6259,7 @@ class TestPaperAccountReset(unittest.IsolatedAsyncioTestCase):
         from src.db.session import get_session
         from src.db.models import (
             Order, Trade, Symbol, Exchange, TelegramChannel, TelegramSignal, TradeDecisionLog,
+            TradeOutcomeTracking,
         )
         from src.execution.executor import ExecutionEngine
         from src.risk.risk_manager import RiskManager
@@ -6302,6 +6303,13 @@ class TestPaperAccountReset(unittest.IsolatedAsyncioTestCase):
 
             session.add(TradeDecisionLog(trade_id=paper_trade.id, step_order=1, step_type="execution", description="x", details={}))
             session.add(TradeDecisionLog(trade_id=real_trade.id, step_order=1, step_type="execution", description="y", details={}))
+            # Отслеживание исхода (FK на trades без ON DELETE) — без его
+            # удаления delete(Trade) падал с ForeignKeyViolation на Postgres.
+            for tr, sym in ((paper_trade, paper_sym), (real_trade, real_sym)):
+                session.add(TradeOutcomeTracking(
+                    trade_id=tr.id, symbol_id=sym.id, direction="long", entry_price=100,
+                    close_price=100, close_time=utcnow(), baseline_pnl_pct=0.0,
+                ))
 
             channel = TelegramChannel(channel_id="@reset_unittest", channel_title="X", active=True)
             session.add(channel)
@@ -6347,6 +6355,9 @@ class TestPaperAccountReset(unittest.IsolatedAsyncioTestCase):
             remaining_logs = (await session.execute(select(TradeDecisionLog))).scalars().all()
             self.assertTrue(all(log.trade_id != paper_trade_id for log in remaining_logs))
             self.assertTrue(any(log.trade_id == real_trade_id for log in remaining_logs))
+            tracked = {t.trade_id for t in (await session.execute(select(TradeOutcomeTracking))).scalars().all()}
+            self.assertNotIn(paper_trade_id, tracked)
+            self.assertIn(real_trade_id, tracked)
 
             sig = (
                 await session.execute(select(TelegramSignal).where(TelegramSignal.channel_id == channel_id))
@@ -6372,7 +6383,7 @@ class TestClearTestAndDemoData(unittest.IsolatedAsyncioTestCase):
             BotConfig, BotEvent, Candle, Exchange, HistoricalSignal, LogEntry,
             MLFeature, MLModel, Order, PerformanceSnapshot, RiskCloseEvent,
             RiskLock, Signal, Strategy, Symbol, TelegramChannel, TelegramSignal,
-            Trade, TradeDecisionLog,
+            Trade, TradeDecisionLog, TradeOutcomeTracking,
         )
         from src.db.session import get_session
         from src.execution.executor import ExecutionEngine
@@ -6411,6 +6422,13 @@ class TestClearTestAndDemoData(unittest.IsolatedAsyncioTestCase):
 
             session.add(TradeDecisionLog(trade_id=paper_trade.id, step_order=1, step_type="execution", description="x", details={}))
             session.add(TradeDecisionLog(trade_id=real_trade.id, step_order=1, step_type="execution", description="y", details={}))
+            # Прод 2026-10-15: кнопка падала с ForeignKeyViolation —
+            # trade_outcome_tracking.trade_id ссылается на trades без ON DELETE.
+            for tr, sym in ((paper_trade, paper_sym), (real_trade, real_sym)):
+                session.add(TradeOutcomeTracking(
+                    trade_id=tr.id, symbol_id=sym.id, direction="long", entry_price=100,
+                    close_price=100, close_time=utcnow(), baseline_pnl_pct=0.0,
+                ))
 
             channel = TelegramChannel(channel_id="@cleartest_channel", channel_title="X", active=True)
             session.add(channel)
@@ -6492,6 +6510,7 @@ class TestClearTestAndDemoData(unittest.IsolatedAsyncioTestCase):
 
             remaining_logs = (await session.execute(select(TradeDecisionLog))).scalars().all()
             self.assertEqual(remaining_logs, [])
+            self.assertEqual((await session.execute(select(TradeOutcomeTracking))).scalars().all(), [])
 
             self.assertEqual((await session.execute(select(RiskCloseEvent))).scalars().all(), [])
             self.assertEqual((await session.execute(select(RiskLock))).scalars().all(), [])
