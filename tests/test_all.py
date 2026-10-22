@@ -5924,6 +5924,37 @@ class TestLogging(unittest.TestCase):
         records = drain_pending_log_records()
         self.assertTrue(any(r["message"] == "проверочная запись для очереди БД" for r in records))
 
+    def test_setup_logging_silences_httpx_request_logs(self):
+        """httpx на INFO логирует URL запроса — у Telegram Bot API в нём токен бота."""
+        import logging as std_logging
+        setup_logging("INFO")
+        self.assertEqual(std_logging.getLogger("httpx").level, std_logging.WARNING)
+        self.assertEqual(std_logging.getLogger("httpcore").level, std_logging.WARNING)
+
+    def test_ring_buffer_handler_redacts_telegram_bot_token(self):
+        """Токен бота не должен попадать в ring-буфер/очередь БД (вкладка "Логи")."""
+        import logging as std_logging
+        from src.utils.logging import drain_pending_log_records, ring_buffer_handler
+
+        drain_pending_log_records()
+        probe_logger = std_logging.getLogger("test.ring_buffer_redact")
+        probe_logger.addHandler(ring_buffer_handler)
+        probe_logger.setLevel(std_logging.INFO)
+        token = "1234567890:AAFakeTokenForRedactionTest_abcdefXYZ"
+        try:
+            probe_logger.info(
+                'HTTP Request: POST https://api.telegram.org/bot%s/sendMessage "HTTP/1.1 200 OK"', token
+            )
+        finally:
+            probe_logger.removeHandler(ring_buffer_handler)
+
+        records = drain_pending_log_records()
+        messages = [r["message"] for r in records if "api.telegram.org" in r["message"]]
+        self.assertEqual(len(messages), 1)
+        self.assertNotIn(token, messages[0])
+        self.assertIn("api.telegram.org/bot<скрыто>/sendMessage", messages[0])
+        self.assertNotIn(token, ring_buffer_handler.records[-1]["message"])
+
     def test_drain_pending_log_records_empties_the_queue(self):
         from src.utils.logging import drain_pending_log_records
         drain_pending_log_records()

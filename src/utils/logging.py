@@ -2,6 +2,7 @@
 import json
 import logging
 import queue
+import re
 from collections import deque
 from datetime import UTC, datetime
 from typing import Any
@@ -20,6 +21,17 @@ _LEVEL_ORDER = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL":
 # src/web/api.py, отдающий персистентную историю из LogEntry, а не только
 # ring-буфер) для фильтрации "уровень и выше" тем же порядком уровней.
 LEVEL_ORDER = _LEVEL_ORDER
+
+# Токен Telegram-бота в URL Bot API (https://api.telegram.org/bot<id>:<secret>/...).
+# Реальный инцидент: httpx на уровне INFO логировал каждый запрос
+# "HTTP Request: POST https://api.telegram.org/bot<токен>/sendMessage" — токен
+# целиком попадал в ring-буфер, LogEntry в БД и вкладку "Логи" дашборда.
+_TELEGRAM_TOKEN_RE = re.compile(r"bot\d+:[A-Za-z0-9_-]{20,}")
+
+
+def redact_secrets(message: str) -> str:
+    """Скрыть секреты (токен Telegram-бота) в тексте лог-записи."""
+    return _TELEGRAM_TOKEN_RE.sub("bot<скрыто>", message)
 
 
 class RingBufferHandler(logging.Handler):
@@ -42,7 +54,7 @@ class RingBufferHandler(logging.Handler):
                 "timestamp": datetime.now(UTC).isoformat(),
                 "level": record.levelname,
                 "logger": record.name,
-                "message": record.getMessage(),
+                "message": redact_secrets(record.getMessage()),
             }
             self.records.append(entry)
             _pending_db_records.put_nowait(entry)
@@ -229,6 +241,12 @@ def setup_logging(level: str | None = None):
         module_logger = logging.getLogger(module_logger_name)
         module_logger.setLevel(numeric_level)
         module_logger.propagate = True
+
+    # httpx/httpcore на INFO пишут каждый запрос с полным URL — для Telegram
+    # Bot API это URL с токеном бота (см. _TELEGRAM_TOKEN_RE). Пользы от этих
+    # записей нет, а сам токен утекал в дашборд/БД — оставляем только WARNING+.
+    for noisy_logger_name in ("httpx", "httpcore"):
+        logging.getLogger(noisy_logger_name).setLevel(logging.WARNING)
 
 
 def log_trade(trade_id: int, symbol: str, side: str, pnl: float, pnl_pct: float,
