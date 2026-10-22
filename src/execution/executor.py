@@ -455,6 +455,21 @@ class ExecutionEngine:
             if market_type == "futures"
             else {"defaultType": "spot"}
         )
+        if exchange_id == "bybit":
+            # ccxt/bybit.fetch_order на unified-аккаунте (UTA — в т.ч. демо-
+            # счёт) БЕЗ params["acknowledged"] не делает запрос вообще, а
+            # всегда бросает ArgumentsRequired ("fetchOrder() can only
+            # access an order if it is in last 500 orders ... Set
+            # params["acknowledged"] = True"). Из-за этого поллинг
+            # _fetch_confirmed_order падал на первой же попытке у КАЖДОГО
+            # ордера ("Не удалось дождаться подтверждения исполнения ... за
+            # 6.0с" через ~1с после создания), а проверка биржевого SL сразу
+            # уходила в фолбэк по истории сделок. Ограничение "последние 500
+            # ордеров" нам известно и обработано (_fetch_closed_order_beyond_
+            # recent_window ловит OrderNotFound так же, как раньше ловила
+            # ArgumentsRequired) — подтверждаем его один раз здесь, на уровне
+            # опций клиента, а не в каждом вызове.
+            market_options["fetchOrder"] = {"acknowledged": True}
         exchange_config: dict = {
             **self._exchange_credentials_config(exchange_id),
             "enableRateLimit": True,

@@ -10094,6 +10094,57 @@ class TestNewExchangesCredentials(unittest.IsolatedAsyncioTestCase):
         # ошибки инициализации биржи.
         self.assertTrue(engine.is_paper)
 
+    async def test_bybit_client_acknowledges_fetch_order_window(self):
+        """
+        ccxt/bybit.fetch_order на unified-аккаунте без acknowledged всегда
+        бросает ArgumentsRequired, не делая запроса, — поллинг исполнения
+        ордера (_fetch_confirmed_order) и проверка биржевого SL никогда не
+        срабатывали (прод 22.10: "Не удалось дождаться подтверждения
+        исполнения" у каждого ордера). Опция должна стоять на клиенте Bybit.
+        """
+        settings.use_exchange_sandbox = True
+        captured: dict = {}
+
+        def fake_bybit(config):
+            captured.update(config)
+            ex = MagicMock()
+            ex.load_markets = AsyncMock()
+            return ex
+
+        engine = ExecutionEngine()
+        for market_type in ("futures", "spot"):
+            captured.clear()
+            with patch("src.execution.executor.ccxt.bybit", side_effect=fake_bybit):
+                await engine._connect_exchange("bybit", market_type)
+            self.assertEqual(captured["options"]["fetchOrder"], {"acknowledged": True})
+
+        # С реальным классом ccxt опция действительно подхватывается
+        # fetch_order (тот же handle_option_bool_and_params, что и внутри).
+        import ccxt.async_support as real_ccxt
+        real = real_ccxt.bybit({"options": captured["options"]})
+        try:
+            acknowledged, _ = real.handle_option_bool_and_params({}, "fetchOrder", "acknowledged", False)
+            self.assertTrue(acknowledged)
+        finally:
+            await real.close()
+
+    async def test_non_bybit_client_has_no_fetch_order_acknowledged_option(self):
+        """Опция специфична для Bybit — другим биржам ccxt отправил бы её как
+        лишний параметр запроса."""
+        settings.use_exchange_sandbox = False
+        captured: dict = {}
+
+        def fake_binance(config):
+            captured.update(config)
+            ex = MagicMock()
+            ex.load_markets = AsyncMock()
+            return ex
+
+        engine = ExecutionEngine()
+        with patch("src.execution.executor.ccxt.binance", side_effect=fake_binance):
+            await engine._connect_exchange("binance", "futures")
+        self.assertNotIn("fetchOrder", captured["options"])
+
     async def test_kucoin_real_account_connects_without_sandbox(self):
         settings.trading_mode = "real"
         settings.kucoin_api_key = "kucoin-key"
@@ -10983,7 +11034,10 @@ class TestMarketTypeFuturesConnection(unittest.IsolatedAsyncioTestCase):
         # TestInitializeConnectsSecondMarketForRestoredPositions) — не
         # относятся к этой проверке.
         called_config = mock_class.call_args_list[0][0][0]
-        self.assertEqual(called_config["options"], {"defaultType": "swap", "defaultSubType": "linear"})
+        self.assertEqual(
+            called_config["options"],
+            {"defaultType": "swap", "defaultSubType": "linear", "fetchOrder": {"acknowledged": True}},
+        )
 
     async def test_spot_market_type_still_connects_to_spot(self):
         settings.market_type = "spot"
@@ -10998,7 +11052,9 @@ class TestMarketTypeFuturesConnection(unittest.IsolatedAsyncioTestCase):
             await engine.initialize("bybit")
 
         called_config = mock_class.call_args_list[0][0][0]
-        self.assertEqual(called_config["options"], {"defaultType": "spot"})
+        self.assertEqual(
+            called_config["options"], {"defaultType": "spot", "fetchOrder": {"acknowledged": True}}
+        )
 
 
 class TestExecuteRealOrderOpensLongAndShortOnFutures(unittest.IsolatedAsyncioTestCase):
