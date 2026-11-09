@@ -7623,6 +7623,129 @@ class TestTradeDetail(unittest.IsolatedAsyncioTestCase):
         detail = await get_trade_detail(result["trade_id"])
         self.assertEqual(detail["market_type"], "futures")
 
+    async def test_detail_includes_raw_signal_and_all_parsed_take_profits(self):
+        """
+        Прод, IMX/USDT #800 (2026-11-09): канал дал 5 целей, бот распознал все
+        5 (parsed_take_profits), но в развороте закрытой сделки не было ни
+        исходного текста сигнала, ни списка целей — только Order.take_profit
+        (финальная цель), и на графике рисовалась одна последняя цель.
+        Пользователь решил, что бот "взял только последний тейк". Теперь
+        detail отдаёт сам сигнал (raw_message + разбор) и все уровни TP с
+        отметкой, до каких дошли выходы позиции.
+        """
+        from src.execution.executor import ExecutionEngine
+        from src.web.api import get_trade_detail
+        from src.db.session import get_session
+        from src.db.models import TelegramChannel, TelegramSignal
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "paper"
+        await engine.initialize("binance")
+
+        symbol = "TRADEDETAILSIG1/USDT"
+        order = await engine.create_order(
+            symbol=symbol, side="buy", amount=10.0, price=100.0, order_type="market",
+            stop_loss=90.0, take_profit=150.0, strategy_id="telegram_signal",
+        )
+        self.assertIsNotNone(order)
+        raw = "#TRADEDETAILSIG1/USDT - Длинная\nЦель 1: 110\nЦель 2: 120\nЦель 3: 150"
+        async with get_session() as session:
+            channel = TelegramChannel(channel_id="@trade_detail_sig_test", channel_title="Detail Sig Test")
+            session.add(channel)
+            await session.flush()
+            session.add(TelegramSignal(
+                channel_id=channel.id, raw_message=raw, message_date=datetime.now(),
+                parsed_pair=symbol, parsed_side="long", parsed_entry=100.0,
+                parsed_sl=90.0, parsed_tp=150.0, parsed_take_profits=[110.0, 120.0, 150.0],
+                parsed_leverage=27.0, decision="executed", executed_order_id=order.id,
+            ))
+            await session.commit()
+
+        # TP1 исполнен, остаток выбит по SL выше входа (после переноса SL)
+        await engine.close_paper_position(
+            symbol=symbol, side="long", entry_price=100.0, amount=5.0,
+            exit_price=110.0, reason="take_profit_1", entry_fee=0.5,
+            holding_seconds=60, order_open_id=order.id,
+        )
+        result = await engine.close_paper_position(
+            symbol=symbol, side="long", entry_price=100.0, amount=5.0,
+            exit_price=105.0, reason="stop_loss", entry_fee=0.5,
+            holding_seconds=120, order_open_id=order.id,
+        )
+
+        detail = await get_trade_detail(result["trade_id"])
+        self.assertIsNotNone(detail["signal"])
+        self.assertEqual(detail["signal"]["raw_message"], raw)
+        self.assertEqual(detail["signal"]["parsed_take_profits"], [110.0, 120.0, 150.0])
+        self.assertEqual(detail["signal"]["parsed_leverage"], 27.0)
+        self.assertEqual(detail["channel"]["channel_title"], "Detail Sig Test")
+        self.assertEqual(
+            [(lvl["level"], lvl["price"], lvl["hit"]) for lvl in detail["take_profits"]],
+            [(1, 110.0, True), (2, 120.0, False), (3, 150.0, False)],
+        )
+
+    async def test_detail_without_signal_falls_back_to_order_take_profit(self):
+        """Не-Telegram сделка: сигнала нет, единственный уровень — TP ордера."""
+        from src.execution.executor import ExecutionEngine
+        from src.web.api import get_trade_detail
+
+        engine = ExecutionEngine()
+        settings.trading_mode = "paper"
+        await engine.initialize("binance")
+
+        symbol = "TRADEDETAILNOSIG1/USDT"
+        order = await engine.create_order(
+            symbol=symbol, side="sell", amount=4.0, price=100.0, order_type="market",
+            stop_loss=110.0, take_profit=80.0,
+        )
+        self.assertIsNotNone(order)
+        result = await engine.close_paper_position(
+            symbol=symbol, side="short", entry_price=100.0, amount=4.0,
+            exit_price=80.0, reason="take_profit_1", entry_fee=0.5,
+            holding_seconds=60, order_open_id=order.id,
+        )
+
+        detail = await get_trade_detail(result["trade_id"])
+        self.assertIsNone(detail["signal"])
+        self.assertEqual(detail["take_profits"], [{"level": 1, "price": 80.0, "hit": True}])
+
+
+class TestClosedTpLevels(unittest.TestCase):
+    """_closed_tp_levels: уровень достигнут, если хоть одна часть позиции
+    закрылась на нём или дальше в прибыль (long — выше, short — ниже)."""
+
+    def test_long_and_short(self):
+        from src.web.api import _closed_tp_levels
+
+        self.assertEqual(
+            [lvl["hit"] for lvl in _closed_tp_levels([110.0, 120.0], "long", [119.95, 95.0])],
+            [True, True],
+        )
+        self.assertEqual(
+            [lvl["hit"] for lvl in _closed_tp_levels([110.0, 120.0], "long", [95.0])],
+            [False, False],
+        )
+        self.assertEqual(
+            [lvl["hit"] for lvl in _closed_tp_levels([90.0, 80.0], "short", [89.0, 105.0])],
+            [True, False],
+        )
+
+
+class TestFormatTpList(unittest.TestCase):
+    """Строка [TG SIGNAL] в логе печатала только финальную цель (parsed_tp) —
+    по логу казалось, что из сигнала с 5 целями распознана одна (IMX/USDT)."""
+
+    def test_lists_all_targets(self):
+        from src.telegram.channel_monitor import format_tp_list
+
+        self.assertEqual(
+            format_tp_list([0.12776, 0.13122, 0.14379, 0.14971, 0.15431], 0.15431),
+            "0.12776 → 0.13122 → 0.14379 → 0.14971 → 0.15431 (5 целей)",
+        )
+        self.assertEqual(format_tp_list([0.5], 0.5), "0.5")
+        self.assertEqual(format_tp_list([], 1.5), "1.5")
+        self.assertEqual(format_tp_list(None, None), "None")
+
 
 class TestRecalculateClosedTrade(unittest.IsolatedAsyncioTestCase):
     """

@@ -241,7 +241,8 @@ async def _handler(event: events.NewMessage.Event):
         }
         logger.info(
             f"[TG SIGNAL] {signal_event['parsed_pair']} {signal_event['parsed_side'].upper()} | "
-            f"Entry: {signal_event['parsed_entry']} | SL: {signal_event['parsed_sl']} | TP: {signal_event['parsed_tp']}"
+            f"Entry: {signal_event['parsed_entry']} | SL: {signal_event['parsed_sl']} | "
+            f"TP: {format_tp_list(signal_event['parsed_take_profits'], signal_event['parsed_tp'])}"
         )
 
         # Уведомить подписчиков
@@ -365,6 +366,20 @@ def unsubscribe_telegram_signal(callback: callable):
 # === Парсер сигналов ===
 
 _KNOWN_QUOTES = ("USDT", "BUSD", "USDC", "USD")
+
+
+def format_tp_list(take_profits: list | None, tp: float | None) -> str:
+    """
+    Все распознанные цели для строки [TG SIGNAL] в логе. Раньше там
+    печатался только parsed_tp — ФИНАЛЬНАЯ цель, хотя parsed_take_profits
+    содержал все: по логу выглядело, будто из сигнала с 5 целями бот
+    распознал одну последнюю (прод, IMX/USDT 2026-11-09).
+    """
+    if take_profits and len(take_profits) > 1:
+        return " → ".join(f"{float(x):g}" for x in take_profits) + f" ({len(take_profits)} целей)"
+    if take_profits:
+        return f"{float(take_profits[0]):g}"
+    return str(tp)
 
 
 def normalize_pair(pair: str) -> str:

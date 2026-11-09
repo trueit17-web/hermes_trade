@@ -546,8 +546,19 @@
   .tp-level.hit .tp-level-mark { color: #4caf50; }
   .tp-level.pending { color: var(--text-dim); }
   .tp-level.pending .tp-level-mark { color: var(--text-dim); }
+  .signal-compare {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 0 24px;
+  }
+  .signal-raw {
+    white-space: pre-wrap; word-break: break-word;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+    background: rgba(255,255,255,.03); border-radius: 6px; padding: 8px 10px;
+  }
   @media (max-width: 640px) {
     .tp-levels-columns { grid-template-columns: 1fr; gap: 14px 0; }
+    .signal-compare { grid-template-columns: 1fr; gap: 14px 0; }
   }
   #lastUpdated { color: var(--text-dim); font-size: 12px; }
   .ws-indicator { display: flex; align-items: center; gap: 6px; font-size: 12px; }
@@ -1826,7 +1837,7 @@ function renderPositions(status) {
       <td>${fmtPrice(pos.entry_price)}</td>
       <td>${cur !== null && cur !== undefined ? fmtPrice(cur) : "—"}</td>
       <td class="muted">${pos.stop_loss ? fmtPrice(pos.stop_loss) : "—"}${pos.stop_loss ? slPctHtml(pos.stop_loss, pos.entry_price, pos.side) : ""}${slBadge}</td>
-      <td class="muted">${pos.take_profit ? fmtPrice(pos.take_profit) : "—"}</td>
+      <td class="muted">${tpCellHtml(pos)}</td>
       <td>${tradeValue !== null ? "$" + fmt(tradeValue) : "—"}</td>
       <td>${pnlHtml}</td>
       <td class="muted">${pos.source || "—"}</td>
@@ -1955,6 +1966,20 @@ function tpLevelGroupHtml(levels) {
 // Два явных подраздела (а не один общий список вперемешку) — чтобы сразу,
 // без разбора значков по каждой строке, было видно, сколько уровней уже
 // сработало и сколько ещё впереди.
+// Колонка TP таблицы открытых позиций: при нескольких целях канала —
+// ближайшая ещё не достигнутая и счётчик "N/всего" (все уровни — в
+// подсказке), а не одна финальная цель, как раньше (pos.take_profit).
+function tpCellHtml(pos) {
+  const tps = pos.take_profits || [];
+  if (tps.length > 1) {
+    const hitCount = Math.min(pos.tp_hit_count || 0, tps.length);
+    const next = hitCount < tps.length ? tps[hitCount] : tps[tps.length - 1];
+    const title = tps.map((v, i) => `TP${i + 1} ${fmtPrice(v)}${i < hitCount ? " ✓" : ""}`).join("\n");
+    return `<span title="${escapeHtml(title)}">${fmtPrice(next)} <span class="muted">(TP${Math.min(hitCount + 1, tps.length)}/${tps.length})</span></span>`;
+  }
+  return pos.take_profit ? fmtPrice(pos.take_profit) : "—";
+}
+
 function tpLevelsHtml(levels) {
   if (!levels || !levels.length) {
     return `<div class="muted" style="padding:4px 0">Уровни Take Profit не заданы</div>`;
@@ -2529,6 +2554,52 @@ async function loadMlForecastInto(badgeId, symbol, marketType) {
   }
 }
 
+// Блок "Сигнал канала: как дан и как распознан" — исходный текст сообщения
+// рядом с тем, что из него вытащил парсер (вход/SL/ВСЕ цели/плечо/доли/
+// правило SL после TP1). Общий для открытой позиции (renderPositionDetail)
+// и закрытой сделки (renderTradeDetail) — в закрытых сделках его раньше не
+// было вовсе, и по карточке ордера (там только финальный TP) было не понять,
+// распознал ли бот все цели канала.
+function signalBlockHtml(s) {
+  if (!s) return "";
+  const has = v => v !== null && v !== undefined;
+  const tps = s.parsed_take_profits && s.parsed_take_profits.length
+    ? s.parsed_take_profits.map((v, i) => `TP${i + 1} ${fmtPrice(v)}`).join(" → ")
+    : (has(s.parsed_tp) ? fmtPrice(s.parsed_tp) : "—");
+  const weights = s.parsed_tp_weights && s.parsed_tp_weights.length
+    ? s.parsed_tp_weights.map(w => fmt(w * 100, 0) + "%").join(" / ")
+    : "не указаны (поровну)";
+  const postTp1 = s.parsed_post_tp1_sl_rule === "breakeven" ? "в безубыток" : "не указано (на полпути к входу)";
+  const side = s.parsed_side ? s.parsed_side.toUpperCase() : "—";
+  return `
+    <div class="trade-detail-block">
+      <h4>Сигнал канала: как дан и как распознан</h4>
+      <div class="signal-compare">
+        <div class="signal-compare-col">
+          <div class="tp-levels-col-title">📩 Сообщение канала${s.message_date ? ` <span class="muted">(${new Date(s.message_date).toLocaleString("ru-RU")})</span>` : ""}</div>
+          ${s.raw_message
+            ? `<div class="signal-raw">${escapeHtml(s.raw_message)}</div>`
+            : `<div class="muted">Текст сообщения не сохранён</div>`}
+        </div>
+        <div class="signal-compare-col">
+          <div class="tp-levels-col-title">🤖 Распознано ботом</div>
+          <div class="trade-detail-grid">
+            <div><span class="muted">Пара / сторона</span><br>${escapeHtml(s.parsed_pair || "—")} ${escapeHtml(side)}</div>
+            <div><span class="muted">Вход</span><br>${has(s.parsed_entry) ? fmtPrice(s.parsed_entry) : "по рынку"}</div>
+            <div><span class="muted">Stop Loss</span><br>${has(s.parsed_sl) ? fmtPrice(s.parsed_sl) : "—"}</div>
+            <div><span class="muted">Плечо</span><br>${has(s.parsed_leverage) ? s.parsed_leverage + "x" : "—"}</div>
+            <div style="grid-column:1 / -1"><span class="muted">Цели (${s.parsed_take_profits && s.parsed_take_profits.length ? s.parsed_take_profits.length : (has(s.parsed_tp) ? 1 : 0)})</span><br>${tps}</div>
+            <div><span class="muted">Доли фиксации</span><br>${weights}</div>
+            <div><span class="muted">SL после TP1</span><br>${postTp1}</div>
+            <div><span class="muted">Качество</span><br>${has(s.quality_score) ? fmt(s.quality_score, 2) : "—"}</div>
+            <div><span class="muted">Решение</span><br>${escapeHtml(signalDecisionBadge(s.decision))}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function renderPositionDetail(d) {
   const changesBlock = d.signal_changes ? `
     <div style="background:rgba(99,102,241,.1); border-radius:6px; padding:8px 10px; margin-bottom:12px; font-size:13px">
@@ -2564,25 +2635,7 @@ function renderPositionDetail(d) {
     </div>
   ` : "";
 
-  const signalBlock = d.signal ? `
-    <div class="trade-detail-block">
-      <h4>Сигнал: разбор и качество</h4>
-      <div class="trade-detail-grid">
-        <div><span class="muted">Качество сигнала</span><br>${d.signal.quality_score !== null && d.signal.quality_score !== undefined ? fmt(d.signal.quality_score, 2) : "—"}</div>
-        <div><span class="muted">Решение</span><br>${escapeHtml(signalDecisionBadge(d.signal.decision))}</div>
-        <div><span class="muted">Из сообщения: вход</span><br>${d.signal.parsed_entry !== null ? fmtPrice(d.signal.parsed_entry) : "—"}</div>
-        <div><span class="muted">Из сообщения: SL</span><br>${d.signal.parsed_sl !== null ? fmtPrice(d.signal.parsed_sl) : "—"}</div>
-        <div><span class="muted">Из сообщения: TP</span><br>${
-          d.signal.parsed_take_profits && d.signal.parsed_take_profits.length
-            ? d.signal.parsed_take_profits.map(v => fmtPrice(v)).join(" → ")
-            : (d.signal.parsed_tp !== null ? fmtPrice(d.signal.parsed_tp) : "—")
-        }</div>
-        <div><span class="muted">Плечо из сообщения</span><br>${d.signal.parsed_leverage !== null && d.signal.parsed_leverage !== undefined ? d.signal.parsed_leverage + "x" : "—"}</div>
-        <div><span class="muted">Сообщение получено</span><br>${d.signal.message_date ? new Date(d.signal.message_date).toLocaleString("ru-RU") : "—"}</div>
-      </div>
-      ${d.signal.raw_message ? `<div class="muted" style="margin-top:8px; white-space:pre-wrap; font-size:12px">${escapeHtml(d.signal.raw_message)}</div>` : ""}
-    </div>
-  ` : "";
+  const signalBlock = signalBlockHtml(d.signal);
 
   const logHtml = d.decision_log && d.decision_log.length ? `
     <div class="trade-detail-block">
@@ -3376,7 +3429,12 @@ function orderCardHtml(o, title, direction) {
     // обычно и так null.
     const entryRef = o.filled_price ?? o.price_requested;
     const slSuffix = o.stop_loss !== null ? slPctHtml(o.stop_loss, entryRef, direction) : "";
-    rows.push(["SL / TP", `${o.stop_loss !== null ? fmtPrice(o.stop_loss) + slSuffix : "—"} / ${o.take_profit !== null ? fmtPrice(o.take_profit) : "—"}`]);
+    // У Telegram-сделки с несколькими целями Order.take_profit — только
+    // ФИНАЛЬНАЯ цель (частичные фиксации ведёт сам бот по всем уровням),
+    // поэтому явно подписываем это, иначе выглядит как "взят один тейк".
+    const tpSuffix = o.take_profit !== null && o.tp_levels_count > 1
+      ? ` <span class="muted">(последняя из ${o.tp_levels_count} целей)</span>` : "";
+    rows.push(["SL / TP", `${o.stop_loss !== null ? fmtPrice(o.stop_loss) + slSuffix : "—"} / ${o.take_profit !== null ? fmtPrice(o.take_profit) + tpSuffix : "—"}`]);
   }
   rows.push(["Время", o.created_at ? new Date(o.created_at).toLocaleString("ru-RU") : "—"]);
   if (o.notes) rows.push(["Заметка", escapeHtml(o.notes)]);
@@ -3418,6 +3476,7 @@ function orderCardsRowHtml(openingOrder, leg, label, showOpeningCard = true, dir
 }
 
 function renderTradeDetail(d, chartPrefix = "trade-chart") {
+  if (d.opening_order && d.take_profits) d.opening_order.tp_levels_count = d.take_profits.length;
   // Все "ноги" в d.legs делят один и тот же открывающий ордер (группа
   // собрана на бэкенде по order_open_id) — карточку открывающего ордера
   // показываем только у первой ноги, чтобы не дублировать её на каждом
@@ -3513,6 +3572,16 @@ function renderTradeDetail(d, chartPrefix = "trade-chart") {
     </div>
   `;
 
+  // Все цели (у Telegram-сделок — из распознанного сигнала, не только
+  // финальная Order.take_profit) с отметкой, до каких дошли выходы позиции.
+  const tpLevels = d.take_profits || [];
+  const tpBlock = tpLevels.length > 1 ? `
+    <div class="trade-detail-block">
+      <h4>Take Profit (${tpLevels.filter(l => l.hit).length} из ${tpLevels.length} достигнуто)</h4>
+      ${tpLevelsHtml(tpLevels)}
+    </div>
+  ` : "";
+
   // График — справа на половину ширины блока, слева от него данные
   // источника сделки ("Сделка": символ/сторона/источник/цены/PnL) — тот
   // же приём, что и в renderPositionDetail.
@@ -3523,6 +3592,8 @@ function renderTradeDetail(d, chartPrefix = "trade-chart") {
         <div class="chart-source-col">${dealBlock}</div>
         <div class="chart-source-col">${chartBlockHtml(chartPrefix, d.trade_id)}</div>
       </div>
+      ${signalBlockHtml(d.signal)}
+      ${tpBlock}
       ${ordersHtml}
       ${legsHtml}
       ${logHtml}
@@ -3549,8 +3620,13 @@ function initTradeDetailChart(d, chartPrefix = "trade-chart") {
   const exitPrice = exitAmount
     ? closedLegs.reduce((sum, leg) => sum + (leg.exit_price ? leg.exit_price * leg.amount : 0), 0) / exitAmount
     : null;
-  const takeProfits = d.opening_order && d.opening_order.take_profit !== null && d.opening_order.take_profit !== undefined
-    ? [{ price: d.opening_order.take_profit }] : [];
+  // Все уровни TP (d.take_profits — с бэкенда, из распознанного сигнала),
+  // а не только финальная цель ордера — иначе на графике закрытой сделки
+  // с 5 целями канала была видна одна последняя.
+  const takeProfits = d.take_profits && d.take_profits.length
+    ? d.take_profits.map(l => ({ price: l.price, hit: l.hit, level: l.level }))
+    : (d.opening_order && d.opening_order.take_profit !== null && d.opening_order.take_profit !== undefined
+      ? [{ price: d.opening_order.take_profit }] : []);
   initTradeChart(id, {
     symbol: d.symbol,
     marketType: d.market_type,

@@ -319,6 +319,57 @@ def _position_source_label(strategy_id: str | None, channel_title: str | None = 
     return strategy.name if strategy else strategy_id
 
 
+def _signal_card(ts) -> dict:
+    """
+    Исходный Telegram-сигнал и то, как бот его распознал — для блока
+    "Сигнал: исходный текст и разбор" в развороте открытой позиции
+    (GET /positions/detail) и закрытой сделки (GET /trades/{id}/detail).
+
+    Раньше в закрытой сделке этого блока не было вовсе, а из ордера там
+    виден только Order.take_profit — ФИНАЛЬНАЯ цель канала (см. _tp_levels
+    в main.py). Реальный случай (прод, IMX/USDT #800, 2026-11-09): канал
+    дал 5 целей, бот распознал все 5 (parsed_take_profits) и вёл по ним
+    частичную фиксацию, но в карточке сделки и на её графике была только
+    последняя цель 0.15431 — выглядело так, будто бот взял один тейк.
+    """
+    return {
+        "id": ts.id,
+        "quality_score": ts.quality_score,
+        "decision": ts.decision,
+        "reject_reason": ts.reject_reason,
+        "parsed_pair": ts.parsed_pair,
+        "parsed_side": ts.parsed_side,
+        "parsed_entry": float(ts.parsed_entry) if ts.parsed_entry is not None else None,
+        "parsed_sl": float(ts.parsed_sl) if ts.parsed_sl is not None else None,
+        "parsed_tp": float(ts.parsed_tp) if ts.parsed_tp is not None else None,
+        "parsed_take_profits": [float(x) for x in ts.parsed_take_profits] if ts.parsed_take_profits else [],
+        "parsed_leverage": float(ts.parsed_leverage) if ts.parsed_leverage is not None else None,
+        "parsed_tp_weights": ts.parsed_tp_weights,
+        "parsed_post_tp1_sl_rule": ts.parsed_post_tp1_sl_rule,
+        "raw_message": ts.raw_message,
+        "message_date": ts.message_date.isoformat() + "Z" if ts.message_date else None,
+    }
+
+
+def _closed_tp_levels(take_profits: list[float], direction: str | None, exit_prices: list[float]) -> list[dict]:
+    """
+    Уровни TP закрытой сделки с отметкой "достигнут". Для закрытой позиции
+    счётчика tp_hit_count уже нет (он живёт только в памяти бота, пока
+    позиция открыта), поэтому уровень считается достигнутым, если хотя бы
+    одна часть позиции закрылась по цене на этом уровне или дальше в
+    прибыльную сторону (с допуском 0.1% на проскальзывание исполнения).
+    """
+    is_short = direction == "short"
+    levels = []
+    for i, price in enumerate(take_profits):
+        if is_short:
+            hit = any(p <= price * 1.001 for p in exit_prices)
+        else:
+            hit = any(p >= price * 0.999 for p in exit_prices)
+        levels.append({"level": i + 1, "price": float(price), "hit": hit})
+    return levels
+
+
 DASHBOARD_HTML_PATH = Path(__file__).parent / "static" / "dashboard.html"
 LOGIN_HTML_PATH = Path(__file__).parent / "static" / "login.html"
 
@@ -462,6 +513,16 @@ async def get_status():
             )
             pos["current_price"] = execution_engine.last_prices.get(symbol)
             pos["order_id_exchange"] = exchange_ids_by_order.get(pos.get("order_id"))
+            # Все цели канала (execution_engine знает только финальный
+            # take_profit) — колонка TP в таблице открытых позиций показывает
+            # ближайшую ещё не достигнутую цель и сколько их всего, а не
+            # одну последнюю (см. _signal_card про инцидент IMX/USDT).
+            bot_pos = (
+                bot_registry.current_bot.open_positions.get(symbol)
+                if bot_registry.current_bot is not None else None
+            ) or {}
+            pos["take_profits"] = [float(x) for x in (bot_pos.get("take_profits") or [])]
+            pos["tp_hit_count"] = bot_pos.get("tp_hit_count", pos.get("tp_hit_count", 0))
 
     balance = (
         execution_engine.get_paper_balance()
@@ -923,20 +984,7 @@ async def get_position_detail(symbol: str):
                         "channel_id": ts.channel.channel_id,
                         "channel_title": ts.channel.channel_title,
                     }
-                signal = {
-                    "quality_score": ts.quality_score,
-                    "decision": ts.decision,
-                    "reject_reason": ts.reject_reason,
-                    "parsed_pair": ts.parsed_pair,
-                    "parsed_side": ts.parsed_side,
-                    "parsed_entry": float(ts.parsed_entry) if ts.parsed_entry is not None else None,
-                    "parsed_sl": float(ts.parsed_sl) if ts.parsed_sl is not None else None,
-                    "parsed_tp": float(ts.parsed_tp) if ts.parsed_tp is not None else None,
-                    "parsed_take_profits": ts.parsed_take_profits,
-                    "parsed_leverage": float(ts.parsed_leverage) if ts.parsed_leverage is not None else None,
-                    "raw_message": ts.raw_message,
-                    "message_date": ts.message_date.isoformat() + "Z" if ts.message_date else None,
-                }
+                signal = _signal_card(ts)
 
     # Decision log для НЕ-Telegram позиций (алго-стратегии/ручные) — то,
     # что уже накоплено в памяти decision_logger с момента открытия и ещё
@@ -1388,14 +1436,39 @@ async def get_trade_detail(trade_id: int):
         opened_at = trade.order_open.created_at if trade.order_open else group[0].created_at
 
         channel_title = None
+        channel = None
+        signal = None
         if trade.order_open_id is not None:
-            channel_title = (
+            ts = (
                 await session.execute(
-                    select(TelegramChannel.channel_title)
-                    .join(TelegramSignal, TelegramSignal.channel_id == TelegramChannel.id)
+                    select(TelegramSignal)
+                    .options(selectinload(TelegramSignal.channel))
                     .where(TelegramSignal.executed_order_id == trade.order_open_id)
+                    .order_by(TelegramSignal.id.desc())
+                    .limit(1)
                 )
             ).scalar_one_or_none()
+            if ts is not None:
+                signal = _signal_card(ts)
+                if ts.channel:
+                    channel_title = ts.channel.channel_title
+                    channel = {
+                        "id": ts.channel.id,
+                        "channel_id": ts.channel.channel_id,
+                        "channel_title": ts.channel.channel_title,
+                    }
+
+        # Все цели канала (а не только финальная Order.take_profit) — см.
+        # _signal_card. Для не-Telegram сделок — единственный TP ордера.
+        if signal and signal["parsed_take_profits"]:
+            tp_prices = signal["parsed_take_profits"]
+        elif trade.order_open is not None and trade.order_open.take_profit is not None:
+            tp_prices = [float(trade.order_open.take_profit)]
+        else:
+            tp_prices = []
+        take_profits = _closed_tp_levels(
+            tp_prices, trade.direction, [float(t.exit_price) for t in group if t.exit_price is not None],
+        )
 
         # Тречинг цены после закрытия (см. src/execution/trade_outcome_
         # tracker.py) заведён на Trade.id ПОСЛЕДНЕЙ части позиции — тот же
@@ -1440,6 +1513,9 @@ async def get_trade_detail(trade_id: int):
             "market_type": trade.order_open.market_type if trade.order_open else "spot",
             "direction": trade.direction,
             "source": _position_source_label(trade.strategy.name if trade.strategy else None, channel_title),
+            "channel": channel,
+            "signal": signal,
+            "take_profits": take_profits,
             "entry_price": entry_price,
             "amount": total_amount,
             "pnl": total_pnl,
