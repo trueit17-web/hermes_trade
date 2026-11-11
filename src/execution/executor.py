@@ -59,6 +59,7 @@ _REASON_NOTES_RU = {
     "stop_loss": "стоп-лосс",
     "manual": "вручную",
     "channel_stop_report": "по отчёту канала о стопе",
+    "time_stop": "превышено время в позиции",
 }
 
 

@@ -1832,7 +1832,7 @@ function renderPositions(status) {
       : "";
     return `
     <tr class="trade-row" data-position-symbol="${symbol}" title="Показать подробности позиции">
-      <td class="side-${pos.side === 'long' ? 'long' : 'short'}"><span class="expand-arrow">▸</span>${symbol}${leverageBadge}</td>
+      <td class="side-${pos.side === 'long' ? 'long' : 'short'}"><span class="expand-arrow">▸</span>${symbol}${leverageBadge}${positionAgeHtml(pos, status.position_max_holding_hours)}</td>
       <td>${fmt(pos.amount, 6)}</td>
       <td>${fmtPrice(pos.entry_price)}</td>
       <td>${cur !== null && cur !== undefined ? fmtPrice(cur) : "—"}</td>
@@ -1966,6 +1966,22 @@ function tpLevelGroupHtml(levels) {
 // Два явных подраздела (а не один общий список вперемешку) — чтобы сразу,
 // без разбора значков по каждой строке, было видно, сколько уровней уже
 // сработало и сколько ещё впереди.
+// Возраст позиции рядом с символом в таблице открытых позиций. Зависшие
+// позиции занимают слоты лимита открытых позиций — раньше их возраст был
+// виден только в развороте подробностей. Если задан лимит времени в
+// позиции (настройка «Макс. время в позиции») и он превышен — подсвечиваем.
+function positionAgeHtml(pos, maxHoldingHours) {
+  if (!pos.opened_at) return "";
+  const hours = (Date.now() - new Date(pos.opened_at.endsWith("Z") ? pos.opened_at : pos.opened_at + "Z").getTime()) / 3600000;
+  if (!(hours >= 0)) return "";
+  const label = hours >= 48 ? `${Math.floor(hours / 24)}д` : (hours >= 1 ? `${Math.floor(hours)}ч` : `${Math.max(1, Math.floor(hours * 60))}м`);
+  const over = maxHoldingHours > 0 && hours > maxHoldingHours;
+  const title = over
+    ? `В позиции дольше лимита (${maxHoldingHours} ч)`
+    : "Сколько позиция открыта";
+  return ` <span class="${over ? "pnl-neg" : "muted"}" style="font-size:11px" title="${title}">${over ? "⏰ " : ""}${label}</span>`;
+}
+
 // Колонка TP таблицы открытых позиций: при нескольких целях канала —
 // ближайшая ещё не достигнутая и счётчик "N/всего" (все уровни — в
 // подсказке), а не одна финальная цель, как раньше (pos.take_profit).

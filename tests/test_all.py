@@ -24524,3 +24524,288 @@ class TestCandleFetchRateLimitRetry(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(df)
         self.assertEqual(ingest.exchange.fetch_ohlcv.await_count, 1)
         sleep.assert_not_awaited()
+
+
+class TestSignalStopDistanceAndRewardRiskFilter(unittest.TestCase):
+    """
+    Фильтр сигналов «стоп слишком далеко / прибыль не окупает риск»
+    (signal_filter_reject_reason, src/utils/trading_math.py). Прод, канал
+    «Сигналы Фьючерсы (AI)», PEOPLE/USDT 2026-10-16: вход 0.0082, стоп 0.0049
+    (40%), единственная цель 0.009 (+9.8%) — соотношение 0.24. Семь таких
+    позиций висели от 5 до 26 дней.
+    """
+
+    def test_reward_risk_single_target(self):
+        from src.utils.trading_math import reward_risk_ratio
+
+        self.assertAlmostEqual(reward_risk_ratio(0.0082, 0.0049, [0.009], "long"), 0.0008 / 0.0033)
+
+    def test_reward_risk_uses_average_of_targets_and_short_side(self):
+        from src.utils.trading_math import reward_risk_ratio
+
+        # short: вход 100, стоп 110 (риск 10), цели 98/96/90 -> средняя прибыль (2+4+10)/3
+        self.assertAlmostEqual(reward_risk_ratio(100.0, 110.0, [98.0, 96.0, 90.0], "short"), (16 / 3) / 10)
+
+    def test_reward_risk_respects_channel_weights(self):
+        from src.utils.trading_math import reward_risk_ratio
+
+        # 50% на первой цели, 25%/25% на остальных
+        ratio = reward_risk_ratio(100.0, 90.0, [110.0, 120.0, 140.0], "long", [0.5, 0.25, 0.25])
+        self.assertAlmostEqual(ratio, (10 * 0.5 + 20 * 0.25 + 40 * 0.25) / 10)
+        # длина долей не совпала с числом целей -> поровну
+        ratio = reward_risk_ratio(100.0, 90.0, [110.0, 120.0, 140.0], "long", [0.5, 0.5])
+        self.assertAlmostEqual(ratio, ((10 + 20 + 40) / 3) / 10)
+
+    def test_target_already_passed_counts_as_zero_not_negative(self):
+        from src.utils.trading_math import reward_risk_ratio
+
+        # вход по рынку 105 уже выше первой цели 104
+        self.assertAlmostEqual(reward_risk_ratio(105.0, 100.0, [104.0, 115.0], "long"), (0 + 10) / 2 / 5)
+
+    def test_reward_risk_not_computable(self):
+        from src.utils.trading_math import reward_risk_ratio
+
+        self.assertIsNone(reward_risk_ratio(100.0, 90.0, [], "long"))
+        self.assertIsNone(reward_risk_ratio(100.0, None, [110.0], "long"))
+        self.assertIsNone(reward_risk_ratio(100.0, 100.0, [110.0], "long"))
+
+    def test_filter_disabled_by_default_thresholds(self):
+        from src.utils.trading_math import signal_filter_reject_reason
+
+        self.assertIsNone(signal_filter_reject_reason(0.0082, 0.0049, [0.009], "long", 0.0, 0.0))
+
+    def test_filter_rejects_far_stop(self):
+        from src.utils.trading_math import signal_filter_reject_reason
+
+        reason = signal_filter_reject_reason(0.0082, 0.0049, [0.009], "long", 15.0, 0.0)
+        self.assertIn("стоп слишком далеко", reason)
+        self.assertIn("40.2%", reason)
+        # стоп 5% при лимите 15% проходит
+        self.assertIsNone(signal_filter_reject_reason(100.0, 95.0, [110.0], "long", 15.0, 0.0))
+
+    def test_filter_rejects_low_reward_risk(self):
+        from src.utils.trading_math import signal_filter_reject_reason
+
+        reason = signal_filter_reject_reason(0.0082, 0.0049, [0.009], "long", 0.0, 0.5)
+        self.assertIn("прибыль не окупает риск", reason)
+        self.assertIn("0.24", reason)
+        self.assertIsNone(signal_filter_reject_reason(100.0, 95.0, [110.0], "long", 0.0, 0.5))
+
+    def test_filter_skipped_without_stop_and_rr_skipped_without_targets(self):
+        from src.utils.trading_math import signal_filter_reject_reason
+
+        self.assertIsNone(signal_filter_reject_reason(100.0, None, [110.0], "long", 15.0, 1.0))
+        # целей нет: соотношение не считается, но дистанция до стопа проверяется
+        self.assertIsNone(signal_filter_reject_reason(100.0, 95.0, [], "long", 15.0, 1.0))
+        self.assertIsNotNone(signal_filter_reject_reason(100.0, 60.0, [], "long", 15.0, 1.0))
+
+
+class TestTelegramSignalRejectedByStopFilter(unittest.IsolatedAsyncioTestCase):
+    """_execute_telegram_signal: фильтр считается от цены исполнения и
+    итогового стопа, отклоняет с понятной причиной, exact_execution обходит."""
+
+    _KEYS = (
+        "trading_mode", "telegram_signals_max_sl_pct_of_margin", "telegram_signals_min_sl_pct_of_margin",
+        "telegram_signals_max_leverage", "telegram_signals_max_sl_distance_pct", "telegram_signals_min_reward_risk",
+    )
+
+    def setUp(self):
+        self._saved = {k: getattr(settings, k) for k in self._KEYS}
+        settings.trading_mode = "real"
+        settings.telegram_signals_max_sl_pct_of_margin = 40.0
+        settings.telegram_signals_min_sl_pct_of_margin = 0.0
+        settings.telegram_signals_max_leverage = 15.0
+        settings.telegram_signals_max_sl_distance_pct = 0.0
+        settings.telegram_signals_min_reward_risk = 0.0
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(settings, k, v)
+
+    async def _run(self, **extra):
+        import src.main as main_module
+        bot = main_module.TradingBot()
+        event = {
+            "parsed_pair": "PEOPLEFILTER/USDT", "parsed_side": "long",
+            "parsed_entry": 0.0082, "parsed_sl": 0.0049, "parsed_tp": 0.009,
+            "parsed_take_profits": [0.009], "parsed_leverage": 14,
+            "channel_market_type": "futures", "channel_id": "@filter_test",
+            "channel_position_size_pct": 5.0, "channel_leverage_mode": "fit_leverage",
+        }
+        event.update(extra)
+        with patch("src.main.execution_engine") as mock_engine:
+            mock_engine.get_real_balance = AsyncMock(return_value=10000.0)
+            mock_engine.get_reference_price = AsyncMock(return_value=0.0082)
+            mock_engine.create_order = AsyncMock(return_value=None)
+            await bot._execute_telegram_signal(event)
+        return event, mock_engine.create_order
+
+    async def test_executes_when_filter_disabled(self):
+        event, create = await self._run()
+        create.assert_awaited_once()
+        self.assertNotIn("reject_reason", event)
+
+    async def test_rejected_by_stop_distance(self):
+        settings.telegram_signals_max_sl_distance_pct = 15.0
+        event, create = await self._run()
+        create.assert_not_awaited()
+        self.assertIn("стоп слишком далеко", event["reject_reason"])
+
+    async def test_rejected_by_reward_risk(self):
+        settings.telegram_signals_min_reward_risk = 0.5
+        event, create = await self._run()
+        create.assert_not_awaited()
+        self.assertIn("прибыль не окупает риск", event["reject_reason"])
+
+    async def test_normal_signal_passes_enabled_filter(self):
+        settings.telegram_signals_max_sl_distance_pct = 15.0
+        settings.telegram_signals_min_reward_risk = 0.5
+        event, create = await self._run(parsed_sl=0.0078, parsed_tp=0.0095, parsed_take_profits=[0.0086, 0.0095])
+        create.assert_awaited_once()
+        self.assertNotIn("reject_reason", event)
+
+    async def test_exact_execution_bypasses_filter(self):
+        settings.telegram_signals_max_sl_distance_pct = 15.0
+        settings.telegram_signals_min_reward_risk = 0.5
+        event, create = await self._run(channel_exact_execution=True)
+        create.assert_awaited_once()
+        self.assertNotIn("reject_reason", event)
+
+
+class TestPositionHoldingLimit(unittest.IsolatedAsyncioTestCase):
+    """
+    Ограничение времени в позиции (position_max_holding_hours). Прод,
+    2026-11: позиции висели до 26 дней, занимая слоты лимита открытых
+    позиций. "notify" — только предупреждение (один раз), "close" —
+    закрытие по рынку с причиной time_stop.
+    """
+
+    def _make_bot(self):
+        import src.main as main_module
+        return main_module.TradingBot(), main_module.execution_engine
+
+    def setUp(self):
+        self._saved = {k: getattr(settings, k) for k in (
+            "trading_mode", "position_max_holding_hours", "position_max_holding_action",
+        )}
+        settings.trading_mode = "paper"
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(settings, k, v)
+
+    def _open(self, bot, engine, symbol, hours_ago):
+        from datetime import timedelta
+
+        from src.utils.timeutils import utcnow
+
+        engine.paper_positions[symbol] = {"side": "long", "entry_price": 100.0, "amount": 2.0}
+        bot.open_positions[symbol] = {
+            "side": "long", "entry_price": 100.0, "amount": 2.0, "sl": 60.0, "tp": 110.0,
+            "take_profits": [110.0], "tp_hit_count": 0, "strategy_id": "telegram_signal",
+            "opened_at": utcnow() - timedelta(hours=hours_ago),
+        }
+
+    def test_holding_limit_exceeded_helper(self):
+        from datetime import timedelta
+
+        from src.utils.timeutils import utcnow
+        from src.utils.trading_math import holding_limit_exceeded
+
+        now = utcnow()
+        self.assertTrue(holding_limit_exceeded(now - timedelta(hours=121), now, 120))
+        self.assertFalse(holding_limit_exceeded(now - timedelta(hours=119), now, 120))
+        self.assertFalse(holding_limit_exceeded(now - timedelta(hours=999), now, 0))
+        self.assertFalse(holding_limit_exceeded(None, now, 120))
+
+    async def test_disabled_limit_leaves_old_position_alone(self):
+        bot, engine = self._make_bot()
+        settings.position_max_holding_hours = 0.0
+        settings.position_max_holding_action = "close"
+        self._open(bot, engine, "HOLDOFF/USDT", hours_ago=600)
+        close_mock = AsyncMock()
+        with patch.object(engine, "close_paper_position", close_mock), \
+                patch("src.main.send_notification", AsyncMock()) as notify:
+            closed = await bot._check_position_exit("HOLDOFF/USDT", 95.0)
+        self.assertFalse(closed)
+        close_mock.assert_not_awaited()
+        notify.assert_not_awaited()
+        engine.paper_positions.pop("HOLDOFF/USDT", None)
+
+    async def test_notify_mode_warns_once_and_keeps_position(self):
+        bot, engine = self._make_bot()
+        settings.position_max_holding_hours = 120.0
+        settings.position_max_holding_action = "notify"
+        self._open(bot, engine, "HOLDNOTIFY/USDT", hours_ago=200)
+        close_mock = AsyncMock()
+        with patch.object(engine, "close_paper_position", close_mock), \
+                patch("src.main.send_notification", AsyncMock()) as notify:
+            first = await bot._check_position_exit("HOLDNOTIFY/USDT", 95.0)
+            second = await bot._check_position_exit("HOLDNOTIFY/USDT", 95.0)
+        self.assertFalse(first)
+        self.assertFalse(second)
+        close_mock.assert_not_awaited()
+        notify.assert_awaited_once()
+        text = notify.await_args.args[0]
+        self.assertIn("HOLDNOTIFY/USDT", text)
+        self.assertIn("-10.00 USDT", text)
+        self.assertIn("HOLDNOTIFY/USDT", bot.open_positions)
+        engine.paper_positions.pop("HOLDNOTIFY/USDT", None)
+
+    async def test_close_mode_closes_whole_position_with_time_stop_reason(self):
+        bot, engine = self._make_bot()
+        settings.position_max_holding_hours = 120.0
+        settings.position_max_holding_action = "close"
+        self._open(bot, engine, "HOLDCLOSE/USDT", hours_ago=200)
+        close_mock = AsyncMock(return_value={
+            "pnl": -10.0, "pnl_pct": -5.0, "outcome": "loss", "trade_id": 1,
+        })
+        with patch.object(engine, "close_paper_position", close_mock), \
+                patch("src.main.send_notification", AsyncMock()) as notify, \
+                patch("src.main.protection_manager.on_close", AsyncMock()), \
+                patch("src.main.decision_logger.flush_for_trade", AsyncMock()), \
+                patch.object(bot, "_link_telegram_signal_trade", AsyncMock()):
+            closed = await bot._check_position_exit("HOLDCLOSE/USDT", 95.0)
+        self.assertTrue(closed)
+        kwargs = close_mock.await_args.kwargs
+        self.assertEqual(kwargs["reason"], "time_stop")
+        self.assertAlmostEqual(kwargs["amount"], 2.0)
+        self.assertNotIn("HOLDCLOSE/USDT", bot.open_positions)
+        self.assertIn("Превышено время в позиции", notify.await_args.args[0])
+        engine.paper_positions.pop("HOLDCLOSE/USDT", None)
+
+    async def test_fresh_position_not_closed_in_close_mode(self):
+        bot, engine = self._make_bot()
+        settings.position_max_holding_hours = 120.0
+        settings.position_max_holding_action = "close"
+        self._open(bot, engine, "HOLDFRESH/USDT", hours_ago=10)
+        close_mock = AsyncMock()
+        with patch.object(engine, "close_paper_position", close_mock):
+            closed = await bot._check_position_exit("HOLDFRESH/USDT", 95.0)
+        self.assertFalse(closed)
+        close_mock.assert_not_awaited()
+        engine.paper_positions.pop("HOLDFRESH/USDT", None)
+
+    async def test_stop_loss_takes_priority_over_time_stop(self):
+        bot, engine = self._make_bot()
+        settings.position_max_holding_hours = 120.0
+        settings.position_max_holding_action = "close"
+        self._open(bot, engine, "HOLDSL/USDT", hours_ago=200)
+        close_mock = AsyncMock(return_value={
+            "pnl": -80.0, "pnl_pct": -40.0, "outcome": "loss", "trade_id": 1,
+        })
+        with patch.object(engine, "close_paper_position", close_mock), \
+                patch("src.main.send_notification", AsyncMock()), \
+                patch("src.main.protection_manager.on_close", AsyncMock()), \
+                patch("src.main.decision_logger.flush_for_trade", AsyncMock()), \
+                patch.object(bot, "_link_telegram_signal_trade", AsyncMock()):
+            await bot._check_position_exit("HOLDSL/USDT", 59.0)
+        self.assertEqual(close_mock.await_args.kwargs["reason"], "stop_loss")
+        engine.paper_positions.pop("HOLDSL/USDT", None)
+
+    def test_reason_labels(self):
+        import src.main as main_module
+        from src.execution.executor import _reason_notes_ru
+
+        self.assertEqual(main_module.TradingBot._reason_ru("time_stop", False, 1), "Превышено время в позиции")
+        self.assertEqual(_reason_notes_ru("time_stop"), "превышено время в позиции")

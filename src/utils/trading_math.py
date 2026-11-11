@@ -84,3 +84,77 @@ def risk_based_size_pct(entry: float, stop_loss: float, risk_pct: float, max_siz
     if max_size_pct > 0 and size > max_size_pct:
         return max_size_pct, True
     return size, False
+
+
+def reward_risk_ratio(
+    entry: float, stop_loss: float, take_profits: list[float], side: str,
+    weights: list[float] | None = None,
+) -> float | None:
+    """
+    Соотношение прибыль/риск сигнала: СРЕДНЯЯ (взвешенная долями фиксации)
+    дистанция до целей, делённая на дистанцию до стопа. Именно среднюю, а
+    не дальнюю цель: бот фиксирует позицию частями на каждом уровне (см.
+    _check_position_exit в main.py), так что ожидаемая прибыль при
+    достижении ВСЕХ целей — это среднее, а не максимум.
+
+    Цель, уже пройденная ценой входа (канал дал вход по рынку позже своих
+    же первых целей), прибыли не даёт — считается за 0, а не за минус.
+    None — посчитать нельзя (нет целей, нет стопа или стоп на цене входа).
+    weights — доли фиксации канала (см. extract_tp_weights); при несовпадении
+    длины со списком целей используется равное распределение, как и при
+    фактическом закрытии.
+    """
+    if not entry or not stop_loss or not take_profits:
+        return None
+    risk = abs(entry - stop_loss)
+    if risk <= 0:
+        return None
+    rewards = [max((tp - entry) if side == "long" else (entry - tp), 0.0) for tp in take_profits]
+    if weights and len(weights) == len(rewards) and sum(weights) > 0:
+        reward = sum(r * w for r, w in zip(rewards, weights, strict=True)) / sum(weights)
+    else:
+        reward = sum(rewards) / len(rewards)
+    return reward / risk
+
+
+def signal_filter_reject_reason(
+    entry: float, stop_loss: float | None, take_profits: list[float], side: str,
+    max_sl_distance_pct: float, min_reward_risk: float,
+    weights: list[float] | None = None,
+) -> str | None:
+    """
+    Причина отклонения сигнала фильтром «стоп слишком далеко / прибыль не
+    окупает риск» — None, если сигнал проходит (или оба порога выключены, 0).
+
+    Мотив (прод, канал «Сигналы Фьючерсы (AI)», 2026-10/11): часть сигналов
+    идёт со стопом 40–70% от входа и единственной целью около +10% — семь
+    таких позиций висели от 5 до 26 дней с суммарным убытком при
+    срабатывании стопов втрое больше всей реализованной прибыли счёта.
+    Оба порога по умолчанию выключены: на той же истории закрытые сделки с
+    далёким стопом были и самыми прибыльными, поэтому включать и подбирать
+    значения — осознанное решение пользователя, а не дефолт бота.
+
+    Без стопа фильтр не применяется (считать нечего); без целей — только
+    проверка дистанции до стопа.
+    """
+    if not entry or not stop_loss:
+        return None
+    if max_sl_distance_pct and max_sl_distance_pct > 0:
+        distance_pct = stop_distance_fraction(entry, stop_loss) * 100
+        if distance_pct > max_sl_distance_pct:
+            return f"стоп слишком далеко: {distance_pct:.1f}% от входа (лимит {max_sl_distance_pct:g}%)"
+    if min_reward_risk and min_reward_risk > 0:
+        ratio = reward_risk_ratio(entry, stop_loss, take_profits, side, weights)
+        if ratio is not None and ratio < min_reward_risk:
+            return f"прибыль не окупает риск: соотношение {ratio:.2f} (минимум {min_reward_risk:g})"
+    return None
+
+
+def holding_limit_exceeded(opened_at, now, max_holding_hours: float) -> bool:
+    """
+    Позиция открыта дольше лимита (см. position_max_holding_hours в
+    config.py). False, если лимит выключен (0) или время открытия неизвестно.
+    """
+    if not max_holding_hours or max_holding_hours <= 0 or opened_at is None:
+        return False
+    return (now - opened_at).total_seconds() > max_holding_hours * 3600

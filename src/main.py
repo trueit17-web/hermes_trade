@@ -58,7 +58,9 @@ from src.utils.trading_math import (
     breakeven_stop_price,
     fit_leverage_to_stop,
     halfway_to_entry_stop_price,
+    holding_limit_exceeded,
     risk_based_size_pct,
+    signal_filter_reject_reason,
     stop_distance_fraction,
 )
 from src.web.api import app as web_app
@@ -1614,6 +1616,25 @@ class TradingBot:
             signal_event["reject_reason"] = f"цена {ref_price:.6g} уже прошла SL канала {sl:.6g}"
             return None
 
+        # Фильтр «стоп слишком далеко / прибыль не окупает риск» — см.
+        # signal_filter_reject_reason. Считается здесь, а не раньше: от
+        # цены реального исполнения (ref_price) и ИТОГОВОГО стопа — уже
+        # после дефолтного SL и капов выше, то есть ровно от тех уровней,
+        # с которыми позиция реально открылась бы. Каналы с exact_execution
+        # фильтр не трогает (точное исполнение обходит фильтры сигнала,
+        # оставляя только портфельные ограничения — см. комментарий выше).
+        if not exact_execution:
+            filter_reason = signal_filter_reject_reason(
+                ref_price, sl, take_profits or ([tp] if tp else []), side,
+                settings.telegram_signals_max_sl_distance_pct,
+                settings.telegram_signals_min_reward_risk,
+                tp_weights,
+            )
+            if filter_reason:
+                logger.info(f"🚫 Сигнал по {pair} отклонён: {filter_reason}")
+                signal_event["reject_reason"] = filter_reason
+                return None
+
         if settings.is_paper:
             balance = execution_engine.get_paper_balance()
         else:
@@ -2577,6 +2598,8 @@ class TradingBot:
         """
         if reason == "stop_loss":
             return "Stop Loss"
+        if reason == "time_stop":
+            return "Превышено время в позиции"
         if reason.startswith("take_profit_"):
             level = reason.rsplit("_", 1)[-1]
             if is_partial:
@@ -2764,6 +2787,43 @@ class TradingBot:
         if not edited:
             await send_notification(edited_text)
 
+    async def _holding_limit_hit(self, symbol: str, position: dict, current_price: float) -> bool:
+        """
+        Ограничение времени в позиции (position_max_holding_hours, см.
+        config.py). Возвращает True, только если лимит превышен И выбрано
+        действие "close" — тогда _check_position_exit закрывает позицию по
+        рынку с причиной time_stop.
+
+        При действии "notify" (дефолт) позиция остаётся открытой: один раз
+        на позицию пишем WARNING в лог и шлём уведомление в Telegram. Флаг
+        "уже предупредили" живёт только в памяти — после рестарта бота
+        предупреждение по всё ещё зависшей позиции придёт повторно, что
+        для напоминания о зависшей позиции скорее уместно, чем нет.
+        """
+        if not holding_limit_exceeded(position.get("opened_at"), utcnow(), settings.position_max_holding_hours):
+            return False
+        if settings.position_max_holding_action == "close":
+            return True
+        if position.get("_holding_limit_notified"):
+            return False
+        position["_holding_limit_notified"] = True
+
+        held_hours = (utcnow() - position["opened_at"]).total_seconds() / 3600
+        entry_price = position.get("entry_price") or 0.0
+        direction = 1 if position.get("side") == "long" else -1
+        pnl_pct = direction * (current_price - entry_price) / entry_price * 100 if entry_price else 0.0
+        pnl = direction * (current_price - entry_price) * position.get("amount", 0.0)
+        text = (
+            f"⏰ Позиция {symbol} {str(position.get('side', '')).upper()} открыта {held_hours / 24:.1f} дн. "
+            f"(лимит {settings.position_max_holding_hours:g} ч) | сейчас {pnl:+.2f} USDT ({pnl_pct:+.2f}%)"
+        )
+        logger.warning(text)
+        await send_notification(
+            text + "\nПозиция оставлена открытой — закройте вручную или включите автозакрытие в настройках.",
+            reply_to_message_id=position.get("notification_message_id"),
+        )
+        return False
+
     async def _check_position_exit(self, symbol: str, current_price: float) -> bool:
         """
         Проверить открытую позицию на достижение SL или одного из уровней
@@ -2859,6 +2919,12 @@ class TradingBot:
                     level_hit = level
                     reason = f"take_profit_{level + 1}"
                     break
+
+        if reason is None and await self._holding_limit_hit(symbol, position, current_price):
+            # Позиция открыта дольше лимита и выбрано действие "close" —
+            # закрываем целиком тем же путём, что и SL (level_hit=None →
+            # is_partial=False ниже, close_amount = весь остаток).
+            reason = "time_stop"
 
         if reason is None:
             return False

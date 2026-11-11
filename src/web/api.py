@@ -540,6 +540,9 @@ async def get_status():
         "risk_state": risk_manager.get_state(),
         "paper_balance": balance,
         "paper_positions": open_positions,
+        # Для подсветки зависших позиций в таблице открытых позиций (см.
+        # positionAgeHtml в dashboard.html) — 0, если лимит выключен.
+        "position_max_holding_hours": settings.position_max_holding_hours,
         "active_strategies": strategy_registry.list_strategies(),
         "ml_models": await model_registry.list_models(),
         "ml_active_model": await model_registry.get_active_model("direction_classifier"),
