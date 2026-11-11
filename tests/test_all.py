@@ -4778,6 +4778,44 @@ class TestParseTelegramSignalImageRouting(unittest.IsolatedAsyncioTestCase):
         groq_mock.chat.completions.create.assert_not_called()
         cerebras_mock.chat.completions.create.assert_not_called()
 
+    async def test_photo_with_full_text_caption_parsed_by_regex_without_llm(self):
+        """Реальный инцидент (прод, @kripto_signaly7, WLD): фото-график с
+        подписью-сигналом — ветка image_bytes уходила сразу в vision-LLM,
+        минуя regex; Gemini ответил 503, сигнал потерян. Подпись должна
+        разбираться регулярками, LLM при этом не вызывается вовсе."""
+        import src.telegram.llm_parser as llm_parser_module
+        import src.telegram.gemini_parser as gemini_parser_module
+        from src.telegram.channel_monitor import parse_telegram_signal
+        settings.telegram_llm_fallback_enabled = True
+        settings.anthropic_api_key = "test-key"
+        settings.gemini_api_key = "test-key"
+
+        anthropic_mock = AsyncMock()
+        anthropic_mock.messages.create = AsyncMock(
+            side_effect=AssertionError("regex должен был разобрать подпись без LLM")
+        )
+        llm_parser_module._client = anthropic_mock
+        gemini_mock = MagicMock()
+        gemini_mock.aio.models.generate_content = AsyncMock(
+            side_effect=AssertionError("regex должен был разобрать подпись без LLM")
+        )
+        gemini_parser_module._client = gemini_mock
+
+        caption = (
+            "**🚀**** WLD SHORT x25**\n\n**➡**** Вход: **по рынку \n"
+            "✅** Тейки: 0.3160 0.3124 0.2942\n****❌**** Стоп: 0.3359**\n\n"
+            "📉**Канал с**[**VIP Сигналами**](https://t.me/+-zCMRGFXVpxhNGE8)"
+        )
+        result = await parse_telegram_signal(caption, image_bytes=b"\xff\xd8\xff\xe0fake-jpeg-bytes")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["pair"], "WLD/USDT")
+        self.assertEqual(result["side"], "short")
+        self.assertIsNone(result["entry"])
+        self.assertEqual(result["sl"], 0.3359)
+        self.assertEqual(result["take_profits"], [0.316, 0.3124, 0.2942])
+        anthropic_mock.messages.create.assert_not_called()
+        gemini_mock.aio.models.generate_content.assert_not_called()
+
     async def test_both_vision_fallbacks_fail_returns_none(self):
         import src.telegram.llm_parser as llm_parser_module
         import src.telegram.gemini_parser as gemini_parser_module
