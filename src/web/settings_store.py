@@ -355,6 +355,69 @@ def _cast(field: dict, raw_value: Any) -> Any:
     return str(raw_value)
 
 
+# Модули LLM-парсеров кешируют клиент провайдера с ключом на момент
+# первого запроса (_client) — после смены/удаления ключа кеш нужно сбросить,
+# иначе новый ключ подхватился бы только после рестарта бота.
+_LLM_CLIENT_MODULES = {
+    "anthropic_api_key": "src.telegram.llm_parser",
+    "gemini_api_key": "src.telegram.gemini_parser",
+    "groq_api_key": "src.telegram.groq_parser",
+    "cerebras_api_key": "src.telegram.cerebras_parser",
+}
+
+
+def _reset_llm_client(key: str) -> None:
+    module_name = _LLM_CLIENT_MODULES.get(key)
+    if module_name is None:
+        return
+    import sys
+
+    module = sys.modules.get(module_name)
+    if module is not None and hasattr(module, "_client"):
+        module._client = None
+
+
+async def clear_secret_settings(keys: list[str]) -> dict:
+    """Удалить сохранённые секреты (API-ключи) — кнопка «Удалить» у
+    поля-секрета на вкладке «Настройки».
+
+    Через обычное обновление настроек секрет удалить нельзя: пустое значение
+    там означает «не менять» (см. apply_settings_update). Значение
+    сохраняется в bot_config как пустая строка, а не удаляется строкой: так
+    оно при старте бота перекрывает и ключ, заданный в переменных окружения
+    (.env) — load_settings_overrides пропускает только None.
+    """
+    cleared: list[str] = []
+    errors: dict[str, str] = {}
+    async with get_session() as session:
+        for key in keys:
+            field = _SCHEMA_BY_KEY.get(key)
+            if field is None:
+                errors[key] = "неизвестный параметр"
+                continue
+            if field["type"] != "secret":
+                errors[key] = "удалять можно только секреты (API-ключи)"
+                continue
+            setattr(settings, key, "")
+            _reset_llm_client(key)
+            existing = (
+                await session.execute(select(BotConfig).where(BotConfig.config_key == key))
+            ).scalar_one_or_none()
+            if existing:
+                existing.config_value = {"value": ""}
+                existing.source = "settings_ui"
+                existing.updated_by = "web"
+            else:
+                session.add(BotConfig(
+                    config_key=key, config_value={"value": ""}, source="settings_ui", updated_by="web",
+                ))
+            cleared.append(key)
+        await session.commit()
+    if cleared:
+        logger.info(f"Удалены секреты из настроек: {cleared}")
+    return {"cleared": cleared, "errors": errors}
+
+
 async def apply_settings_update(updates: dict[str, Any]) -> dict:
     """Применить и сохранить изменения настроек.
 
@@ -382,6 +445,8 @@ async def apply_settings_update(updates: dict[str, Any]) -> dict:
                 continue
 
             setattr(settings, key, casted)
+            if field["type"] == "secret":
+                _reset_llm_client(key)
             if key in _RISK_PARAM_MAP:
                 risk_changes[_RISK_PARAM_MAP[key]] = casted
 

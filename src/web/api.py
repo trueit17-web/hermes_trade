@@ -52,7 +52,7 @@ from src.utils.logging import LEVEL_ORDER, get_logger_families
 from src.utils.timeutils import utcnow
 from src.web import auth
 from src.web.connections_status import get_connections_status
-from src.web.settings_store import apply_settings_update, get_settings_snapshot
+from src.web.settings_store import apply_settings_update, clear_secret_settings, get_settings_snapshot
 from src.web.system_metrics import get_system_metrics
 
 logger = logging.getLogger(__name__)
@@ -179,6 +179,11 @@ class LoginRequest(BaseModel):
 class SettingsUpdateRequest(BaseModel):
     """Запрос на обновление настроек бота (вкладка «Настройки»)."""
     values: dict[str, Any] = Field(default_factory=dict)
+
+
+class SettingsClearSecretsRequest(BaseModel):
+    """Удалить сохранённые секреты (API-ключи) — см. clear_secret_settings."""
+    keys: list[str] = Field(default_factory=list)
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -2006,6 +2011,14 @@ async def get_settings():
 async def update_settings(request: SettingsUpdateRequest):
     """Обновить настройки бота — применяется немедленно и сохраняется на будущие перезапуски."""
     result = await apply_settings_update(request.values)
+    return {"success": not result["errors"], **result}
+
+
+@app.post("/settings/clear-secrets")
+async def clear_settings_secrets(request: SettingsClearSecretsRequest):
+    """Удалить сохранённые API-ключи (обычное обновление настроек пустое
+    значение секрета трактует как «не менять» и удалить ключ не позволяет)."""
+    result = await clear_secret_settings(request.keys)
     return {"success": not result["errors"], **result}
 
 

@@ -4743,7 +4743,8 @@ function renderSettingsField(f) {
     inputHtml = `<label class="toggle"><input type="checkbox" id="${id}" data-key="${f.key}" data-type="${f.type}" ${f.value ? "checked" : ""}><span class="slider"></span></label>`;
   } else if (f.type === "secret") {
     const placeholder = f.configured ? `сохранено (${f.value}) — оставьте пустым` : "не задано";
-    inputHtml = `<input type="password" id="${id}" data-key="${f.key}" data-type="${f.type}" placeholder="${placeholder}" autocomplete="off">`;
+    inputHtml = `<input type="password" id="${id}" data-key="${f.key}" data-type="${f.type}" placeholder="${placeholder}" autocomplete="off">`
+      + (f.configured ? ` <button type="button" class="btn-ghost secret-clear-btn" data-clear-secret="${f.key}" title="Удалить сохранённый ключ">✕ Удалить</button>` : "");
   } else if (f.type === "int" || f.type === "float") {
     inputHtml = `<input type="number" ${f.type === "float" ? 'step="any"' : 'step="1"'} id="${id}" data-key="${f.key}" data-type="${f.type}" value="${f.value ?? ""}">`;
   } else {
@@ -4802,6 +4803,25 @@ async function loadSettings() {
     // а не только чекбоксы, как раньше.
     container.querySelectorAll('select[data-key]').forEach(sel => {
       sel.addEventListener("change", applySettingsDependencies);
+    });
+    // Пустое поле секрета при сохранении означает «не менять» — удалить
+    // ключ можно только этой кнопкой (POST /settings/clear-secrets).
+    container.querySelectorAll("[data-clear-secret]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const key = btn.dataset.clearSecret;
+        if (!confirm(`Удалить сохранённый ключ «${key}»? Бот перестанет использовать этого провайдера.`)) return;
+        try {
+          const result = await api("/settings/clear-secrets", { method: "POST", body: JSON.stringify({ keys: [key] }) });
+          if (result.success) {
+            showToast("Ключ удалён");
+            loadSettings();
+          } else {
+            showToast("Ошибка: " + Object.values(result.errors || {}).join(", "), true);
+          }
+        } catch (err) {
+          showToast("Ошибка: " + err.message, true);
+        }
+      });
     });
   } catch (err) {
     container.innerHTML = `<div class="muted">Ошибка загрузки: ${err.message}</div>`;

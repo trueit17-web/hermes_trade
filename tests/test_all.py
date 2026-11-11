@@ -24809,3 +24809,84 @@ class TestPositionHoldingLimit(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(main_module.TradingBot._reason_ru("time_stop", False, 1), "Превышено время в позиции")
         self.assertEqual(_reason_notes_ru("time_stop"), "превышено время в позиции")
+
+
+class TestClearSecretSettings(unittest.IsolatedAsyncioTestCase):
+    """
+    POST /settings/clear-secrets — удаление сохранённого API-ключа. Обычное
+    обновление настроек пустой секрет трактует как «не менять», поэтому
+    удалить ключ (прод, 2026-11-11: Anthropic отвечал «credit balance is too
+    low» на каждый сигнал перед переходом к Gemini) было нельзя вовсе.
+    """
+
+    def setUp(self):
+        self._saved = settings.anthropic_api_key
+
+    def tearDown(self):
+        settings.anthropic_api_key = self._saved
+
+    async def test_clears_secret_persists_empty_and_resets_client(self):
+        from sqlalchemy import select
+
+        import src.telegram.llm_parser as llm_parser
+        from src.db.models import BotConfig
+        from src.db.session import get_session
+        from src.web.settings_store import (
+            apply_settings_update,
+            clear_secret_settings,
+            get_settings_snapshot,
+            load_settings_overrides,
+        )
+
+        await apply_settings_update({"anthropic_api_key": "sk-test-to-remove"})
+        self.assertEqual(settings.anthropic_api_key, "sk-test-to-remove")
+        llm_parser._client = object()
+
+        result = await clear_secret_settings(["anthropic_api_key"])
+        self.assertEqual(result, {"cleared": ["anthropic_api_key"], "errors": {}})
+        self.assertEqual(settings.anthropic_api_key, "")
+        self.assertIsNone(llm_parser._client)
+        field = next(f for f in get_settings_snapshot() if f["key"] == "anthropic_api_key")
+        self.assertFalse(field["configured"])
+
+        async with get_session() as session:
+            row = (
+                await session.execute(select(BotConfig).where(BotConfig.config_key == "anthropic_api_key"))
+            ).scalar_one()
+            self.assertEqual(row.config_value, {"value": ""})
+
+        # При старте пустая строка перекрывает ключ из окружения (.env).
+        settings.anthropic_api_key = "sk-from-env"
+        await load_settings_overrides()
+        self.assertEqual(settings.anthropic_api_key, "")
+
+        # Парсер без ключа сразу отдаёт None, не обращаясь к провайдеру.
+        saved_flag = settings.telegram_llm_fallback_enabled
+        settings.telegram_llm_fallback_enabled = True
+        try:
+            self.assertIsNone(await llm_parser.parse_with_llm("BTC long 100 sl 90 tp 120"))
+        finally:
+            settings.telegram_llm_fallback_enabled = saved_flag
+
+    async def test_rejects_non_secret_and_unknown_keys(self):
+        from src.web.settings_store import clear_secret_settings
+
+        result = await clear_secret_settings(["risk_daily_loss_limit_usd", "no_such_key"])
+        self.assertEqual(result["cleared"], [])
+        self.assertIn("risk_daily_loss_limit_usd", result["errors"])
+        self.assertIn("no_such_key", result["errors"])
+
+    async def test_empty_secret_in_regular_update_still_means_keep(self):
+        from src.web.settings_store import apply_settings_update
+
+        await apply_settings_update({"anthropic_api_key": "sk-keep-me"})
+        await apply_settings_update({"anthropic_api_key": ""})
+        self.assertEqual(settings.anthropic_api_key, "sk-keep-me")
+
+    async def test_endpoint(self):
+        from src.web.api import SettingsClearSecretsRequest, clear_settings_secrets
+
+        settings.anthropic_api_key = "sk-endpoint"
+        resp = await clear_settings_secrets(SettingsClearSecretsRequest(keys=["anthropic_api_key"]))
+        self.assertTrue(resp["success"])
+        self.assertEqual(settings.anthropic_api_key, "")
